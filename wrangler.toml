@@ -1,6 +1,6 @@
 name = "llm-gateway"
 main = "_worker.js"
-compatibility_date = "2026-06-30"
+compatibility_date = "2026-06-29"
 
 [observability.logs]
 enabled = true
