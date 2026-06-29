@@ -226,7 +226,7 @@ It merges multiple upstream LLM API keys behind your own unified endpoint. The c
 
 ### Configuration Model
 
-The recommended setup is now “environment variables + KV”:
+The recommended setup is now "environment variables + KV":
 
 - env vars hold only the root-level settings
 - the actual upstream pool config lives in KV
