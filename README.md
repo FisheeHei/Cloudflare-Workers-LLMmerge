@@ -47,8 +47,9 @@
 
 Cloudflare deployment persistence:
 
-- non-sensitive defaults are pinned in `wrangler.toml` under `[vars]`
-- `API_KEY_CRYPT_SECRET` should be configured as a Cloudflare Secret
+- runtime 默认值内置在 `_worker.js`
+- 本地开发示例放在 `.dev.vars.example`
+- Pages / Workers 面板里的 Variables 与 Secrets 会直接进入 `env`
 - upstream pools and generated client keys are stored in KV
 - redeploying the Worker should not require re-entering KV-backed settings
 

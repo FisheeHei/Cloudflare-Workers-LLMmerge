@@ -1,14 +1,14 @@
+"$schema" = "./node_modules/wrangler/config-schema.json"
+
 name = "llm-gateway"
-main = "_worker.js"
+pages_build_output_dir = "."
 compatibility_date = "2026-06-29"
 
-[vars]
-ADMIN_TOKEN = "llmmerge-admin"
-REQUEST_TIMEOUT_MS = "90000"
-UPSTREAM_COOLDOWN_TTL = "60"
-MODEL_CACHE_TTL = "3600"
-UPSTREAMS_JSON = "[]"
-CLIENTS_JSON = "[]"
+# ponytail: runtime defaults live in _worker.js so Pages Variables / Secrets can override them.
+# Supported names: ADMIN_TOKEN, API_KEY_CRYPT_SECRET, REQUEST_TIMEOUT_MS,
+# UPSTREAM_COOLDOWN_TTL, MODEL_CACHE_TTL, UPSTREAMS_JSON, CLIENTS_JSON.
 
-[observability.logs]
-enabled = true
+# Required for the admin page.
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "<YOUR_KV_NAMESPACE_ID>"

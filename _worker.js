@@ -135,6 +135,13 @@ export default {
         });
       }
 
+      if (env.ASSETS && request.method === "GET" && pathname !== "/") {
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) {
+          return assetResponse;
+        }
+      }
+
       if (request.method === "GET") {
         return html(renderNginxWelcomePage());
       }
@@ -1348,7 +1355,11 @@ function renderAdminPage() {
       cursor: pointer;
       background: var(--accent);
       color: white;
+      transition: transform .16s ease, opacity .16s ease, filter .16s ease;
     }
+    button:hover { filter: brightness(1.04); }
+    button:active { transform: translateY(1px); }
+    button[disabled] { opacity: .62; cursor: wait; }
     button.secondary { background: #eadcc5; color: #3a2b1f; }
     button.good { background: var(--accent-2); }
     button.danger { background: #8d2f23; }
@@ -1481,6 +1492,33 @@ function renderAdminPage() {
       margin: 10px 0 0;
       overflow: auto;
     }
+    .output-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .toast {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      max-width: min(360px, calc(100vw - 32px));
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(215, 199, 170, .9);
+      background: rgba(31, 41, 55, .94);
+      color: #fff;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, .2);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(8px);
+      transition: opacity .18s ease, transform .18s ease;
+      z-index: 60;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
     @media (max-width: 860px) {
       .span-8, .span-6, .span-4, .span-3, .span-2 { grid-column: span 12; }
       .client-item, .upstream-head { flex-direction: column; align-items: flex-start; }
@@ -1553,6 +1591,10 @@ function renderAdminPage() {
           <button class="good" id="create-client">生成客户端 Key</button>
         </div>
         <pre id="client-output" hidden></pre>
+        <div class="output-actions" id="client-output-actions" hidden>
+          <button type="button" class="secondary" id="copy-client-output">Copy client JSON</button>
+          <button type="button" class="secondary" id="copy-client-key">Copy API key</button>
+        </div>
         <div class="client-list" id="client-list"></div>
       </section>
     </div>
@@ -1613,6 +1655,8 @@ function renderAdminPage() {
     </div>
   </div>
 
+  <div class="toast" id="toast" aria-live="polite"></div>
+
   <script>
     const API_BASE = location.pathname.replace(/\/+$/, "") + "/api";
     const state = {
@@ -1621,6 +1665,7 @@ function renderAdminPage() {
       clients: [],
       gateway: null,
       draftPresetId: null,
+      lastCreatedClient: null,
     };
 
     const byId = (id) => document.getElementById(id);
@@ -1709,6 +1754,38 @@ function renderAdminPage() {
 
     function closeVendorModal() {
       byId("vendor-modal").classList.remove("open");
+    }
+
+    let toastTimer = null;
+
+    function showToast(message) {
+      const toast = byId("toast");
+      toast.textContent = message;
+      toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toast.classList.remove("show");
+      }, 2200);
+    }
+
+    async function copyText(value, successMessage) {
+      if (!value) {
+        throw new Error("Nothing to copy.");
+      }
+      await navigator.clipboard.writeText(value);
+      showToast(successMessage || "Copied.");
+    }
+
+    async function withButtonBusy(button, label, task) {
+      const original = button.textContent;
+      button.disabled = true;
+      button.textContent = label;
+      try {
+        return await task();
+      } finally {
+        button.disabled = false;
+        button.textContent = original;
+      }
     }
 
     function applyVendorPreset() {
@@ -2035,11 +2112,14 @@ function renderAdminPage() {
         throw new Error(data?.error?.message || "创建客户端失败");
       }
 
+      state.lastCreatedClient = data.client;
       byId("client-output").hidden = false;
       byId("client-output").textContent = JSON.stringify(data.client, null, 2);
+      byId("client-output-actions").hidden = false;
       byId("client-name").value = "";
       byId("client-models").value = "";
       byId("client-upstreams").value = "";
+      showToast("Client key created.");
       await loadClients();
     }
 
@@ -2062,18 +2142,43 @@ function renderAdminPage() {
       try {
         await loadConfig();
         await loadClients();
-        byId("open-vendor-modal").addEventListener("click", openVendorModal);
-        byId("close-vendor-modal").addEventListener("click", closeVendorModal);
-        byId("create-vendor").addEventListener("click", () => {
-          try {
-            createVendorFromModal();
-          } catch (error) {
-            showError(error);
+        byId("vendor-modal").addEventListener("click", (event) => {
+          if (event.target === byId("vendor-modal")) {
+            closeVendorModal();
           }
         });
-        byId("save-config").addEventListener("click", () => saveConfig().catch(showError));
-        byId("refresh-models").addEventListener("click", () => refreshModels().catch(showError));
-        byId("create-client").addEventListener("click", () => createClient().catch(showError));
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") {
+            closeVendorModal();
+          }
+        });
+        byId("open-vendor-modal").addEventListener("click", openVendorModal);
+        byId("close-vendor-modal").addEventListener("click", closeVendorModal);
+        byId("create-vendor").addEventListener("click", (event) =>
+          withButtonBusy(event.currentTarget, "Adding...", async () => {
+            createVendorFromModal();
+            showToast("Upstream draft added.");
+          }).catch(showError),
+        );
+        byId("save-config").addEventListener("click", (event) =>
+          withButtonBusy(event.currentTarget, "Saving...", saveConfig).catch(showError),
+        );
+        byId("refresh-models").addEventListener("click", (event) =>
+          withButtonBusy(event.currentTarget, "Refreshing...", refreshModels).catch(showError),
+        );
+        byId("create-client").addEventListener("click", (event) =>
+          withButtonBusy(event.currentTarget, "Creating...", createClient).catch(showError),
+        );
+        byId("copy-client-output").addEventListener("click", (event) =>
+          withButtonBusy(event.currentTarget, "Copying...", () =>
+            copyText(byId("client-output").textContent, "Client JSON copied."),
+          ).catch(showError),
+        );
+        byId("copy-client-key").addEventListener("click", (event) =>
+          withButtonBusy(event.currentTarget, "Copying...", () =>
+            copyText(state.lastCreatedClient?.api_key, "API key copied."),
+          ).catch(showError),
+        );
       } catch (error) {
         showError(error);
       }
