@@ -1,4 +1,4 @@
-name = "llm-gateway"
+name = "api-llm-merge"
 main = "_worker.js"
 compatibility_date = "2026-06-29"
 
