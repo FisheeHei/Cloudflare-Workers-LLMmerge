@@ -20,6 +20,7 @@ const GATEWAY_CONFIG_KEY = "gateway:config";
 const DEFAULT_TIMEOUT_MS = 90000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
+const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
   {
@@ -58,6 +59,7 @@ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
+      const pathname = normalizePathname(url.pathname);
       const app = createApp(env);
 
       if (request.method === "OPTIONS") {
@@ -67,7 +69,7 @@ export default {
         });
       }
 
-      if (url.pathname === "/health") {
+      if (pathname === "/health") {
         return withCorsResponse(
           json(
             {
@@ -81,22 +83,22 @@ export default {
         );
       }
 
-      if (request.method === "GET" && url.pathname === app.adminPath) {
+      if (request.method === "GET" && pathname === app.adminPath) {
         return html(renderAdminPage());
       }
 
-      if (url.pathname.startsWith(`${app.adminPath}/api/`)) {
-        return handleAdminApi(request, url, app);
+      if (pathname.startsWith(`${app.adminPath}/api/`)) {
+        return handleAdminApi(request, url, pathname, app);
       }
 
-      if (url.pathname === MODEL_PATH && request.method === "GET") {
+      if (pathname === MODEL_PATH && request.method === "GET") {
         const runtime = await loadRuntimeConfig(app);
         const client = await requireClient(request, runtime);
         return withCorsResponse(await listModels(client, runtime));
       }
 
       if (
-        (url.pathname === CHAT_PATH || url.pathname === EMBEDDINGS_PATH) &&
+        (pathname === CHAT_PATH || pathname === EMBEDDINGS_PATH) &&
         request.method === "POST"
       ) {
         const runtime = await loadRuntimeConfig(app);
@@ -114,7 +116,7 @@ export default {
         const proxyResponse = await proxyRequest({
           client,
           model,
-          pathname: url.pathname,
+          pathname,
           request,
           bodyText,
           runtime,
@@ -145,10 +147,7 @@ export default {
 };
 
 function createApp(env) {
-  const adminToken = String(env.ADMIN_TOKEN || "").trim();
-  if (!adminToken) {
-    throw badConfig("Missing ADMIN_TOKEN.");
-  }
+  const adminToken = String(env.ADMIN_TOKEN || DEFAULT_ADMIN_TOKEN).trim();
 
   if (!/^[A-Za-z0-9._~-]+$/.test(adminToken)) {
     throw badConfig("ADMIN_TOKEN may only contain URL-safe characters.");
@@ -168,12 +167,12 @@ function createApp(env) {
   };
 }
 
-async function handleAdminApi(request, url, app) {
+async function handleAdminApi(request, url, pathname, app) {
   if (!app.kv) {
     throw badConfig("A KV binding named `KV` is required for the admin page.");
   }
 
-  const apiPath = url.pathname.slice(app.adminPath.length);
+  const apiPath = pathname.slice(app.adminPath.length);
 
   if (apiPath === "/api/config" && request.method === "GET") {
     const stored = await getEditableConfig(app);
@@ -987,6 +986,15 @@ function parseJsonBody(bodyText) {
   }
 }
 
+function normalizePathname(pathname) {
+  const value = String(pathname || "").trim();
+  if (!value || value === "/") {
+    return "/";
+  }
+
+  return value.replace(/\/+$/, "") || "/";
+}
+
 function parsePositiveInt(value, fallback) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -1470,7 +1478,7 @@ function renderAdminPage() {
   </div>
 
   <script>
-    const API_BASE = location.pathname.replace(/\\/+$/, "") + "/api";
+    const API_BASE = location.pathname.replace(/\/+$/, "") + "/api";
     const state = {
       config: null,
       presets: [],
@@ -1627,9 +1635,19 @@ function renderAdminPage() {
       byId("gateway-url-pill").textContent = state.gateway.base_url;
     }
 
+    async function parseApiResponse(response) {
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        return response.json();
+      }
+
+      const text = await response.text();
+      throw new Error("Admin API returned non-JSON content. Check that you are visiting the admin page without a broken path.");
+    }
+
     async function loadConfig() {
       const response = await fetch(API_BASE + "/config");
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(payload?.error?.message || "读取配置失败");
       }
@@ -1648,7 +1666,7 @@ function renderAdminPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(collectConfig()),
       });
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(payload?.error?.message || "保存失败");
       }
@@ -1661,7 +1679,7 @@ function renderAdminPage() {
     async function refreshModels() {
       setStatus("正在刷新模型缓存...");
       const response = await fetch(API_BASE + "/refresh", { method: "POST" });
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(payload?.error?.message || "刷新失败");
       }
@@ -1671,7 +1689,7 @@ function renderAdminPage() {
 
     async function loadClients() {
       const response = await fetch(API_BASE + "/clients");
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(payload?.error?.message || "读取客户端列表失败");
       }
@@ -1720,7 +1738,7 @@ function renderAdminPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await response.json();
+      const data = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(data?.error?.message || "创建客户端失败");
       }
@@ -1737,7 +1755,7 @@ function renderAdminPage() {
       const response = await fetch(API_BASE + "/clients/" + encodeURIComponent(id), {
         method: "DELETE",
       });
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(payload?.error?.message || "删除客户端失败");
       }
