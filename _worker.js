@@ -164,13 +164,13 @@ function createApp(env) {
     env,
     envClients: parseJsonEnvArray(env.CLIENTS_JSON, "CLIENTS_JSON"),
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
-    kv: env.GATEWAY_KV || null,
+    kv: env.KV || null,
   };
 }
 
 async function handleAdminApi(request, url, app) {
   if (!app.kv) {
-    throw badConfig("GATEWAY_KV binding is required for the admin page.");
+    throw badConfig("A KV binding named `KV` is required for the admin page.");
   }
 
   const apiPath = url.pathname.slice(app.adminPath.length);

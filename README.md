@@ -51,6 +51,12 @@
 - 实际上游池配置写入 KV
 - 管理后台编辑后直接覆盖 KV 配置
 
+说明：
+
+- Cloudflare KV 命名空间本身可以叫任何名字
+- 但绑定到 Worker 的变量名必须是 `KV`
+- 代码读取的是 `env.KV`
+
 最少环境变量：
 
 ```env
@@ -128,7 +134,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 
 1. 创建 `.dev.vars`
 2. 参考 [.dev.vars.example](D:/迁移文件/新建文件夹%20(3)/LLM-merge/.dev.vars.example) 填写配置
-3. 创建并绑定 KV namespace
+3. 在 Cloudflare 中创建并绑定一个名字为 `KV` 的 KV namespace
 4. 运行：
 
 ```bash
@@ -140,10 +146,15 @@ wrangler dev
 创建 KV：
 
 ```bash
-wrangler kv namespace create GATEWAY_KV
+wrangler kv namespace create KV
 ```
 
-将返回的 namespace id 填入 [wrangler.toml](D:/迁移文件/新建文件夹%20(3)/LLM-merge/wrangler.toml)。
+然后在你的 Cloudflare Workers 或 Pages 项目设置里，绑定一个名字为 `KV` 的 KV namespace。
+
+也就是说：
+
+- 命名空间显示名随意
+- 绑定变量名固定为 `KV`
 
 写入 secrets：
 

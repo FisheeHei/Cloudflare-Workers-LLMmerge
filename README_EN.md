@@ -49,6 +49,12 @@ The recommended setup is now "environment variables + KV":
 - the actual upstream pool config lives in KV
 - saving from the admin dashboard overwrites the KV config directly
 
+Notes:
+
+- the Cloudflare KV namespace itself may have any name
+- but the Worker binding name must be `KV`
+- the code reads from `env.KV`
+
 Minimum env vars:
 
 ```env
@@ -126,7 +132,7 @@ Retryable status codes by default:
 
 1. Create `.dev.vars`
 2. Fill it based on [.dev.vars.example](D:/迁移文件/新建文件夹%20(3)/LLM-merge/.dev.vars.example)
-3. Create and bind a KV namespace
+3. Create and bind a KV namespace named `KV` in Cloudflare
 4. Run:
 
 ```bash
@@ -138,10 +144,15 @@ wrangler dev
 Create KV:
 
 ```bash
-wrangler kv namespace create GATEWAY_KV
+wrangler kv namespace create KV
 ```
 
-Put the returned namespace id into [wrangler.toml](D:/迁移文件/新建文件夹%20(3)/LLM-merge/wrangler.toml).
+Then bind that KV namespace to your Cloudflare Workers or Pages project with the binding name `KV`.
+
+In other words:
+
+- the namespace display name can be anything
+- the binding variable name must be `KV`
 
 Set secrets:
 
