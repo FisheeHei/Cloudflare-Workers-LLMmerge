@@ -45,6 +45,13 @@
 
 ## 配置方式
 
+Cloudflare deployment persistence:
+
+- non-sensitive defaults are pinned in `wrangler.toml` under `[vars]`
+- `API_KEY_CRYPT_SECRET` should be configured as a Cloudflare Secret
+- upstream pools and generated client keys are stored in KV
+- redeploying the Worker should not require re-entering KV-backed settings
+
 当前推荐“环境变量 + KV”的混合方式：
 
 - 环境变量只放少量根配置

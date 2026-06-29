@@ -2,5 +2,13 @@ name = "llm-gateway"
 main = "_worker.js"
 compatibility_date = "2026-06-29"
 
+[vars]
+ADMIN_TOKEN = "llmmerge-admin"
+REQUEST_TIMEOUT_MS = "90000"
+UPSTREAM_COOLDOWN_TTL = "60"
+MODEL_CACHE_TTL = "3600"
+UPSTREAMS_JSON = "[]"
+CLIENTS_JSON = "[]"
+
 [observability.logs]
 enabled = true

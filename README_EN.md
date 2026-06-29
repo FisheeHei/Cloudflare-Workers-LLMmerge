@@ -49,6 +49,13 @@ The recommended setup is now "environment variables + KV":
 - the actual upstream pool config lives in KV
 - saving from the admin dashboard overwrites the KV config directly
 
+Cloudflare deployment persistence:
+
+- non-sensitive defaults are pinned in `wrangler.toml` under `[vars]`
+- secrets must be configured in Cloudflare as encrypted secrets
+- redeploying the Worker should not require re-entering values stored in KV
+- the admin dashboard writes upstream pools and virtual client keys into KV
+
 Notes:
 
 - the Cloudflare KV namespace itself may have any name
@@ -62,6 +69,12 @@ API_KEY_CRYPT_SECRET=change-me-32-bytes-or-longer
 REQUEST_TIMEOUT_MS=90000
 UPSTREAM_COOLDOWN_TTL=60
 MODEL_CACHE_TTL=3600
+```
+
+Required secret:
+
+```bash
+wrangler secret put API_KEY_CRYPT_SECRET
 ```
 
 `ADMIN_TOKEN` is now optional.
@@ -162,10 +175,7 @@ In other words:
 Set secrets:
 
 ```bash
-wrangler secret put ADMIN_TOKEN
 wrangler secret put API_KEY_CRYPT_SECRET
-wrangler secret put UPSTREAMS_JSON
-wrangler secret put CLIENTS_JSON
 ```
 
 If you do not want to set `ADMIN_TOKEN` explicitly, you may skip it, and the default admin path will be:
