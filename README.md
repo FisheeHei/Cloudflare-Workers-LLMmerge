@@ -60,12 +60,17 @@
 最少环境变量：
 
 ```env
-ADMIN_TOKEN=change-me-admin-token
 API_KEY_CRYPT_SECRET=change-me-32-bytes-or-longer
 REQUEST_TIMEOUT_MS=90000
 UPSTREAM_COOLDOWN_TTL=60
 MODEL_CACHE_TTL=3600
 ```
+
+`ADMIN_TOKEN` 现在可以省略。
+
+- 如果未设置，默认值是 `llmmerge-admin`
+- 对应后台地址就是 `/<默认值>`，也就是 `/llmmerge-admin`
+- 更建议你自行覆盖成随机值
 
 可选静态种子配置：
 
@@ -163,6 +168,12 @@ wrangler secret put ADMIN_TOKEN
 wrangler secret put API_KEY_CRYPT_SECRET
 wrangler secret put UPSTREAMS_JSON
 wrangler secret put CLIENTS_JSON
+```
+
+如果你不想显式设置 `ADMIN_TOKEN`，也可以不写这项，此时后台默认路径为：
+
+```text
+/llmmerge-admin
 ```
 
 部署：

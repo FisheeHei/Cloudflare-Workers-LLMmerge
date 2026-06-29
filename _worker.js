@@ -28,30 +28,35 @@ const PRESET_TEMPLATES = [
     name: "NVIDIA NIM",
     base_url: "https://integrate.api.nvidia.com/v1",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: false,
   },
   {
     id: "deepinfra",
     name: "DeepInfra",
     base_url: "https://api.deepinfra.com/v1/openai",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: false,
   },
   {
     id: "together",
     name: "Together AI",
     base_url: "https://api.together.xyz/v1",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: false,
   },
   {
     id: "claude-openai",
-    name: "Claude via OpenAI-Compatible Base",
+    name: "Custom Claude-Compatible",
     base_url: "",
     paths: [CHAT_PATH],
+    requires_base_url: true,
   },
   {
     id: "generic-openai",
-    name: "Generic OpenAI-Compatible",
+    name: "Custom OpenAI-Compatible",
     base_url: "",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: true,
   },
 ];
 
@@ -269,7 +274,11 @@ async function buildGatewayConfigFromEnv(app) {
       api_key_encrypted: plaintextKey
         ? await ensureEncryptedValue(plaintextKey, app.encryptionSecret)
         : "",
-      base_url: String(upstream.base_url || presetById(presetId)?.base_url || "").trim(),
+      base_url: resolveBaseUrl(
+        presetId,
+        upstream.base_url,
+        presetById(presetId)?.base_url,
+      ),
       enabled: upstream.enabled !== false,
       headers: normalizeHeaders(upstream.headers),
       id: String(upstream.id || crypto.randomUUID()),
@@ -326,7 +335,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
       api_key_encrypted: apiKeyValue
         ? await ensureEncryptedValue(apiKeyValue, app.encryptionSecret)
         : "",
-      base_url: String(item.base_url || defaults.base_url || "").trim(),
+      base_url: resolveBaseUrl(preset, item.base_url, defaults.base_url),
       enabled: item.enabled !== false,
       headers: normalizeHeaders(item.headers),
       id: String(item.id || crypto.randomUUID()),
@@ -1037,6 +1046,15 @@ function normalizeHeaders(value) {
   return headers;
 }
 
+function resolveBaseUrl(presetId, inputBaseUrl, defaultBaseUrl) {
+  const preset = presetById(presetId);
+  if (preset && preset.requires_base_url === false) {
+    return String(defaultBaseUrl || preset.base_url || "").trim();
+  }
+
+  return String(inputBaseUrl || defaultBaseUrl || "").trim();
+}
+
 function getBearerToken(request) {
   const auth = request.headers.get("authorization") || "";
   if (!auth.startsWith("Bearer ")) {
@@ -1347,6 +1365,23 @@ function renderAdminPage() {
       display: grid;
       gap: 14px;
     }
+    .group-card {
+      border: 1px solid #cfbea0;
+      background: #fff9ef;
+      padding: 14px;
+      border-radius: 20px;
+    }
+    .group-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .group-head h3 {
+      margin: 0;
+      font: 700 18px/1.2 Georgia, "Times New Roman", serif;
+    }
     .upstream-card {
       border: 1px solid #d7c7aa;
       background: #fffcf6;
@@ -1526,6 +1561,23 @@ function renderAdminPage() {
       };
     }
 
+    function baseUrlLocked(presetId) {
+      const preset = presetById(presetId);
+      return !!preset && preset.requires_base_url === false;
+    }
+
+    function groupUpstreams(items) {
+      const groups = new Map();
+      for (const item of items) {
+        const key = item.preset || "generic-openai";
+        if (!groups.has(key)) {
+          groups.set(key, []);
+        }
+        groups.get(key).push(item);
+      }
+      return [...groups.entries()];
+    }
+
     function renderPresets() {
       const host = byId("preset-buttons");
       host.innerHTML = state.presets
@@ -1592,6 +1644,77 @@ function renderAdminPage() {
             baseInput.value = preset.base_url || "";
           }
           pathsInput.value = (preset.paths || []).join(", ");
+        });
+      });
+    }
+
+    function renderUpstreams() {
+      const host = byId("upstream-list");
+      if (!state.config.upstreams.length) {
+        host.innerHTML = '<div class="note">No upstream keys yet. Use a template button above to add one.</div>';
+        return;
+      }
+
+      host.innerHTML = groupUpstreams(state.config.upstreams)
+        .map(([groupId, items]) => {
+          const groupPreset = presetById(groupId);
+          const groupTitle = groupPreset ? groupPreset.name : groupId;
+
+          const cards = items.map((item) => {
+            const presetOptions = state.presets
+              .map((preset) => '<option value="' + esc(preset.id) + '"' + (preset.id === item.preset ? " selected" : "") + '>' + esc(preset.name) + "</option>")
+              .join("");
+
+            const lockedBaseUrl = baseUrlLocked(item.preset);
+
+            return '<article class="upstream-card" data-id="' + esc(item.id) + '">' +
+              '<div class="upstream-head">' +
+                '<strong>' + esc(item.note || item.name || "BYOK Key") + '</strong>' +
+                '<button type="button" class="danger delete-upstream">Delete</button>' +
+              '</div>' +
+              '<div class="row">' +
+                '<div class="field span-3"><label>Template</label><select data-field="preset">' + presetOptions + '</select></div>' +
+                '<div class="field span-3"><label>Note</label><input data-field="note" value="' + esc(item.note) + '" placeholder="My NVIDIA key"></div>' +
+                '<div class="field span-3"><label>Internal Name</label><input data-field="name" value="' + esc(item.name) + '" placeholder="nim-main"></div>' +
+                '<div class="field span-3"><label>Enabled</label><select data-field="enabled"><option value="true"' + (item.enabled ? " selected" : "") + '>true</option><option value="false"' + (!item.enabled ? " selected" : "") + '>false</option></select></div>' +
+                '<div class="field span-6"><label>Base URL' + (lockedBaseUrl ? ' (preset)' : '') + '</label><input data-field="base_url" value="' + esc(item.base_url) + '" placeholder="https://integrate.api.nvidia.com/v1"' + (lockedBaseUrl ? ' readonly' : '') + '></div>' +
+                '<div class="field span-6"><label>API Key (ciphertext after save)</label><input class="mono" data-field="api_key_value" value="' + esc(item.api_key_value) + '" placeholder="nvapi-... or enc::..."></div>' +
+                '<div class="field span-4"><label>Weight</label><input data-field="weight" type="number" min="1" value="' + esc(item.weight) + '"></div>' +
+                '<div class="field span-4"><label>Priority</label><input data-field="priority" type="number" value="' + esc(item.priority) + '"></div>' +
+                '<div class="field span-4"><label>Paths</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '" placeholder="/v1/chat/completions,/v1/embeddings"></div>' +
+                '<div class="field span-12"><label>Models</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
+              '</div>' +
+            '</article>';
+          }).join("");
+
+          return '<section class="group-card">' +
+            '<div class="group-head">' +
+              '<h3>' + esc(groupTitle) + '</h3>' +
+              '<span class="note">' + esc(items.length) + ' keys</span>' +
+            '</div>' +
+            cards +
+          '</section>';
+        })
+        .join("");
+
+      host.querySelectorAll(".delete-upstream").forEach((button) => {
+        button.addEventListener("click", (event) => {
+          const card = event.target.closest(".upstream-card");
+          state.config.upstreams = state.config.upstreams.filter((item) => item.id !== card.dataset.id);
+          renderUpstreams();
+        });
+      });
+
+      host.querySelectorAll('select[data-field="preset"]').forEach((select) => {
+        select.addEventListener("change", (event) => {
+          const card = event.target.closest(".upstream-card");
+          const preset = presetById(event.target.value);
+          const baseInput = card.querySelector('[data-field="base_url"]');
+          const pathsInput = card.querySelector('[data-field="paths"]');
+          baseInput.readOnly = !!preset && preset.requires_base_url === false;
+          baseInput.value = preset && preset.requires_base_url === false ? (preset.base_url || "") : "";
+          pathsInput.value = (preset.paths || []).join(", ");
+          renderUpstreams();
         });
       });
     }

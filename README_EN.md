@@ -58,12 +58,17 @@ Notes:
 Minimum env vars:
 
 ```env
-ADMIN_TOKEN=change-me-admin-token
 API_KEY_CRYPT_SECRET=change-me-32-bytes-or-longer
 REQUEST_TIMEOUT_MS=90000
 UPSTREAM_COOLDOWN_TTL=60
 MODEL_CACHE_TTL=3600
 ```
+
+`ADMIN_TOKEN` is now optional.
+
+- if omitted, the default value is `llmmerge-admin`
+- the admin page path becomes `/<default>`, which means `/llmmerge-admin`
+- overriding it with your own random value is still strongly recommended
 
 Optional static seed config:
 
@@ -161,6 +166,12 @@ wrangler secret put ADMIN_TOKEN
 wrangler secret put API_KEY_CRYPT_SECRET
 wrangler secret put UPSTREAMS_JSON
 wrangler secret put CLIENTS_JSON
+```
+
+If you do not want to set `ADMIN_TOKEN` explicitly, you may skip it, and the default admin path will be:
+
+```text
+/llmmerge-admin
 ```
 
 Deploy:
