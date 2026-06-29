@@ -1382,6 +1382,50 @@ function renderAdminPage() {
       margin: 0;
       font: 700 18px/1.2 Georgia, "Times New Roman", serif;
     }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(33, 24, 15, .55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+    .modal-backdrop.open {
+      display: flex;
+    }
+    .modal-card {
+      width: min(760px, 100%);
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+      background: #fffaf2;
+      border: 1px solid #cfbea0;
+      border-radius: 24px;
+      padding: 18px;
+      box-shadow: 0 26px 60px rgba(0,0,0,.18);
+    }
+    .template-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-bottom: 14px;
+    }
+    .template-card {
+      border: 1px solid #d7c7aa;
+      background: #fffcf6;
+      border-radius: 18px;
+      padding: 14px;
+      cursor: pointer;
+    }
+    .template-card.active {
+      border-color: #a54d2d;
+      box-shadow: inset 0 0 0 1px #a54d2d;
+    }
+    .template-card strong {
+      display: block;
+      margin-bottom: 6px;
+    }
     .upstream-card {
       border: 1px solid #d7c7aa;
       background: #fffcf6;
@@ -1477,7 +1521,9 @@ function renderAdminPage() {
 
       <section class="panel">
         <h2>上游 API Keys</h2>
-        <div class="toolbar" id="preset-buttons"></div>
+        <div class="toolbar">
+          <button class="good" id="open-vendor-modal">新建供应商</button>
+        </div>
         <p class="note">保存后输入框里展示的是加密串，不会回显明文。你可以继续直接改密文对应的备注，也可以重新贴入新的明文 key 覆盖它。</p>
         <div class="upstream-list" id="upstream-list"></div>
         <div class="toolbar" style="margin-top:14px;">
@@ -1512,6 +1558,61 @@ function renderAdminPage() {
     </div>
   </div>
 
+  <div class="modal-backdrop" id="vendor-modal">
+    <div class="modal-card">
+      <div class="toolbar" style="justify-content:space-between;">
+        <h2 style="margin:0;">新建供应商</h2>
+        <button type="button" class="secondary" id="close-vendor-modal">关闭</button>
+      </div>
+      <p class="note">先选择供应商模板。预设模板只需要输入 API key；自定义模板需要同时输入 Base URL 和 API key。</p>
+      <div class="template-grid" id="vendor-template-grid"></div>
+      <div class="row">
+        <div class="field span-4">
+          <label for="vendor-note">备注</label>
+          <input id="vendor-note" placeholder="我的 NIM Key">
+        </div>
+        <div class="field span-4">
+          <label for="vendor-name">内部名称</label>
+          <input id="vendor-name" placeholder="nim-main">
+        </div>
+        <div class="field span-4">
+          <label for="vendor-enabled">启用</label>
+          <select id="vendor-enabled">
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+        </div>
+        <div class="field span-6">
+          <label for="vendor-base-url">Base URL</label>
+          <input id="vendor-base-url" placeholder="https://integrate.api.nvidia.com/v1">
+        </div>
+        <div class="field span-6">
+          <label for="vendor-api-key">API Key</label>
+          <input id="vendor-api-key" class="mono" placeholder="nvapi-...">
+        </div>
+        <div class="field span-4">
+          <label for="vendor-weight">权重</label>
+          <input id="vendor-weight" type="number" min="1" value="1">
+        </div>
+        <div class="field span-4">
+          <label for="vendor-priority">优先级</label>
+          <input id="vendor-priority" type="number" value="100">
+        </div>
+        <div class="field span-4">
+          <label for="vendor-paths">路径</label>
+          <input id="vendor-paths" value="/v1/chat/completions, /v1/embeddings">
+        </div>
+        <div class="field span-12">
+          <label for="vendor-models">模型白名单</label>
+          <textarea id="vendor-models" placeholder="可留空，或填逗号/换行分隔的模型名"></textarea>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button class="good" id="create-vendor">添加到 Key 池</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const API_BASE = location.pathname.replace(/\/+$/, "") + "/api";
     const state = {
@@ -1519,6 +1620,7 @@ function renderAdminPage() {
       presets: [],
       clients: [],
       gateway: null,
+      draftPresetId: null,
     };
 
     const byId = (id) => document.getElementById(id);
@@ -1579,17 +1681,84 @@ function renderAdminPage() {
     }
 
     function renderPresets() {
-      const host = byId("preset-buttons");
+      const host = byId("vendor-template-grid");
       host.innerHTML = state.presets
-        .map((preset) => '<button type="button" class="secondary" data-preset="' + esc(preset.id) + '">新增 ' + esc(preset.name) + '</button>')
+        .map((preset) => '<button type="button" class="template-card' + (state.draftPresetId === preset.id ? ' active' : '') + '" data-preset="' + esc(preset.id) + '">' +
+          '<strong>' + esc(preset.name) + '</strong>' +
+          '<span class="note">' + (preset.requires_base_url === false ? '只需 API Key' : '需要 Base URL + API Key') + '</span>' +
+        '</button>')
         .join("");
 
       host.querySelectorAll("button[data-preset]").forEach((button) => {
         button.addEventListener("click", () => {
-          state.config.upstreams.push(makeUpstream(button.dataset.preset));
-          renderUpstreams();
+          state.draftPresetId = button.dataset.preset;
+          applyVendorPreset();
+          renderPresets();
         });
       });
+    }
+
+    function openVendorModal() {
+      if (!state.draftPresetId && state.presets.length) {
+        state.draftPresetId = state.presets[0].id;
+      }
+      applyVendorPreset();
+      renderPresets();
+      byId("vendor-modal").classList.add("open");
+    }
+
+    function closeVendorModal() {
+      byId("vendor-modal").classList.remove("open");
+    }
+
+    function applyVendorPreset() {
+      const preset = presetById(state.draftPresetId);
+      if (!preset) {
+        return;
+      }
+      const baseInput = byId("vendor-base-url");
+      const pathsInput = byId("vendor-paths");
+      const locked = preset.requires_base_url === false;
+      baseInput.readOnly = locked;
+      baseInput.value = locked ? (preset.base_url || "") : "";
+      pathsInput.value = (preset.paths || []).join(", ");
+    }
+
+    function createVendorFromModal() {
+      const preset = presetById(state.draftPresetId);
+      if (!preset) {
+        throw new Error("请先选择供应商模板");
+      }
+
+      const entry = makeUpstream(preset.id);
+      entry.note = byId("vendor-note").value.trim();
+      entry.name = byId("vendor-name").value.trim() || entry.name;
+      entry.base_url = byId("vendor-base-url").value.trim();
+      entry.api_key_value = byId("vendor-api-key").value.trim();
+      entry.weight = Number(byId("vendor-weight").value || 1);
+      entry.priority = Number(byId("vendor-priority").value || 100);
+      entry.enabled = byId("vendor-enabled").value === "true";
+      entry.paths = splitList(byId("vendor-paths").value);
+      entry.models = splitList(byId("vendor-models").value);
+
+      if (!entry.api_key_value) {
+        throw new Error("API Key 不能为空");
+      }
+      if (!entry.base_url) {
+        throw new Error("Base URL 不能为空");
+      }
+
+      state.config.upstreams.push(entry);
+      renderUpstreams();
+      closeVendorModal();
+      byId("vendor-note").value = "";
+      byId("vendor-name").value = "";
+      byId("vendor-api-key").value = "";
+      byId("vendor-models").value = "";
+      byId("vendor-weight").value = "1";
+      byId("vendor-priority").value = "100";
+      byId("vendor-enabled").value = "true";
+      applyVendorPreset();
     }
 
     function renderUpstreams() {
@@ -1893,6 +2062,15 @@ function renderAdminPage() {
       try {
         await loadConfig();
         await loadClients();
+        byId("open-vendor-modal").addEventListener("click", openVendorModal);
+        byId("close-vendor-modal").addEventListener("click", closeVendorModal);
+        byId("create-vendor").addEventListener("click", () => {
+          try {
+            createVendorFromModal();
+          } catch (error) {
+            showError(error);
+          }
+        });
         byId("save-config").addEventListener("click", () => saveConfig().catch(showError));
         byId("refresh-models").addEventListener("click", () => refreshModels().catch(showError));
         byId("create-client").addEventListener("click", () => createClient().catch(showError));
