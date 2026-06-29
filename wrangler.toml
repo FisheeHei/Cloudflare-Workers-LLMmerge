@@ -1,0 +1,10 @@
+name = "llm-gateway"
+main = "_worker.js"
+compatibility_date = "2026-06-30"
+
+[observability.logs]
+enabled = true
+
+[[kv_namespaces]]
+binding = "GATEWAY_KV"
+id = "replace-with-your-kv-namespace-id"

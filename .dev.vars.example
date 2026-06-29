@@ -1,0 +1,7 @@
+ADMIN_TOKEN=change-me-admin-token
+API_KEY_CRYPT_SECRET=change-me-32-bytes-or-longer
+REQUEST_TIMEOUT_MS=90000
+UPSTREAM_COOLDOWN_TTL=60
+MODEL_CACHE_TTL=3600
+UPSTREAMS_JSON=[{"name":"nim-primary","base_url":"https://integrate.api.nvidia.com/v1","api_key":"nvapi-xxxxxxxx","models":["meta/llama-3.1-8b-instruct","nvidia/nv-embed-v1"],"paths":["/v1/chat/completions","/v1/embeddings"],"weight":3},{"name":"nim-secondary","base_url":"https://integrate.api.nvidia.com/v1","api_key":"nvapi-yyyyyyyy","models":["meta/llama-3.1-8b-instruct"],"paths":["/v1/chat/completions"],"weight":1}]
+CLIENTS_JSON=[{"name":"default-client","key":"sk-gw-demo-please-change","models":["*"],"upstreams":["nim-primary","nim-secondary"]}]
