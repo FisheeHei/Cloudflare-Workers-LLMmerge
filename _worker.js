@@ -1468,10 +1468,11 @@ function renderAdminPage() {
       background: #f2e7d3; padding: 4px 10px; border-radius: 8px;
       font-size: 14px; word-break: break-all;
     }
-    .gateway-urls { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; }
+    .gateway-urls { margin-top: 12px; }
     .url-card {
-      flex: 1; min-width: 280px; border: 1px solid var(--line);
+      border: 1px solid var(--line);
       background: rgba(255,253,248,.7); border-radius: 14px; padding: 14px;
+      max-width: 520px;
     }
     .url-card .url-card-head { font-weight: 600; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
     .url-card code { display: block; margin-bottom: 8px; }
@@ -1612,14 +1613,9 @@ function renderAdminPage() {
     <h1>LLM Gateway</h1>
     <div class="gateway-urls">
       <div class="url-card">
-        <div class="url-card-head">OpenAI Compatible</div>
-        <code id="gateway-url-openai">loading...</code>
-        <button class="small secondary copy-url" data-url="openai">\u590d\u5236</button>
-      </div>
-      <div class="url-card">
-        <div class="url-card-head">Claude Compatible (ANTHROPIC_BASE_URL)</div>
-        <code id="gateway-url-claude">loading...</code>
-        <button class="small secondary copy-url" data-url="claude">\u590d\u5236</button>
+        <div class="url-card-head">Gateway URL <span class="note">(OpenAI + Claude Compatible)</span></div>
+        <code id="gateway-url-pill">loading...</code>
+        <button class="small secondary" id="copy-gateway-url">\u590d\u5236</button>
       </div>
     </div>
   </div>
@@ -1933,8 +1929,7 @@ function renderAdminPage() {
     byId("model-cache-ttl").value = state.config.settings.model_cache_ttl;
     byId("routing-load-balance").checked = state.config.routing.load_balance !== false;
     byId("routing-failover").checked = state.config.routing.failover !== false;
-    byId("gateway-url-openai").textContent = state.gateway.base_url;
-    byId("gateway-url-claude").textContent = state.gateway.base_url;
+    byId("gateway-url-pill").textContent = state.gateway.base_url;
   }
 
   async function loadConfig() {
@@ -2111,13 +2106,11 @@ function renderAdminPage() {
           copyText(byId("client-output-text").textContent, "JSON \u5df2\u590d\u5236")
         ).catch(showError)
       );
-      document.querySelectorAll(".copy-url").forEach((btn) => {
-        btn.addEventListener("click", (e) =>
-          withButtonBusy(e.currentTarget, "\u590d\u5236\u4e2d...", () =>
-            copyText(state.gateway?.base_url, "Gateway URL \u5df2\u590d\u5236")
-          ).catch(showError)
-        );
-      });
+      byId("copy-gateway-url").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u590d\u5236\u4e2d...", () =>
+          copyText(state.gateway?.base_url, "Gateway URL \u5df2\u590d\u5236")
+        ).catch(showError)
+      );
 
       await loadConfig();
       await loadClients();
