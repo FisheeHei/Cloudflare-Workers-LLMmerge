@@ -21,7 +21,7 @@ const GATEWAY_CONFIG_KEY = "gateway:config";
 const LOG_KEY = "gateway:logs";
 const STATS_PREFIX = "gateway:stats:";
 const STATS_WINDOW_HOURS = 24;
-const DEFAULT_TIMEOUT_MS = 90000;
+const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
@@ -1789,7 +1789,7 @@ function renderAdminPage() {
     <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
     <div class="settings-body">
       <div class="row">
-        <div class="field span-4"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba490000)</label><input id="request-timeout" type="number" min="1000" placeholder="90000"></div>
+        <div class="field span-4"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba490000)</label><input id="request-timeout" type="number" min="1000" placeholder="30000"></div>
         <div class="field span-4"><label>\u51b7\u5374 TTL (s, \u9ed8\u8ba460)</label><input id="cooldown-ttl" type="number" min="1" placeholder="60"></div>
         <div class="field span-4"><label>\u6a21\u578b\u7f13\u5b58 TTL (s, \u9ed8\u8ba43600)</label><input id="model-cache-ttl" type="number" min="1" placeholder="3600"></div>
       </div>
@@ -2035,7 +2035,7 @@ function renderAdminPage() {
   function collectConfig() {
     return {
       settings: {
-        request_timeout_ms: Number(byId("request-timeout").value || 90000),
+        request_timeout_ms: Number(byId("request-timeout").value || 30000),
         upstream_cooldown_ttl: Number(byId("cooldown-ttl").value || 60),
         model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
       },
