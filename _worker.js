@@ -65,7 +65,9 @@ export default {
     try {
       const url = new URL(request.url);
       const pathname = normalizePathname(url.pathname);
+      const pathnameLower = pathname.toLowerCase();
       const app = createApp(env);
+      const adminRoute = matchAdminRoute(pathnameLower, app);
 
       if (request.method === "OPTIONS") {
         return new Response(null, {
@@ -88,12 +90,12 @@ export default {
         );
       }
 
-      if (request.method === "GET" && pathname === app.adminPath) {
+      if (request.method === "GET" && adminRoute?.kind === "page") {
         return html(renderAdminPage());
       }
 
-      if (pathname.startsWith(`${app.adminPath}/api/`)) {
-        return handleAdminApi(request, url, pathname, app);
+      if (adminRoute?.kind === "api") {
+        return handleAdminApi(request, url, pathnameLower, app, adminRoute.basePath);
       }
 
       if (pathname === MODEL_PATH && request.method === "GET") {
@@ -159,7 +161,7 @@ export default {
 };
 
 function createApp(env) {
-  const adminToken = String(env.ADMIN_TOKEN || DEFAULT_ADMIN_TOKEN).trim();
+  const adminToken = pickAdminToken(env);
 
   if (!/^[A-Za-z0-9._~-]+$/.test(adminToken)) {
     throw badConfig("ADMIN_TOKEN may only contain URL-safe characters.");
@@ -167,11 +169,12 @@ function createApp(env) {
 
   return {
     adminPath: `/${adminToken}`,
+    adminPaths: buildAdminPathAliases(adminToken),
     adminToken,
     defaultCooldownTtl: parsePositiveInt(env.UPSTREAM_COOLDOWN_TTL, DEFAULT_COOLDOWN_TTL),
     defaultModelCacheTtl: parsePositiveInt(env.MODEL_CACHE_TTL, DEFAULT_MODEL_CACHE_TTL),
     defaultTimeoutMs: parsePositiveInt(env.REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-    encryptionSecret: String(env.API_KEY_CRYPT_SECRET || env.ADMIN_TOKEN || ""),
+    encryptionSecret: String(env.API_KEY_CRYPT_SECRET || adminToken || ""),
     env,
     envClients: parseJsonEnvArray(env.CLIENTS_JSON, "CLIENTS_JSON"),
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
@@ -179,12 +182,12 @@ function createApp(env) {
   };
 }
 
-async function handleAdminApi(request, url, pathname, app) {
+async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   if (!app.kv) {
     throw badConfig("A KV binding named `KV` is required for the admin page.");
   }
 
-  const apiPath = pathname.slice(app.adminPath.length);
+  const apiPath = pathname.slice(adminBasePath.length);
 
   if (apiPath === "/api/config" && request.method === "GET") {
     const stored = await getEditableConfig(app);
@@ -1009,6 +1012,55 @@ function normalizePathname(pathname) {
   }
 
   return value.replace(/\/+$/, "") || "/";
+}
+
+function pickAdminToken(env) {
+  const candidates = [
+    env.ADMIN_TOKEN,
+    env.ADMIN,
+    env.admin,
+    env.TOKEN,
+    env.token,
+  ];
+
+  for (const value of candidates) {
+    const token = String(value || "").trim();
+    if (token) {
+      return token;
+    }
+  }
+
+  return DEFAULT_ADMIN_TOKEN;
+}
+
+function buildAdminPathAliases(adminToken) {
+  const raw = `/${adminToken}`;
+  const variants = new Set([raw.toLowerCase()]);
+  const normalized = adminToken.toLowerCase();
+
+  if (normalized.includes("-")) {
+    variants.add(`/${normalized.replace(/-/g, "")}`);
+    variants.add(`/${normalized.replace(/-/g, "_")}`);
+  }
+
+  if (normalized.includes("_")) {
+    variants.add(`/${normalized.replace(/_/g, "-")}`);
+    variants.add(`/${normalized.replace(/_/g, "")}`);
+  }
+
+  return [...variants].map((value) => normalizePathname(value));
+}
+
+function matchAdminRoute(pathnameLower, app) {
+  for (const basePath of app.adminPaths) {
+    if (pathnameLower === basePath) {
+      return { kind: "page", basePath };
+    }
+    if (pathnameLower.startsWith(`${basePath}/api/`)) {
+      return { kind: "api", basePath };
+    }
+  }
+  return null;
 }
 
 function parsePositiveInt(value, fallback) {
