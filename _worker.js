@@ -1554,12 +1554,12 @@ function renderAdminPage() {
 </div>
 
 <script>
-  const API_BASE = location.pathname.replace(/\/+$/, "") + "/api";
+  const API_BASE = location.pathname.replace(/\\/+$/, "") + "/api";
   const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
-  function splitList(value) { return text(value).split(/[,\n]/).map((s) => s.trim()).filter(Boolean); }
+  function splitList(value) { return text(value).split(/[,\\n]/).map((s) => s.trim()).filter(Boolean); }
   function esc(value) { return text(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
   function presetById(id) { return state.presets.find((p) => p.id === id) || state.presets[0]; }
   function baseUrlLocked(presetId) { const p = presetById(presetId); return !!p && p.requires_base_url === false; }
@@ -1710,7 +1710,7 @@ function renderAdminPage() {
             '<div class="field span-3"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '"></div>' +
           '</div>' +
           '<div class="row">' +
-            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\n")) + '</textarea></div>' +
+            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
           '</div>' +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
         '</div>' +
