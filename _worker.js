@@ -260,6 +260,32 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, id }, 200));
   }
 
+  if (apiPath === "/api/health" && request.method === "POST") {
+    const runtime = await loadRuntimeConfig(app);
+    const results = [];
+    for (const upstream of runtime.upstreams) {
+      const started = Date.now();
+      try {
+        const resp = await fetchWithTimeout(
+          buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
+          { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+          Math.min(runtime.requestTimeoutMs, 15000),
+        );
+        const latency = Date.now() - started;
+        if (resp.ok) {
+          const payload = await resp.json().catch(() => ({}));
+          const models = Array.isArray(payload.data) ? payload.data.map((m) => m?.id).filter(Boolean) : [];
+          results.push({ name: upstream.name, ok: true, models_count: models.length, latency_ms: latency });
+        } else {
+          results.push({ name: upstream.name, ok: false, status: resp.status, latency_ms: latency });
+        }
+      } catch (err) {
+        results.push({ name: upstream.name, ok: false, error: err.message, latency_ms: Date.now() - started });
+      }
+    }
+    return withCorsResponse(json({ ok: true, results }, 200));
+  }
+
   return withCorsResponse(json(openAiError("Admin route not found.", "not_found_error"), 404));
 }
 
@@ -1393,6 +1419,14 @@ function renderAdminPage() {
       border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
     }
     .upstream-card summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .health-dot {
+      width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+      background: #d1d5db; transition: background .3s ease;
+    }
+    .health-dot.ok { background: #22c55e; }
+    .health-dot.fail { background: #ef4444; }
+    .health-dot.checking { background: #f59e0b; animation: pulse .6s ease infinite alternate; }
+    @keyframes pulse { to { opacity: .4; } }
     .upstream-card summary .card-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
     .upstream-card .card-body { padding: 0 16px 14px; }
 
@@ -1489,6 +1523,7 @@ function renderAdminPage() {
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
       <button class="secondary" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
+      <button class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
       <span class="note" id="config-status"></span>
     </div>
     <div id="upstream-list"></div>
@@ -1668,6 +1703,7 @@ function renderAdminPage() {
         '<summary>' +
           '<span class="card-badge">' + esc(badge) + '</span>' +
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
+          '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u2713' : '\u2717') + '</span>' +
         '</summary>' +
         '<div class="card-body">' +
@@ -1797,6 +1833,23 @@ function renderAdminPage() {
     setTimeout(() => byId("config-status").textContent = "", 5000);
   }
 
+  async function checkHealth() {
+    const dots = document.querySelectorAll(".health-dot");
+    dots.forEach((d) => { d.className = "health-dot checking"; d.title = "\u68c0\u67e5\u4e2d..."; });
+    const resp = await fetch(API_BASE + "/health", { method: "POST" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u5065\u5eb7\u5ea6\u68c0\u67e5\u5931\u8d25");
+    (payload.results || []).forEach((r) => {
+      const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
+      if (!dot) return;
+      dot.className = "health-dot " + (r.ok ? "ok" : "fail");
+      dot.title = r.ok ? (r.models_count + " \u4e2a\u6a21\u578b, " + r.latency_ms + "ms") : ("\u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+    });
+    const ok = (payload.results || []).filter((r) => r.ok).length;
+    const total = (payload.results || []).length;
+    showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
+  }
+
   /* ---- Clients ---- */
   async function loadClients() {
     const resp = await fetch(API_BASE + "/clients");
@@ -1882,6 +1935,9 @@ function renderAdminPage() {
       );
       byId("refresh-models").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", refreshModels).catch(showError)
+      );
+      byId("check-health").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", checkHealth).catch(showError)
       );
       byId("create-client").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u751f\u6210\u4e2d...", createClient).catch(showError)
