@@ -1580,6 +1580,12 @@ function renderAdminPage() {
       <span class="note" id="settings-status"></span>
     </div>
   </details>
+
+  <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
+    v26-06-30-capability ·
+    <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
+    · by FisheeHei
+  </footer>
 </div>
 
 <div id="toast"></div>
