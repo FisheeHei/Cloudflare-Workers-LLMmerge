@@ -16,6 +16,7 @@ const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 const MODEL_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
 const EMBEDDINGS_PATH = "/v1/embeddings";
+const MESSAGES_PATH = "/v1/messages";
 const GATEWAY_CONFIG_KEY = "gateway:config";
 const DEFAULT_TIMEOUT_MS = 90000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
@@ -127,6 +128,83 @@ export default {
           upstream: proxyResponse.upstream.name,
           client: client.name || client.id || "client",
           attempts: proxyResponse.attempts,
+        });
+      }
+
+      // ponytail: translate Anthropic messages <-> OpenAI chat.completions for Claude Code compatibility.
+      if (pathname === MESSAGES_PATH && request.method === "POST") {
+        const runtime = await loadRuntimeConfig(app);
+        const client = await requireClient(request, runtime);
+        const bodyText = await request.text();
+        const anthropicPayload = parseJsonBody(bodyText);
+        const model = anthropicPayload.model;
+
+        if (!model || typeof model !== "string") {
+          return withCorsResponse(
+            json({ type: "error", error: { type: "invalid_request_error", message: "`model` is required." } }, 400),
+          );
+        }
+
+        // Anthropic -> OpenAI request translation
+        const openaiMessages = [];
+        if (anthropicPayload.system && typeof anthropicPayload.system === "string") {
+          openaiMessages.push({ role: "system", content: anthropicPayload.system });
+        }
+        for (const msg of (anthropicPayload.messages || [])) {
+          openaiMessages.push({ role: msg.role, content: typeof msg.content === "string" ? msg.content : (Array.isArray(msg.content) ? msg.content.map((b) => b.text || "").join("") : "") });
+        }
+
+        const openaiBody = JSON.stringify({
+          model,
+          messages: openaiMessages,
+          max_tokens: anthropicPayload.max_tokens,
+          temperature: anthropicPayload.temperature,
+          top_p: anthropicPayload.top_p,
+          stop: anthropicPayload.stop_sequences,
+        });
+
+        const proxyResponse = await proxyRequest({
+          client, model,
+          pathname: CHAT_PATH,
+          request,
+          bodyText: openaiBody,
+          runtime,
+          search: url.search,
+        });
+
+        const openaiResp = proxyResponse.response;
+        const respBody = await openaiResp.text();
+        const openaiPayload = parseJsonBody(respBody);
+        const choice = (openaiPayload.choices || [])[0] || {};
+        const finish = choice.finish_reason || "stop";
+
+        // OpenAI -> Anthropic response translation
+        const anthropicResp = {
+          id: "msg_" + (openaiPayload.id || crypto.randomUUID()),
+          type: "message",
+          role: "assistant",
+          model: openaiPayload.model || model,
+          content: [{ type: "text", text: (choice.message || {}).content || "" }],
+          stop_reason: finish === "stop" ? "end_turn" : finish === "length" ? "max_tokens" : "end_turn",
+          stop_sequence: null,
+          usage: openaiPayload.usage ? {
+            input_tokens: openaiPayload.usage.prompt_tokens || 0,
+            output_tokens: openaiPayload.usage.completion_tokens || 0,
+          } : { input_tokens: 0, output_tokens: 0 },
+        };
+
+        const headers = new Headers(openaiResp.headers);
+        headers.set("content-type", "application/json; charset=utf-8");
+        headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
+        headers.set("x-llm-gateway-client", client.name || client.id || "client");
+        headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+        for (const [k, v] of Object.entries(CORS_HEADERS)) {
+          headers.set(k, v);
+        }
+
+        return new Response(JSON.stringify(anthropicResp), {
+          status: openaiResp.ok ? 200 : openaiResp.status,
+          headers,
         });
       }
 
@@ -1390,6 +1468,14 @@ function renderAdminPage() {
       background: #f2e7d3; padding: 4px 10px; border-radius: 8px;
       font-size: 14px; word-break: break-all;
     }
+    .gateway-urls { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; }
+    .url-card {
+      flex: 1; min-width: 280px; border: 1px solid var(--line);
+      background: rgba(255,253,248,.7); border-radius: 14px; padding: 14px;
+    }
+    .url-card .url-card-head { font-weight: 600; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    .url-card code { display: block; margin-bottom: 8px; }
+    .url-card button { margin-right: 6px; }
     .panel { padding: 20px; }
     .panel h2 { margin: 0 0 14px; font: 700 20px/1.2 Georgia, "Times New Roman", serif; }
 
@@ -1524,10 +1610,17 @@ function renderAdminPage() {
 <div class="wrap">
   <div class="hero">
     <h1>LLM Gateway</h1>
-    <div class="hero-row">
-      <span class="note">Gateway URL:</span>
-      <code id="gateway-url-pill">loading...</code>
-      <button class="small secondary" id="copy-gateway-url">\u590d\u5236</button>
+    <div class="gateway-urls">
+      <div class="url-card">
+        <div class="url-card-head">OpenAI Compatible</div>
+        <code id="gateway-url-openai">loading...</code>
+        <button class="small secondary copy-url" data-url="openai">\u590d\u5236</button>
+      </div>
+      <div class="url-card">
+        <div class="url-card-head">Claude Compatible (ANTHROPIC_BASE_URL)</div>
+        <code id="gateway-url-claude">loading...</code>
+        <button class="small secondary copy-url" data-url="claude">\u590d\u5236</button>
+      </div>
     </div>
   </div>
 
@@ -1840,7 +1933,8 @@ function renderAdminPage() {
     byId("model-cache-ttl").value = state.config.settings.model_cache_ttl;
     byId("routing-load-balance").checked = state.config.routing.load_balance !== false;
     byId("routing-failover").checked = state.config.routing.failover !== false;
-    byId("gateway-url-pill").textContent = state.gateway.base_url;
+    byId("gateway-url-openai").textContent = state.gateway.base_url;
+    byId("gateway-url-claude").textContent = state.gateway.base_url;
   }
 
   async function loadConfig() {
@@ -2017,11 +2111,13 @@ function renderAdminPage() {
           copyText(byId("client-output-text").textContent, "JSON \u5df2\u590d\u5236")
         ).catch(showError)
       );
-      byId("copy-gateway-url").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "\u590d\u5236\u4e2d...", () =>
-          copyText(state.gateway?.base_url, "Gateway URL \u5df2\u590d\u5236")
-        ).catch(showError)
-      );
+      document.querySelectorAll(".copy-url").forEach((btn) => {
+        btn.addEventListener("click", (e) =>
+          withButtonBusy(e.currentTarget, "\u590d\u5236\u4e2d...", () =>
+            copyText(state.gateway?.base_url, "Gateway URL \u5df2\u590d\u5236")
+          ).catch(showError)
+        );
+      });
 
       await loadConfig();
       await loadClients();
