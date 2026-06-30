@@ -1384,7 +1384,7 @@ function renderAdminPage() {
     }
     .upstream-card summary::-webkit-details-marker { display: none; }
     .upstream-card summary::before {
-      content: "\25B6"; font-size: 10px; color: var(--muted);
+      content: "\u25B6"; font-size: 10px; color: var(--muted);
       transition: transform .2s ease; flex-shrink: 0;
     }
     .upstream-card[open] summary::before { transform: rotate(90deg); }
@@ -1423,7 +1423,7 @@ function renderAdminPage() {
     }
     .settings-panel summary::-webkit-details-marker { display: none; }
     .settings-panel summary::before {
-      content: "\25B6"; font-size: 10px; color: var(--muted);
+      content: "\u25B6"; font-size: 10px; color: var(--muted);
       transition: transform .2s ease;
     }
     .settings-panel[open] summary::before { transform: rotate(90deg); }
