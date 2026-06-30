@@ -45,15 +45,8 @@ const PRESET_TEMPLATES = [
     requires_base_url: false,
   },
   {
-    id: "claude-openai",
-    name: "Custom Claude-Compatible",
-    base_url: "",
-    paths: [CHAT_PATH],
-    requires_base_url: true,
-  },
-  {
-    id: "generic-openai",
-    name: "Custom OpenAI-Compatible",
+    id: "custom",
+    name: "\u81ea\u5b9a\u4e49",
     base_url: "",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
     requires_base_url: true,
@@ -281,6 +274,42 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, results }, 200));
   }
 
+  const detectMatch = apiPath.match(/^\/api\/upstreams\/([^/]+)\/detect$/);
+  if (detectMatch && request.method === "POST") {
+    const upstreamName = decodeURIComponent(detectMatch[1]);
+    const runtime = await loadRuntimeConfig(app);
+    const upstream = runtime.upstreams.find((u) => u.name === upstreamName);
+    if (!upstream) {
+      return withCorsResponse(json(openAiError("Upstream not found.", "not_found_error"), 404));
+    }
+    const started = Date.now();
+    try {
+      const resp = await fetchWithTimeout(
+        buildUpstreamUrl(upstream.base_url, EMBEDDINGS_PATH, ""),
+        {
+          method: "POST",
+          headers: buildUpstreamHeaders(null, upstream),
+          body: JSON.stringify({ model: "detect", input: "test" }),
+        },
+        10000,
+      );
+      const latency = Date.now() - started;
+      const ok = resp.ok || resp.status === 400;
+      const capability = ok ? "openai" : "claude";
+      const paths = ok ? [CHAT_PATH, EMBEDDINGS_PATH] : [CHAT_PATH];
+      const config = await getEditableConfig(app);
+      const target = config.upstreams.find((u) => u.name === upstreamName);
+      if (target) {
+        target.capability = capability;
+        target.paths = paths;
+        await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(config));
+      }
+      return withCorsResponse(json({ ok: true, capability, paths, latency_ms: latency }, 200));
+    } catch (err) {
+      return withCorsResponse(json({ ok: true, capability: "claude", paths: [CHAT_PATH], latency_ms: Date.now() - started }, 200));
+    }
+  }
+
   return withCorsResponse(json(openAiError("Admin route not found.", "not_found_error"), 404));
 }
 
@@ -322,6 +351,7 @@ async function buildGatewayConfigFromEnv(app) {
       preset: presetId,
       priority: parsePriority(upstream.priority, index + 1),
       weight: parsePositiveInt(upstream.weight, 1),
+      capability: upstream.capability || null,
     });
   }
 
@@ -379,6 +409,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
       preset,
       priority: parsePriority(item.priority, index + 1),
       weight: parsePositiveInt(item.weight, 1),
+      capability: item.capability || null,
     });
   }
 
@@ -418,6 +449,7 @@ function toPublicGatewayConfig(config) {
     settings: config.settings,
     upstreams: config.upstreams.map((upstream) => ({
       ...upstream,
+      capability: upstream.capability || null,
       api_key_value: upstream.api_key_encrypted || "",
     })),
     version: config.version || 1,
@@ -989,9 +1021,9 @@ function inferPresetId(baseUrl) {
     return "together";
   }
   if (value.includes("anthropic") || value.includes("claude")) {
-    return "claude-openai";
+    return "custom";
   }
-  return "generic-openai";
+  return "custom";
 }
 
 function presetById(id) {
@@ -1422,6 +1454,10 @@ function renderAdminPage() {
     .health-dot.fail { background: #ef4444; }
     .health-dot.checking { background: #f59e0b; animation: pulse .6s ease infinite alternate; }
     @keyframes pulse { to { opacity: .4; } }
+    .capability-badge {
+      background: #e0d5c0; color: #3a2b1f; padding: 2px 8px;
+      border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap;
+    }
     .upstream-card summary .card-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
     .upstream-card .card-body { padding: 0 16px 14px; }
 
@@ -1583,7 +1619,7 @@ function renderAdminPage() {
 
   function splitList(value) { return text(value).split(/[,\\n]/).map((s) => s.trim()).filter(Boolean); }
   function esc(value) { return text(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
-  function presetById(id) { return state.presets.find((p) => p.id === id) || state.presets[0]; }
+  function presetById(id) { return state.presets.find((p) => p.id === id) || state.presets.find((p) => p.id === "custom") || state.presets[0]; }
   function baseUrlLocked(presetId) { const p = presetById(presetId); return !!p && p.requires_base_url === false; }
 
   let toastTimer = null;
@@ -1705,6 +1741,7 @@ function renderAdminPage() {
           '<span class="card-badge">' + esc(badge) + '</span>' +
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
+          (item.preset === "custom" || item.preset === "generic-openai" || item.preset === "claude-openai" ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u2713' : '\u2717') + '</span>' +
         '</summary>' +
         '<div class="card-body">' +
@@ -1727,10 +1764,17 @@ function renderAdminPage() {
             '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
           '</div>' +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
+          (item.preset === "custom" || item.preset === "generic-openai" || item.preset === "claude-openai" ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
         '</div>' +
       '</details>';
     }).join("");
 
+    host.querySelectorAll(".detect-upstream").forEach((btn) => {
+      btn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        await withButtonBusy(btn, "\u68c0\u6d4b\u4e2d...", () => detectCapability(btn.dataset.upstream));
+      });
+    });
     host.querySelectorAll(".delete-upstream").forEach((btn) => {
       btn.addEventListener("click", async (event) => {
         event.preventDefault();
@@ -1849,6 +1893,17 @@ function renderAdminPage() {
     const ok = (payload.results || []).filter((r) => r.ok).length;
     const total = (payload.results || []).length;
     showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
+  }
+
+  async function detectCapability(upstreamName) {
+    const resp = await fetch(API_BASE + "/upstreams/" + encodeURIComponent(upstreamName) + "/detect", { method: "POST" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u68c0\u6d4b\u5931\u8d25");
+    const badge = document.querySelector('.capability-badge[data-upstream="' + upstreamName + '"]');
+    if (badge) {
+      badge.textContent = payload.capability === "openai" ? "\u2713 OpenAI" : "Claude";
+    }
+    showToast(upstreamName + ": " + (payload.capability === "openai" ? "OpenAI Compatible (chat+embeddings)" : "Claude Compatible (chat only)") + ", " + payload.latency_ms + "ms");
   }
 
   /* ---- Clients ---- */
