@@ -117,13 +117,17 @@ export default {
           );
         }
 
+        // ponytail: strip Claude-only params that upstream OpenAI APIs reject
+        delete payload.thinking;
+        var cleanedBody = JSON.stringify(payload);
+
         const started = Date.now();
         const proxyResponse = await proxyRequest({
           client,
           model,
           pathname,
           request,
-          bodyText,
+          bodyText: cleanedBody,
           runtime,
           search: url.search,
         });
