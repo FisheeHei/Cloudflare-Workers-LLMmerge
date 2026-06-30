@@ -1807,7 +1807,7 @@ function renderAdminPage() {
     </div>
   </details>
 
-  <div class="panel" id="log-panel">
+  <div class="panel">
     <div class="toolbar">
       <h2>请求日志</h2>
       <button class="small secondary" id="load-logs">刷新</button>
@@ -1815,16 +1815,8 @@ function renderAdminPage() {
     <div class="live-log" id="live-log"></div>
   </div>
 
-  <div class="panel" id="logs-panel">
-    <div class="toolbar">
-      <h2>详细日志</h2>
-
-    </div>
-    <div class="live-log" id="live-log"></div>
-  </div>
-
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-01-stats ·
+    v26-07-01-logfix ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
@@ -2070,21 +2062,23 @@ function renderAdminPage() {
 
   /* ---- Settings ---- */
   function renderSettings() {
-    byId("request-timeout").value = state.config.settings.request_timeout_ms;
-    byId("cooldown-ttl").value = state.config.settings.upstream_cooldown_ttl;
-    byId("model-cache-ttl").value = state.config.settings.model_cache_ttl;
-    byId("routing-load-balance").checked = state.config.routing.load_balance !== false;
-    byId("routing-failover").checked = state.config.routing.failover !== false;
-    byId("gateway-url-pill").textContent = state.gateway.base_url;
+    var s = state.config && state.config.settings || {};
+    var r = state.config && state.config.routing || {};
+    byId("request-timeout").value = s.request_timeout_ms || "";
+    byId("cooldown-ttl").value = s.upstream_cooldown_ttl || "";
+    byId("model-cache-ttl").value = s.model_cache_ttl || "";
+    byId("routing-load-balance").checked = r.load_balance !== false;
+    byId("routing-failover").checked = r.failover !== false;
+    byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
   }
 
   async function loadConfig() {
     const resp = await fetch(API_BASE + "/config");
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u914d\u7f6e\u5931\u8d25");
-    state.config = payload.config;
-    state.presets = payload.presets;
-    state.gateway = payload.gateway;
+    state.config = payload.config || {};
+    state.presets = payload.presets || [];
+    state.gateway = payload.gateway || {};
     renderSettings();
     renderUpstreams();
   }
@@ -2185,6 +2179,7 @@ function renderAdminPage() {
             '</div>'
         ).join("")
       : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
+    renderLogs(logs);
   }
 
   /* ---- Logs ---- */
