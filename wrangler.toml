@@ -1,14 +1,15 @@
 "$schema" = "./node_modules/wrangler/config-schema.json"
 
 name = "llm-gateway"
-pages_build_output_dir = "."
 compatibility_date = "2026-06-29"
 
-# ponytail: runtime defaults live in _worker.js so Pages Variables / Secrets can override them.
-# Supported names: ADMIN_TOKEN, API_KEY_CRYPT_SECRET, REQUEST_TIMEOUT_MS,
+# ponytail: keep this file local-only for `wrangler pages dev`.
+# Do not set `pages_build_output_dir` here, so Pages production config stays managed in Cloudflare.
+# Configure production Variables / Secrets in the Workers & Pages dashboard instead.
+# Supported runtime names: ADMIN_TOKEN, API_KEY_CRYPT_SECRET, REQUEST_TIMEOUT_MS,
 # UPSTREAM_COOLDOWN_TTL, MODEL_CACHE_TTL, UPSTREAMS_JSON, CLIENTS_JSON.
 
-# Required for the admin page.
+# Optional local binding for `wrangler pages dev`.
 # [[kv_namespaces]]
 # binding = "KV"
 # id = "<YOUR_KV_NAMESPACE_ID>"

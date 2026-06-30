@@ -54,6 +54,7 @@ Cloudflare deployment persistence:
 - runtime defaults live in `_worker.js`
 - `.dev.vars.example` is the local template
 - Pages / Workers Variables and Secrets are read directly from `env`
+- production Variables and Secrets should be managed in the Cloudflare dashboard
 - redeploying the Worker should not require re-entering values stored in KV
 - the admin dashboard writes upstream pools and virtual client keys into KV
 
@@ -160,12 +161,14 @@ wrangler dev
 
 ## Deployment
 
-This repository is checked in as a Pages Advanced Mode project.
+This repository is checked in for Pages Advanced Mode, but `wrangler.toml` is kept local-only on purpose.
 
-- `wrangler.toml` uses `pages_build_output_dir = "."`
-- deploy Pages with Git integration or `wrangler pages deploy .`
-- the same runtime code still works on Workers, but Cloudflare does not allow one `wrangler.toml` to declare both `main` and `pages_build_output_dir`
-- if you want a dedicated Worker deploy, point `main` at `_worker.js` in a Worker-specific config or pass the script path on the command line
+- do not put production `vars` in `wrangler.toml`
+- do not put `pages_build_output_dir` in `wrangler.toml`
+- manage production Variables and Secrets in the Cloudflare dashboard so both stay editable there
+- use Git integration for Pages production deploys
+- use `wrangler pages dev .` for local development
+- the same runtime code still works on Workers, but use a Worker-specific config or CLI args if you want `wrangler deploy`
 
 Create KV:
 
@@ -195,7 +198,7 @@ If you do not want to set `ADMIN_TOKEN` explicitly, you may skip it, and the def
 Deploy:
 
 ```bash
-wrangler pages deploy .
+git push
 ```
 
 ## OpenAI SDK Example

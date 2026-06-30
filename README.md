@@ -50,6 +50,7 @@ Cloudflare deployment persistence:
 - runtime 默认值内置在 `_worker.js`
 - 本地开发示例放在 `.dev.vars.example`
 - Pages / Workers 面板里的 Variables 与 Secrets 会直接进入 `env`
+- 生产环境的 Variables 与 Secrets 请在 Cloudflare 仪表板管理
 - upstream pools and generated client keys are stored in KV
 - redeploying the Worker should not require re-entering KV-backed settings
 
