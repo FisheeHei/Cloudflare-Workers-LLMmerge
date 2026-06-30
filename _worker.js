@@ -363,7 +363,16 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   if (apiPath === "/api/config" && request.method === "PUT") {
     const payload = parseJsonBody(await request.text());
-    const normalized = await normalizeGatewayConfigPayload(payload, app);
+    // ponytail: merge into existing so a partial payload never wipes upstreams
+    const existing = await getEditableConfig(app);
+    const merged = {
+      settings: { ...existing.settings, ...(payload.settings || {}) },
+      routing: { ...existing.routing, ...(payload.routing || {}) },
+      upstreams: Array.isArray(payload.upstreams) && payload.upstreams.length
+        ? payload.upstreams
+        : (existing.upstreams || []),
+    };
+    const normalized = await normalizeGatewayConfigPayload(merged, app);
     await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
 
     return withCorsResponse(
@@ -499,8 +508,9 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
 async function getEditableConfig(app) {
   const stored = app.kv ? await app.kv.get(GATEWAY_CONFIG_KEY, "json") : null;
-  if (stored && typeof stored === "object") {
-    return await normalizeGatewayConfigPayload(stored, app);
+  // ponytail: KV data is already normalized; skip re-normalization
+  if (stored && typeof stored === "object" && Array.isArray(stored.upstreams)) {
+    return stored;
   }
 
   return buildGatewayConfigFromEnv(app);
@@ -566,26 +576,26 @@ async function normalizeGatewayConfigPayload(payload, app) {
 
   for (let index = 0; index < upstreamEntries.length; index += 1) {
     const item = upstreamEntries[index];
-    if (!item || typeof item !== "object") {
-      continue;
-    }
+    if (!item || typeof item !== "object") continue;
 
     const preset = presetById(item.preset) ? item.preset : "generic-openai";
     const defaults = presetById(preset) || presetById("generic-openai");
-    const apiKeyValue = String(
-      item.api_key_value || item.api_key_encrypted || item.api_key || "",
-    ).trim();
+    const apiKeyValue = String(item.api_key_value || item.api_key_encrypted || item.api_key || "").trim();
+    const name = String(item.name || `upstream-${index + 1}`).trim();
+    const baseUrl = resolveBaseUrl(preset, item.base_url, defaults.base_url);
+
+    if (!name) throw httpError(400, "Each upstream needs a name.");
+    if (!baseUrl) throw httpError(400, `Upstream ${name} is missing base_url.`);
+    if (!apiKeyValue) throw httpError(400, `Upstream ${name} is missing api_key.`);
 
     upstreams.push({
-      api_key_encrypted: apiKeyValue
-        ? await ensureEncryptedValue(apiKeyValue, app.encryptionSecret)
-        : "",
-      base_url: resolveBaseUrl(preset, item.base_url, defaults.base_url),
+      api_key_encrypted: await ensureEncryptedValue(apiKeyValue, app.encryptionSecret),
+      base_url: baseUrl,
       enabled: item.enabled !== false,
       headers: normalizeHeaders(item.headers),
       id: String(item.id || crypto.randomUUID()),
       models: normalizeStringArray(item.models),
-      name: String(item.name || `upstream-${index + 1}`).trim(),
+      name,
       note: String(item.note || "").trim(),
       paths: normalizeStringArray(item.paths).length
         ? normalizeStringArray(item.paths)
@@ -597,18 +607,6 @@ async function normalizeGatewayConfigPayload(payload, app) {
     });
   }
 
-  for (const upstream of upstreams) {
-    if (!upstream.name) {
-      throw httpError(400, "Each upstream needs a name.");
-    }
-    if (!upstream.base_url) {
-      throw httpError(400, `Upstream ${upstream.name} is missing base_url.`);
-    }
-    if (!upstream.api_key_encrypted) {
-      throw httpError(400, `Upstream ${upstream.name} is missing api_key.`);
-    }
-  }
-
   return {
     routing: {
       failover: routing.failover !== false,
@@ -617,10 +615,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
     settings: {
       model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
       request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
-      upstream_cooldown_ttl: parsePositiveInt(
-        settings.upstream_cooldown_ttl,
-        app.defaultCooldownTtl,
-      ),
+      upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
     },
     upstreams,
     version: 1,
@@ -1816,7 +1811,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-01-logfix ·
+    v26-07-01-merge ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
