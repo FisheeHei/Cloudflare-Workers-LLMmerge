@@ -1770,20 +1770,6 @@ function renderAdminPage() {
     <div id="log-list"><div class="note">\u52a0\u8f7d\u4e2d...</div></div>
   </div>
 
-  <div class="panel" id="stats-panel">
-    <div class="toolbar">
-      <h2>统计</h2>
-      <button class="small secondary" id="load-stats">加载统计</button>
-    </div>
-    <div class="stats-grid">
-      <div class="stat-box"><span class="stat-num" id="stat-total">-</span><span class="stat-label">24h 请求</span></div>
-      <div class="stat-box"><span class="stat-num" id="stat-success">-</span><span class="stat-label">成功</span></div>
-      <div class="stat-box"><span class="stat-num" id="stat-fail">-</span><span class="stat-label">失败</span></div>
-      <div class="stat-box"><span class="stat-num" id="stat-tokens">-</span><span class="stat-label">24h Tokens</span></div>
-    </div>
-    <div class="chart-bar" id="chart-requests"></div>
-    <div class="live-log" id="live-log"></div>
-  </div>
 
   <details class="panel settings-panel">
     <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
@@ -1805,6 +1791,14 @@ function renderAdminPage() {
       <span class="note" id="settings-status"></span>
     </div>
   </details>
+
+  <div class="panel" id="log-panel">
+    <div class="toolbar">
+      <h2>请求日志</h2>
+      <button class="small secondary" id="load-logs">刷新</button>
+    </div>
+    <div class="live-log" id="live-log"></div>
+  </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
     v26-07-01-stats ·
@@ -2150,21 +2144,25 @@ function renderAdminPage() {
       return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + h + 'px" title="' + b.hour + ': ' + b.total + ' req, ' + (b.prompt_tokens + b.completion_tokens) + ' tokens"></div>';
     }).join("");
 
-    // Live log
-    const logResp = await fetch(API_BASE + "/logs");
-    const logPayload = await parseApiResponse(logResp);
-    const logs = logPayload.logs || [];
+    showToast("\u7edf\u8ba1\u5df2\u52a0\u8f7d");
+  }
+
+  async function loadLogs() {
+    const resp = await fetch(API_BASE + "/logs");
+    const payload = await parseApiResponse(resp);
+    const logs = payload.logs || [];
     byId("live-log").innerHTML = logs.length
-      ? logs.slice(0, 15).map((l) =>
+      ? logs.slice(0, 20).map((l) =>
           '<div class="log-row">' +
             '<span class="log-badge ' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</span>' +
-            '<span>' + esc(l.upstream) + '</span>' +
+            '<strong>' + esc(l.upstream) + '</strong>' +
             '<span class="note">' + esc(l.model) + '</span>' +
             '<span class="note">' + esc(l.latency_ms + "ms") + '</span>' +
+            '<span class="note">' + esc((l.prompt_tokens || 0) + (l.completion_tokens || 0) + " tk") + '</span>' +
             '</div>'
         ).join("")
       : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
-    showToast("\u7edf\u8ba1\u5df2\u52a0\u8f7d");
+  }
   }
 
   /* ---- Logs ---- */
@@ -2293,6 +2291,9 @@ function renderAdminPage() {
       byId("load-stats").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadStats).catch(showError)
       );
+      byId("load-logs").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadLogs).catch(showError)
+      );
       byId("create-client").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u751f\u6210\u4e2d...", createClient).catch(showError)
       );
@@ -2322,6 +2323,7 @@ function renderAdminPage() {
       await loadConfig();
       await loadClients();
       loadStats().catch(() => {});
+      loadLogs().catch(() => {});
       loadLogs().catch(() => {});
     } catch (error) { showError(error); }
   }
