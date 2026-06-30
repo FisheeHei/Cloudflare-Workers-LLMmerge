@@ -18,6 +18,9 @@ const CHAT_PATH = "/v1/chat/completions";
 const EMBEDDINGS_PATH = "/v1/embeddings";
 const MESSAGES_PATH = "/v1/messages";
 const GATEWAY_CONFIG_KEY = "gateway:config";
+const LOG_KEY = "gateway:logs";
+const STATS_PREFIX = "gateway:stats:";
+const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 90000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
@@ -114,6 +117,7 @@ export default {
           );
         }
 
+        const started = Date.now();
         const proxyResponse = await proxyRequest({
           client,
           model,
@@ -124,15 +128,42 @@ export default {
           search: url.search,
         });
 
-        return withGatewayHeaders(proxyResponse.response, {
-          upstream: proxyResponse.upstream.name,
+        // ponytail: log request with token usage, re-emit response body
+        const upstreamResp = proxyResponse.response;
+        const respBody = await upstreamResp.text();
+        const usagePayload = (() => { try { return JSON.parse(respBody); } catch { return {}; } })();
+        const usage = usagePayload.usage || {};
+        const loggedStatus = upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502);
+        const logEntry = {
+          ts: new Date().toISOString(),
           client: client.name || client.id || "client",
-          attempts: proxyResponse.attempts,
+          upstream: proxyResponse.upstream.name,
+          model,
+          path: pathname,
+          status: loggedStatus,
+          latency_ms: Date.now() - started,
+          prompt_tokens: usage.prompt_tokens || 0,
+          completion_tokens: usage.completion_tokens || 0,
+        };
+        appendLog(app, logEntry);
+        recordStats(app, logEntry);
+
+        const headers = new Headers(upstreamResp.headers);
+        for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
+        headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
+        headers.set("x-llm-gateway-client", client.name || client.id || "client");
+        headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+
+        return new Response(respBody, {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers,
         });
       }
 
       // ponytail: translate Anthropic messages <-> OpenAI chat.completions for Claude Code compatibility.
       if (pathname === MESSAGES_PATH && request.method === "POST") {
+        const started = Date.now();
         const runtime = await loadRuntimeConfig(app);
         const client = await requireClient(request, runtime);
         const bodyText = await request.text();
@@ -202,6 +233,19 @@ export default {
           headers.set(k, v);
         }
 
+        const loggedStatusMsg = openaiResp.ok ? openaiResp.status : (openaiResp.status || 502);
+        appendLog(app, {
+          ts: new Date().toISOString(),
+          client: client.name || client.id || "client",
+          upstream: proxyResponse.upstream.name,
+          model,
+          path: MESSAGES_PATH,
+          status: loggedStatusMsg,
+          latency_ms: Date.now() - started,
+          prompt_tokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
+          completion_tokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
+        });
+
         return new Response(JSON.stringify(anthropicResp), {
           status: openaiResp.ok ? 200 : openaiResp.status,
           headers,
@@ -251,6 +295,46 @@ function createApp(env) {
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
     kv: env.KV || null,
   };
+}
+
+// ponytail: fire-and-forget request logging. Stores last 50 entries in KV.
+async function appendLog(app, entry) {
+  if (!app.kv) return;
+  try {
+    const raw = await app.kv.get(LOG_KEY, "json");
+    const logs = Array.isArray(raw) ? raw : [];
+    logs.push(entry);
+    if (logs.length > 50) logs.splice(0, logs.length - 50);
+    await app.kv.put(LOG_KEY, JSON.stringify(logs));
+  } catch { /* log failures must not break the response */ }
+}
+
+async function recordStats(app, entry) {
+  if (!app.kv) return;
+  try {
+    const now = new Date(entry.ts);
+    const hour = now.getFullYear() + "-" +
+      String(now.getMonth() + 1).padStart(2, "0") + "-" +
+      String(now.getDate()).padStart(2, "0") + ":" +
+      String(now.getHours()).padStart(2, "0");
+    const key = STATS_PREFIX + hour;
+    const raw = await app.kv.get(key, "json");
+    const bucket = (raw && typeof raw === "object") ? raw : {
+      total: 0, success: 0, fail: 0,
+      prompt_tokens: 0, completion_tokens: 0,
+      upstreams: {}, models: {},
+    };
+    bucket.total += 1;
+    if (entry.status >= 200 && entry.status < 400) bucket.success += 1;
+    else bucket.fail += 1;
+    bucket.prompt_tokens += entry.prompt_tokens || 0;
+    bucket.completion_tokens += entry.completion_tokens || 0;
+    const up = entry.upstream || "unknown";
+    bucket.upstreams[up] = (bucket.upstreams[up] || 0) + 1;
+    const mdl = entry.model || "unknown";
+    bucket.models[mdl] = (bucket.models[mdl] || 0) + 1;
+    await app.kv.put(key, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
+  } catch { /* stats failures must not break the response */ }
 }
 
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
@@ -329,6 +413,28 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     const id = decodeURIComponent(clientMatch[1]);
     await deleteClientRecord(app.kv, id);
     return withCorsResponse(json({ ok: true, id }, 200));
+  }
+
+  if (apiPath === "/api/logs" && request.method === "GET") {
+    const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
+    const logs = Array.isArray(raw) ? raw : [];
+    return withCorsResponse(json({ ok: true, logs: logs.reverse() }, 200));
+  }
+
+  if (apiPath === "/api/stats" && request.method === "GET") {
+    const now = new Date();
+    const buckets = [];
+    for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
+      const t = new Date(now.getTime() - h * 3600000);
+      const hourKey = t.getFullYear() + "-" +
+        String(t.getMonth() + 1).padStart(2, "0") + "-" +
+        String(t.getDate()).padStart(2, "0") + ":" +
+        String(t.getHours()).padStart(2, "0");
+      const raw = app.kv ? await app.kv.get(STATS_PREFIX + hourKey, "json") : null;
+      const bucket = (raw && typeof raw === "object") ? raw : { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+      buckets.push({ hour: hourKey, ...bucket });
+    }
+    return withCorsResponse(json({ ok: true, buckets }, 200));
   }
 
   // ponytail: health check only verifies connectivity, does not parse model list.
@@ -1605,6 +1711,12 @@ function renderAdminPage() {
       z-index: 100;
     }
     #toast.show { opacity: 1; transform: translateX(-50%) translateY(-6px); }
+    .log-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .log-table th, .log-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line); }
+    .log-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
+    .log-table .mono { font-size: 12px; }
+    .log-table .ok { color: var(--accent-2); }
+    .log-table .err { color: #8d2f23; }
   </style>
 </head>
 <body>
@@ -1647,6 +1759,30 @@ function renderAdminPage() {
       <span class="note" id="config-status"></span>
     </div>
     <div id="upstream-list"></div>
+  </div>
+
+  <div class="panel" id="log-panel">
+    <div class="toolbar">
+      <h2>\u8c03\u7528\u65e5\u5fd7</h2>
+      <button class="small secondary" id="refresh-logs">\u5237\u65b0</button>
+      <span class="note" id="token-total"></span>
+    </div>
+    <div id="log-list"><div class="note">\u52a0\u8f7d\u4e2d...</div></div>
+  </div>
+
+  <div class="panel" id="stats-panel">
+    <div class="toolbar">
+      <h2>统计</h2>
+      <button class="small secondary" id="load-stats">加载统计</button>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-box"><span class="stat-num" id="stat-total">-</span><span class="stat-label">24h 请求</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-success">-</span><span class="stat-label">成功</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-fail">-</span><span class="stat-label">失败</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-tokens">-</span><span class="stat-label">24h Tokens</span></div>
+    </div>
+    <div class="chart-bar" id="chart-requests"></div>
+    <div class="live-log" id="live-log"></div>
   </div>
 
   <details class="panel settings-panel">
@@ -1994,6 +2130,77 @@ function renderAdminPage() {
     showToast(upstreamName + ": " + (payload.capability === "openai" ? "OpenAI Compatible (chat+embeddings)" : "Claude Compatible (chat only)") + ", " + payload.latency_ms + "ms");
   }
 
+  async function loadStats() {
+    const resp = await fetch(API_BASE + "/stats");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u7edf\u8ba1\u5931\u8d25");
+    const buckets = payload.buckets || [];
+    let total = 0, success = 0, fail = 0, pt = 0, ct = 0;
+    buckets.forEach((b) => { total += b.total; success += b.success; fail += b.fail; pt += b.prompt_tokens; ct += b.completion_tokens; });
+    byId("stat-total").textContent = total;
+    byId("stat-success").textContent = success;
+    byId("stat-fail").textContent = fail;
+    byId("stat-tokens").textContent = (pt + ct).toLocaleString();
+
+    // Bar chart - max height 100px
+    const maxVal = Math.max(1, ...buckets.map((b) => b.total));
+    byId("chart-requests").innerHTML = buckets.map((b) => {
+      const h = Math.max(2, Math.round(b.total / maxVal * 100));
+      const label = b.total ? (b.hour.slice(-2) + "h " + b.total) : "";
+      return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + h + 'px" title="' + b.hour + ': ' + b.total + ' req, ' + (b.prompt_tokens + b.completion_tokens) + ' tokens"></div>';
+    }).join("");
+
+    // Live log
+    const logResp = await fetch(API_BASE + "/logs");
+    const logPayload = await parseApiResponse(logResp);
+    const logs = logPayload.logs || [];
+    byId("live-log").innerHTML = logs.length
+      ? logs.slice(0, 15).map((l) =>
+          '<div class="log-row">' +
+            '<span class="log-badge ' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</span>' +
+            '<span>' + esc(l.upstream) + '</span>' +
+            '<span class="note">' + esc(l.model) + '</span>' +
+            '<span class="note">' + esc(l.latency_ms + "ms") + '</span>' +
+            '</div>'
+        ).join("")
+      : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
+    showToast("\u7edf\u8ba1\u5df2\u52a0\u8f7d");
+  }
+
+  /* ---- Logs ---- */
+  async function loadLogs() {
+    const resp = await fetch(API_BASE + "/logs");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u65e5\u5fd7\u52a0\u8f7d\u5931\u8d25");
+    renderLogs(payload.logs || []);
+  }
+
+  function renderLogs(logs) {
+    if (!logs.length) {
+      byId("log-list").innerHTML = '<div class="note">\u6682\u65e0\u8c03\u7528\u8bb0\u5f55\u3002</div>';
+      byId("token-total").textContent = "";
+      return;
+    }
+    const totalPrompt = logs.reduce((s, l) => s + (l.prompt_tokens || 0), 0);
+    const totalCompletion = logs.reduce((s, l) => s + (l.completion_tokens || 0), 0);
+    byId("token-total").textContent = "\u603b\u8ba1: " + totalPrompt + " input + " + totalCompletion + " output = " + (totalPrompt + totalCompletion) + " tokens (" + logs.length + " \u8bf7\u6c42)";
+
+    byId("log-list").innerHTML = '<table class="log-table"><thead><tr>' +
+      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Tokens</th>' +
+    '</tr></thead><tbody>' +
+    logs.map((l) => '<tr>' +
+      '<td>' + esc((l.ts || "").slice(11, 19)) + '</td>' +
+      '<td>' + esc(l.client || "") + '</td>' +
+      '<td>' + esc(l.upstream || "") + '</td>' +
+      '<td class="mono">' + esc(l.model || "") + '</td>' +
+      '<td class="mono">' + esc((l.path || "").replace("/v1/", "")) + '</td>' +
+      '<td class="' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</td>' +
+      '<td>' + esc(l.latency_ms) + 'ms</td>' +
+      '<td>' + esc(l.prompt_tokens || 0) + '/' + esc(l.completion_tokens || 0) + '</td>' +
+    '</tr>').join("") +
+    '</tbody></table>';
+  }
+
   /* ---- Clients ---- */
   async function loadClients() {
     const resp = await fetch(API_BASE + "/clients");
@@ -2083,6 +2290,9 @@ function renderAdminPage() {
       byId("check-health").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", checkHealth).catch(showError)
       );
+      byId("load-stats").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadStats).catch(showError)
+      );
       byId("create-client").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u751f\u6210\u4e2d...", createClient).catch(showError)
       );
@@ -2105,8 +2315,14 @@ function renderAdminPage() {
         ).catch(showError)
       );
 
+      byId("refresh-logs").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", loadLogs).catch(showError)
+      );
+
       await loadConfig();
       await loadClients();
+      loadStats().catch(() => {});
+      loadLogs().catch(() => {});
     } catch (error) { showError(error); }
   }
 
