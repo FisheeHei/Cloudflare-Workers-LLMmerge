@@ -1498,18 +1498,20 @@ function renderAdminPage() {
     <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
     <div class="settings-body">
       <div class="row">
-        <div class="field span-4"><label>\u8bf7\u6c42\u8d85\u65f6 (ms)</label><input id="request-timeout" type="number" min="1000"></div>
-        <div class="field span-4"><label>\u51b7\u5374 TTL (s)</label><input id="cooldown-ttl" type="number" min="1"></div>
-        <div class="field span-4"><label>\u6a21\u578b\u7f13\u5b58 TTL (s)</label><input id="model-cache-ttl" type="number" min="1"></div>
+        <div class="field span-4"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba490000)</label><input id="request-timeout" type="number" min="1000" placeholder="90000"></div>
+        <div class="field span-4"><label>\u51b7\u5374 TTL (s, \u9ed8\u8ba460)</label><input id="cooldown-ttl" type="number" min="1" placeholder="60"></div>
+        <div class="field span-4"><label>\u6a21\u578b\u7f13\u5b58 TTL (s, \u9ed8\u8ba43600)</label><input id="model-cache-ttl" type="number" min="1" placeholder="3600"></div>
       </div>
       <div class="row">
         <div class="field span-6">
-          <label><input type="checkbox" id="routing-load-balance"> \u8d1f\u8f7d\u5747\u8861</label>
+          <label><input type="checkbox" id="routing-load-balance"> \u8d1f\u8f7d\u5747\u8861 (\u9ed8\u8ba4\u5f00)</label>
         </div>
         <div class="field span-6">
-          <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb</label>
+          <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb (\u9ed8\u8ba4\u5f00)</label>
         </div>
       </div>
+      <button class="good small" id="save-settings">\u4fdd\u5b58\u8bbe\u7f6e</button>
+      <span class="note" id="settings-status"></span>
     </div>
   </details>
 </div>
@@ -1779,6 +1781,12 @@ function renderAdminPage() {
     setTimeout(() => byId("config-status").textContent = "", 3000);
   }
 
+  async function saveSettings() {
+    await saveConfig();
+    byId("settings-status").textContent = "\u2713 \u5df2\u4fdd\u5b58";
+    setTimeout(() => byId("settings-status").textContent = "", 3000);
+  }
+
   async function refreshModels() {
     const resp = await fetch(API_BASE + "/refresh", { method: "POST" });
     const payload = await parseApiResponse(resp);
@@ -1868,6 +1876,9 @@ function renderAdminPage() {
       );
       byId("save-config").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u4fdd\u5b58\u4e2d...", saveConfig).catch(showError)
+      );
+      byId("save-settings").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u4fdd\u5b58\u4e2d...", saveSettings).catch(showError)
       );
       byId("refresh-models").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", refreshModels).catch(showError)
