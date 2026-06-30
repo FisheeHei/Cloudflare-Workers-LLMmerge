@@ -95,7 +95,7 @@ export default {
       }
 
       if (adminRoute?.kind === "api") {
-        return handleAdminApi(request, url, pathnameLower, app, adminRoute.basePath);
+        return await handleAdminApi(request, url, pathnameLower, app, adminRoute.basePath);
       }
 
       if (pathname === MODEL_PATH && request.method === "GET") {
