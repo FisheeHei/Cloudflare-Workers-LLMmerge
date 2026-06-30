@@ -1732,6 +1732,21 @@ function renderAdminPage() {
     </div>
   </div>
 
+  <div class="panel" id="stats-panel">
+    <div class="toolbar">
+      <h2>统计</h2>
+      <span class="note" id="stat-current-model"></span>
+      <button class="small secondary" id="load-stats">加载统计</button>
+    </div>
+    <div class="chart-bar" id="chart-requests"></div>
+    <div class="stats-grid">
+      <div class="stat-box"><span class="stat-num" id="stat-total">-</span><span class="stat-label">24h 请求</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-success">-</span><span class="stat-label">成功</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-fail">-</span><span class="stat-label">失败</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-tokens">-</span><span class="stat-label">24h Tokens</span></div>
+    </div>
+  </div>
+
   <div class="panel">
     <h2>\u5ba2\u6237\u7aef Keys</h2>
     <div id="client-list"></div>
@@ -1796,6 +1811,14 @@ function renderAdminPage() {
     <div class="toolbar">
       <h2>请求日志</h2>
       <button class="small secondary" id="load-logs">刷新</button>
+    </div>
+    <div class="live-log" id="live-log"></div>
+  </div>
+
+  <div class="panel" id="logs-panel">
+    <div class="toolbar">
+      <h2>详细日志</h2>
+      <button class="small secondary" id="load-logs">加载日志</button>
     </div>
     <div class="live-log" id="live-log"></div>
   </div>
@@ -2294,6 +2317,9 @@ function renderAdminPage() {
       byId("load-logs").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadLogs).catch(showError)
       );
+      byId("load-logs").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadLogs).catch(showError)
+      );
       byId("create-client").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u751f\u6210\u4e2d...", createClient).catch(showError)
       );
@@ -2323,6 +2349,7 @@ function renderAdminPage() {
       await loadConfig();
       await loadClients();
       loadStats().catch(() => {});
+      loadLogs().catch(() => {});
       loadLogs().catch(() => {});
       loadLogs().catch(() => {});
     } catch (error) { showError(error); }
