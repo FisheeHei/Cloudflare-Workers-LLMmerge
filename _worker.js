@@ -2148,11 +2148,20 @@ function renderAdminPage() {
     byId("stat-fail").textContent = fail;
     byId("stat-tokens").textContent = (pt + ct).toLocaleString();
 
-    // Bar chart - max height 100px
-    const maxVal = Math.max(1, ...buckets.map((b) => b.total));
-    byId("chart-requests").innerHTML = buckets.map((b) => {
-      const h = Math.max(2, Math.round(b.total / maxVal * 100));
-      const label = b.total ? (b.hour.slice(-2) + "h " + b.total) : "";
+    // Bar chart - always show 24h grid, zero-fill missing hours
+    var now = new Date();
+    var pad2 = function(n) { return String(n).padStart(2, "0"); };
+    var today = now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate());
+    var skeleton = [];
+    for (var h = 0; h < 24; h++) {
+      var key = today + "T" + pad2(h);
+      var hit = buckets.find(function(b) { return b.hour === key; });
+      skeleton.push(hit || { hour: key, total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0 });
+    }
+    var maxVal = Math.max(1, /* highest bar */ 0);
+    skeleton.forEach(function(b) { if (b.total > maxVal) maxVal = b.total; });
+    byId("chart-requests").innerHTML = skeleton.map(function(b) {
+      var h = Math.max(2, Math.round(b.total / maxVal * 100));
       return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + h + 'px" title="' + b.hour + ': ' + b.total + ' req, ' + (b.prompt_tokens + b.completion_tokens) + ' tokens"></div>';
     }).join("");
 
