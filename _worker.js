@@ -1686,8 +1686,8 @@ function renderAdminPage() {
       <div class="field span-12"><label>\u6a21\u677f</label><select id="vendor-preset"></select></div>
     </div>
     <div class="row">
-      <div class="field span-6"><label>\u5907\u6ce8</label><input id="vendor-note" placeholder="\u6211\u7684 NVIDIA key"></div>
-      <div class="field span-6"><label>\u5185\u90e8\u540d\u79f0</label><input id="vendor-name" placeholder="nim-main (\u53ef\u7701\u7565)"></div>
+      <div class="field span-6"><label>\u5907\u6ce8</label><input id="vendor-note" placeholder="\u4f8b\u5982: \u4e3b\u529b Key"></div>
+      <div class="field span-6"><label>\u5185\u90e8\u540d\u79f0</label><input id="vendor-name" placeholder="my-upstream (\u53ef\u7701\u7565)"></div>
     </div>
     <div class="row">
       <div class="field span-6"><label>Base URL</label><input id="vendor-base-url" placeholder="https://..."></div>
