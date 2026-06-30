@@ -2199,8 +2199,6 @@ function renderAdminPage() {
 
     async function boot() {
       try {
-        await loadConfig();
-        await loadClients();
         byId("vendor-modal").addEventListener("click", (event) => {
           if (event.target === byId("vendor-modal")) {
             closeVendorModal();
@@ -2238,6 +2236,8 @@ function renderAdminPage() {
             copyText(state.lastCreatedClient?.api_key, "API key copied."),
           ).catch(showError),
         );
+        await loadConfig();
+        await loadClients();
       } catch (error) {
         showError(error);
       }
