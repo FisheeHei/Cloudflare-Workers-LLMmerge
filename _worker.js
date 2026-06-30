@@ -1551,7 +1551,9 @@ function renderAdminPage() {
 <div class="modal-backdrop" id="vendor-modal">
   <div class="modal-card">
     <h3>\u6dfb\u52a0\u4e0a\u6e38</h3>
-    <div class="template-grid" id="vendor-template-grid"></div>
+    <div class="row">
+      <div class="field span-12"><label>\u6a21\u677f</label><select id="vendor-preset"></select></div>
+    </div>
     <div class="row">
       <div class="field span-6"><label>\u5907\u6ce8</label><input id="vendor-note" placeholder="\u6211\u7684 NVIDIA key"></div>
       <div class="field span-6"><label>\u5185\u90e8\u540d\u79f0</label><input id="vendor-name" placeholder="nim-main (\u53ef\u7701\u7565)"></div>
@@ -1575,7 +1577,7 @@ function renderAdminPage() {
 
 <script>
   const API_BASE = location.pathname.replace(/\\/+$/, "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, lastCreatedClient: null };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
@@ -1615,9 +1617,9 @@ function renderAdminPage() {
 
   /* ---- Modal ---- */
   function openVendorModal() {
-    byId("vendor-base-url").readOnly = false;
-    byId("vendor-base-url").value = "";
-    byId("vendor-paths").value = "/v1/chat/completions, /v1/embeddings";
+    if (!state.draftPresetId && state.presets.length) state.draftPresetId = state.presets[0].id;
+    renderPresets();
+    applyVendorPreset();
     ["vendor-note","vendor-name","vendor-api-key","vendor-models"].forEach((id) => byId(id).value = "");
     byId("vendor-weight").value = "1"; byId("vendor-enabled").value = "true";
     byId("vendor-modal").classList.add("open");
@@ -1625,33 +1627,37 @@ function renderAdminPage() {
   function closeVendorModal() { byId("vendor-modal").classList.remove("open"); }
 
   function renderPresets() {
-    const host = byId("vendor-template-grid");
-    let items = state.presets.map((p) =>
-      \`<button type="button" class="template-card\${state.draftPresetId === p.id ? " active" : ""}" data-preset="\${esc(p.id)}">
-        <strong>\${esc(p.name)}</strong>
-        <span class="note">\${p.requires_base_url === false ? "\u9884\u8bbe Base URL" : "\u81ea\u5b9a\u4e49 Base URL"}</span>
-      </button>\`
-    ).join("");
-    items += \`<button type="button" class="template-card custom\${state.draftPresetId === "_custom" ? " active" : ""}" data-preset="_custom">
-      <strong>\u81ea\u5b9a\u4e49</strong>
-      <span class="note">\u624b\u52a8\u8f93\u5165 Base URL + API Key</span>
-    </button>\`;
-    host.innerHTML = items;
-
+    const sel = byId("vendor-preset");
+    sel.innerHTML = state.presets.map((p) =>
+      '<option value="' + esc(p.id) + '">' + esc(p.name) + (p.requires_base_url === false ? ' (\u9884\u8bbe ' + esc(p.base_url || "") + ')' : ' (\u81ea\u5b9a\u4e49)') + '</option>'
+    ).join("") + '<option value="_custom">\u81ea\u5b9a\u4e49 (Base URL \u7559\u7a7a)</option>';
+    sel.value = state.draftPresetId || (state.presets[0] ? state.presets[0].id : "_custom");
+    if (!sel._wired) {
+      sel._wired = true;
+      sel.addEventListener("change", () => { state.draftPresetId = sel.value; applyVendorPreset(); });
+    }
   }
 
   function applyVendorPreset() {
-    // ponytail: BYOK style - everything is user-editable.
-    byId("vendor-base-url").readOnly = false;
-    byId("vendor-base-url").value = "";
-    byId("vendor-paths").value = "/v1/chat/completions, /v1/embeddings";
+    const baseInput = byId("vendor-base-url");
+    const pathsInput = byId("vendor-paths");
+    if (state.draftPresetId === "_custom") {
+      baseInput.readOnly = false;
+      baseInput.value = "";
+      pathsInput.value = "/v1/chat/completions, /v1/embeddings";
+      return;
+    }
+    const preset = presetById(state.draftPresetId);
+    if (!preset) return;
+    const locked = preset.requires_base_url === false;
+    baseInput.readOnly = locked;
+    baseInput.value = locked ? (preset.base_url || "") : "";
+    pathsInput.value = (preset.paths || []).join(", ");
   }
 
   function createVendorFromModal() {
-    const isCustom = state.draftPresetId === "_custom";
-    const preset = isCustom ? null : presetById(state.draftPresetId);
-    if (!isCustom && !preset) throw new Error("\u8bf7\u5148\u9009\u62e9\u6a21\u677f");
-
+    const presetId = state.draftPresetId || "generic-openai";
+    const isCustom = presetId === "_custom";
     const note = byId("vendor-note").value.trim();
     const name = byId("vendor-name").value.trim();
     const baseUrl = byId("vendor-base-url").value.trim();
@@ -1663,8 +1669,8 @@ function renderAdminPage() {
 
     state.config.upstreams.push({
       id: crypto.randomUUID ? crypto.randomUUID() : "u-" + suffix,
-      preset: isCustom ? "generic-openai" : preset.id,
-      note, name: name || (isCustom ? "custom-" + suffix : preset.id + "-" + suffix),
+      preset: isCustom ? "generic-openai" : presetId,
+      note, name: name || (isCustom ? "custom-" + suffix : presetId + "-" + suffix),
       base_url: baseUrl, api_key_value: apiKey,
       models: splitList(byId("vendor-models").value),
       paths: splitList(byId("vendor-paths").value),
@@ -1675,7 +1681,7 @@ function renderAdminPage() {
     renderUpstreams(); closeVendorModal();
     ["vendor-note","vendor-name","vendor-api-key","vendor-models"].forEach((id) => byId(id).value = "");
     byId("vendor-weight").value = "1"; byId("vendor-enabled").value = "true";
-    applyVendorPreset();
+    renderPresets();
   }
 
   /* ---- Upstreams ---- */
