@@ -1761,8 +1761,8 @@ function renderAdminPage() {
     const sel = byId("vendor-preset");
     sel.innerHTML = state.presets.map((p) =>
       '<option value="' + esc(p.id) + '">' + esc(p.name) + (p.requires_base_url === false ? ' (\u9884\u8bbe ' + esc(p.base_url || "") + ')' : ' (\u81ea\u5b9a\u4e49)') + '</option>'
-    ).join("") + '<option value="_custom">\u81ea\u5b9a\u4e49 (Base URL \u7559\u7a7a)</option>';
-    sel.value = state.draftPresetId || (state.presets[0] ? state.presets[0].id : "_custom");
+    ).join("");
+    sel.value = state.draftPresetId || (state.presets[0] ? state.presets[0].id : "custom");
     if (!sel._wired) {
       sel._wired = true;
       sel.addEventListener("change", () => { state.draftPresetId = sel.value; applyVendorPreset(); });
@@ -1772,12 +1772,6 @@ function renderAdminPage() {
   function applyVendorPreset() {
     const baseInput = byId("vendor-base-url");
     const pathsInput = byId("vendor-paths");
-    if (state.draftPresetId === "_custom") {
-      baseInput.readOnly = false;
-      baseInput.value = "";
-      pathsInput.value = "/v1/chat/completions, /v1/embeddings";
-      return;
-    }
     const preset = presetById(state.draftPresetId);
     if (!preset) return;
     const locked = preset.requires_base_url === false;
@@ -1787,8 +1781,7 @@ function renderAdminPage() {
   }
 
   function createVendorFromModal() {
-    const presetId = state.draftPresetId || "generic-openai";
-    const isCustom = presetId === "_custom";
+    const presetId = state.draftPresetId || "custom";
     const note = byId("vendor-note").value.trim();
     const name = byId("vendor-name").value.trim();
     const baseUrl = byId("vendor-base-url").value.trim();
@@ -1800,8 +1793,8 @@ function renderAdminPage() {
 
     state.config.upstreams.push({
       id: crypto.randomUUID ? crypto.randomUUID() : "u-" + suffix,
-      preset: isCustom ? "generic-openai" : presetId,
-      note, name: name || (isCustom ? "custom-" + suffix : presetId + "-" + suffix),
+      preset: presetId,
+      note, name: name || presetId + "-" + suffix,
       base_url: baseUrl, api_key_value: apiKey,
       models: splitList(byId("vendor-models").value),
       paths: splitList(byId("vendor-paths").value),
