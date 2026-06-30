@@ -1302,7 +1302,7 @@ function renderAdminPage() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LLM Gateway Admin</title>
+  <title>LLM Gateway \u7ba1\u7406\u9762\u677f</title>
   <style>
     :root {
       --bg: #f5f1e8;
@@ -1580,72 +1580,72 @@ function renderAdminPage() {
 <body>
   <div class="wrap">
     <section class="hero">
-      <h1>LLM Gateway Admin</h1>
-      <p>这个页面只在当前隐藏路径下可见。对外的 OpenAI 兼容入口固定�?<code id="gateway-url">/v1</code>�?/p>
+      <h1>LLM Gateway \u7ba1\u7406\u9762\u677f</h1>
+      <p>\u8fd9\u4e2a\u9875\u9762\u53ea\u5728\u5f53\u524d\u9690\u85cf\u8def\u5f84\u4e0b\u53ef\u89c1\u3002\u5bf9\u5916\u7684 OpenAI \u517c\u5bb9\u5165\u53e3\u56fa\u5b9a\u4e3a <code id="gateway-url">/v1</code>\u3002</p>
     </section>
 
     <div class="grid">
       <section class="panel">
-        <h2>基础配置</h2>
+        <h2>\u57fa\u7840\u914d\u7f6e</h2>
         <div class="row">
           <div class="field span-4">
-            <label for="request-timeout">请求超时（毫秒）</label>
+            <label for="request-timeout">\u8bf7\u6c42\u8d85\u65f6\uff08\u6beb\u79d2\uff09</label>
             <input id="request-timeout" type="number" min="1000">
           </div>
           <div class="field span-4">
-            <label for="cooldown-ttl">失败冷却（秒�?/label>
+            <label for="cooldown-ttl">\u5931\u8d25\u51b7\u5374\uff08\u79d2\uff09</label>
             <input id="cooldown-ttl" type="number" min="1">
           </div>
           <div class="field span-4">
-            <label for="model-cache-ttl">模型缓存（秒�?/label>
+            <label for="model-cache-ttl">\u6a21\u578b\u7f13\u5b58\uff08\u79d2\uff09</label>
             <input id="model-cache-ttl" type="number" min="1">
           </div>
         </div>
         <div class="toolbar">
-          <label class="checkbox"><input id="routing-load-balance" type="checkbox">启用负载均衡</label>
-          <label class="checkbox"><input id="routing-failover" type="checkbox">启用失败轮询</label>
+          <label class="checkbox"><input id="routing-load-balance" type="checkbox">\u542f\u7528\u8d1f\u8f7d\u5747\u8861</label>
+          <label class="checkbox"><input id="routing-failover" type="checkbox">\u542f\u7528\u5931\u8d25\u8f6e\u8be2</label>
           <span class="pill mono" id="gateway-url-pill">/v1</span>
         </div>
-        <p class="note">负载均衡负责�?key 分流；失败轮询负责上游异常时自动切换。两个都开就是混合模式�?/p>
+        <p class="note">\u8d1f\u8f7d\u5747\u8861\u8d1f\u8d23\u591a key \u5206\u6d41\uff1b\u5931\u8d25\u8f6e\u8be2\u8d1f\u8d23\u4e0a\u6e38\u5f02\u5e38\u65f6\u81ea\u52a8\u5207\u6362\u3002\u4e24\u4e2a\u90fd\u5f00\u5c31\u662f\u6df7\u5408\u6a21\u5f0f\u3002</p>
       </section>
 
       <section class="panel">
-        <h2>上游 API Keys</h2>
+        <h2>\u4e0a\u6e38 API Keys</h2>
         <div class="toolbar">
-          <button class="good" id="open-vendor-modal">新建供应�?/button>
+          <button class="good" id="open-vendor-modal">\u65b0\u5efa\u4f9b\u5e94\u5546</button>
         </div>
-        <p class="note">保存后输入框里展示的是加密串，不会回显明文。你可以继续直接改密文对应的备注，也可以重新贴入新的明文 key 覆盖它�?/p>
+        <p class="note">\u4fdd\u5b58\u540e\u8f93\u5165\u6846\u91cc\u5c55\u793a\u7684\u662f\u52a0\u5bc6\u4e32\uff0c\u4e0d\u4f1a\u56de\u663e\u660e\u6587\u3002\u4f60\u53ef\u4ee5\u7ee7\u7eed\u76f4\u63a5\u6539\u5bc6\u6587\u5bf9\u5e94\u7684\u5907\u6ce8\uff0c\u4e5f\u53ef\u4ee5\u91cd\u65b0\u8d34\u5165\u65b0\u7684\u660e\u6587 key \u8986\u76d6\u5b83\u3002</p>
         <div class="upstream-list" id="upstream-list"></div>
         <div class="toolbar" style="margin-top:14px;">
-          <button class="good" id="save-config">保存配置</button>
-          <button class="secondary" id="refresh-models">刷新模型缓存</button>
+          <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
+          <button class="secondary" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
         </div>
         <div class="status" id="config-status"></div>
       </section>
 
       <section class="panel">
-        <h2>客户�?Keys</h2>
+        <h2>\u5ba2\u6237\u7aef Keys</h2>
         <div class="row">
           <div class="field span-4">
-            <label for="client-name">备注</label>
+            <label for="client-name">\u5907\u6ce8</label>
             <input id="client-name" placeholder="demo-user">
           </div>
           <div class="field span-4">
-            <label for="client-models">模型白名单（逗号分隔，可留空�?/label>
-            <input id="client-models" placeholder="* �?meta/llama-3.1-8b-instruct">
+            <label for="client-models">\u6a21\u578b\u767d\u540d\u5355\uff08\u9017\u53f7\u5206\u9694\uff0c\u53ef\u7559\u7a7a\uff09</label>
+            <input id="client-models" placeholder="* \u6216 meta/llama-3.1-8b-instruct">
           </div>
           <div class="field span-4">
-            <label for="client-upstreams">上游白名单（逗号分隔，可留空�?/label>
+            <label for="client-upstreams">\u4e0a\u6e38\u767d\u540d\u5355\uff08\u9017\u53f7\u5206\u9694\uff0c\u53ef\u7559\u7a7a\uff09</label>
             <input id="client-upstreams" placeholder="nim-main,nim-backup">
           </div>
         </div>
         <div class="toolbar">
-          <button class="good" id="create-client">生成客户�?Key</button>
+          <button class="good" id="create-client">\u751f\u6210\u5ba2\u6237\u7aef Key</button>
         </div>
         <pre id="client-output" hidden></pre>
         <div class="output-actions" id="client-output-actions" hidden>
-          <button type="button" class="secondary" id="copy-client-output">Copy client JSON</button>
-          <button type="button" class="secondary" id="copy-client-key">Copy API key</button>
+          <button type="button" class="secondary" id="copy-client-output">\u590d\u5236\u5ba2\u6237\u7aef JSON</button>
+          <button type="button" class="secondary" id="copy-client-key">\u590d\u5236 API Key</button>
         </div>
         <div class="client-list" id="client-list"></div>
       </section>
@@ -1655,22 +1655,22 @@ function renderAdminPage() {
   <div class="modal-backdrop" id="vendor-modal">
     <div class="modal-card">
       <div class="toolbar" style="justify-content:space-between;">
-        <h2 style="margin:0;">新建供应�?/h2>
-        <button type="button" class="secondary" id="close-vendor-modal">关闭</button>
+        <h2 style="margin:0;">\u65b0\u5efa\u4f9b\u5e94\u5546</h2>
+        <button type="button" class="secondary" id="close-vendor-modal">\u5173\u95ed</button>
       </div>
-      <p class="note">先选择供应商模板。预设模板只需要输�?API key；自定义模板需要同时输�?Base URL �?API key�?/p>
+      <p class="note">\u5148\u9009\u62e9\u4f9b\u5e94\u5546\u6a21\u677f\u3002\u9884\u8bbe\u6a21\u677f\u53ea\u9700\u8981\u8f93\u5165 API key\uff1b\u81ea\u5b9a\u4e49\u6a21\u677f\u9700\u8981\u540c\u65f6\u8f93\u5165 Base URL \u548c API key\u3002</p>
       <div class="template-grid" id="vendor-template-grid"></div>
       <div class="row">
         <div class="field span-4">
-          <label for="vendor-note">备注</label>
-          <input id="vendor-note" placeholder="我的 NIM Key">
+          <label for="vendor-note">\u5907\u6ce8</label>
+          <input id="vendor-note" placeholder="\u6211\u7684 NIM Key">
         </div>
         <div class="field span-4">
-          <label for="vendor-name">内部名称</label>
+          <label for="vendor-name">\u5185\u90e8\u540d\u79f0</label>
           <input id="vendor-name" placeholder="nim-main">
         </div>
         <div class="field span-4">
-          <label for="vendor-enabled">启用</label>
+          <label for="vendor-enabled">\u542f\u7528</label>
           <select id="vendor-enabled">
             <option value="true">true</option>
             <option value="false">false</option>
@@ -1685,24 +1685,24 @@ function renderAdminPage() {
           <input id="vendor-api-key" class="mono" placeholder="nvapi-...">
         </div>
         <div class="field span-4">
-          <label for="vendor-weight">权重</label>
+          <label for="vendor-weight">\u6743\u91cd</label>
           <input id="vendor-weight" type="number" min="1" value="1">
         </div>
         <div class="field span-4">
-          <label for="vendor-priority">优先�?/label>
+          <label for="vendor-priority">\u4f18\u5148\u7ea7</label>
           <input id="vendor-priority" type="number" value="100">
         </div>
         <div class="field span-4">
-          <label for="vendor-paths">路径</label>
+          <label for="vendor-paths">\u8def\u5f84</label>
           <input id="vendor-paths" value="/v1/chat/completions, /v1/embeddings">
         </div>
         <div class="field span-12">
-          <label for="vendor-models">模型白名�?/label>
-          <textarea id="vendor-models" placeholder="可留空，或填逗号/换行分隔的模型名"></textarea>
+          <label for="vendor-models">\u6a21\u578b\u767d\u540d\u5355</label>
+          <textarea id="vendor-models" placeholder="\u53ef\u7559\u7a7a\uff0c\u6216\u586b\u9017\u53f7/\u6362\u884c\u5206\u9694\u7684\u6a21\u578b\u540d"></textarea>
         </div>
       </div>
       <div class="toolbar">
-        <button class="good" id="create-vendor">添加�?Key �?/button>
+        <button class="good" id="create-vendor">\u6dfb\u52a0\u5230 Key \u6c60</button>
       </div>
     </div>
   </div>
@@ -1782,7 +1782,7 @@ function renderAdminPage() {
       host.innerHTML = state.presets
         .map((preset) => '<button type="button" class="template-card' + (state.draftPresetId === preset.id ? ' active' : '') + '" data-preset="' + esc(preset.id) + '">' +
           '<strong>' + esc(preset.name) + '</strong>' +
-          '<span class="note">' + (preset.requires_base_url === false ? '只需 API Key' : '需�?Base URL + API Key') + '</span>' +
+          '<span class="note">' + (preset.requires_base_url === false ? '\u53ea\u9700 API Key' : '\u9700\u8981 Base URL + API Key') + '</span>' +
         '</button>')
         .join("");
 
@@ -1822,10 +1822,10 @@ function renderAdminPage() {
 
     async function copyText(value, successMessage) {
       if (!value) {
-        throw new Error("Nothing to copy.");
+        throw new Error("\u6ca1\u6709\u53ef\u590d\u5236\u7684\u5185\u5bb9");
       }
       await navigator.clipboard.writeText(value);
-      showToast(successMessage || "Copied.");
+      showToast(successMessage || "\u5df2\u590d\u5236");
     }
 
     async function withButtonBusy(button, label, task) {
@@ -1856,7 +1856,7 @@ function renderAdminPage() {
     function createVendorFromModal() {
       const preset = presetById(state.draftPresetId);
       if (!preset) {
-        throw new Error("请先选择供应商模�?);
+        throw new Error("\u8bf7\u5148\u9009\u62e9\u4f9b\u5e94\u5546\u6a21\u677f");
       }
 
       const entry = makeUpstream(preset.id);
@@ -1871,10 +1871,10 @@ function renderAdminPage() {
       entry.models = splitList(byId("vendor-models").value);
 
       if (!entry.api_key_value) {
-        throw new Error("API Key 不能为空");
+        throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
       }
       if (!entry.base_url) {
-        throw new Error("Base URL 不能为空");
+        throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
       }
 
       state.config.upstreams.push(entry);
@@ -1893,66 +1893,7 @@ function renderAdminPage() {
     function renderUpstreams() {
       const host = byId("upstream-list");
       if (!state.config.upstreams.length) {
-        host.innerHTML = '<div class="note">还没有上游，先点上面的预设按钮加一个�?/div>';
-        return;
-      }
-
-      host.innerHTML = state.config.upstreams
-        .map((item, index) => {
-          const presetOptions = state.presets
-            .map((preset) => '<option value="' + esc(preset.id) + '"' + (preset.id === item.preset ? " selected" : "") + '>' + esc(preset.name) + "</option>")
-            .join("");
-
-          return '<article class="upstream-card" data-id="' + esc(item.id) + '">' +
-            '<div class="upstream-head">' +
-              '<strong>' + esc(item.note || item.name || "未命名上�?) + '</strong>' +
-              '<button type="button" class="danger delete-upstream">删除</button>' +
-            '</div>' +
-            '<div class="row">' +
-              '<div class="field span-3"><label>模板</label><select data-field="preset">' + presetOptions + '</select></div>' +
-              '<div class="field span-3"><label>备注</label><input data-field="note" value="' + esc(item.note) + '" placeholder="我的 NIM Key"></div>' +
-              '<div class="field span-3"><label>内部名称</label><input data-field="name" value="' + esc(item.name) + '" placeholder="nim-main"></div>' +
-              '<div class="field span-3"><label>启用</label><select data-field="enabled"><option value="true"' + (item.enabled ? " selected" : "") + '>true</option><option value="false"' + (!item.enabled ? " selected" : "") + '>false</option></select></div>' +
-              '<div class="field span-6"><label>Base URL</label><input data-field="base_url" value="' + esc(item.base_url) + '" placeholder="https://integrate.api.nvidia.com/v1"></div>' +
-              '<div class="field span-6"><label>API Key（保存后显示密文�?/label><input class="mono" data-field="api_key_value" value="' + esc(item.api_key_value) + '" placeholder="nvapi-... �?enc::..."></div>' +
-              '<div class="field span-4"><label>权重</label><input data-field="weight" type="number" min="1" value="' + esc(item.weight) + '"></div>' +
-              '<div class="field span-4"><label>优先级（数字越小越优先）</label><input data-field="priority" type="number" value="' + esc(item.priority) + '"></div>' +
-              '<div class="field span-4"><label>路径白名�?/label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '" placeholder="/v1/chat/completions,/v1/embeddings"></div>' +
-              '<div class="field span-12"><label>模型白名单（逗号或换行分隔，可留空）</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
-            '</div>' +
-          '</article>';
-        })
-        .join("");
-
-      host.querySelectorAll(".delete-upstream").forEach((button) => {
-        button.addEventListener("click", async (event) => {
-          const btn = event.currentTarget;
-          btn.disabled = true;
-          const card = btn.closest(".upstream-card");
-          state.config.upstreams = state.config.upstreams.filter((item) => item.id !== card.dataset.id);
-          renderUpstreams();
-          showToast("Upstream removed.");
-        });
-      });
-
-      host.querySelectorAll('select[data-field="preset"]').forEach((select) => {
-        select.addEventListener("change", (event) => {
-          const card = event.target.closest(".upstream-card");
-          const preset = presetById(event.target.value);
-          const baseInput = card.querySelector('[data-field="base_url"]');
-          const pathsInput = card.querySelector('[data-field="paths"]');
-          if (!baseInput.value) {
-            baseInput.value = preset.base_url || "";
-          }
-          pathsInput.value = (preset.paths || []).join(", ");
-        });
-      });
-    }
-
-    function renderUpstreams() {
-      const host = byId("upstream-list");
-      if (!state.config.upstreams.length) {
-        host.innerHTML = '<div class="note">No upstream keys yet. Use a template button above to add one.</div>';
+        host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u4e0a\u6e38 key\uff0c\u5148\u70b9\u4e0a\u9762\u7684\u6a21\u677f\u52a0\u4e00\u4e2a\u3002</div>';
         return;
       }
 
@@ -1970,20 +1911,20 @@ function renderAdminPage() {
 
             return '<article class="upstream-card" data-id="' + esc(item.id) + '">' +
               '<div class="upstream-head">' +
-                '<strong>' + esc(item.note || item.name || "BYOK Key") + '</strong>' +
-                '<button type="button" class="danger delete-upstream">Delete</button>' +
+                '<strong>' + esc(item.note || item.name || '\u81ea\u5e26 Key') + '</strong>' +
+                '<button type="button" class="danger delete-upstream">\u5220\u9664</button>' +
               '</div>' +
               '<div class="row">' +
-                '<div class="field span-3"><label>Template</label><select data-field="preset">' + presetOptions + '</select></div>' +
-                '<div class="field span-3"><label>Note</label><input data-field="note" value="' + esc(item.note) + '" placeholder="My NVIDIA key"></div>' +
-                '<div class="field span-3"><label>Internal Name</label><input data-field="name" value="' + esc(item.name) + '" placeholder="nim-main"></div>' +
-                '<div class="field span-3"><label>Enabled</label><select data-field="enabled"><option value="true"' + (item.enabled ? " selected" : "") + '>true</option><option value="false"' + (!item.enabled ? " selected" : "") + '>false</option></select></div>' +
-                '<div class="field span-6"><label>Base URL' + (lockedBaseUrl ? ' (preset)' : '') + '</label><input data-field="base_url" value="' + esc(item.base_url) + '" placeholder="https://integrate.api.nvidia.com/v1"' + (lockedBaseUrl ? ' readonly' : '') + '></div>' +
-                '<div class="field span-6"><label>API Key (ciphertext after save)</label><input class="mono" data-field="api_key_value" value="' + esc(item.api_key_value) + '" placeholder="nvapi-... or enc::..."></div>' +
-                '<div class="field span-4"><label>Weight</label><input data-field="weight" type="number" min="1" value="' + esc(item.weight) + '"></div>' +
-                '<div class="field span-4"><label>Priority</label><input data-field="priority" type="number" value="' + esc(item.priority) + '"></div>' +
-                '<div class="field span-4"><label>Paths</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '" placeholder="/v1/chat/completions,/v1/embeddings"></div>' +
-                '<div class="field span-12"><label>Models</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
+                '<div class="field span-3"><label>\u6a21\u677f</label><select data-field="preset">' + presetOptions + '</select></div>' +
+                '<div class="field span-3"><label>\u5907\u6ce8</label><input data-field="note" value="' + esc(item.note) + '" placeholder="\u6211\u7684 NVIDIA key"></div>' +
+                '<div class="field span-3"><label>\u5185\u90e8\u540d\u79f0</label><input data-field="name" value="' + esc(item.name) + '" placeholder="nim-main"></div>' +
+                '<div class="field span-3"><label>\u542f\u7528</label><select data-field="enabled"><option value="true"' + (item.enabled ? " selected" : "") + '>true</option><option value="false"' + (!item.enabled ? " selected" : "") + '>false</option></select></div>' +
+                '<div class="field span-6"><label>Base URL' + (lockedBaseUrl ? ' \uff08\u9884\u8bbe\uff09' : '') + '</label><input data-field="base_url" value="' + esc(item.base_url) + '" placeholder="https://integrate.api.nvidia.com/v1"' + (lockedBaseUrl ? ' readonly' : '') + '></div>' +
+                '<div class="field span-6"><label>API Key\uff08\u4fdd\u5b58\u540e\u663e\u793a\u5bc6\u6587\uff09</label><input class="mono" data-field="api_key_value" value="' + esc(item.api_key_value) + '" placeholder="nvapi-... \u6216 enc::..."></div>' +
+                '<div class="field span-4"><label>\u6743\u91cd</label><input data-field="weight" type="number" min="1" value="' + esc(item.weight) + '"></div>' +
+                '<div class="field span-4"><label>\u4f18\u5148\u7ea7</label><input data-field="priority" type="number" value="' + esc(item.priority) + '"></div>' +
+                '<div class="field span-4"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '" placeholder="/v1/chat/completions,/v1/embeddings"></div>' +
+                '<div class="field span-12"><label>\u6a21\u578b</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
               '</div>' +
             '</article>';
           }).join("");
@@ -1991,7 +1932,7 @@ function renderAdminPage() {
           return '<section class="group-card">' +
             '<div class="group-head">' +
               '<h3>' + esc(groupTitle) + '</h3>' +
-              '<span class="note">' + esc(items.length) + ' keys</span>' +
+              '<span class="note">' + esc(items.length) + ' \u4e2a key</span>' +
             '</div>' +
             cards +
           '</section>';
@@ -2005,7 +1946,7 @@ function renderAdminPage() {
           const card = btn.closest(".upstream-card");
           state.config.upstreams = state.config.upstreams.filter((item) => item.id !== card.dataset.id);
           renderUpstreams();
-          showToast("Upstream removed.");
+          showToast("\u5df2\u5220\u9664\u4e0a\u6e38");
         });
       });
 
@@ -2069,14 +2010,14 @@ function renderAdminPage() {
       }
 
       const text = await response.text();
-      throw new Error("Admin API returned non-JSON content. Check that you are visiting the admin page without a broken path.");
+      throw new Error("Admin API \u8fd4\u56de\u7684\u4e0d\u662f JSON\uff0c\u8bf7\u786e\u8ba4\u5f53\u524d\u8bbf\u95ee\u7684\u7ba1\u7406\u8def\u5f84\u6b63\u786e\u3002");
     }
 
     async function loadConfig() {
       const response = await fetch(API_BASE + "/config");
       const payload = await parseApiResponse(response);
       if (!response.ok) {
-        throw new Error(payload?.error?.message || "读取配置失败");
+        throw new Error(payload?.error?.message || "\u8bfb\u53d6\u914d\u7f6e\u5931\u8d25");
       }
       state.config = payload.config;
       state.presets = payload.presets;
@@ -2087,7 +2028,7 @@ function renderAdminPage() {
     }
 
     async function saveConfig() {
-      setStatus("正在保存配置...");
+      setStatus("\u6b63\u5728\u4fdd\u5b58\u914d\u7f6e...");
       const response = await fetch(API_BASE + "/config", {
         method: "PUT",
         headers: { "content-type": "application/json" },
@@ -2095,30 +2036,30 @@ function renderAdminPage() {
       });
       const payload = await parseApiResponse(response);
       if (!response.ok) {
-        throw new Error(payload?.error?.message || "保存失败");
+        throw new Error(payload?.error?.message || "\u4fdd\u5b58\u5931\u8d25");
       }
       state.config = payload.config;
       renderSettings();
       renderUpstreams();
-      setStatus("配置已保存�?);
+      setStatus("\u914d\u7f6e\u5df2\u4fdd\u5b58\u3002");
     }
 
     async function refreshModels() {
-      setStatus("正在刷新模型缓存...");
+      setStatus("\u6b63\u5728\u5237\u65b0\u6a21\u578b\u7f13\u5b58...");
       const response = await fetch(API_BASE + "/refresh", { method: "POST" });
       const payload = await parseApiResponse(response);
       if (!response.ok) {
-        throw new Error(payload?.error?.message || "刷新失败");
+        throw new Error(payload?.error?.message || "\u5237\u65b0\u5931\u8d25");
       }
       const summary = (payload.result || []).map((item) => item.name + ": " + item.model_count).join(" | ");
-      setStatus("模型缓存已刷新�?" + summary);
+      setStatus("\u6a21\u578b\u7f13\u5b58\u5df2\u5237\u65b0\u3002" + summary);
     }
 
     async function loadClients() {
       const response = await fetch(API_BASE + "/clients");
       const payload = await parseApiResponse(response);
       if (!response.ok) {
-        throw new Error(payload?.error?.message || "读取客户端列表失�?);
+        throw new Error(payload?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u5217\u8868\u5931\u8d25");
       }
       state.clients = payload;
       renderClients();
@@ -2127,7 +2068,7 @@ function renderAdminPage() {
     function renderClients() {
       const host = byId("client-list");
       if (!state.clients.length) {
-        host.innerHTML = '<div class="note">还没有客户端 key�?/div>';
+        host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u5ba2\u6237\u7aef key\u3002</div>';
         return;
       }
 
@@ -2136,16 +2077,16 @@ function renderAdminPage() {
           '<div class="client-meta">' +
             '<strong>' + esc(client.name) + '</strong>' +
             '<span class="mono">' + esc(client.key_preview || "") + '</span>' +
-            '<span class="note">models: ' + esc((client.models || []).join(", ") || "*") + '</span>' +
+            '<span class="note">\u6a21\u578b: ' + esc((client.models || []).join(", ") || "*") + '</span>' +
           '</div>' +
-          '<button type="button" class="danger" data-client-id="' + esc(client.id) + '">删除</button>' +
+          '<button type="button" class="danger" data-client-id="' + esc(client.id) + '">\u5220\u9664</button>' +
         '</article>'
       ).join("");
 
       host.querySelectorAll("button[data-client-id]").forEach((button) => {
         button.addEventListener("click", async (event) => {
           const btn = event.currentTarget;
-          await withButtonBusy(btn, "Deleting...", () => deleteClient(btn.dataset.clientId));
+          await withButtonBusy(btn, "\u5220\u9664\u4e2d...", () => deleteClient(btn.dataset.clientId));
         });
       });
     }
@@ -2168,7 +2109,7 @@ function renderAdminPage() {
       });
       const data = await parseApiResponse(response);
       if (!response.ok) {
-        throw new Error(data?.error?.message || "创建客户端失�?);
+        throw new Error(data?.error?.message || "\u521b\u5efa\u5ba2\u6237\u7aef\u5931\u8d25");
       }
 
       state.lastCreatedClient = data.client;
@@ -2178,7 +2119,7 @@ function renderAdminPage() {
       byId("client-name").value = "";
       byId("client-models").value = "";
       byId("client-upstreams").value = "";
-      showToast("Client key created.");
+      showToast("\u5ba2\u6237\u7aef Key \u5df2\u521b\u5efa");
       await loadClients();
     }
 
@@ -2188,7 +2129,7 @@ function renderAdminPage() {
       });
       const payload = await parseApiResponse(response);
       if (!response.ok) {
-        throw new Error(payload?.error?.message || "删除客户端失�?);
+        throw new Error(payload?.error?.message || "\u5220\u9664\u5ba2\u6237\u7aef\u5931\u8d25");
       }
       await loadClients();
     }
@@ -2212,28 +2153,28 @@ function renderAdminPage() {
         byId("open-vendor-modal").addEventListener("click", openVendorModal);
         byId("close-vendor-modal").addEventListener("click", closeVendorModal);
         byId("create-vendor").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "Adding...", async () => {
+          withButtonBusy(event.currentTarget, "\u6dfb\u52a0\u4e2d...", async () => {
             createVendorFromModal();
-            showToast("Upstream draft added.");
+            showToast("\u4e0a\u6e38\u8349\u7a3f\u5df2\u6dfb\u52a0");
           }).catch(showError),
         );
         byId("save-config").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "Saving...", saveConfig).catch(showError),
+          withButtonBusy(event.currentTarget, "\u4fdd\u5b58\u4e2d...", saveConfig).catch(showError),
         );
         byId("refresh-models").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "Refreshing...", refreshModels).catch(showError),
+          withButtonBusy(event.currentTarget, "\u5237\u65b0\u4e2d...", refreshModels).catch(showError),
         );
         byId("create-client").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "Creating...", createClient).catch(showError),
+          withButtonBusy(event.currentTarget, "\u521b\u5efa\u4e2d...", createClient).catch(showError),
         );
         byId("copy-client-output").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "Copying...", () =>
-            copyText(byId("client-output").textContent, "Client JSON copied."),
+          withButtonBusy(event.currentTarget, "\u590d\u5236\u4e2d...", () =>
+            copyText(byId("client-output").textContent, "\u5ba2\u6237\u7aef JSON \u5df2\u590d\u5236"),
           ).catch(showError),
         );
         byId("copy-client-key").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "Copying...", () =>
-            copyText(state.lastCreatedClient?.api_key, "API key copied."),
+          withButtonBusy(event.currentTarget, "\u590d\u5236\u4e2d...", () =>
+            copyText(state.lastCreatedClient?.api_key, "API Key \u5df2\u590d\u5236"),
           ).catch(showError),
         );
         await loadConfig();
