@@ -1818,7 +1818,7 @@ function renderAdminPage() {
   <div class="panel" id="logs-panel">
     <div class="toolbar">
       <h2>详细日志</h2>
-      <button class="small secondary" id="load-logs">加载日志</button>
+
     </div>
     <div class="live-log" id="live-log"></div>
   </div>
@@ -1860,7 +1860,7 @@ function renderAdminPage() {
 </div>
 
 <script>
-  const API_BASE = location.pathname.replace(/\\/+$/, "") + "/api";
+    const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
   const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
@@ -2186,15 +2186,9 @@ function renderAdminPage() {
         ).join("")
       : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
   }
-  }
 
   /* ---- Logs ---- */
-  async function loadLogs() {
-    const resp = await fetch(API_BASE + "/logs");
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "\u65e5\u5fd7\u52a0\u8f7d\u5931\u8d25");
-    renderLogs(payload.logs || []);
-  }
+  
 
   function renderLogs(logs) {
     if (!logs.length) {
@@ -2317,9 +2311,7 @@ function renderAdminPage() {
       byId("load-logs").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadLogs).catch(showError)
       );
-      byId("load-logs").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadLogs).catch(showError)
-      );
+
       byId("create-client").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u751f\u6210\u4e2d...", createClient).catch(showError)
       );
@@ -2350,8 +2342,8 @@ function renderAdminPage() {
       await loadClients();
       loadStats().catch(() => {});
       loadLogs().catch(() => {});
-      loadLogs().catch(() => {});
-      loadLogs().catch(() => {});
+
+
     } catch (error) { showError(error); }
   }
 
