@@ -260,6 +260,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, id }, 200));
   }
 
+  // ponytail: health check only verifies connectivity, does not parse model list.
   if (apiPath === "/api/health" && request.method === "POST") {
     const runtime = await loadRuntimeConfig(app);
     const results = [];
@@ -269,16 +270,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
         const resp = await fetchWithTimeout(
           buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
           { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
-          Math.min(runtime.requestTimeoutMs, 15000),
+          10000,
         );
         const latency = Date.now() - started;
-        if (resp.ok) {
-          const payload = await resp.json().catch(() => ({}));
-          const models = Array.isArray(payload.data) ? payload.data.map((m) => m?.id).filter(Boolean) : [];
-          results.push({ name: upstream.name, ok: true, models_count: models.length, latency_ms: latency });
-        } else {
-          results.push({ name: upstream.name, ok: false, status: resp.status, latency_ms: latency });
-        }
+        results.push({ name: upstream.name, ok: resp.ok, status: resp.status, latency_ms: latency });
       } catch (err) {
         results.push({ name: upstream.name, ok: false, error: err.message, latency_ms: Date.now() - started });
       }
@@ -1843,7 +1838,7 @@ function renderAdminPage() {
       const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
       if (!dot) return;
       dot.className = "health-dot " + (r.ok ? "ok" : "fail");
-      dot.title = r.ok ? (r.models_count + " \u4e2a\u6a21\u578b, " + r.latency_ms + "ms") : ("\u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+      dot.title = r.ok ? ("HTTP " + r.status + ", " + r.latency_ms + "ms") : ("\u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
     });
     const ok = (payload.results || []).filter((r) => r.ok).length;
     const total = (payload.results || []).length;
