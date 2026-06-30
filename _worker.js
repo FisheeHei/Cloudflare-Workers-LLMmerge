@@ -1442,18 +1442,6 @@ function renderAdminPage() {
       border-radius: 24px; padding: 20px; box-shadow: 0 26px 60px rgba(0,0,0,.18);
     }
     .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, "Times New Roman", serif; }
-    .template-grid { display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 16px; }
-    .template-card {
-      border: 1px solid #d7c7aa; background: #fffcf6;
-      border-radius: 14px; padding: 12px; cursor: pointer;
-      text-align: left; font: inherit; color: inherit;
-      transition: border-color .15s ease;
-    }
-    .template-card:hover { border-color: #a54d2d; }
-    .template-card.active { border-color: #a54d2d; box-shadow: inset 0 0 0 2px #a54d2d; }
-    .template-card strong { display: block; margin-bottom: 4px; }
-    .template-card .note { font-size: 12px; }
-    .template-card.custom { border-style: dashed; }
     .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
 
     #toast {
@@ -1555,7 +1543,7 @@ function renderAdminPage() {
 
 <script>
   const API_BASE = location.pathname.replace(/\\/+$/, "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null };
+  const state = { config: null, presets: [], clients: [], gateway: null, lastCreatedClient: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
@@ -1585,7 +1573,7 @@ function renderAdminPage() {
   async function parseApiResponse(response) {
     const ct = response.headers.get("content-type") || "";
     if (ct.includes("application/json")) return response.json();
-    throw new Error("Admin API \u8fd4\u56de\u7684\u4e0d\u662f JSON");
+    const body = await response.text().catch(() => "(unreadable)"); throw new Error("Admin API \u8fd4\u56de\u7684\u4e0d\u662f JSON (status " + response.status + ", body=" + body.slice(0, 200) + ")");
   }
 
   function showError(error) {
@@ -1595,9 +1583,11 @@ function renderAdminPage() {
 
   /* ---- Modal ---- */
   function openVendorModal() {
-    if (!state.draftPresetId && state.presets.length) state.draftPresetId = state.presets[0].id;
-    applyVendorPreset();
-    renderPresets();
+    byId("vendor-base-url").readOnly = false;
+    byId("vendor-base-url").value = "";
+    byId("vendor-paths").value = "/v1/chat/completions, /v1/embeddings";
+    ["vendor-note","vendor-name","vendor-api-key","vendor-models"].forEach((id) => byId(id).value = "");
+    byId("vendor-weight").value = "1"; byId("vendor-enabled").value = "true";
     byId("vendor-modal").classList.add("open");
   }
   function closeVendorModal() { byId("vendor-modal").classList.remove("open"); }
@@ -1616,28 +1606,13 @@ function renderAdminPage() {
     </button>\`;
     host.innerHTML = items;
 
-    host.querySelectorAll("button[data-preset]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        state.draftPresetId = btn.dataset.preset;
-        applyVendorPreset();
-        renderPresets();
-      });
-    });
   }
 
   function applyVendorPreset() {
-    const baseInput = byId("vendor-base-url");
-    const pathsInput = byId("vendor-paths");
-    if (state.draftPresetId === "_custom") {
-      baseInput.readOnly = false; baseInput.value = "";
-      pathsInput.value = "/v1/chat/completions, /v1/embeddings";
-      return;
-    }
-    const preset = presetById(state.draftPresetId);
-    if (!preset) return;
-    baseInput.readOnly = preset.requires_base_url === false;
-    baseInput.value = preset.base_url || "";
-    pathsInput.value = (preset.paths || []).join(", ");
+    // ponytail: BYOK style - everything is user-editable.
+    byId("vendor-base-url").readOnly = false;
+    byId("vendor-base-url").value = "";
+    byId("vendor-paths").value = "/v1/chat/completions, /v1/embeddings";
   }
 
   function createVendorFromModal() {
@@ -1787,7 +1762,6 @@ function renderAdminPage() {
     state.presets = payload.presets;
     state.gateway = payload.gateway;
     renderSettings();
-    renderPresets();
     renderUpstreams();
   }
 
