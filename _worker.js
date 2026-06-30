@@ -1302,7 +1302,7 @@ function renderAdminPage() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LLM Gateway \u7ba1\u7406\u9762\u677f</title>
+  <title>LLM Gateway</title>
   <style>
     :root {
       --bg: #f5f1e8;
@@ -1316,657 +1316,445 @@ function renderAdminPage() {
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background:
-        radial-gradient(circle at top left, rgba(165,77,45,.18), transparent 28%),
-        linear-gradient(180deg, #efe5d2 0%, var(--bg) 42%, #f8f4ec 100%);
+      background: radial-gradient(circle at top left, rgba(165,77,45,.18), transparent 28%),
+                  linear-gradient(180deg, #efe5d2 0%, var(--bg) 42%, #f8f4ec 100%);
       color: var(--ink);
       font: 15px/1.5 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
-    .wrap {
-      width: min(1180px, calc(100vw - 24px));
-      margin: 0 auto;
-      padding: 24px 0 48px;
-    }
+    .wrap { width: min(960px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 48px; }
+
     .hero, .panel {
       background: rgba(255,253,248,.94);
       border: 1px solid var(--line);
       box-shadow: 0 18px 40px rgba(38,28,18,.08);
       backdrop-filter: blur(8px);
-    }
-    .hero {
-      padding: 24px;
       margin-bottom: 18px;
     }
-    .hero h1 {
-      margin: 0 0 8px;
-      font: 700 30px/1.15 Georgia, "Times New Roman", serif;
-      letter-spacing: .02em;
-    }
-    .hero p { margin: 0; color: var(--muted); }
+    .hero { padding: 24px; }
+    .hero h1 { margin: 0 0 10px; font: 700 30px/1.15 Georgia, "Times New Roman", serif; }
+    .hero-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .hero code {
-      background: #f2e7d3;
-      padding: 2px 6px;
-      border-radius: 6px;
+      background: #f2e7d3; padding: 4px 10px; border-radius: 8px;
+      font-size: 14px; word-break: break-all;
     }
-    .grid {
-      display: grid;
-      gap: 18px;
-      grid-template-columns: repeat(12, 1fr);
-    }
-    .panel {
-      padding: 18px;
-      grid-column: span 12;
-    }
-    .panel h2 {
-      margin: 0 0 14px;
-      font: 700 22px/1.2 Georgia, "Times New Roman", serif;
-    }
-    .row {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(12, 1fr);
-      margin-bottom: 12px;
-    }
-    .field {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .field label {
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .span-12 { grid-column: span 12; }
-    .span-8 { grid-column: span 8; }
-    .span-6 { grid-column: span 6; }
-    .span-4 { grid-column: span 4; }
-    .span-3 { grid-column: span 3; }
-    .span-2 { grid-column: span 2; }
-    input, textarea, select {
-      width: 100%;
-      border: 1px solid #cdbda2;
-      background: #fffdfa;
-      color: var(--ink);
-      border-radius: 10px;
-      padding: 10px 12px;
-      font: inherit;
-    }
-    textarea { min-height: 94px; resize: vertical; }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-      margin-bottom: 12px;
-    }
+    .panel { padding: 20px; }
+    .panel h2 { margin: 0 0 14px; font: 700 20px/1.2 Georgia, "Times New Roman", serif; }
+
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+    .toolbar h2 { margin: 0; }
+
     button {
-      border: 0;
-      border-radius: 999px;
-      padding: 10px 16px;
-      font: 600 14px/1.1 inherit;
-      cursor: pointer;
-      background: var(--accent);
-      color: white;
-      transition: transform .16s ease, opacity .16s ease, filter .16s ease;
+      border: 0; border-radius: 999px; padding: 9px 16px;
+      font: 600 13px/1.1 inherit; cursor: pointer;
+      background: var(--accent); color: white;
+      transition: transform .16s ease, opacity .16s ease;
     }
-    button:hover { filter: brightness(1.04); }
+    button:hover { filter: brightness(1.06); }
     button:active { transform: translateY(1px); }
-    button[disabled] { opacity: .62; cursor: wait; }
+    button[disabled] { opacity: .55; cursor: wait; }
+    button.small { padding: 6px 12px; font-size: 12px; }
     button.secondary { background: #eadcc5; color: #3a2b1f; }
     button.good { background: var(--accent-2); }
     button.danger { background: #8d2f23; }
-    .note {
-      color: var(--muted);
-      font-size: 13px;
+
+    input, textarea, select {
+      width: 100%; border: 1px solid #cdbda2; background: #fffdfa;
+      color: var(--ink); border-radius: 10px; padding: 9px 12px; font: inherit;
     }
-    .status {
-      min-height: 22px;
-      color: var(--accent-2);
-      font-weight: 600;
-    }
-    .upstream-list {
-      display: grid;
-      gap: 14px;
-    }
-    .group-card {
-      border: 1px solid #cfbea0;
-      background: #fff9ef;
-      padding: 14px;
-      border-radius: 20px;
-    }
-    .group-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-    .group-head h3 {
-      margin: 0;
-      font: 700 18px/1.2 Georgia, "Times New Roman", serif;
-    }
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(33, 24, 15, .55);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      padding: 16px;
-      z-index: 50;
-    }
-    .modal-backdrop.open {
-      display: flex;
-    }
-    .modal-card {
-      width: min(760px, 100%);
-      max-height: calc(100vh - 32px);
-      overflow: auto;
-      background: #fffaf2;
-      border: 1px solid #cfbea0;
-      border-radius: 24px;
-      padding: 18px;
-      box-shadow: 0 26px 60px rgba(0,0,0,.18);
-    }
-    .template-grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      margin-bottom: 14px;
-    }
-    .template-card {
-      border: 1px solid #d7c7aa;
-      background: #fffcf6;
-      border-radius: 18px;
-      padding: 14px;
-      cursor: pointer;
-    }
-    .template-card.active {
-      border-color: #a54d2d;
-      box-shadow: inset 0 0 0 1px #a54d2d;
-    }
-    .template-card strong {
-      display: block;
-      margin-bottom: 6px;
-    }
+    textarea { min-height: 72px; resize: vertical; }
+    .note { color: var(--muted); font-size: 13px; }
+    .mono { font-family: "Cascadia Code", "Fira Code", Consolas, monospace; font-size: 13px; }
+
+    .row { display: grid; gap: 12px; grid-template-columns: repeat(12, 1fr); margin-bottom: 10px; }
+    .field { display: flex; flex-direction: column; gap: 5px; }
+    .field label { color: var(--muted); font-size: 13px; }
+    .span-12 { grid-column: span 12; }
+    .span-6 { grid-column: span 6; }
+    .span-4 { grid-column: span 4; }
+    .span-3 { grid-column: span 3; }
+
     .upstream-card {
-      border: 1px solid #d7c7aa;
-      background: #fffcf6;
-      padding: 14px;
-      border-radius: 18px;
+      border: 1px solid #cfbea0; background: #fff9ef;
+      border-radius: 16px; margin-bottom: 10px; overflow: hidden;
     }
-    .upstream-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 12px;
-      align-items: center;
+    .upstream-card summary {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 16px; cursor: pointer; user-select: none;
+      list-style: none;
     }
-    .mono { font-family: Consolas, "SFMono-Regular", monospace; }
-    .checkbox {
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-      color: var(--ink);
-      font-size: 14px;
+    .upstream-card summary::-webkit-details-marker { display: none; }
+    .upstream-card summary::before {
+      content: "\25B6"; font-size: 10px; color: var(--muted);
+      transition: transform .2s ease; flex-shrink: 0;
     }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      border: 1px solid var(--line);
-      background: #f8efdfe0;
-      padding: 8px 12px;
-      border-radius: 999px;
+    .upstream-card[open] summary::before { transform: rotate(90deg); }
+    .upstream-card summary .card-badge {
+      background: #eadcc5; color: #3a2b1f; padding: 3px 10px;
+      border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
     }
-    .client-list {
-      display: grid;
-      gap: 10px;
-      margin-top: 12px;
-    }
+    .upstream-card summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .upstream-card summary .card-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+    .upstream-card .card-body { padding: 0 16px 14px; }
+
     .client-item {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: center;
-      padding: 12px 14px;
-      border-radius: 14px;
-      border: 1px solid #d7c7aa;
-      background: #fffcf6;
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 14px; border: 1px solid #cfbea0;
+      background: #fff9ef; border-radius: 12px; margin-bottom: 8px;
     }
-    .client-meta { display: grid; gap: 4px; }
-    pre {
-      white-space: pre-wrap;
-      background: #fbf5e8;
-      border: 1px solid #e3d4b8;
-      border-radius: 12px;
-      padding: 12px;
-      margin: 10px 0 0;
-      overflow: auto;
+    .client-item .client-meta { flex: 1; min-width: 0; }
+    .client-item .client-meta strong { display: block; }
+    .client-item .client-meta .mono { color: var(--muted); word-break: break-all; }
+    .client-create { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+    .client-create input { flex: 1; min-width: 160px; }
+
+    .key-output {
+      margin-top: 12px; padding: 14px; background: #f2e7d3;
+      border-radius: 12px; border: 1px solid #cfbea0;
     }
-    .output-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 10px;
+    .key-output pre {
+      margin: 0 0 8px; font-size: 13px; word-break: break-all; white-space: pre-wrap;
+      font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
     }
-    .toast {
-      position: fixed;
-      right: 16px;
-      bottom: 16px;
-      max-width: min(360px, calc(100vw - 32px));
-      padding: 12px 14px;
-      border-radius: 14px;
-      border: 1px solid rgba(215, 199, 170, .9);
-      background: rgba(31, 41, 55, .94);
-      color: #fff;
-      box-shadow: 0 16px 40px rgba(0, 0, 0, .2);
-      opacity: 0;
-      pointer-events: none;
-      transform: translateY(8px);
-      transition: opacity .18s ease, transform .18s ease;
-      z-index: 60;
+    .key-output .key-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .settings-panel summary {
+      cursor: pointer; user-select: none; list-style: none;
+      display: flex; align-items: center; gap: 8px;
     }
-    .toast.show {
-      opacity: 1;
-      transform: translateY(0);
+    .settings-panel summary::-webkit-details-marker { display: none; }
+    .settings-panel summary::before {
+      content: "\25B6"; font-size: 10px; color: var(--muted);
+      transition: transform .2s ease;
     }
-    @media (max-width: 860px) {
-      .span-8, .span-6, .span-4, .span-3, .span-2 { grid-column: span 12; }
-      .client-item, .upstream-head { flex-direction: column; align-items: flex-start; }
+    .settings-panel[open] summary::before { transform: rotate(90deg); }
+    .settings-panel summary h2 { margin: 0; }
+    .settings-body { padding-top: 14px; }
+
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(33,24,15,.55);
+      display: none; align-items: center; justify-content: center;
+      padding: 16px; z-index: 50;
     }
+    .modal-backdrop.open { display: flex; }
+    .modal-card {
+      width: min(680px, 100%); max-height: calc(100vh - 32px); overflow: auto;
+      background: #fffaf2; border: 1px solid #cfbea0;
+      border-radius: 24px; padding: 20px; box-shadow: 0 26px 60px rgba(0,0,0,.18);
+    }
+    .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, "Times New Roman", serif; }
+    .template-grid { display: grid; gap: 10px; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 16px; }
+    .template-card {
+      border: 1px solid #d7c7aa; background: #fffcf6;
+      border-radius: 14px; padding: 12px; cursor: pointer;
+      text-align: left; font: inherit; color: inherit;
+      transition: border-color .15s ease;
+    }
+    .template-card:hover { border-color: #a54d2d; }
+    .template-card.active { border-color: #a54d2d; box-shadow: inset 0 0 0 2px #a54d2d; }
+    .template-card strong { display: block; margin-bottom: 4px; }
+    .template-card .note { font-size: 12px; }
+    .template-card.custom { border-style: dashed; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+
+    #toast {
+      position: fixed; bottom: 32px; left: 50%; transform: translateX(-50%);
+      background: #1f2937; color: #f9fafb; padding: 12px 28px;
+      border-radius: 999px; font-size: 14px; font-weight: 600;
+      opacity: 0; pointer-events: none;
+      transition: opacity .25s ease, transform .25s ease;
+      z-index: 100;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(-6px); }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <section class="hero">
-      <h1>LLM Gateway \u7ba1\u7406\u9762\u677f</h1>
-      <p>\u8fd9\u4e2a\u9875\u9762\u53ea\u5728\u5f53\u524d\u9690\u85cf\u8def\u5f84\u4e0b\u53ef\u89c1\u3002\u5bf9\u5916\u7684 OpenAI \u517c\u5bb9\u5165\u53e3\u56fa\u5b9a\u4e3a <code id="gateway-url">/v1</code>\u3002</p>
-    </section>
-
-    <div class="grid">
-      <section class="panel">
-        <h2>\u57fa\u7840\u914d\u7f6e</h2>
-        <div class="row">
-          <div class="field span-4">
-            <label for="request-timeout">\u8bf7\u6c42\u8d85\u65f6\uff08\u6beb\u79d2\uff09</label>
-            <input id="request-timeout" type="number" min="1000">
-          </div>
-          <div class="field span-4">
-            <label for="cooldown-ttl">\u5931\u8d25\u51b7\u5374\uff08\u79d2\uff09</label>
-            <input id="cooldown-ttl" type="number" min="1">
-          </div>
-          <div class="field span-4">
-            <label for="model-cache-ttl">\u6a21\u578b\u7f13\u5b58\uff08\u79d2\uff09</label>
-            <input id="model-cache-ttl" type="number" min="1">
-          </div>
-        </div>
-        <div class="toolbar">
-          <label class="checkbox"><input id="routing-load-balance" type="checkbox">\u542f\u7528\u8d1f\u8f7d\u5747\u8861</label>
-          <label class="checkbox"><input id="routing-failover" type="checkbox">\u542f\u7528\u5931\u8d25\u8f6e\u8be2</label>
-          <span class="pill mono" id="gateway-url-pill">/v1</span>
-        </div>
-        <p class="note">\u8d1f\u8f7d\u5747\u8861\u8d1f\u8d23\u591a key \u5206\u6d41\uff1b\u5931\u8d25\u8f6e\u8be2\u8d1f\u8d23\u4e0a\u6e38\u5f02\u5e38\u65f6\u81ea\u52a8\u5207\u6362\u3002\u4e24\u4e2a\u90fd\u5f00\u5c31\u662f\u6df7\u5408\u6a21\u5f0f\u3002</p>
-      </section>
-
-      <section class="panel">
-        <h2>\u4e0a\u6e38 API Keys</h2>
-        <div class="toolbar">
-          <button class="good" id="open-vendor-modal">\u65b0\u5efa\u4f9b\u5e94\u5546</button>
-        </div>
-        <p class="note">\u4fdd\u5b58\u540e\u8f93\u5165\u6846\u91cc\u5c55\u793a\u7684\u662f\u52a0\u5bc6\u4e32\uff0c\u4e0d\u4f1a\u56de\u663e\u660e\u6587\u3002\u4f60\u53ef\u4ee5\u7ee7\u7eed\u76f4\u63a5\u6539\u5bc6\u6587\u5bf9\u5e94\u7684\u5907\u6ce8\uff0c\u4e5f\u53ef\u4ee5\u91cd\u65b0\u8d34\u5165\u65b0\u7684\u660e\u6587 key \u8986\u76d6\u5b83\u3002</p>
-        <div class="upstream-list" id="upstream-list"></div>
-        <div class="toolbar" style="margin-top:14px;">
-          <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
-          <button class="secondary" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
-        </div>
-        <div class="status" id="config-status"></div>
-      </section>
-
-      <section class="panel">
-        <h2>\u5ba2\u6237\u7aef Keys</h2>
-        <div class="row">
-          <div class="field span-4">
-            <label for="client-name">\u5907\u6ce8</label>
-            <input id="client-name" placeholder="demo-user">
-          </div>
-          <div class="field span-4">
-            <label for="client-models">\u6a21\u578b\u767d\u540d\u5355\uff08\u9017\u53f7\u5206\u9694\uff0c\u53ef\u7559\u7a7a\uff09</label>
-            <input id="client-models" placeholder="* \u6216 meta/llama-3.1-8b-instruct">
-          </div>
-          <div class="field span-4">
-            <label for="client-upstreams">\u4e0a\u6e38\u767d\u540d\u5355\uff08\u9017\u53f7\u5206\u9694\uff0c\u53ef\u7559\u7a7a\uff09</label>
-            <input id="client-upstreams" placeholder="nim-main,nim-backup">
-          </div>
-        </div>
-        <div class="toolbar">
-          <button class="good" id="create-client">\u751f\u6210\u5ba2\u6237\u7aef Key</button>
-        </div>
-        <pre id="client-output" hidden></pre>
-        <div class="output-actions" id="client-output-actions" hidden>
-          <button type="button" class="secondary" id="copy-client-output">\u590d\u5236\u5ba2\u6237\u7aef JSON</button>
-          <button type="button" class="secondary" id="copy-client-key">\u590d\u5236 API Key</button>
-        </div>
-        <div class="client-list" id="client-list"></div>
-      </section>
+<div class="wrap">
+  <div class="hero">
+    <h1>LLM Gateway</h1>
+    <div class="hero-row">
+      <span class="note">Gateway URL:</span>
+      <code id="gateway-url-pill">loading...</code>
+      <button class="small secondary" id="copy-gateway-url">\u590d\u5236</button>
     </div>
   </div>
 
-  <div class="modal-backdrop" id="vendor-modal">
-    <div class="modal-card">
-      <div class="toolbar" style="justify-content:space-between;">
-        <h2 style="margin:0;">\u65b0\u5efa\u4f9b\u5e94\u5546</h2>
-        <button type="button" class="secondary" id="close-vendor-modal">\u5173\u95ed</button>
+  <div class="panel">
+    <h2>\u5ba2\u6237\u7aef Keys</h2>
+    <div id="client-list"></div>
+    <div class="client-create">
+      <input id="client-name" placeholder="\u540d\u79f0 (\u53ef\u9009)">
+      <button class="good" id="create-client">\u751f\u6210 Key</button>
+      <button class="small secondary" id="refresh-client-key" hidden>\u5237\u65b0</button>
+    </div>
+    <div class="key-output" id="client-output" hidden>
+      <pre id="client-output-text" class="mono"></pre>
+      <div class="key-actions">
+        <button class="small good" id="copy-client-key">\u590d\u5236 Key</button>
+        <button class="small secondary" id="copy-client-json">\u590d\u5236 JSON</button>
       </div>
-      <p class="note">\u5148\u9009\u62e9\u4f9b\u5e94\u5546\u6a21\u677f\u3002\u9884\u8bbe\u6a21\u677f\u53ea\u9700\u8981\u8f93\u5165 API key\uff1b\u81ea\u5b9a\u4e49\u6a21\u677f\u9700\u8981\u540c\u65f6\u8f93\u5165 Base URL \u548c API key\u3002</p>
-      <div class="template-grid" id="vendor-template-grid"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="toolbar">
+      <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
+      <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
+      <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
+      <button class="secondary" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
+      <span class="note" id="config-status"></span>
+    </div>
+    <div id="upstream-list"></div>
+  </div>
+
+  <details class="panel settings-panel">
+    <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
+    <div class="settings-body">
       <div class="row">
-        <div class="field span-4">
-          <label for="vendor-note">\u5907\u6ce8</label>
-          <input id="vendor-note" placeholder="\u6211\u7684 NIM Key">
-        </div>
-        <div class="field span-4">
-          <label for="vendor-name">\u5185\u90e8\u540d\u79f0</label>
-          <input id="vendor-name" placeholder="nim-main">
-        </div>
-        <div class="field span-4">
-          <label for="vendor-enabled">\u542f\u7528</label>
-          <select id="vendor-enabled">
-            <option value="true">true</option>
-            <option value="false">false</option>
-          </select>
-        </div>
-        <div class="field span-6">
-          <label for="vendor-base-url">Base URL</label>
-          <input id="vendor-base-url" placeholder="https://integrate.api.nvidia.com/v1">
-        </div>
-        <div class="field span-6">
-          <label for="vendor-api-key">API Key</label>
-          <input id="vendor-api-key" class="mono" placeholder="nvapi-...">
-        </div>
-        <div class="field span-4">
-          <label for="vendor-weight">\u6743\u91cd</label>
-          <input id="vendor-weight" type="number" min="1" value="1">
-        </div>
-        <div class="field span-4">
-          <label for="vendor-priority">\u4f18\u5148\u7ea7</label>
-          <input id="vendor-priority" type="number" value="100">
-        </div>
-        <div class="field span-4">
-          <label for="vendor-paths">\u8def\u5f84</label>
-          <input id="vendor-paths" value="/v1/chat/completions, /v1/embeddings">
-        </div>
-        <div class="field span-12">
-          <label for="vendor-models">\u6a21\u578b\u767d\u540d\u5355</label>
-          <textarea id="vendor-models" placeholder="\u53ef\u7559\u7a7a\uff0c\u6216\u586b\u9017\u53f7/\u6362\u884c\u5206\u9694\u7684\u6a21\u578b\u540d"></textarea>
-        </div>
+        <div class="field span-4"><label>\u8bf7\u6c42\u8d85\u65f6 (ms)</label><input id="request-timeout" type="number" min="1000"></div>
+        <div class="field span-4"><label>\u51b7\u5374 TTL (s)</label><input id="cooldown-ttl" type="number" min="1"></div>
+        <div class="field span-4"><label>\u6a21\u578b\u7f13\u5b58 TTL (s)</label><input id="model-cache-ttl" type="number" min="1"></div>
       </div>
-      <div class="toolbar">
-        <button class="good" id="create-vendor">\u6dfb\u52a0\u5230 Key \u6c60</button>
+      <div class="row">
+        <div class="field span-6">
+          <label><input type="checkbox" id="routing-load-balance"> \u8d1f\u8f7d\u5747\u8861</label>
+        </div>
+        <div class="field span-6">
+          <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb</label>
+        </div>
       </div>
     </div>
+  </details>
+</div>
+
+<div id="toast"></div>
+
+<div class="modal-backdrop" id="vendor-modal">
+  <div class="modal-card">
+    <h3>\u6dfb\u52a0\u4e0a\u6e38</h3>
+    <div class="template-grid" id="vendor-template-grid"></div>
+    <div class="row">
+      <div class="field span-6"><label>\u5907\u6ce8</label><input id="vendor-note" placeholder="\u6211\u7684 NVIDIA key"></div>
+      <div class="field span-6"><label>\u5185\u90e8\u540d\u79f0</label><input id="vendor-name" placeholder="nim-main (\u53ef\u7701\u7565)"></div>
+    </div>
+    <div class="row">
+      <div class="field span-6"><label>Base URL</label><input id="vendor-base-url" placeholder="https://..."></div>
+      <div class="field span-6"><label>API Key</label><input id="vendor-api-key" class="mono" placeholder="nvapi-... \u6216 sk-..."></div>
+    </div>
+    <div class="row">
+      <div class="field span-4"><label>\u6a21\u578b (\u9017\u53f7\u5206\u9694, \u7559\u7a7a=\u81ea\u52a8)</label><input id="vendor-models" placeholder="model-a, model-b"></div>
+      <div class="field span-4"><label>\u8def\u5f84 (\u9017\u53f7\u5206\u9694)</label><input id="vendor-paths" value="/v1/chat/completions, /v1/embeddings"></div>
+      <div class="field span-2"><label>\u6743\u91cd</label><input id="vendor-weight" type="number" min="1" value="1"></div>
+      <div class="field span-2"><label>\u542f\u7528</label><select id="vendor-enabled"><option value="true">\u662f</option><option value="false">\u5426</option></select></div>
+    </div>
+    <div class="modal-actions">
+      <button class="secondary" id="close-vendor-modal">\u53d6\u6d88</button>
+      <button class="good" id="create-vendor">\u6dfb\u52a0</button>
+    </div>
   </div>
+</div>
 
-  <div class="toast" id="toast" aria-live="polite"></div>
+<script>
+  const API_BASE = location.pathname.replace(/\/+$/, "") + "/api";
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null };
+  const byId = (id) => document.getElementById(id);
+  const text = (value) => String(value ?? "");
 
-  <script>
-    const API_BASE = location.pathname.replace(/\/+$/, "") + "/api";
-    const state = {
-      config: null,
-      presets: [],
-      clients: [],
-      gateway: null,
-      draftPresetId: null,
-      lastCreatedClient: null,
-    };
+  function splitList(value) { return text(value).split(/[,\n]/).map((s) => s.trim()).filter(Boolean); }
+  function esc(value) { return text(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  function presetById(id) { return state.presets.find((p) => p.id === id) || state.presets[0]; }
+  function baseUrlLocked(presetId) { const p = presetById(presetId); return !!p && p.requires_base_url === false; }
 
-    const byId = (id) => document.getElementById(id);
-    const text = (value) => String(value ?? "");
+  let toastTimer = null;
+  function showToast(message) {
+    const t = byId("toast"); t.textContent = message; t.classList.add("show");
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2200);
+  }
 
-    function splitList(value) {
-      return text(value)
-        .split(/[,\\n]/)
-        .map((item) => item.trim())
-        .filter(Boolean);
-    }
+  async function copyText(value, successMessage) {
+    if (!value) throw new Error("\u6ca1\u6709\u53ef\u590d\u5236\u7684\u5185\u5bb9");
+    await navigator.clipboard.writeText(value);
+    showToast(successMessage || "\u5df2\u590d\u5236");
+  }
 
-    function esc(value) {
-      return text(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
+  async function withButtonBusy(button, label, task) {
+    const orig = button.textContent; button.disabled = true; button.textContent = label;
+    try { return await task(); }
+    finally { button.disabled = false; button.textContent = orig; }
+  }
 
-    function presetById(id) {
-      return state.presets.find((item) => item.id === id) || state.presets[0];
-    }
+  async function parseApiResponse(response) {
+    const ct = response.headers.get("content-type") || "";
+    if (ct.includes("application/json")) return response.json();
+    throw new Error("Admin API \u8fd4\u56de\u7684\u4e0d\u662f JSON");
+  }
 
-    function makeUpstream(presetId) {
-      const preset = presetById(presetId);
-      const suffix = Math.random().toString(36).slice(2, 7);
-      return {
-        id: crypto.randomUUID ? crypto.randomUUID() : "u-" + suffix,
-        preset: preset.id,
-        note: "",
-        name: preset.id + "-" + suffix,
-        base_url: preset.base_url || "",
-        api_key_value: "",
-        models: [],
-        paths: [...preset.paths],
-        weight: 1,
-        priority: 100,
-        enabled: true,
-      };
-    }
+  function showError(error) {
+    console.error(error);
+    showToast(error.message || "Error");
+  }
 
-    function baseUrlLocked(presetId) {
-      const preset = presetById(presetId);
-      return !!preset && preset.requires_base_url === false;
-    }
+  /* ---- Modal ---- */
+  function openVendorModal() {
+    if (!state.draftPresetId && state.presets.length) state.draftPresetId = state.presets[0].id;
+    applyVendorPreset();
+    renderPresets();
+    byId("vendor-modal").classList.add("open");
+  }
+  function closeVendorModal() { byId("vendor-modal").classList.remove("open"); }
 
-    function groupUpstreams(items) {
-      const groups = new Map();
-      for (const item of items) {
-        const key = item.preset || "generic-openai";
-        if (!groups.has(key)) {
-          groups.set(key, []);
-        }
-        groups.get(key).push(item);
-      }
-      return [...groups.entries()];
-    }
+  function renderPresets() {
+    const host = byId("vendor-template-grid");
+    let items = state.presets.map((p) =>
+      \`<button type="button" class="template-card\${state.draftPresetId === p.id ? " active" : ""}" data-preset="\${esc(p.id)}">
+        <strong>\${esc(p.name)}</strong>
+        <span class="note">\${p.requires_base_url === false ? "\u9884\u8bbe Base URL" : "\u81ea\u5b9a\u4e49 Base URL"}</span>
+      </button>\`
+    ).join("");
+    items += \`<button type="button" class="template-card custom\${state.draftPresetId === "_custom" ? " active" : ""}" data-preset="_custom">
+      <strong>\u81ea\u5b9a\u4e49</strong>
+      <span class="note">\u624b\u52a8\u8f93\u5165 Base URL + API Key</span>
+    </button>\`;
+    host.innerHTML = items;
 
-    function renderPresets() {
-      const host = byId("vendor-template-grid");
-      host.innerHTML = state.presets
-        .map((preset) => '<button type="button" class="template-card' + (state.draftPresetId === preset.id ? ' active' : '') + '" data-preset="' + esc(preset.id) + '">' +
-          '<strong>' + esc(preset.name) + '</strong>' +
-          '<span class="note">' + (preset.requires_base_url === false ? '\u53ea\u9700 API Key' : '\u9700\u8981 Base URL + API Key') + '</span>' +
-        '</button>')
-        .join("");
-
-      host.querySelectorAll("button[data-preset]").forEach((button) => {
-        button.addEventListener("click", () => {
-          state.draftPresetId = button.dataset.preset;
-          applyVendorPreset();
-          renderPresets();
-        });
+    host.querySelectorAll("button[data-preset]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.draftPresetId = btn.dataset.preset;
+        applyVendorPreset();
+        renderPresets();
       });
+    });
+  }
+
+  function applyVendorPreset() {
+    const baseInput = byId("vendor-base-url");
+    const pathsInput = byId("vendor-paths");
+    if (state.draftPresetId === "_custom") {
+      baseInput.readOnly = false; baseInput.value = "";
+      pathsInput.value = "/v1/chat/completions, /v1/embeddings";
+      return;
+    }
+    const preset = presetById(state.draftPresetId);
+    if (!preset) return;
+    baseInput.readOnly = preset.requires_base_url === false;
+    baseInput.value = preset.base_url || "";
+    pathsInput.value = (preset.paths || []).join(", ");
+  }
+
+  function createVendorFromModal() {
+    const isCustom = state.draftPresetId === "_custom";
+    const preset = isCustom ? null : presetById(state.draftPresetId);
+    if (!isCustom && !preset) throw new Error("\u8bf7\u5148\u9009\u62e9\u6a21\u677f");
+
+    const note = byId("vendor-note").value.trim();
+    const name = byId("vendor-name").value.trim();
+    const baseUrl = byId("vendor-base-url").value.trim();
+    const apiKey = byId("vendor-api-key").value.trim();
+    const suffix = Math.random().toString(36).slice(2, 7);
+
+    if (!apiKey) throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
+    if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
+
+    state.config.upstreams.push({
+      id: crypto.randomUUID ? crypto.randomUUID() : "u-" + suffix,
+      preset: isCustom ? "generic-openai" : preset.id,
+      note, name: name || (isCustom ? "custom-" + suffix : preset.id + "-" + suffix),
+      base_url: baseUrl, api_key_value: apiKey,
+      models: splitList(byId("vendor-models").value),
+      paths: splitList(byId("vendor-paths").value),
+      weight: Number(byId("vendor-weight").value || 1),
+      priority: 100, enabled: byId("vendor-enabled").value === "true",
+    });
+
+    renderUpstreams(); closeVendorModal();
+    ["vendor-note","vendor-name","vendor-api-key","vendor-models"].forEach((id) => byId(id).value = "");
+    byId("vendor-weight").value = "1"; byId("vendor-enabled").value = "true";
+    applyVendorPreset();
+  }
+
+  /* ---- Upstreams ---- */
+  function renderUpstreams() {
+    const host = byId("upstream-list");
+    if (!state.config.upstreams.length) {
+      host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u4e0a\u6e38\uff0c\u70b9\u4e0a\u65b9\u201c+ \u6dfb\u52a0\u4e0a\u6e38\u201d\u5f00\u59cb\u3002</div>';
+      return;
     }
 
-    function openVendorModal() {
-      if (!state.draftPresetId && state.presets.length) {
-        state.draftPresetId = state.presets[0].id;
-      }
-      applyVendorPreset();
-      renderPresets();
-      byId("vendor-modal").classList.add("open");
-    }
+    host.innerHTML = state.config.upstreams.map((item) => {
+      const p = presetById(item.preset);
+      const badge = p ? p.name : (item.preset || "generic");
+      const locked = baseUrlLocked(item.preset);
+      const presetOptions = state.presets.map((pr) =>
+        '<option value="' + esc(pr.id) + '"' + (pr.id === item.preset ? ' selected' : '') + '>' + esc(pr.name) + '</option>'
+      ).join("");
 
-    function closeVendorModal() {
-      byId("vendor-modal").classList.remove("open");
-    }
+      return '<details class="upstream-card" data-id="' + esc(item.id) + '">' +
+        '<summary>' +
+          '<span class="card-badge">' + esc(badge) + '</span>' +
+          '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
+          '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u2713' : '\u2717') + '</span>' +
+        '</summary>' +
+        '<div class="card-body">' +
+          '<div class="row">' +
+            '<div class="field span-4"><label>\u6a21\u677f</label><select data-field="preset">' + presetOptions + '</select></div>' +
+            '<div class="field span-4"><label>\u5907\u6ce8</label><input data-field="note" value="' + esc(item.note) + '"></div>' +
+            '<div class="field span-4"><label>\u5185\u90e8\u540d\u79f0</label><input data-field="name" value="' + esc(item.name) + '"></div>' +
+          '</div>' +
+          '<div class="row">' +
+            '<div class="field span-6"><label>Base URL' + (locked ? ' (\u9884\u8bbe)' : '') + '</label><input data-field="base_url" value="' + esc(item.base_url) + '"' + (locked ? ' readonly' : '') + '></div>' +
+            '<div class="field span-6"><label>API Key (\u4fdd\u5b58\u540e\u663e\u793a\u5bc6\u6587)</label><input class="mono" data-field="api_key_value" value="' + esc(item.api_key_value) + '"></div>' +
+          '</div>' +
+          '<div class="row">' +
+            '<div class="field span-3"><label>\u6743\u91cd</label><input data-field="weight" type="number" min="1" value="' + esc(item.weight) + '"></div>' +
+            '<div class="field span-3"><label>\u4f18\u5148\u7ea7</label><input data-field="priority" type="number" value="' + esc(item.priority) + '"></div>' +
+            '<div class="field span-3"><label>\u542f\u7528</label><select data-field="enabled"><option value="true"' + (item.enabled ? ' selected' : '') + '>\u662f</option><option value="false"' + (!item.enabled ? ' selected' : '') + '>\u5426</option></select></div>' +
+            '<div class="field span-3"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '"></div>' +
+          '</div>' +
+          '<div class="row">' +
+            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\n")) + '</textarea></div>' +
+          '</div>' +
+          '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
+        '</div>' +
+      '</details>';
+    }).join("");
 
-    let toastTimer = null;
-
-    function showToast(message) {
-      const toast = byId("toast");
-      toast.textContent = message;
-      toast.classList.add("show");
-      clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => {
-        toast.classList.remove("show");
-      }, 2200);
-    }
-
-    async function copyText(value, successMessage) {
-      if (!value) {
-        throw new Error("\u6ca1\u6709\u53ef\u590d\u5236\u7684\u5185\u5bb9");
-      }
-      await navigator.clipboard.writeText(value);
-      showToast(successMessage || "\u5df2\u590d\u5236");
-    }
-
-    async function withButtonBusy(button, label, task) {
-      const original = button.textContent;
-      button.disabled = true;
-      button.textContent = label;
-      try {
-        return await task();
-      } finally {
-        button.disabled = false;
-        button.textContent = original;
-      }
-    }
-
-    function applyVendorPreset() {
-      const preset = presetById(state.draftPresetId);
-      if (!preset) {
-        return;
-      }
-      const baseInput = byId("vendor-base-url");
-      const pathsInput = byId("vendor-paths");
-      const locked = preset.requires_base_url === false;
-      baseInput.readOnly = locked;
-      baseInput.value = locked ? (preset.base_url || "") : "";
-      pathsInput.value = (preset.paths || []).join(", ");
-    }
-
-    function createVendorFromModal() {
-      const preset = presetById(state.draftPresetId);
-      if (!preset) {
-        throw new Error("\u8bf7\u5148\u9009\u62e9\u4f9b\u5e94\u5546\u6a21\u677f");
-      }
-
-      const entry = makeUpstream(preset.id);
-      entry.note = byId("vendor-note").value.trim();
-      entry.name = byId("vendor-name").value.trim() || entry.name;
-      entry.base_url = byId("vendor-base-url").value.trim();
-      entry.api_key_value = byId("vendor-api-key").value.trim();
-      entry.weight = Number(byId("vendor-weight").value || 1);
-      entry.priority = Number(byId("vendor-priority").value || 100);
-      entry.enabled = byId("vendor-enabled").value === "true";
-      entry.paths = splitList(byId("vendor-paths").value);
-      entry.models = splitList(byId("vendor-models").value);
-
-      if (!entry.api_key_value) {
-        throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
-      }
-      if (!entry.base_url) {
-        throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
-      }
-
-      state.config.upstreams.push(entry);
-      renderUpstreams();
-      closeVendorModal();
-      byId("vendor-note").value = "";
-      byId("vendor-name").value = "";
-      byId("vendor-api-key").value = "";
-      byId("vendor-models").value = "";
-      byId("vendor-weight").value = "1";
-      byId("vendor-priority").value = "100";
-      byId("vendor-enabled").value = "true";
-      applyVendorPreset();
-    }
-
-    function renderUpstreams() {
-      const host = byId("upstream-list");
-      if (!state.config.upstreams.length) {
-        host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u4e0a\u6e38 key\uff0c\u5148\u70b9\u4e0a\u9762\u7684\u6a21\u677f\u52a0\u4e00\u4e2a\u3002</div>';
-        return;
-      }
-
-      host.innerHTML = groupUpstreams(state.config.upstreams)
-        .map(([groupId, items]) => {
-          const groupPreset = presetById(groupId);
-          const groupTitle = groupPreset ? groupPreset.name : groupId;
-
-          const cards = items.map((item) => {
-            const presetOptions = state.presets
-              .map((preset) => '<option value="' + esc(preset.id) + '"' + (preset.id === item.preset ? " selected" : "") + '>' + esc(preset.name) + "</option>")
-              .join("");
-
-            const lockedBaseUrl = baseUrlLocked(item.preset);
-
-            return '<article class="upstream-card" data-id="' + esc(item.id) + '">' +
-              '<div class="upstream-head">' +
-                '<strong>' + esc(item.note || item.name || '\u81ea\u5e26 Key') + '</strong>' +
-                '<button type="button" class="danger delete-upstream">\u5220\u9664</button>' +
-              '</div>' +
-              '<div class="row">' +
-                '<div class="field span-3"><label>\u6a21\u677f</label><select data-field="preset">' + presetOptions + '</select></div>' +
-                '<div class="field span-3"><label>\u5907\u6ce8</label><input data-field="note" value="' + esc(item.note) + '" placeholder="\u6211\u7684 NVIDIA key"></div>' +
-                '<div class="field span-3"><label>\u5185\u90e8\u540d\u79f0</label><input data-field="name" value="' + esc(item.name) + '" placeholder="nim-main"></div>' +
-                '<div class="field span-3"><label>\u542f\u7528</label><select data-field="enabled"><option value="true"' + (item.enabled ? " selected" : "") + '>true</option><option value="false"' + (!item.enabled ? " selected" : "") + '>false</option></select></div>' +
-                '<div class="field span-6"><label>Base URL' + (lockedBaseUrl ? ' \uff08\u9884\u8bbe\uff09' : '') + '</label><input data-field="base_url" value="' + esc(item.base_url) + '" placeholder="https://integrate.api.nvidia.com/v1"' + (lockedBaseUrl ? ' readonly' : '') + '></div>' +
-                '<div class="field span-6"><label>API Key\uff08\u4fdd\u5b58\u540e\u663e\u793a\u5bc6\u6587\uff09</label><input class="mono" data-field="api_key_value" value="' + esc(item.api_key_value) + '" placeholder="nvapi-... \u6216 enc::..."></div>' +
-                '<div class="field span-4"><label>\u6743\u91cd</label><input data-field="weight" type="number" min="1" value="' + esc(item.weight) + '"></div>' +
-                '<div class="field span-4"><label>\u4f18\u5148\u7ea7</label><input data-field="priority" type="number" value="' + esc(item.priority) + '"></div>' +
-                '<div class="field span-4"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '" placeholder="/v1/chat/completions,/v1/embeddings"></div>' +
-                '<div class="field span-12"><label>\u6a21\u578b</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
-              '</div>' +
-            '</article>';
-          }).join("");
-
-          return '<section class="group-card">' +
-            '<div class="group-head">' +
-              '<h3>' + esc(groupTitle) + '</h3>' +
-              '<span class="note">' + esc(items.length) + ' \u4e2a key</span>' +
-            '</div>' +
-            cards +
-          '</section>';
-        })
-        .join("");
-
-      host.querySelectorAll(".delete-upstream").forEach((button) => {
-        button.addEventListener("click", async (event) => {
-          const btn = event.currentTarget;
-          btn.disabled = true;
-          const card = btn.closest(".upstream-card");
-          state.config.upstreams = state.config.upstreams.filter((item) => item.id !== card.dataset.id);
+    host.querySelectorAll(".delete-upstream").forEach((btn) => {
+      btn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        const card = btn.closest(".upstream-card");
+        await withButtonBusy(btn, "\u5220\u9664\u4e2d...", async () => {
+          state.config.upstreams = state.config.upstreams.filter((u) => u.id !== card.dataset.id);
           renderUpstreams();
           showToast("\u5df2\u5220\u9664\u4e0a\u6e38");
         });
       });
+    });
 
-      host.querySelectorAll('select[data-field="preset"]').forEach((select) => {
-        select.addEventListener("change", (event) => {
-          const card = event.target.closest(".upstream-card");
-          const preset = presetById(event.target.value);
-          const baseInput = card.querySelector('[data-field="base_url"]');
-          const pathsInput = card.querySelector('[data-field="paths"]');
-          baseInput.readOnly = !!preset && preset.requires_base_url === false;
-          baseInput.value = preset && preset.requires_base_url === false ? (preset.base_url || "") : "";
-          pathsInput.value = (preset.paths || []).join(", ");
-          renderUpstreams();
-        });
+    host.querySelectorAll('select[data-field="preset"]').forEach((sel) => {
+      sel.addEventListener("change", () => {
+        const card = sel.closest(".upstream-card");
+        const p = presetById(sel.value);
+        const baseInput = card.querySelector('[data-field="base_url"]');
+        const pathsInput = card.querySelector('[data-field="paths"]');
+        baseInput.readOnly = !!p && p.requires_base_url === false;
+        if (p && p.requires_base_url === false) baseInput.value = p.base_url || "";
+        pathsInput.value = (p?.paths || []).join(", ");
       });
-    }
+    });
+  }
 
-    function collectConfig() {
-      const upstreams = [...document.querySelectorAll(".upstream-card")].map((card, index) => ({
-        id: card.dataset.id || "upstream-" + index,
+  function collectConfig() {
+    return {
+      settings: {
+        request_timeout_ms: Number(byId("request-timeout").value || 90000),
+        upstream_cooldown_ttl: Number(byId("cooldown-ttl").value || 60),
+        model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
+      },
+      routing: {
+        load_balance: byId("routing-load-balance").checked,
+        failover: byId("routing-failover").checked,
+      },
+      upstreams: [...document.querySelectorAll(".upstream-card")].map((card) => ({
+        id: card.dataset.id,
         preset: card.querySelector('[data-field="preset"]').value,
         note: card.querySelector('[data-field="note"]').value.trim(),
         name: card.querySelector('[data-field="name"]').value.trim(),
@@ -1977,221 +1765,169 @@ function renderAdminPage() {
         enabled: card.querySelector('[data-field="enabled"]').value === "true",
         paths: splitList(card.querySelector('[data-field="paths"]').value),
         models: splitList(card.querySelector('[data-field="models"]').value),
-      }));
+      })),
+    };
+  }
 
-      return {
-        settings: {
-          request_timeout_ms: Number(byId("request-timeout").value || 90000),
-          upstream_cooldown_ttl: Number(byId("cooldown-ttl").value || 60),
-          model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
-        },
-        routing: {
-          load_balance: byId("routing-load-balance").checked,
-          failover: byId("routing-failover").checked,
-        },
-        upstreams,
-      };
+  /* ---- Settings ---- */
+  function renderSettings() {
+    byId("request-timeout").value = state.config.settings.request_timeout_ms;
+    byId("cooldown-ttl").value = state.config.settings.upstream_cooldown_ttl;
+    byId("model-cache-ttl").value = state.config.settings.model_cache_ttl;
+    byId("routing-load-balance").checked = state.config.routing.load_balance !== false;
+    byId("routing-failover").checked = state.config.routing.failover !== false;
+    byId("gateway-url-pill").textContent = state.gateway.base_url;
+  }
+
+  async function loadConfig() {
+    const resp = await fetch(API_BASE + "/config");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u914d\u7f6e\u5931\u8d25");
+    state.config = payload.config;
+    state.presets = payload.presets;
+    state.gateway = payload.gateway;
+    renderSettings();
+    renderPresets();
+    renderUpstreams();
+  }
+
+  async function saveConfig() {
+    const resp = await fetch(API_BASE + "/config", {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify(collectConfig()),
+    });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u4fdd\u5b58\u5931\u8d25");
+    state.config = payload.config;
+    renderSettings(); renderUpstreams();
+    showToast("\u914d\u7f6e\u5df2\u4fdd\u5b58");
+    byId("config-status").textContent = "\u2713 \u5df2\u4fdd\u5b58";
+    setTimeout(() => byId("config-status").textContent = "", 3000);
+  }
+
+  async function refreshModels() {
+    const resp = await fetch(API_BASE + "/refresh", { method: "POST" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u5237\u65b0\u5931\u8d25");
+    const summary = (payload.result || []).map((r) => r.name + ":" + r.model_count).join(", ");
+    showToast("\u6a21\u578b\u7f13\u5b58\u5df2\u5237\u65b0");
+    byId("config-status").textContent = "\u2713 \u5df2\u5237\u65b0 " + summary;
+    setTimeout(() => byId("config-status").textContent = "", 5000);
+  }
+
+  /* ---- Clients ---- */
+  async function loadClients() {
+    const resp = await fetch(API_BASE + "/clients");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u5931\u8d25");
+    state.clients = payload;
+    renderClients();
+  }
+
+  function renderClients() {
+    const host = byId("client-list");
+    if (!state.clients.length) {
+      host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u5ba2\u6237\u7aef Key\uff0c\u70b9\u201c\u751f\u6210 Key\u201d\u521b\u5efa\u3002</div>';
+      return;
     }
-
-    function renderSettings() {
-      byId("request-timeout").value = state.config.settings.request_timeout_ms;
-      byId("cooldown-ttl").value = state.config.settings.upstream_cooldown_ttl;
-      byId("model-cache-ttl").value = state.config.settings.model_cache_ttl;
-      byId("routing-load-balance").checked = state.config.routing.load_balance !== false;
-      byId("routing-failover").checked = state.config.routing.failover !== false;
-      byId("gateway-url").textContent = state.gateway.base_url;
-      byId("gateway-url-pill").textContent = state.gateway.base_url;
-    }
-
-    async function parseApiResponse(response) {
-      const contentType = response.headers.get("content-type") || "";
-      if (contentType.includes("application/json")) {
-        return response.json();
-      }
-
-      const text = await response.text();
-      throw new Error("Admin API \u8fd4\u56de\u7684\u4e0d\u662f JSON\uff0c\u8bf7\u786e\u8ba4\u5f53\u524d\u8bbf\u95ee\u7684\u7ba1\u7406\u8def\u5f84\u6b63\u786e\u3002");
-    }
-
-    async function loadConfig() {
-      const response = await fetch(API_BASE + "/config");
-      const payload = await parseApiResponse(response);
-      if (!response.ok) {
-        throw new Error(payload?.error?.message || "\u8bfb\u53d6\u914d\u7f6e\u5931\u8d25");
-      }
-      state.config = payload.config;
-      state.presets = payload.presets;
-      state.gateway = payload.gateway;
-      renderSettings();
-      renderPresets();
-      renderUpstreams();
-    }
-
-    async function saveConfig() {
-      setStatus("\u6b63\u5728\u4fdd\u5b58\u914d\u7f6e...");
-      const response = await fetch(API_BASE + "/config", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(collectConfig()),
-      });
-      const payload = await parseApiResponse(response);
-      if (!response.ok) {
-        throw new Error(payload?.error?.message || "\u4fdd\u5b58\u5931\u8d25");
-      }
-      state.config = payload.config;
-      renderSettings();
-      renderUpstreams();
-      setStatus("\u914d\u7f6e\u5df2\u4fdd\u5b58\u3002");
-    }
-
-    async function refreshModels() {
-      setStatus("\u6b63\u5728\u5237\u65b0\u6a21\u578b\u7f13\u5b58...");
-      const response = await fetch(API_BASE + "/refresh", { method: "POST" });
-      const payload = await parseApiResponse(response);
-      if (!response.ok) {
-        throw new Error(payload?.error?.message || "\u5237\u65b0\u5931\u8d25");
-      }
-      const summary = (payload.result || []).map((item) => item.name + ": " + item.model_count).join(" | ");
-      setStatus("\u6a21\u578b\u7f13\u5b58\u5df2\u5237\u65b0\u3002" + summary);
-    }
-
-    async function loadClients() {
-      const response = await fetch(API_BASE + "/clients");
-      const payload = await parseApiResponse(response);
-      if (!response.ok) {
-        throw new Error(payload?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u5217\u8868\u5931\u8d25");
-      }
-      state.clients = payload;
-      renderClients();
-    }
-
-    function renderClients() {
-      const host = byId("client-list");
-      if (!state.clients.length) {
-        host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u5ba2\u6237\u7aef key\u3002</div>';
-        return;
-      }
-
-      host.innerHTML = state.clients.map((client) =>
-        '<article class="client-item">' +
-          '<div class="client-meta">' +
-            '<strong>' + esc(client.name) + '</strong>' +
-            '<span class="mono">' + esc(client.key_preview || "") + '</span>' +
-            '<span class="note">\u6a21\u578b: ' + esc((client.models || []).join(", ") || "*") + '</span>' +
-          '</div>' +
-          '<button type="button" class="danger" data-client-id="' + esc(client.id) + '">\u5220\u9664</button>' +
-        '</article>'
-      ).join("");
-
-      host.querySelectorAll("button[data-client-id]").forEach((button) => {
-        button.addEventListener("click", async (event) => {
-          const btn = event.currentTarget;
-          await withButtonBusy(btn, "\u5220\u9664\u4e2d...", () => deleteClient(btn.dataset.clientId));
+    host.innerHTML = state.clients.map((c) =>
+      '<div class="client-item">' +
+        '<div class="client-meta">' +
+          '<strong>' + esc(c.name) + '</strong>' +
+          '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
+          '<span class="note">\u6a21\u578b: ' + esc((c.models || []).join(", ") || "*") + '</span>' +
+        '</div>' +
+        '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '">\u5220\u9664</button>' +
+      '</div>'
+    ).join("");
+    host.querySelectorAll("button[data-client-id]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await withButtonBusy(btn, "\u5220\u9664\u4e2d...", async () => {
+          await deleteClient(btn.dataset.clientId);
+          showToast("\u5df2\u5220\u9664\u5ba2\u6237\u7aef");
         });
       });
-    }
+    });
+  }
 
-    async function createClient() {
-      const payload = {
-        name: byId("client-name").value.trim() || "generated-client",
-        models: splitList(byId("client-models").value),
-        upstreams: splitList(byId("client-upstreams").value),
-      };
+  async function createClient() {
+    const payload = {
+      name: byId("client-name").value.trim() || "generated-client",
+      models: ["*"],
+      upstreams: [],
+    };
+    const resp = await fetch(API_BASE + "/clients", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(data?.error?.message || "\u521b\u5efa\u5931\u8d25");
 
-      if (!payload.models.length) {
-        payload.models = ["*"];
-      }
+    state.lastCreatedClient = data.client;
+    byId("client-output").hidden = false;
+    byId("client-output-text").textContent = JSON.stringify(data.client, null, 2);
+    byId("refresh-client-key").hidden = false;
+    showToast("\u5ba2\u6237\u7aef Key \u5df2\u751f\u6210");
+    await loadClients();
+  }
 
-      const response = await fetch(API_BASE + "/clients", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await parseApiResponse(response);
-      if (!response.ok) {
-        throw new Error(data?.error?.message || "\u521b\u5efa\u5ba2\u6237\u7aef\u5931\u8d25");
-      }
+  async function deleteClient(id) {
+    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(id), { method: "DELETE" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u5220\u9664\u5931\u8d25");
+    await loadClients();
+  }
 
-      state.lastCreatedClient = data.client;
-      byId("client-output").hidden = false;
-      byId("client-output").textContent = JSON.stringify(data.client, null, 2);
-      byId("client-output-actions").hidden = false;
-      byId("client-name").value = "";
-      byId("client-models").value = "";
-      byId("client-upstreams").value = "";
-      showToast("\u5ba2\u6237\u7aef Key \u5df2\u521b\u5efa");
+  /* ---- Boot ---- */
+  async function boot() {
+    try {
+      byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeVendorModal(); });
+      byId("open-vendor-modal").addEventListener("click", openVendorModal);
+      byId("close-vendor-modal").addEventListener("click", closeVendorModal);
+
+      byId("create-vendor").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u6dfb\u52a0\u4e2d...", async () => {
+          createVendorFromModal();
+          showToast("\u4e0a\u6e38\u5df2\u6dfb\u52a0");
+        }).catch(showError)
+      );
+      byId("save-config").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u4fdd\u5b58\u4e2d...", saveConfig).catch(showError)
+      );
+      byId("refresh-models").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", refreshModels).catch(showError)
+      );
+      byId("create-client").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u751f\u6210\u4e2d...", createClient).catch(showError)
+      );
+      byId("refresh-client-key").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u751f\u6210\u4e2d...", createClient).catch(showError)
+      );
+      byId("copy-client-key").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u590d\u5236\u4e2d...", () =>
+          copyText(state.lastCreatedClient?.api_key, "API Key \u5df2\u590d\u5236")
+        ).catch(showError)
+      );
+      byId("copy-client-json").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u590d\u5236\u4e2d...", () =>
+          copyText(byId("client-output-text").textContent, "JSON \u5df2\u590d\u5236")
+        ).catch(showError)
+      );
+      byId("copy-gateway-url").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u590d\u5236\u4e2d...", () =>
+          copyText(state.gateway?.base_url, "Gateway URL \u5df2\u590d\u5236")
+        ).catch(showError)
+      );
+
+      await loadConfig();
       await loadClients();
-    }
+    } catch (error) { showError(error); }
+  }
 
-    async function deleteClient(id) {
-      const response = await fetch(API_BASE + "/clients/" + encodeURIComponent(id), {
-        method: "DELETE",
-      });
-      const payload = await parseApiResponse(response);
-      if (!response.ok) {
-        throw new Error(payload?.error?.message || "\u5220\u9664\u5ba2\u6237\u7aef\u5931\u8d25");
-      }
-      await loadClients();
-    }
-
-    function setStatus(message) {
-      byId("config-status").textContent = message || "";
-    }
-
-    async function boot() {
-      try {
-        byId("vendor-modal").addEventListener("click", (event) => {
-          if (event.target === byId("vendor-modal")) {
-            closeVendorModal();
-          }
-        });
-        document.addEventListener("keydown", (event) => {
-          if (event.key === "Escape") {
-            closeVendorModal();
-          }
-        });
-        byId("open-vendor-modal").addEventListener("click", openVendorModal);
-        byId("close-vendor-modal").addEventListener("click", closeVendorModal);
-        byId("create-vendor").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "\u6dfb\u52a0\u4e2d...", async () => {
-            createVendorFromModal();
-            showToast("\u4e0a\u6e38\u8349\u7a3f\u5df2\u6dfb\u52a0");
-          }).catch(showError),
-        );
-        byId("save-config").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "\u4fdd\u5b58\u4e2d...", saveConfig).catch(showError),
-        );
-        byId("refresh-models").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "\u5237\u65b0\u4e2d...", refreshModels).catch(showError),
-        );
-        byId("create-client").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "\u521b\u5efa\u4e2d...", createClient).catch(showError),
-        );
-        byId("copy-client-output").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "\u590d\u5236\u4e2d...", () =>
-            copyText(byId("client-output").textContent, "\u5ba2\u6237\u7aef JSON \u5df2\u590d\u5236"),
-          ).catch(showError),
-        );
-        byId("copy-client-key").addEventListener("click", (event) =>
-          withButtonBusy(event.currentTarget, "\u590d\u5236\u4e2d...", () =>
-            copyText(state.lastCreatedClient?.api_key, "API Key \u5df2\u590d\u5236"),
-          ).catch(showError),
-        );
-        await loadConfig();
-        await loadClients();
-      } catch (error) {
-        showError(error);
-      }
-    }
-
-    function showError(error) {
-      console.error(error);
-      setStatus(error.message || "Error");
-      showToast(error.message || "Error");
-    }
-
-    boot();
-  </script>
+  boot();
+</script>
 </body>
 </html>`;
 }
+
