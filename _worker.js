@@ -238,7 +238,7 @@ export default {
         }
 
         const loggedStatusMsg = openaiResp.ok ? openaiResp.status : (openaiResp.status || 502);
-        appendLog(app, {
+        var msgLogEntry = {
           ts: new Date().toISOString(),
           client: client.name || client.id || "client",
           upstream: proxyResponse.upstream.name,
@@ -248,7 +248,9 @@ export default {
           latency_ms: Date.now() - started,
           prompt_tokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
           completion_tokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
-        });
+        };
+        appendLog(app, msgLogEntry);
+        recordStats(app, msgLogEntry);
 
         return new Response(JSON.stringify(anthropicResp), {
           status: openaiResp.ok ? 200 : openaiResp.status,
@@ -301,44 +303,77 @@ function createApp(env) {
   };
 }
 
-// ponytail: fire-and-forget request logging. Stores last 50 entries in KV.
-async function appendLog(app, entry) {
-  if (!app.kv) return;
-  try {
-    const raw = await app.kv.get(LOG_KEY, "json");
-    const logs = Array.isArray(raw) ? raw : [];
-    logs.push(entry);
-    if (logs.length > 50) logs.splice(0, logs.length - 50);
-    await app.kv.put(LOG_KEY, JSON.stringify(logs));
-  } catch { /* log failures must not break the response */ }
+// ponytail: in-memory batch for stats + logs, flush every 90s to KV
+var _pendingLogs = [];
+var _pendingStats = {}; // hourKey -> bucket
+var _lastFlush = 0;
+var FLUSH_INTERVAL_MS = 90000;
+
+function appendLog(app, entry) {
+  _pendingLogs.push(entry);
+  if (_pendingLogs.length > 200) _pendingLogs.splice(0, _pendingLogs.length - 200);
+  flushBatch(app);
 }
 
-async function recordStats(app, entry) {
+function recordStats(app, entry) {
+  var now = new Date(entry.ts);
+  var hour = now.getFullYear() + "-" +
+    String(now.getMonth() + 1).padStart(2, "0") + "-" +
+    String(now.getDate()).padStart(2, "0") + ":" +
+    String(now.getHours()).padStart(2, "0");
+  if (!_pendingStats[hour]) {
+    _pendingStats[hour] = { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+  }
+  var b = _pendingStats[hour];
+  b.total += 1;
+  if (entry.status >= 200 && entry.status < 400) b.success += 1;
+  else b.fail += 1;
+  b.prompt_tokens += entry.prompt_tokens || 0;
+  b.completion_tokens += entry.completion_tokens || 0;
+  var up = entry.upstream || "unknown";
+  b.upstreams[up] = (b.upstreams[up] || 0) + 1;
+  var mdl = entry.model || "unknown";
+  b.models[mdl] = (b.models[mdl] || 0) + 1;
+  flushBatch(app);
+}
+
+async function flushBatch(app) {
   if (!app.kv) return;
-  try {
-    const now = new Date(entry.ts);
-    const hour = now.getFullYear() + "-" +
-      String(now.getMonth() + 1).padStart(2, "0") + "-" +
-      String(now.getDate()).padStart(2, "0") + ":" +
-      String(now.getHours()).padStart(2, "0");
-    const key = STATS_PREFIX + hour;
-    const raw = await app.kv.get(key, "json");
-    const bucket = (raw && typeof raw === "object") ? raw : {
-      total: 0, success: 0, fail: 0,
-      prompt_tokens: 0, completion_tokens: 0,
-      upstreams: {}, models: {},
-    };
-    bucket.total += 1;
-    if (entry.status >= 200 && entry.status < 400) bucket.success += 1;
-    else bucket.fail += 1;
-    bucket.prompt_tokens += entry.prompt_tokens || 0;
-    bucket.completion_tokens += entry.completion_tokens || 0;
-    const up = entry.upstream || "unknown";
-    bucket.upstreams[up] = (bucket.upstreams[up] || 0) + 1;
-    const mdl = entry.model || "unknown";
-    bucket.models[mdl] = (bucket.models[mdl] || 0) + 1;
-    await app.kv.put(key, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
-  } catch { /* stats failures must not break the response */ }
+  var now = Date.now();
+  if (now - _lastFlush < FLUSH_INTERVAL_MS) return;
+  _lastFlush = now;
+  try { await _doFlush(app); } catch { /* flush failures must not break */ }
+}
+
+async function _doFlush(app) {
+  // Flush logs: merge with existing, keep last 50
+  if (_pendingLogs.length > 0) {
+    var logsToFlush = _pendingLogs.splice(0);
+    var raw = await app.kv.get(LOG_KEY, "json");
+    var existing = Array.isArray(raw) ? raw : [];
+    existing.push(...logsToFlush);
+    if (existing.length > 50) existing.splice(0, existing.length - 50);
+    await app.kv.put(LOG_KEY, JSON.stringify(existing));
+  }
+  // Flush stats: merge each hour bucket with KV
+  var keys = Object.keys(_pendingStats);
+  if (keys.length > 0) {
+    var writes = keys.map(async function(hourKey) {
+      var delta = _pendingStats[hourKey];
+      delete _pendingStats[hourKey];
+      var raw = await app.kv.get(STATS_PREFIX + hourKey, "json");
+      var bucket = (raw && typeof raw === "object") ? raw : { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+      bucket.total += delta.total;
+      bucket.success += delta.success;
+      bucket.fail += delta.fail;
+      bucket.prompt_tokens += delta.prompt_tokens;
+      bucket.completion_tokens += delta.completion_tokens;
+      for (var u in delta.upstreams) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
+      for (var m in delta.models) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
+      await app.kv.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
+    });
+    await Promise.all(writes);
+  }
 }
 
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
@@ -429,12 +464,14 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/logs" && request.method === "GET") {
+    await _doFlush(app);
     const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
     const logs = Array.isArray(raw) ? raw : [];
     return withCorsResponse(json({ ok: true, logs: logs.reverse() }, 200));
   }
 
   if (apiPath === "/api/stats" && request.method === "GET") {
+    await _doFlush(app);
     const now = new Date();
     const buckets = [];
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
@@ -1838,7 +1875,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-01-dualchart ·
+    v26-07-01-batchstats ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
@@ -2401,8 +2438,9 @@ function renderAdminPage() {
 
       await loadConfig();
       await loadClients();
-      loadStats().catch(() => {});
-      loadLogs().catch(() => {});
+      await loadStats();
+      await loadLogs();
+      setInterval(function() { loadStats().catch(function(){}); loadLogs().catch(function(){}); }, 60000);
 
 
     } catch (error) { showError(error); }
