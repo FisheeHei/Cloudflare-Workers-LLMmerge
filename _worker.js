@@ -1818,6 +1818,7 @@ function renderAdminPage() {
     <div class="toolbar">
       <h2>统计</h2>
       <span class="note" id="stat-current-model"></span>
+      <span class="note" id="stat-updated"></span>
       <button class="small secondary" id="load-stats">加载统计</button>
     </div>
     <div class="chart-label">请求量</div>
@@ -2293,6 +2294,7 @@ function renderAdminPage() {
       return '<div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + b.hour.slice(-2) + '" title="' + b.hour + ': ' + b.prompt_tokens + ' in / ' + b.completion_tokens + ' out tokens">' + seg + '</div>';
     }).join("");
 
+    byId("stat-updated").textContent = new Date().toLocaleTimeString();
     showToast("统计已加载");
   }
 
@@ -2467,9 +2469,9 @@ function renderAdminPage() {
 
       await loadConfig();
       await loadClients();
-      await loadStats();
-      await loadLogs();
-      setInterval(function() { loadStats().catch(function(){}); loadLogs().catch(function(){}); }, 60000);
+      loadStats().catch(function(){}); // ponytail: don't block boot on stats
+      loadLogs().catch(function(){});  // don't block on logs either
+      setInterval(function() { loadStats().catch(function(){}); loadLogs().catch(function(){}); }, 30000);
 
 
     } catch (error) { showError(error); }
