@@ -1721,7 +1721,10 @@ function renderAdminPage() {
     .chart-bar .bar.fail { background: #8d2f23; }
     .chart-bar .bar::after { content: attr(data-h); position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 9px; color: var(--muted); }
     .chart-bar .bar:nth-child(6n)::after { display: block; }
-    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .chart-label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 8px 0 2px; }
+    .chart-label:first-of-type { margin-top: 0; }
+    .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .stats-grid-2col { grid-template-columns: repeat(2, 1fr); }
     .stat-box { background: var(--bg-raised); border-radius: 8px; padding: 10px 12px; text-align: center; }
     .stat-num { display: block; font-size: 22px; font-weight: 700; color: var(--fg); }
     .stat-label { font-size: 11px; color: var(--muted); }
@@ -1751,12 +1754,18 @@ function renderAdminPage() {
       <span class="note" id="stat-current-model"></span>
       <button class="small secondary" id="load-stats">加载统计</button>
     </div>
+    <div class="chart-label">请求量</div>
     <div class="chart-bar" id="chart-requests"></div>
     <div class="stats-grid">
       <div class="stat-box"><span class="stat-num" id="stat-total">-</span><span class="stat-label">24h 请求</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-success">-</span><span class="stat-label">成功</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-fail">-</span><span class="stat-label">失败</span></div>
-      <div class="stat-box"><span class="stat-num" id="stat-tokens">-</span><span class="stat-label">24h Tokens</span></div>
+    </div>
+    <div class="chart-label">Tokens</div>
+    <div class="chart-bar" id="chart-tokens"></div>
+    <div class="stats-grid stats-grid-2col">
+      <div class="stat-box"><span class="stat-num" id="stat-pt">-</span><span class="stat-label">Input Tokens</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-ct">-</span><span class="stat-label">Output Tokens</span></div>
     </div>
   </div>
 
@@ -1829,7 +1838,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-01-statsfix ·
+    v26-07-01-dualchart ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
@@ -2157,22 +2166,10 @@ function renderAdminPage() {
   async function loadStats() {
     const resp = await fetch(API_BASE + "/stats");
     const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u7edf\u8ba1\u5931\u8d25");
+    if (!resp.ok) throw new Error(payload?.error?.message || "读取统计失败");
     const buckets = payload.buckets || [];
-    let total = 0, success = 0, fail = 0, pt = 0, ct = 0;
-    buckets.forEach((b) => { total += b.total; success += b.success; fail += b.fail; pt += b.prompt_tokens; ct += b.completion_tokens; });
-    byId("stat-total").textContent = total;
-    byId("stat-success").textContent = success;
-    byId("stat-fail").textContent = fail;
-    byId("stat-tokens").textContent = (pt + ct).toLocaleString();
-    // show last model from highest-hour bucket with activity
-    var lastBucket = skeleton.slice().reverse().find(function(b) { return b.total > 0; });
-    if (lastBucket && lastBucket.models) {
-      var topModel = Object.entries(lastBucket.models).sort(function(a,b){return b[1]-a[1];})[0];
-      byId("stat-current-model").textContent = topModel ? topModel[0] : "";
-    }
 
-    // Bar chart - always show 24h grid, zero-fill missing hours
+    // Build 24h skeleton
     var now = new Date();
     var pad2 = function(n) { return String(n).padStart(2, "0"); };
     var today = now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate());
@@ -2180,25 +2177,57 @@ function renderAdminPage() {
     for (var h = 0; h < 24; h++) {
       var key = today + ":" + pad2(h);
       var hit = buckets.find(function(b) { return b.hour === key; });
-      skeleton.push(hit || { hour: key, total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0 });
+      skeleton.push(hit || { hour: key, total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, models: {} });
     }
-    var maxVal = Math.max(1, /* highest bar */ 0);
-    skeleton.forEach(function(b) { if (b.total > maxVal) maxVal = b.total; });
+
+    // Aggregate totals
+    var total = 0, success = 0, fail = 0, pt = 0, ct = 0;
+    skeleton.forEach(function(b) { total += b.total; success += b.success; fail += b.fail; pt += b.prompt_tokens; ct += b.completion_tokens; });
+    byId("stat-total").textContent = total;
+    byId("stat-success").textContent = success;
+    byId("stat-fail").textContent = fail;
+    byId("stat-pt").textContent = pt.toLocaleString();
+    byId("stat-ct").textContent = ct.toLocaleString();
+
+    // Last model
+    var lastBucket = skeleton.slice().reverse().find(function(b) { return b.total > 0; });
+    if (lastBucket && lastBucket.models) {
+      var topModel = Object.entries(lastBucket.models).sort(function(a,b){return b[1]-a[1];})[0];
+      byId("stat-current-model").textContent = topModel ? topModel[0] : "";
+    }
+
+    // Chart 1: Requests (green=success, red=fail)
+    var maxReq = 1;
+    skeleton.forEach(function(b) { if (b.total > maxReq) maxReq = b.total; });
     byId("chart-requests").innerHTML = skeleton.map(function(b) {
-      var h = Math.max(2, Math.round(b.total / maxVal * 100));
-      var hourLabel = b.hour.slice(-2);
-      var cls = b.fail > 0 && b.success === 0 ? ' fail' : '';
-      var seg = '';
+      var barH = Math.max(2, Math.round(b.total / maxReq * 100));
+      var seg = "";
       if (b.total > 0) {
-        var okH = Math.max(1, Math.round(b.success / b.total * h));
-        var failH = h - okH;
+        var okH = Math.max(1, Math.round(b.success / b.total * barH));
+        var failH = barH - okH;
         seg = '<div style="height:' + okH + 'px;background:var(--accent);border-radius:2px 2px 0 0"></div>';
-        if (failH > 0) seg += '<div style="height:' + failH + 'px;background:#8d2f23;border-radius:0"></div>';
+        if (failH > 0) seg += '<div style="height:' + failH + 'px;background:#8d2f23"></div>';
       }
-      return '<div class="bar' + cls + '" style="height:' + h + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + hourLabel + '" title="' + b.hour + ': ' + b.success + '/' + b.total + ' ok, ' + (b.prompt_tokens + b.completion_tokens) + ' tokens">' + seg + '</div>';
+      return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + b.hour.slice(-2) + '" title="' + b.hour + ': ' + b.success + ' ok / ' + b.total + ' total">' + seg + '</div>';
     }).join("");
 
-    showToast("\u7edf\u8ba1\u5df2\u52a0\u8f7d");
+    // Chart 2: Tokens (indigo=input, violet=output)
+    var maxTok = 1;
+    skeleton.forEach(function(b) { var t = b.prompt_tokens + b.completion_tokens; if (t > maxTok) maxTok = t; });
+    byId("chart-tokens").innerHTML = skeleton.map(function(b) {
+      var tok = b.prompt_tokens + b.completion_tokens;
+      var barH = Math.max(2, Math.round(tok / maxTok * 100));
+      var seg = "";
+      if (tok > 0) {
+        var inH = Math.max(1, Math.round(b.prompt_tokens / tok * barH));
+        var outH = barH - inH;
+        seg = '<div style="height:' + inH + 'px;background:#6366f1;border-radius:2px 2px 0 0"></div>';
+        if (outH > 0) seg += '<div style="height:' + outH + 'px;background:#a78bfa"></div>';
+      }
+      return '<div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + b.hour.slice(-2) + '" title="' + b.hour + ': ' + b.prompt_tokens + ' in / ' + b.completion_tokens + ' out tokens">' + seg + '</div>';
+    }).join("");
+
+    showToast("统计已加载");
   }
 
   async function loadLogs() {
