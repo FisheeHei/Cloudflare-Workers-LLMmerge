@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-instant";
+const VERSION = "v26-07-02-cache";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
