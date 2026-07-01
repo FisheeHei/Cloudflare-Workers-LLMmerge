@@ -139,41 +139,17 @@ export default {
           search: url.search,
         });
 
-        // ponytail: log request with token usage, re-emit response body
+        // ponytail: stream response directly, log with estimates to avoid blocking
         const upstreamResp = proxyResponse.response;
-        const respBody = await upstreamResp.text();
-        const usagePayload = (() => { try { return JSON.parse(respBody); } catch { return {}; } })();
-        const usage = usagePayload.usage || {};
         const loggedStatus = upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502);
-        // ponytail: estimate tokens if upstream omits usage (1 token ~ 4 chars)
-        var pt = usage.prompt_tokens || 0;
-        var ct = usage.completion_tokens || 0;
-        if (!pt && !ct && upstreamResp.ok) {
-          try {
-            var reqObj = JSON.parse(cleanedBody);
-            var reqChars = JSON.stringify(reqObj.messages || []).length;
-            pt = Math.max(1, Math.round(reqChars / 4));
-            // try normal response first, then scan SSE stream for content
-            var respChoice = (usagePayload.choices || [])[0] || {};
-            var respChars = 0;
-            if ((respChoice.message || {}).content) {
-              respChars = respChoice.message.content.length;
-            } else if (respBody.includes("data:")) {
-              // ponytail: extract content from SSE chunks
-              var contents = [];
-              respBody.split("\n").forEach(function(line) {
-                if (!line.startsWith("data: ") || line === "data: [DONE]") return;
-                try {
-                  var chunk = JSON.parse(line.slice(6));
-                  var delta = ((chunk.choices || [])[0] || {}).delta || {};
-                  if (delta.content) contents.push(delta.content);
-                } catch {}
-              });
-              respChars = contents.join("").length;
-            }
-            ct = Math.max(1, Math.round(respChars / 4));
-          } catch { pt = 1; ct = 1; }
-        }
+        // ponytail: estimate input tokens from request size (1 token ~ 4 chars)
+        var pt = 0; var ct = 0;
+        try {
+          var reqObj = JSON.parse(cleanedBody);
+          var reqChars = JSON.stringify(reqObj.messages || []).length;
+          pt = Math.max(1, Math.round(reqChars / 4));
+          ct = 1; // ponytail: output unknown until stream ends, min 1
+        } catch { pt = 1; ct = 1; }
         const logEntry = {
           ts: new Date().toISOString(),
           client: client.name || client.id || "client",
@@ -194,7 +170,7 @@ export default {
         headers.set("x-llm-gateway-client", client.name || client.id || "client");
         headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
 
-        return new Response(respBody, {
+        return new Response(upstreamResp.body, {
           status: upstreamResp.status,
           statusText: upstreamResp.statusText,
           headers,
@@ -1953,7 +1929,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-flushfix ·
+    v26-07-02-streamproxy ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
