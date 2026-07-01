@@ -523,6 +523,28 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, buckets }, 200));
   }
 
+      // ponytail: fetch model list from a specific upstream for picker
+  if (apiPath === "/api/fetch-models" && request.method === "POST") {
+    const runtime = await loadRuntimeConfig(app);
+    const fmatch = parseJsonBody(await request.text());
+    const uName = fmatch.name || "";
+    const ups = runtime.upstreams.find((u) => u.name === uName);
+    if (!ups) return withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404));
+    try {
+      const resp = await fetchWithTimeout(
+        buildUpstreamUrl(ups.base_url, MODEL_PATH, ""),
+        { method: "GET", headers: buildUpstreamHeaders(null, ups) },
+        15000,
+      );
+      if (!resp.ok) return withCorsResponse(json({ ok: false, status: resp.status }, 502));
+      const body = await resp.json();
+      const models = Array.isArray(body.data) ? body.data.map((m) => m.id).filter(Boolean).sort() : [];
+      return withCorsResponse(json({ ok: true, models }, 200));
+    } catch (err) {
+      return withCorsResponse(json({ ok: false, error: err.message }, 502));
+    }
+  }
+
   // ponytail: health check only verifies connectivity, does not parse model list.
   if (apiPath === "/api/health" && request.method === "POST") {
     const runtime = await loadRuntimeConfig(app);
@@ -1849,6 +1871,7 @@ function renderAdminPage() {
 
   <div class="panel">
     <h2>\u5ba2\u6237\u7aef Keys</h2>
+    <p class="note" style="margin:4px 0 8px;font-size:12px">提示：客户端 models 设 ["*"] 可见所有模型，改为 ["deepseek-chat","deepseek-reasoner"] 等具体列表可精简可见模型，不影响实际调用。</p>
     <div id="client-list"></div>
     <div class="client-create">
       <input id="client-name" placeholder="\u540d\u79f0 (\u53ef\u9009)">
@@ -1916,7 +1939,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-deepseek ·
+    v26-07-02-modelpick ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
@@ -1924,6 +1947,7 @@ function renderAdminPage() {
 
 <div id="toast"></div>
 
+<div id="model-picker" style="display:none;position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:90;background:var(--bg-raised);border:1px solid var(--line);border-radius:8px;width:400px;box-shadow:0 4px 24px rgba(0,0,0,.3)"></div>
 <div class="modal-backdrop" id="vendor-modal">
   <div class="modal-card">
     <h3>\u6dfb\u52a0\u4e0a\u6e38</h3>
@@ -2094,7 +2118,7 @@ function renderAdminPage() {
             '<div class="field span-3"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '"></div>' +
           '</div>' +
           '<div class="row">' +
-            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea></div>' +
+            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea><button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:4px">\u4ece\u4e0a\u6e38\u5bfc\u5165\u6a21\u578b</button></div>' +
           '</div>' +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
           (item.preset === "custom" || item.preset === "generic-openai" || item.preset === "claude-openai" ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
@@ -2116,6 +2140,19 @@ function renderAdminPage() {
           state.config.upstreams = state.config.upstreams.filter((u) => u.id !== card.dataset.id);
           renderUpstreams();
           showToast("\u5df2\u5220\u9664\u4e0a\u6e38");
+        });
+      });
+    });
+    host.querySelectorAll(".fetch-models-btn").forEach((btn) => {
+      btn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        var name = btn.dataset.upstream;
+        var card = btn.closest(".upstream-card");
+        var textarea = card ? card.querySelector('[data-field="models"]') : null;
+        await withButtonBusy(btn, "\u5bfc\u5165\u4e2d...", async function() {
+          var models = await fetchUpstreamModels(name);
+          if (!models.length) throw new Error("\u8be5\u4e0a\u6e38\u65e0\u53ef\u7528\u6a21\u578b");
+          showModelPicker(name, models, textarea);
         });
       });
     });
@@ -2239,6 +2276,47 @@ function renderAdminPage() {
       badge.textContent = payload.capability === "openai" ? "\u2713 OpenAI" : "Claude";
     }
     showToast(upstreamName + ": " + (payload.capability === "openai" ? "OpenAI Compatible (chat+embeddings)" : "Claude Compatible (chat only)") + ", " + payload.latency_ms + "ms");
+  }
+
+  async function fetchUpstreamModels(upstreamName) {
+    const resp = await fetch(API_BASE + "/fetch-models", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: upstreamName }),
+    });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error || "获取模型失败");
+    return payload.models || [];
+  }
+
+  function showModelPicker(upstreamName, models, textarea) {
+    // Simple checkbox list: check what's already in textarea, show full list
+    var current = splitList(textarea.value);
+    var currentSet = new Set(current);
+    var html = '<div style="max-height:300px;overflow-y:auto;padding:8px">';
+    html += '<div style="margin-bottom:8px"><button class="small good" id="picker-apply">应用</button> <button class="small secondary" id="picker-cancel">取消</button> <span class="note" id="picker-count">已选 0</span></div>';
+    models.forEach(function(m) {
+      var checked = currentSet.has(m) ? ' checked' : '';
+      html += '<div style="font-size:13px;padding:2px 0"><label><input type="checkbox" class="model-pick" value="' + esc(m) + '"' + checked + '> ' + esc(m) + '</label></div>';
+    });
+    html += '</div>';
+    var panel = byId("model-picker");
+    panel.innerHTML = html;
+    panel.style.display = "block";
+    // Update count
+    panel.querySelectorAll(".model-pick").forEach(function(cb) {
+      cb.addEventListener("change", function() {
+        var n = panel.querySelectorAll(".model-pick:checked").length;
+        byId("picker-count").textContent = "已选 " + n;
+      });
+    });
+    byId("picker-cancel").addEventListener("click", function() { panel.style.display = "none"; });
+    byId("picker-apply").addEventListener("click", function() {
+      var picked = [];
+      panel.querySelectorAll(".model-pick:checked").forEach(function(cb) { picked.push(cb.value); });
+      textarea.value = picked.join("\n");
+      panel.style.display = "none";
+      showToast("已导入 " + picked.length + " 个模型");
+    });
   }
 
   async function loadStats() {
