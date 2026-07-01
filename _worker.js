@@ -1,4 +1,4 @@
-const JSON_HEADERS = {
+﻿const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
 };
 
@@ -142,13 +142,12 @@ export default {
         // ponytail: stream response directly, log with estimates to avoid blocking
         const upstreamResp = proxyResponse.response;
         const loggedStatus = upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502);
-        // ponytail: estimate input tokens from request size (1 token ~ 4 chars)
+        // ponytail: estimate input tokens from already-parsed payload (no re-parse)
         var pt = 0; var ct = 0;
         try {
-          var reqObj = JSON.parse(cleanedBody);
-          var reqChars = JSON.stringify(reqObj.messages || []).length;
+          var reqChars = JSON.stringify(payload.messages || []).length;
           pt = Math.max(1, Math.round(reqChars / 4));
-          ct = 1; // ponytail: output unknown until stream ends, min 1
+          ct = 1;
         } catch { pt = 1; ct = 1; }
         const logEntry = {
           ts: new Date().toISOString(),
@@ -163,6 +162,7 @@ export default {
         };
         appendLog(app, logEntry);
         recordStats(app, logEntry);
+        flushBatch(app);
 
         const headers = new Headers(upstreamResp.headers);
         for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
@@ -263,6 +263,7 @@ export default {
         };
         appendLog(app, msgLogEntry);
         recordStats(app, msgLogEntry);
+        flushBatch(app);
 
         return new Response(JSON.stringify(anthropicResp), {
           status: openaiResp.ok ? 200 : openaiResp.status,
@@ -321,10 +322,10 @@ var _pendingStats = {}; // hourKey -> bucket
 var _lastFlush = 0;
 var FLUSH_INTERVAL_MS = 90000;
 
+// ponytail: appendLog just pushes; caller calls flushBatch after log+stats
 function appendLog(app, entry) {
   _pendingLogs.push(entry);
   if (_pendingLogs.length > 200) _pendingLogs.splice(0, _pendingLogs.length - 200);
-  flushBatch(app);
 }
 
 function recordStats(app, entry) {
@@ -359,22 +360,26 @@ async function flushBatch(app) {
   try { await _doFlush(app); } catch { /* flush failures must not break */ }
 }
 
+// ponytail: parallel log+stats flush instead of sequential blocks
 async function _doFlush(app) {
-  // Flush logs: merge with existing, keep last 50
+  var logPromise = Promise.resolve();
   if (_pendingLogs.length > 0) {
     var logsToFlush = _pendingLogs.splice(0);
-    var raw = await app.kv.get(LOG_KEY, "json");
-    var existing = Array.isArray(raw) ? raw : [];
-    existing.push(...logsToFlush);
-    if (existing.length > 50) existing.splice(0, existing.length - 50);
-    await app.kv.put(LOG_KEY, JSON.stringify(existing));
+    logPromise = (async () => {
+      var raw = await app.kv.get(LOG_KEY, "json");
+      var existing = Array.isArray(raw) ? raw : [];
+      existing.push(...logsToFlush);
+      if (existing.length > 50) existing.splice(0, existing.length - 50);
+      await app.kv.put(LOG_KEY, JSON.stringify(existing));
+    })();
   }
-  // Flush stats: merge each hour bucket with KV
+  var statsPromise = Promise.resolve();
   var keys = Object.keys(_pendingStats);
   if (keys.length > 0) {
-    var writes = keys.map(async function(hourKey) {
-      var delta = _pendingStats[hourKey];
-      delete _pendingStats[hourKey];
+    var deltas = {};
+    for (var k of keys) { deltas[k] = _pendingStats[k]; delete _pendingStats[k]; }
+    statsPromise = Promise.all(keys.map(async function(hourKey) {
+      var delta = deltas[hourKey];
       var raw = await app.kv.get(STATS_PREFIX + hourKey, "json");
       var bucket = (raw && typeof raw === "object") ? raw : { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
       bucket.total += delta.total;
@@ -385,9 +390,9 @@ async function _doFlush(app) {
       for (var u in delta.upstreams) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
       for (var m in delta.models) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
       await app.kv.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
-    });
-    await Promise.all(writes);
+    }));
   }
+  await Promise.all([logPromise, statsPromise]);
 }
 
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
@@ -484,20 +489,24 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, logs: logs.reverse() }, 200));
   }
 
+  // ponytail: parallel KV reads for 24h stats instead of sequential loop
   if (apiPath === "/api/stats" && request.method === "GET") {
     await _doFlush(app);
     const now = new Date();
-    const buckets = [];
+    const hourKeys = [];
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
       const t = new Date(now.getTime() - h * 3600000);
-      const hourKey = t.getFullYear() + "-" +
+      hourKeys.push(t.getFullYear() + "-" +
         String(t.getMonth() + 1).padStart(2, "0") + "-" +
         String(t.getDate()).padStart(2, "0") + ":" +
-        String(t.getHours()).padStart(2, "0");
-      const raw = app.kv ? await app.kv.get(STATS_PREFIX + hourKey, "json") : null;
-      const bucket = (raw && typeof raw === "object") ? raw : { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
-      buckets.push({ hour: hourKey, ...bucket });
+        String(t.getHours()).padStart(2, "0"));
     }
+    const raws = app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null);
+    const empty = { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+    const buckets = hourKeys.map((hour, i) => {
+      const raw = raws[i];
+      return { hour, ...(raw && typeof raw === "object" ? raw : empty) };
+    });
     return withCorsResponse(json({ ok: true, buckets }, 200));
   }
 
@@ -523,54 +532,56 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     }
   }
 
-  // ponytail: health check - try /v1/models, fall back to minimal chat for auth-only endpoints
+// ponytail: parallel health checks instead of sequential loop
   if (apiPath === "/api/health" && request.method === "POST") {
     const runtime = await loadRuntimeConfig(app);
-    const results = [];
-    for (const upstream of runtime.upstreams) {
-      const started = Date.now();
-      try {
-        let resp = await fetchWithTimeout(
-          buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
-          { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
-          10000,
-        );
-        // If models endpoint fails with auth error, try a minimal chat completion
-        if (resp.status === 401 || resp.status === 403) {
-          resp = await fetchWithTimeout(
-            buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
-            {
-              method: "POST",
-              headers: buildUpstreamHeaders(null, upstream),
-              body: JSON.stringify({ model: "health-check", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-            },
+    const results = await Promise.all(
+      runtime.upstreams.map(async (upstream) => {
+        const started = Date.now();
+        try {
+          let resp = await fetchWithTimeout(
+            buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
+            { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
             10000,
           );
+          if (resp.status === 401 || resp.status === 403) {
+            resp = await fetchWithTimeout(
+              buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
+              {
+                method: "POST",
+                headers: buildUpstreamHeaders(null, upstream),
+                body: JSON.stringify({ model: "health-check", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+              },
+              10000,
+            );
+          }
+          const latency = Date.now() - started;
+          return { name: upstream.name, ok: resp.ok || resp.status < 500, status: resp.status, latency_ms: latency };
+        } catch (err) {
+          return { name: upstream.name, ok: false, error: err.message, latency_ms: Date.now() - started };
         }
-        const latency = Date.now() - started;
-        results.push({ name: upstream.name, ok: resp.ok || resp.status < 500, status: resp.status, latency_ms: latency });
-      } catch (err) {
-        results.push({ name: upstream.name, ok: false, error: err.message, latency_ms: Date.now() - started });
-      }
-    }
+      })
+    );
     return withCorsResponse(json({ ok: true, results }, 200));
   }
 
+// ponytail: detect uses single getEditableConfig call, not loadRuntimeConfig + getEditableConfig
   const detectMatch = apiPath.match(/^\/api\/upstreams\/([^/]+)\/detect$/);
   if (detectMatch && request.method === "POST") {
     const upstreamName = decodeURIComponent(detectMatch[1]);
-    const runtime = await loadRuntimeConfig(app);
-    const upstream = runtime.upstreams.find((u) => u.name === upstreamName);
+    const config = await getEditableConfig(app);
+    const upstream = config.upstreams.find((u) => u.name === upstreamName);
     if (!upstream) {
       return withCorsResponse(json(openAiError("Upstream not found.", "not_found_error"), 404));
     }
+    const apiKey = await decryptValue(upstream.api_key_encrypted, app.encryptionSecret);
     const started = Date.now();
     try {
       const resp = await fetchWithTimeout(
         buildUpstreamUrl(upstream.base_url, EMBEDDINGS_PATH, ""),
         {
           method: "POST",
-          headers: buildUpstreamHeaders(null, upstream),
+          headers: { "authorization": "Bearer " + apiKey, "content-type": "application/json", "accept": "application/json", "user-agent": "cf-llm-gateway/0.3" },
           body: JSON.stringify({ model: "detect", input: "test" }),
         },
         10000,
@@ -579,7 +590,6 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       const ok = resp.ok || resp.status === 400;
       const capability = ok ? "openai" : "claude";
       const paths = ok ? [CHAT_PATH, EMBEDDINGS_PATH] : [CHAT_PATH];
-      const config = await getEditableConfig(app);
       const target = config.upstreams.find((u) => u.name === upstreamName);
       if (target) {
         target.capability = capability;
@@ -724,20 +734,19 @@ function toPublicGatewayConfig(config) {
   };
 }
 
+// ponytail: derive AES key once, decrypt all upstream keys in parallel
 async function loadRuntimeConfig(app) {
   const editable = await getEditableConfig(app);
-  const upstreams = [];
+  const aesKey = await deriveAesKey(app.encryptionSecret);
 
-  for (const upstream of editable.upstreams) {
-    if (upstream.enabled === false) {
-      continue;
-    }
-
-    upstreams.push({
-      ...upstream,
-      api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret),
-    });
-  }
+  const decrypted = await Promise.all(
+    editable.upstreams
+      .filter((upstream) => upstream.enabled !== false)
+      .map(async (upstream) => ({
+        ...upstream,
+        api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
+      }))
+  );
 
   return {
     clients: app.envClients.map(normalizeClient),
@@ -747,7 +756,7 @@ async function loadRuntimeConfig(app) {
     routing: editable.routing,
     settings: editable.settings,
     upstreamCooldownTtl: editable.settings.upstream_cooldown_ttl,
-    upstreams,
+    upstreams: decrypted,
   };
 }
 
@@ -772,29 +781,25 @@ async function requireClient(request, runtime) {
   throw httpError(401, "Invalid bearer token.");
 }
 
+// ponytail: parallel upstream model fetch to avoid sequential await loop
 async function listModels(client, runtime) {
-  const rows = [];
   const seen = new Set();
 
-  for (const upstream of runtime.upstreams) {
-    if (!clientAllowsUpstream(client, upstream.name)) {
-      continue;
-    }
+  const allModels = await Promise.all(
+    runtime.upstreams
+      .filter((upstream) => clientAllowsUpstream(client, upstream.name))
+      .map(async (upstream) => {
+        const models = await getUpstreamModels(runtime, upstream);
+        return models
+          .filter((model) => model && model !== "*" && !seen.has(model) && clientAllowsModel(client, model))
+          .map((model) => {
+            seen.add(model);
+            return { id: model, object: "model", owned_by: upstream.note || upstream.name || "gateway" };
+          });
+      })
+  );
 
-    const models = await getUpstreamModels(runtime, upstream);
-    for (const model of models) {
-      if (!model || model === "*" || seen.has(model) || !clientAllowsModel(client, model)) {
-        continue;
-      }
-
-      seen.add(model);
-      rows.push({
-        id: model,
-        object: "model",
-        owned_by: upstream.note || upstream.name || "gateway",
-      });
-    }
-  }
+  const rows = allModels.flat();
 
   rows.sort((a, b) => a.id.localeCompare(b.id));
   return json(
@@ -855,17 +860,14 @@ async function getUpstreamModels(runtime, upstream) {
   }
 }
 
+// ponytail: parallel model refresh
 async function refreshModelCache(runtime) {
-  const results = [];
-
-  for (const upstream of runtime.upstreams) {
-    const models = await getFreshModels(runtime, upstream);
-    results.push({
-      model_count: models.length,
-      name: upstream.name,
-    });
-  }
-
+  const results = await Promise.all(
+    runtime.upstreams.map(async (upstream) => {
+      const models = await getFreshModels(runtime, upstream);
+      return { model_count: models.length, name: upstream.name };
+    })
+  );
   return results;
 }
 
@@ -1226,7 +1228,8 @@ async function ensureEncryptedValue(value, secret) {
   return `enc::${base64UrlEncode(joinBytes(iv, new Uint8Array(cipher)))}`;
 }
 
-async function decryptValue(value, secret) {
+// ponytail: decryptValue accepts optional pre-derived AES key to avoid per-upstream re-derivation
+async function decryptValue(value, secret, preDerivedKey) {
   if (!value) {
     return "";
   }
@@ -1238,7 +1241,7 @@ async function decryptValue(value, secret) {
   const raw = base64UrlDecode(value.slice("enc::".length));
   const iv = raw.slice(0, 12);
   const payload = raw.slice(12);
-  const key = await deriveAesKey(secret);
+  const key = preDerivedKey || (await deriveAesKey(secret));
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, payload);
   return new TextDecoder().decode(plain);
 }
@@ -1929,7 +1932,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-streamproxy ·
+    v26-07-02-perfops ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
