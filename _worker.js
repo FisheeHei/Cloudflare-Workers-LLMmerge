@@ -6,10 +6,12 @@ const HTML_HEADERS = {
   "content-type": "text/html; charset=utf-8",
 };
 
+// ponytail: add max-age so browsers cache preflight for 1h (fewer round-trips)
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
   "access-control-allow-headers": "authorization,content-type,x-admin-token",
+  "access-control-max-age": "3600",
 };
 
 const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
@@ -105,7 +107,10 @@ export default {
       if (pathname === MODEL_PATH && request.method === "GET") {
         const runtime = await loadRuntimeConfig(app);
         const client = await requireClient(request, runtime);
-        return withCorsResponse(await listModels(client, runtime));
+        const res = await listModels(client, runtime);
+        const hdrs = new Headers(res.headers);
+        hdrs.set("cache-control", "public, max-age=30");
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers: hdrs });
       }
 
       if (
@@ -294,15 +299,20 @@ export default {
   },
 };
 
+// ponytail: cache createApp result per-isolate since env is stable across requests
+var _cachedApp = null;
+var _cachedEnvRef = null;
+
 function createApp(env) {
+  if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
   const adminToken = pickAdminToken(env);
 
   if (!/^[A-Za-z0-9._~-]+$/.test(adminToken)) {
     throw badConfig("ADMIN_TOKEN may only contain URL-safe characters.");
   }
 
-  return {
-    adminPath: `/${adminToken}`,
+  _cachedApp = {
+    adminPath: "/" + adminToken,
     adminPaths: buildAdminPathAliases(adminToken),
     adminToken,
     defaultCooldownTtl: parsePositiveInt(env.UPSTREAM_COOLDOWN_TTL, DEFAULT_COOLDOWN_TTL),
@@ -314,6 +324,8 @@ function createApp(env) {
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
     kv: env.KV || null,
   };
+  _cachedEnvRef = env;
+  return _cachedApp;
 }
 
 // ponytail: in-memory batch for stats + logs, flush every 90s to KV
@@ -677,8 +689,8 @@ async function normalizeGatewayConfigPayload(payload, app) {
     const item = upstreamEntries[index];
     if (!item || typeof item !== "object") continue;
 
-    const preset = presetById(item.preset) ? item.preset : "generic-openai";
-    const defaults = presetById(preset) || presetById("generic-openai");
+    const preset = presetById(item.preset) ? item.preset : "custom";
+    const defaults = presetById(preset) || presetById("custom");
     const apiKeyValue = String(item.api_key_value || item.api_key_encrypted || item.api_key || "").trim();
     const name = String(item.name || `upstream-${index + 1}`).trim();
     const baseUrl = resolveBaseUrl(preset, item.base_url, defaults.base_url);
@@ -760,21 +772,44 @@ async function loadRuntimeConfig(app) {
   };
 }
 
+// ponytail: LRU cache per-isolate for client tokens — saves KV read every proxy request
+var _clientCache = {};
+var _clientCacheTs = {};
+var CLIENT_CACHE_TTL_MS = 60000;
+
 async function requireClient(request, runtime) {
   const token = getBearerToken(request);
   if (!token) {
     throw httpError(401, "Missing bearer token.");
   }
 
+  // ponytail: hit in-memory cache if fresh (<60s)
+  var cached = _clientCache[token];
+  if (cached && (Date.now() - (_clientCacheTs[token] || 0)) < CLIENT_CACHE_TTL_MS) {
+    return cached;
+  }
+
   if (runtime.kv) {
     const kvClient = await runtime.kv.get(clientTokenKey(token), "json");
     if (kvClient?.key) {
-      return normalizeClient(kvClient);
+      var nc = normalizeClient(kvClient);
+      _clientCache[token] = nc;
+      _clientCacheTs[token] = Date.now();
+      // ponytail: keep cache small, max 50 entries
+      var keys = Object.keys(_clientCache);
+      if (keys.length > 50) {
+        var oldest = keys.reduce(function(a, b) { return _clientCacheTs[a] < _clientCacheTs[b] ? a : b; });
+        delete _clientCache[oldest];
+        delete _clientCacheTs[oldest];
+      }
+      return nc;
     }
   }
 
   const staticClient = runtime.clients.find((item) => item.key === token);
   if (staticClient) {
+    _clientCache[token] = staticClient;
+    _clientCacheTs[token] = Date.now();
     return staticClient;
   }
 
@@ -1525,18 +1560,19 @@ function mapErrorType(statusCode) {
   return "server_error";
 }
 
+// ponytail: no pretty-print, smaller wire size for large responses
 function json(payload, status) {
-  return new Response(JSON.stringify(payload, null, 2), {
+  return new Response(JSON.stringify(payload), {
     status,
     headers: JSON_HEADERS,
   });
 }
 
+// ponytail: no-store on dynamic admin page to prevent stale cache
 function html(markup, status = 200) {
-  return new Response(markup, {
-    status,
-    headers: HTML_HEADERS,
-  });
+  const h = new Headers(HTML_HEADERS);
+  h.set("cache-control", "no-store");
+  return new Response(markup, { status, headers: h });
 }
 
 function withCorsResponse(response) {
@@ -1545,24 +1581,6 @@ function withCorsResponse(response) {
   for (const [key, value] of Object.entries(CORS_HEADERS)) {
     headers.set(key, value);
   }
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
-function withGatewayHeaders(response, meta) {
-  const headers = new Headers(response.headers);
-
-  for (const [key, value] of Object.entries(CORS_HEADERS)) {
-    headers.set(key, value);
-  }
-
-  headers.set("x-llm-gateway-upstream", meta.upstream);
-  headers.set("x-llm-gateway-client", meta.client);
-  headers.set("x-llm-gateway-attempts", String(meta.attempts));
 
   return new Response(response.body, {
     status: response.status,
@@ -1581,43 +1599,9 @@ function badConfig(message) {
   return httpError(500, message);
 }
 
+// ponytail: minimal nginx decoy — just enough to look real, ~60% smaller
 function renderNginxWelcomePage() {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Welcome to nginx!</title>
-  <style>
-    :root { color-scheme: light; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      background: #f5f7fa;
-      color: #111827;
-      font: 16px/1.6 Georgia, "Times New Roman", serif;
-    }
-    main {
-      width: min(720px, calc(100vw - 32px));
-      background: white;
-      border: 1px solid #d1d5db;
-      box-shadow: 0 18px 50px rgba(0,0,0,.08);
-      padding: 32px;
-    }
-    h1 { margin: 0 0 16px; font-weight: 700; }
-    p { margin: 0 0 12px; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Welcome to nginx!</h1>
-    <p>If you see this page, the web server is successfully installed and working.</p>
-    <p>Further configuration is required.</p>
-  </main>
-</body>
-</html>`;
+  return "<!doctype html><html lang=en><head><meta charset=utf-8><title>Welcome to nginx!</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7fa;color:#111827;font:16px/1.6 Georgia,serif}main{width:min(600px,calc(100vw - 32px));background:#fff;border:1px solid #d1d5db;padding:32px}h1{margin:0 0 16px}p{margin:0 0 12px}</style></head><body><main><h1>Welcome to nginx!</h1><p>If you see this page, the web server is successfully installed and working.</p><p>Further configuration is required.</p></main></body></html>";
 }
 
 function renderAdminPage() {
@@ -1636,6 +1620,8 @@ function renderAdminPage() {
       --line: #d7c7aa;
       --accent: #a54d2d;
       --accent-2: #2f6f5e;
+      --bg-raised: #fff9ef;
+      --fg: #1f2937;
     }
     * { box-sizing: border-box; }
     body {
@@ -1643,7 +1629,7 @@ function renderAdminPage() {
       background: radial-gradient(circle at top left, rgba(165,77,45,.18), transparent 28%),
                   linear-gradient(180deg, #efe5d2 0%, var(--bg) 42%, #f8f4ec 100%);
       color: var(--ink);
-      font: 15px/1.5 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font: 15px/1.5 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
     }
     .wrap { width: min(960px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 48px; }
 
@@ -1655,7 +1641,7 @@ function renderAdminPage() {
       margin-bottom: 18px;
     }
     .hero { padding: 24px; }
-    .hero h1 { margin: 0 0 10px; font: 700 30px/1.15 Georgia, "Times New Roman", serif; }
+    .hero h1 { margin: 0 0 10px; font: 700 30px/1.15 Georgia, serif; }
     .hero-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .hero code {
       background: #f2e7d3; padding: 4px 10px; border-radius: 8px;
@@ -1671,7 +1657,7 @@ function renderAdminPage() {
     .url-card code { display: block; margin-bottom: 8px; }
     .url-card button { margin-right: 6px; }
     .panel { padding: 20px; }
-    .panel h2 { margin: 0 0 14px; font: 700 20px/1.2 Georgia, "Times New Roman", serif; }
+    .panel h2 { margin: 0 0 14px; font: 700 20px/1.2 Georgia, serif; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -1680,7 +1666,7 @@ function renderAdminPage() {
       border: 0; border-radius: 999px; padding: 9px 16px;
       font: 600 13px/1.1 inherit; cursor: pointer;
       background: var(--accent); color: white;
-      transition: transform .16s ease, opacity .16s ease;
+      transition: transform .16s,opacity .16s;
     }
     button:hover { filter: brightness(1.06); }
     button:active { transform: translateY(1px); }
@@ -1696,7 +1682,7 @@ function renderAdminPage() {
     }
     textarea { min-height: 72px; resize: vertical; }
     .note { color: var(--muted); font-size: 13px; }
-    .mono { font-family: "Cascadia Code", "Fira Code", Consolas, monospace; font-size: 13px; }
+    .mono { font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 13px; }
 
     .row { display: grid; gap: 12px; grid-template-columns: repeat(12, 1fr); margin-bottom: 10px; }
     .field { display: flex; flex-direction: column; gap: 5px; }
@@ -1758,7 +1744,7 @@ function renderAdminPage() {
     }
     .key-output pre {
       margin: 0 0 8px; font-size: 13px; word-break: break-all; white-space: pre-wrap;
-      font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+      font-family: "Cascadia Code","Fira Code",Consolas,monospace;
     }
     .key-output .key-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
@@ -1786,7 +1772,7 @@ function renderAdminPage() {
       background: #fffaf2; border: 1px solid #cfbea0;
       border-radius: 24px; padding: 20px; box-shadow: 0 26px 60px rgba(0,0,0,.18);
     }
-    .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, "Times New Roman", serif; }
+    .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, serif; }
     .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
 
     #toast {
@@ -1801,7 +1787,6 @@ function renderAdminPage() {
     .log-table { width: 100%; border-collapse: collapse; font-size: 13px; }
     .log-table th, .log-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line); }
     .log-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
-    .log-table .mono { font-size: 12px; }
     .log-table .ok { color: var(--accent-2); }
     .log-table .err { color: #8d2f23; }
     .chart-bar { display: flex; align-items: flex-end; gap: 2px; height: 110px; padding: 4px 0; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
@@ -1809,8 +1794,7 @@ function renderAdminPage() {
     .chart-bar .bar.fail { background: #8d2f23; }
     .chart-bar .bar::after { content: attr(data-h); position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 9px; color: var(--muted); }
     .chart-bar .bar:nth-child(6n)::after { display: block; }
-    .chart-label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 8px 0 2px; }
-    .chart-label:first-of-type { margin-top: 0; }
+    .chart-label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 8px 0 2px; } .chart-label:first-of-type { margin-top: 0; }
     .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
     .stats-grid-2col { grid-template-columns: repeat(2, 1fr); }
     .stat-box { background: var(--bg-raised); border-radius: 8px; padding: 10px 12px; text-align: center; }
@@ -1932,7 +1916,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-perfops ·
+    v26-07-02-streamline ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
@@ -2091,7 +2075,7 @@ function renderAdminPage() {
           '<span class="card-badge">' + esc(badge) + '</span>' +
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
-          (item.preset === "custom" || item.preset === "generic-openai" || item.preset === "claude-openai" ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
+          (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u2713' : '\u2717') + '</span>' +
         '</summary>' +
         '<div class="card-body">' +
@@ -2114,7 +2098,7 @@ function renderAdminPage() {
             '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea><button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:4px">\u4ece\u4e0a\u6e38\u5bfc\u5165\u6a21\u578b</button></div>' +
           '</div>' +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
-          (item.preset === "custom" || item.preset === "generic-openai" || item.preset === "claude-openai" ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
+          (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
         '</div>' +
       '</details>';
     }).join("");
@@ -2318,15 +2302,16 @@ function renderAdminPage() {
     if (!resp.ok) throw new Error(payload?.error?.message || "读取统计失败");
     const buckets = payload.buckets || [];
 
-    // Build 24h skeleton
+    // ponytail: build 24h skeleton from server buckets (handles cross-day correctly)
     var now = new Date();
     var pad2 = function(n) { return String(n).padStart(2, "0"); };
-    var today = now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate());
+    var bucketMap = {};
+    buckets.forEach(function(b) { bucketMap[b.hour] = b; });
     var skeleton = [];
-    for (var h = 0; h < 24; h++) {
-      var key = today + ":" + pad2(h);
-      var hit = buckets.find(function(b) { return b.hour === key; });
-      skeleton.push(hit || { hour: key, total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, models: {} });
+    for (var h = 23; h >= 0; h--) {
+      var t = new Date(now.getTime() - h * 3600000);
+      var key = t.getFullYear() + "-" + pad2(t.getMonth() + 1) + "-" + pad2(t.getDate()) + ":" + pad2(t.getHours());
+      skeleton.push(bucketMap[key] || { hour: key, total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, models: {} });
     }
 
     // Aggregate totals
@@ -2554,11 +2539,19 @@ function renderAdminPage() {
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", loadLogs).catch(showError)
       );
 
-      await loadConfig();
-      await loadClients();
+      // ponytail: parallel boot — config + clients fetch together
+      await Promise.all([loadConfig(), loadClients()]);
       loadStats().catch(function(){}); // ponytail: don't block boot on stats
       loadLogs().catch(function(){});  // don't block on logs either
-      setInterval(function() { loadStats().catch(function(){}); loadLogs().catch(function(){}); }, 30000);
+      // ponytail: only auto-refresh when stats panel is visible (save KV reads)
+      var statsPanel = byId("stats-panel");
+      var logPanel = byId("log-panel");
+      setInterval(function() {
+        var statsVisible = !statsPanel || statsPanel.offsetParent !== null;
+        var logVisible = !logPanel || logPanel.offsetParent !== null;
+        if (statsVisible) loadStats().catch(function(){});
+        if (logVisible) loadLogs().catch(function(){});
+      }, 30000);
 
 
     } catch (error) { showError(error); }
