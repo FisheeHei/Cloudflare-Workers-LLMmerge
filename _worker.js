@@ -97,7 +97,7 @@ export default {
       }
 
       if (request.method === "GET" && adminRoute?.kind === "page") {
-        return html(renderAdminPage());
+        return html(renderAdminPage(url.origin));
       }
 
       if (adminRoute?.kind === "api") {
@@ -1601,7 +1601,8 @@ function renderNginxWelcomePage() {
   return "<!doctype html><html lang=en><head><meta charset=utf-8><title>Welcome to nginx!</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7fa;color:#111827;font:16px/1.6 Georgia,serif}main{width:min(600px,calc(100vw - 32px));background:#fff;border:1px solid #d1d5db;padding:32px}h1{margin:0 0 16px}p{margin:0 0 12px}</style></head><body><main><h1>Welcome to nginx!</h1><p>If you see this page, the web server is successfully installed and working.</p><p>Further configuration is required.</p></main></body></html>";
 }
 
-function renderAdminPage() {
+// ponytail: origin param lets us pre-fill gateway URL server-side (no API wait)
+function renderAdminPage(origin) {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1811,7 +1812,7 @@ function renderAdminPage() {
     <div class="gateway-urls">
       <div class="url-card">
         <div class="url-card-head">Gateway URL <span class="note">(OpenAI + Claude Compatible)</span></div>
-        <code id="gateway-url-pill">loading...</code>
+        <code id="gateway-url-pill">${origin}/v1</code>
         <button class="small secondary" id="copy-gateway-url">\u590d\u5236</button>
       </div>
     </div>
@@ -1913,7 +1914,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-polish ·
+    v26-07-02-instant ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
@@ -2548,7 +2549,7 @@ function renderAdminPage() {
         var logVisible = !logPanel || logPanel.offsetParent !== null;
         if (statsVisible) loadStats().catch(function(){});
         if (logVisible) loadLogs().catch(function(){});
-      }, 30000);
+      }, 120000); // ponytail: 2min auto-refresh to save KV quota
 
 
     } catch (error) { showError(error); }
