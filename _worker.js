@@ -49,6 +49,13 @@ const PRESET_TEMPLATES = [
     requires_base_url: false,
   },
   {
+    id: "deepseek",
+    name: "DeepSeek",
+    base_url: "https://api.deepseek.com/v1",
+    paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: false,
+  },
+  {
     id: "custom",
     name: "\u81ea\u5b9a\u4e49",
     base_url: "",
@@ -1909,7 +1916,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-sessiontok ·
+    v26-07-02-deepseek ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
