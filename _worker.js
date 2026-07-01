@@ -1716,6 +1716,20 @@ function renderAdminPage() {
     .log-table .mono { font-size: 12px; }
     .log-table .ok { color: var(--accent-2); }
     .log-table .err { color: #8d2f23; }
+    .chart-bar { display: flex; align-items: flex-end; gap: 2px; height: 110px; padding: 4px 0; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
+    .chart-bar .bar { flex: 1; min-width: 8px; background: var(--accent); border-radius: 2px 2px 0 0; position: relative; cursor: default; }
+    .chart-bar .bar.fail { background: #8d2f23; }
+    .chart-bar .bar::after { content: attr(data-h); position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 9px; color: var(--muted); }
+    .chart-bar .bar:nth-child(6n)::after { display: block; }
+    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .stat-box { background: var(--bg-raised); border-radius: 8px; padding: 10px 12px; text-align: center; }
+    .stat-num { display: block; font-size: 22px; font-weight: 700; color: var(--fg); }
+    .stat-label { font-size: 11px; color: var(--muted); }
+    .live-log { max-height: 200px; overflow-y: auto; }
+    .log-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .log-badge { display: inline-block; width: 28px; text-align: center; border-radius: 4px; font-size: 11px; font-weight: 700; padding: 2px 0; }
+    .log-badge.ok { background: #065f4620; color: var(--accent-2); }
+    .log-badge.err { background: #8d2f2320; color: #8d2f23; }
   </style>
 </head>
 <body>
@@ -2151,6 +2165,12 @@ function renderAdminPage() {
     byId("stat-success").textContent = success;
     byId("stat-fail").textContent = fail;
     byId("stat-tokens").textContent = (pt + ct).toLocaleString();
+    // show last model from highest-hour bucket with activity
+    var lastBucket = skeleton.slice().reverse().find(function(b) { return b.total > 0; });
+    if (lastBucket && lastBucket.models) {
+      var topModel = Object.entries(lastBucket.models).sort(function(a,b){return b[1]-a[1];})[0];
+      byId("stat-current-model").textContent = topModel ? topModel[0] : "";
+    }
 
     // Bar chart - always show 24h grid, zero-fill missing hours
     var now = new Date();
@@ -2158,7 +2178,7 @@ function renderAdminPage() {
     var today = now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate());
     var skeleton = [];
     for (var h = 0; h < 24; h++) {
-      var key = today + "T" + pad2(h);
+      var key = today + ":" + pad2(h);
       var hit = buckets.find(function(b) { return b.hour === key; });
       skeleton.push(hit || { hour: key, total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0 });
     }
@@ -2166,7 +2186,16 @@ function renderAdminPage() {
     skeleton.forEach(function(b) { if (b.total > maxVal) maxVal = b.total; });
     byId("chart-requests").innerHTML = skeleton.map(function(b) {
       var h = Math.max(2, Math.round(b.total / maxVal * 100));
-      return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + h + 'px" title="' + b.hour + ': ' + b.total + ' req, ' + (b.prompt_tokens + b.completion_tokens) + ' tokens"></div>';
+      var hourLabel = b.hour.slice(-2);
+      var cls = b.fail > 0 && b.success === 0 ? ' fail' : '';
+      var seg = '';
+      if (b.total > 0) {
+        var okH = Math.max(1, Math.round(b.success / b.total * h));
+        var failH = h - okH;
+        seg = '<div style="height:' + okH + 'px;background:var(--accent);border-radius:2px 2px 0 0"></div>';
+        if (failH > 0) seg += '<div style="height:' + failH + 'px;background:#8d2f23;border-radius:0"></div>';
+      }
+      return '<div class="bar' + cls + '" style="height:' + h + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + hourLabel + '" title="' + b.hour + ': ' + b.success + '/' + b.total + ' ok, ' + (b.prompt_tokens + b.completion_tokens) + ' tokens">' + seg + '</div>';
     }).join("");
 
     showToast("\u7edf\u8ba1\u5df2\u52a0\u8f7d");
