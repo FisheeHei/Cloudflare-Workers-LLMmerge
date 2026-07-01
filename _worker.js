@@ -545,20 +545,32 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     }
   }
 
-  // ponytail: health check only verifies connectivity, does not parse model list.
+  // ponytail: health check - try /v1/models, fall back to minimal chat for auth-only endpoints
   if (apiPath === "/api/health" && request.method === "POST") {
     const runtime = await loadRuntimeConfig(app);
     const results = [];
     for (const upstream of runtime.upstreams) {
       const started = Date.now();
       try {
-        const resp = await fetchWithTimeout(
+        let resp = await fetchWithTimeout(
           buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
           { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
           10000,
         );
+        // If models endpoint fails with auth error, try a minimal chat completion
+        if (resp.status === 401 || resp.status === 403) {
+          resp = await fetchWithTimeout(
+            buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
+            {
+              method: "POST",
+              headers: buildUpstreamHeaders(null, upstream),
+              body: JSON.stringify({ model: "health-check", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+            },
+            10000,
+          );
+        }
         const latency = Date.now() - started;
-        results.push({ name: upstream.name, ok: resp.ok, status: resp.status, latency_ms: latency });
+        results.push({ name: upstream.name, ok: resp.ok || resp.status < 500, status: resp.status, latency_ms: latency });
       } catch (err) {
         results.push({ name: upstream.name, ok: false, error: err.message, latency_ms: Date.now() - started });
       }
