@@ -26,6 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
+const VERSION = "v26-07-02-instant";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -97,7 +98,15 @@ export default {
       }
 
       if (request.method === "GET" && adminRoute?.kind === "page") {
-        return html(renderAdminPage(url.origin));
+        // ponytail: ETag-based conditional request — CDN caches, revalidates with 304
+        var inm = request.headers.get("if-none-match") || ""; if (inm.includes(VERSION)) {
+          return new Response(null, { status: 304, headers: { etag: '"'+VERSION+'"', "cache-control": "public, max-age=0, must-revalidate" } });
+        }
+        const pageBody = renderAdminPage(url.origin);
+        const pageHdrs = new Headers(HTML_HEADERS);
+        pageHdrs.set("cache-control", "public, max-age=0, must-revalidate");
+        pageHdrs.set("etag", '"'+VERSION+'"');
+        return new Response(pageBody, { status: 200, headers: pageHdrs });
       }
 
       if (adminRoute?.kind === "api") {
@@ -1566,9 +1575,10 @@ function json(payload, status) {
 }
 
 // ponytail: no-store on dynamic admin page to prevent stale cache
+// ponytail: allow CDN cache with ETag revalidation (admin HTML is static, data loaded by JS)
 function html(markup, status = 200) {
   const h = new Headers(HTML_HEADERS);
-  h.set("cache-control", "no-store");
+  h.set("cache-control", "public, max-age=86400");
   return new Response(markup, { status, headers: h });
 }
 
@@ -1914,7 +1924,7 @@ function renderAdminPage(origin) {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-instant ·
+    ${VERSION} ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
