@@ -138,6 +138,35 @@ export default {
         const usagePayload = (() => { try { return JSON.parse(respBody); } catch { return {}; } })();
         const usage = usagePayload.usage || {};
         const loggedStatus = upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502);
+        // ponytail: estimate tokens if upstream omits usage (1 token ~ 4 chars)
+        var pt = usage.prompt_tokens || 0;
+        var ct = usage.completion_tokens || 0;
+        if (!pt && !ct && upstreamResp.ok) {
+          try {
+            var reqObj = JSON.parse(cleanedBody);
+            var reqChars = JSON.stringify(reqObj.messages || []).length;
+            pt = Math.max(1, Math.round(reqChars / 4));
+            // try normal response first, then scan SSE stream for content
+            var respChoice = (usagePayload.choices || [])[0] || {};
+            var respChars = 0;
+            if ((respChoice.message || {}).content) {
+              respChars = respChoice.message.content.length;
+            } else if (respBody.includes("data:")) {
+              // ponytail: extract content from SSE chunks
+              var contents = [];
+              respBody.split("\n").forEach(function(line) {
+                if (!line.startsWith("data: ") || line === "data: [DONE]") return;
+                try {
+                  var chunk = JSON.parse(line.slice(6));
+                  var delta = ((chunk.choices || [])[0] || {}).delta || {};
+                  if (delta.content) contents.push(delta.content);
+                } catch {}
+              });
+              respChars = contents.join("").length;
+            }
+            ct = Math.max(1, Math.round(respChars / 4));
+          } catch { pt = 1; ct = 1; }
+        }
         const logEntry = {
           ts: new Date().toISOString(),
           client: client.name || client.id || "client",
@@ -146,8 +175,8 @@ export default {
           path: pathname,
           status: loggedStatus,
           latency_ms: Date.now() - started,
-          prompt_tokens: usage.prompt_tokens || 0,
-          completion_tokens: usage.completion_tokens || 0,
+          prompt_tokens: pt,
+          completion_tokens: ct,
         };
         appendLog(app, logEntry);
         recordStats(app, logEntry);
