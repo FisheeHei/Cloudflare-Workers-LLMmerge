@@ -376,7 +376,9 @@ function recordStats(app, entry) {
 async function flushBatch(app) {
   if (!app.kv) return;
   var now = Date.now();
-  if (now - _lastFlush < FLUSH_INTERVAL_MS) return;
+  // ponytail: flush if 90s passed OR 3+ items accumulated
+  var pendingCount = Object.keys(_pendingStats).length + _pendingLogs.length;
+  if (now - _lastFlush < FLUSH_INTERVAL_MS && pendingCount < 3) return;
   _lastFlush = now;
   try { await _doFlush(app); } catch { /* flush failures must not break */ }
 }
