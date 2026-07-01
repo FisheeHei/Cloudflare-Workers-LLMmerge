@@ -1909,7 +1909,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-01-batchstats ·
+    v26-07-02-sessiontok ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
