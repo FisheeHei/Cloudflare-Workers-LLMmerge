@@ -1831,8 +1831,12 @@ function renderAdminPage() {
     <div class="chart-label">Tokens</div>
     <div class="chart-bar" id="chart-tokens"></div>
     <div class="stats-grid stats-grid-2col">
-      <div class="stat-box"><span class="stat-num" id="stat-pt">-</span><span class="stat-label">Input Tokens</span></div>
-      <div class="stat-box"><span class="stat-num" id="stat-ct">-</span><span class="stat-label">Output Tokens</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-pt">-</span><span class="stat-label">Input</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-ct">-</span><span class="stat-label">Output</span></div>
+    </div>
+    <div class="stats-grid stats-grid-2col" style="margin-top:4px">
+      <div class="stat-box"><span class="stat-num" id="stat-pt-session">0</span><span class="stat-label">会话 Input</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-ct-session">0</span><span class="stat-label">会话 Output</span></div>
     </div>
   </div>
 
@@ -1942,7 +1946,7 @@ function renderAdminPage() {
 
 <script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0 };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
@@ -2255,6 +2259,11 @@ function renderAdminPage() {
     byId("stat-fail").textContent = fail;
     byId("stat-pt").textContent = pt.toLocaleString();
     byId("stat-ct").textContent = ct.toLocaleString();
+    // ponytail: track session cumulative (what this page load has seen)
+    state.sessionInputTokens = Math.max(state.sessionInputTokens, pt);
+    state.sessionOutputTokens = Math.max(state.sessionOutputTokens, ct);
+    byId("stat-pt-session").textContent = state.sessionInputTokens.toLocaleString();
+    byId("stat-ct-session").textContent = state.sessionOutputTokens.toLocaleString();
 
     // Last model
     var lastBucket = skeleton.slice().reverse().find(function(b) { return b.total > 0; });
