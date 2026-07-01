@@ -147,13 +147,9 @@ export default {
         // ponytail: stream response directly, log with estimates to avoid blocking
         const upstreamResp = proxyResponse.response;
         const loggedStatus = upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502);
-        // ponytail: estimate input tokens from already-parsed payload (no re-parse)
-        var pt = 0; var ct = 0;
-        try {
-          var reqChars = JSON.stringify(payload.messages || []).length;
-          pt = Math.max(1, Math.round(reqChars / 4));
-          ct = 1;
-        } catch { pt = 1; ct = 1; }
+        // ponytail: estimate input tokens from already-serialized body (no extra stringify)
+        var pt = Math.max(1, Math.round(cleanedBody.length / 4));
+        var ct = 1;
         const logEntry = {
           ts: new Date().toISOString(),
           client: client.name || client.id || "client",
@@ -816,25 +812,26 @@ async function requireClient(request, runtime) {
   throw httpError(401, "Invalid bearer token.");
 }
 
-// ponytail: parallel upstream model fetch to avoid sequential await loop
+// ponytail: parallel fetch, then deduplicate (avoids race condition in concurrent seen.add)
 async function listModels(client, runtime) {
-  const seen = new Set();
-
-  const allModels = await Promise.all(
+  const allResults = await Promise.all(
     runtime.upstreams
       .filter((upstream) => clientAllowsUpstream(client, upstream.name))
       .map(async (upstream) => {
         const models = await getUpstreamModels(runtime, upstream);
         return models
-          .filter((model) => model && model !== "*" && !seen.has(model) && clientAllowsModel(client, model))
-          .map((model) => {
-            seen.add(model);
-            return { id: model, object: "model", owned_by: upstream.note || upstream.name || "gateway" };
-          });
+          .filter((model) => model && model !== "*" && clientAllowsModel(client, model))
+          .map((model) => ({ id: model, object: "model", owned_by: upstream.note || upstream.name || "gateway" }));
       })
   );
 
-  const rows = allModels.flat();
+  const seen = new Set();
+  const rows = [];
+  for (const group of allResults) {
+    for (const row of group) {
+      if (!seen.has(row.id)) { seen.add(row.id); rows.push(row); }
+    }
+  }
 
   rows.sort((a, b) => a.id.localeCompare(b.id));
   return json(
@@ -1916,7 +1913,7 @@ function renderAdminPage() {
   </div>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    v26-07-02-streamline ·
+    v26-07-02-polish ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
