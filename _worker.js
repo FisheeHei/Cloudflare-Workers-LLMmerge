@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-fix";
+const VERSION = "v26-07-02-stats-last-model";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -336,8 +336,9 @@ function createApp(env) {
 // ponytail: in-memory batch for stats + logs, flush every 90s to KV
 var _pendingLogs = [];
 var _pendingStats = {}; // hourKey -> bucket
-var _lastFlush = 0;
-var FLUSH_INTERVAL_MS = 90000;
+var _lastFlush = Date.now();
+var FLUSH_INTERVAL_MS = 15 * 60 * 1000;
+var FLUSH_PENDING_LIMIT = 200;
 
 // ponytail: appendLog just pushes; caller calls flushBatch after log+stats
 function appendLog(app, entry) {
@@ -352,27 +353,17 @@ function recordStats(app, entry) {
     String(now.getDate()).padStart(2, "0") + ":" +
     String(now.getHours()).padStart(2, "0");
   if (!_pendingStats[hour]) {
-    _pendingStats[hour] = { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+    _pendingStats[hour] = emptyStatsBucket();
   }
-  var b = _pendingStats[hour];
-  b.total += 1;
-  if (entry.status >= 200 && entry.status < 400) b.success += 1;
-  else b.fail += 1;
-  b.prompt_tokens += entry.prompt_tokens || 0;
-  b.completion_tokens += entry.completion_tokens || 0;
-  var up = entry.upstream || "unknown";
-  b.upstreams[up] = (b.upstreams[up] || 0) + 1;
-  var mdl = entry.model || "unknown";
-  b.models[mdl] = (b.models[mdl] || 0) + 1;
+  addStatsEntry(_pendingStats[hour], entry);
   flushBatch(app);
 }
 
 async function flushBatch(app) {
   if (!app.kv) return;
   var now = Date.now();
-  // ponytail: flush if 90s passed OR 3+ items accumulated
-  var pendingCount = Object.keys(_pendingStats).length + _pendingLogs.length;
-  if (now - _lastFlush < FLUSH_INTERVAL_MS && pendingCount < 3) return;
+  // ponytail: Free KV has tight write limits; dashboard reads merge pending memory instead.
+  if (now - _lastFlush < FLUSH_INTERVAL_MS && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
   _lastFlush = now;
   try { await _doFlush(app); } catch { /* flush failures must not break */ }
 }
@@ -398,18 +389,53 @@ async function _doFlush(app) {
     statsPromise = Promise.all(keys.map(async function(hourKey) {
       var delta = deltas[hourKey];
       var raw = await app.kv.get(STATS_PREFIX + hourKey, "json");
-      var bucket = (raw && typeof raw === "object") ? raw : { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
-      bucket.total += delta.total;
-      bucket.success += delta.success;
-      bucket.fail += delta.fail;
-      bucket.prompt_tokens += delta.prompt_tokens;
-      bucket.completion_tokens += delta.completion_tokens;
-      for (var u in delta.upstreams) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
-      for (var m in delta.models) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
+      var bucket = mergeStatsBucket(raw, delta);
       await app.kv.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
     }));
   }
   await Promise.all([logPromise, statsPromise]);
+}
+
+function emptyStatsBucket() {
+  return { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+}
+
+function addStatsEntry(bucket, entry) {
+  bucket.total += 1;
+  if (entry.status >= 200 && entry.status < 400) bucket.success += 1;
+  else bucket.fail += 1;
+  bucket.prompt_tokens += entry.prompt_tokens || 0;
+  bucket.completion_tokens += entry.completion_tokens || 0;
+  var up = entry.upstream || "unknown";
+  bucket.upstreams[up] = (bucket.upstreams[up] || 0) + 1;
+  var mdl = entry.model || "unknown";
+  bucket.models[mdl] = (bucket.models[mdl] || 0) + 1;
+}
+
+function mergeStatsBucket(base, delta) {
+  var bucket = (base && typeof base === "object") ? {
+    total: base.total || 0,
+    success: base.success || 0,
+    fail: base.fail || 0,
+    prompt_tokens: base.prompt_tokens || 0,
+    completion_tokens: base.completion_tokens || 0,
+    upstreams: { ...(base.upstreams || {}) },
+    models: { ...(base.models || {}) },
+  } : emptyStatsBucket();
+  if (!delta || typeof delta !== "object") return bucket;
+  bucket.total += delta.total || 0;
+  bucket.success += delta.success || 0;
+  bucket.fail += delta.fail || 0;
+  bucket.prompt_tokens += delta.prompt_tokens || 0;
+  bucket.completion_tokens += delta.completion_tokens || 0;
+  for (var u in (delta.upstreams || {})) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
+  for (var m in (delta.models || {})) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
+  return bucket;
+}
+
+async function getMergedLogs(app) {
+  const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
+  return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse();
 }
 
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
@@ -500,15 +526,12 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/logs" && request.method === "GET") {
-    await _doFlush(app);
-    const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
-    const logs = Array.isArray(raw) ? raw : [];
-    return withCorsResponse(json({ ok: true, logs: logs.reverse() }, 200));
+    const logs = await getMergedLogs(app);
+    return withCorsResponse(json({ ok: true, logs }, 200));
   }
 
   // ponytail: parallel KV reads for 24h stats instead of sequential loop
   if (apiPath === "/api/stats" && request.method === "GET") {
-    await _doFlush(app);
     const now = new Date();
     const hourKeys = [];
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
@@ -519,12 +542,12 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
         String(t.getHours()).padStart(2, "0"));
     }
     const raws = app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null);
-    const empty = { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+    const logs = await getMergedLogs(app);
     const buckets = hourKeys.map((hour, i) => {
       const raw = raws[i];
-      return { hour, ...(raw && typeof raw === "object" ? raw : empty) };
+      return { hour, ...mergeStatsBucket(raw, _pendingStats[hour]) };
     });
-    return withCorsResponse(json({ ok: true, buckets }, 200));
+    return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "" }, 200));
   }
 
       // ponytail: fetch model list from a specific upstream for picker
@@ -986,7 +1009,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         {
           method: request.method,
           headers: buildUpstreamHeaders(request, upstream),
-          body: bodyText,
+          body: sanitizeProxyBody(bodyText, upstream),
         },
         runtime.requestTimeoutMs,
       );
@@ -1106,6 +1129,49 @@ function buildUpstreamUrl(baseUrl, pathname, search) {
   }
 
   return `${base}${path}${search}`;
+}
+
+function sanitizeProxyBody(bodyText, upstream) {
+  if (!bodyText) return bodyText;
+
+  let payload;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch {
+    return bodyText;
+  }
+
+  let changed = false;
+  if ("thinking" in payload) {
+    delete payload.thinking;
+    changed = true;
+  }
+
+  const baseUrl = String(upstream.base_url || "").toLowerCase();
+  const isNvidia = baseUrl.includes("integrate.api.nvidia.com");
+  if (!isNvidia) return changed ? JSON.stringify(payload) : bodyText;
+
+  if ("reasoning_split" in payload) {
+    delete payload.reasoning_split;
+    changed = true;
+  }
+
+  if ("enable_thinking" in payload) {
+    const enableThinking = payload.enable_thinking;
+    delete payload.enable_thinking;
+    const model = String(payload.model || "").toLowerCase();
+    if (model.includes("qwen")) {
+      payload.chat_template_kwargs = {
+        ...(payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object"
+          ? payload.chat_template_kwargs
+          : {}),
+        enable_thinking: enableThinking,
+      };
+    }
+    changed = true;
+  }
+
+  return changed ? JSON.stringify(payload) : bodyText;
 }
 
 function buildUpstreamHeaders(request, upstream) {
@@ -2337,11 +2403,13 @@ function renderAdminPage(origin) {
     byId("stat-ct-session").textContent = state.sessionOutputTokens.toLocaleString();
 
     // Last model
+    var currentModel = payload.last_model || "";
     var lastBucket = skeleton.slice().reverse().find(function(b) { return b.total > 0; });
-    if (lastBucket && lastBucket.models) {
+    if (!currentModel && lastBucket && lastBucket.models) {
       var topModel = Object.entries(lastBucket.models).sort(function(a,b){return b[1]-a[1];})[0];
-      byId("stat-current-model").textContent = topModel ? topModel[0] : "";
+      currentModel = topModel ? topModel[0] : "";
     }
+    byId("stat-current-model").textContent = currentModel;
 
     // Chart 1: Requests (green=success, red=fail)
     var maxReq = 1;
