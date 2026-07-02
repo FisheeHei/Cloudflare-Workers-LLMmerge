@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-diag";
+const VERSION = "v26-07-02-fix";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2298,7 +2298,7 @@ function renderAdminPage(origin) {
     byId("picker-apply").addEventListener("click", function() {
       var picked = [];
       panel.querySelectorAll(".model-pick:checked").forEach(function(cb) { picked.push(cb.value); });
-      textarea.value = picked.join("\n");
+      textarea.value = picked.join("\\n");
       panel.style.display = "none";
       showToast("已导入 " + picked.length + " 个模型");
     });
