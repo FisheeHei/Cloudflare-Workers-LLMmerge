@@ -1,225 +1,293 @@
-# Cloudflare Workers LLM Merge
+# ⚡ LLM-merge
 
 [中文 README](./README.md)
 
-A single-file LLM gateway for Cloudflare Workers, also compatible with Cloudflare Pages Advanced Mode.
+LLM-merge is a single-file LLM gateway for Cloudflare Workers / Pages Advanced Mode. It merges multiple OpenAI-compatible upstreams behind your own `/v1` endpoint and ships with a hidden admin dashboard for upstreams, client keys, model import, logs, and stats.
 
-It merges multiple upstream LLM API keys behind your own unified endpoint. The current focus is:
+> [!IMPORTANT]
+> `ADMIN_TOKEN` is only a path segment, not a real login system. Use a random long value in production.
 
-- OpenAI-compatible proxying
-- Multiple upstream API key aggregation
-- Weighted load balancing
-- Failover retry
-- KV-backed configuration
-- Hidden admin dashboard
-- Virtual client API key issuance
+> [!WARNING]
+> `API_KEY_CRYPT_SECRET` encrypts upstream API keys. Do not rotate it casually after production data already exists.
 
-## Key Features
+## ✨ Features
 
-- Unified OpenAI-compatible `/v1` endpoint
-- Multiple providers or multiple keys from the same provider
-- Weighted request distribution
-- Automatic fallback to the next upstream on failure
-- Upstream configuration stored in Cloudflare KV
-- Upstream API keys encrypted before storage
-- Hidden admin page available only at `/{ADMIN_TOKEN}`
-- nginx-style welcome page for all other browser visits
-- Virtual `sk-gw-...` style client keys
-- Manual upstream model cache refresh
+- Unified OpenAI-compatible endpoints: `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`
+- Claude Code-compatible `/v1/messages`, internally converted to OpenAI Chat Completions
+- Multiple upstreams, multiple API keys, enable/disable, weight, priority, path allowlist, model allowlist
+- `load_balance` and `failover` routing switches
+- Hidden admin dashboard at `/{ADMIN_TOKEN}`
+- Model picker that can import from a saved upstream or a draft upstream, grouped by source and family
+- Virtual `sk-gw-...` client keys with model and upstream restrictions
+- KV-backed persistence for config, client keys, model cache, cooldown state, logs, and stats
+- Encrypted storage for upstream API keys
 
-## Current Endpoints
+## 🧭 Admin dashboard
 
-- `GET /health`
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- `POST /v1/embeddings`
-- `GET /{ADMIN_TOKEN}`
-- `GET /{ADMIN_TOKEN}/api/config`
-- `PUT /{ADMIN_TOKEN}/api/config`
-- `POST /{ADMIN_TOKEN}/api/refresh`
-- `GET /{ADMIN_TOKEN}/api/clients`
-- `POST /{ADMIN_TOKEN}/api/clients`
-- `DELETE /{ADMIN_TOKEN}/api/clients/:id`
+Dashboard areas:
 
-## Configuration Model
+| Area | Purpose |
+| --- | --- |
+| Overview | Request counts, success rate, token totals, current model |
+| Client Keys | Create, refresh, copy, and delete `sk-gw-...` keys |
+| Upstreams | Add, edit, delete upstreams, and configure models, paths, weight, and priority |
+| Model Picker | Pull models from an upstream and filter by source / family before writing back |
+| Logs & Diagnostics | Recent requests, health checks, upstream capability detection |
+| Global Settings | Timeout, cooldown, model cache TTL, routing switches |
 
-The recommended setup is now "environment variables + KV":
+The dashboard supports:
 
-- env vars hold only the root-level settings
-- the actual upstream pool config lives in KV
-- saving from the admin dashboard overwrites the KV config directly
-
-Cloudflare deployment persistence:
-
-- runtime defaults live in `_worker.js`
-- `.dev.vars.example` is the local template
-- Pages / Workers Variables and Secrets are read directly from `env`
-- production Variables and Secrets should be managed in the Cloudflare dashboard
-- redeploying the Worker should not require re-entering values stored in KV
-- the admin dashboard writes upstream pools and virtual client keys into KV
-
-Notes:
-
-- the Cloudflare KV namespace itself may have any name
-- but the Worker binding name must be `KV`
-- the code reads from `env.KV`
-
-Minimum env vars:
-
-```env
-API_KEY_CRYPT_SECRET=change-me-32-bytes-or-longer
-REQUEST_TIMEOUT_MS=90000
-UPSTREAM_COOLDOWN_TTL=60
-MODEL_CACHE_TTL=3600
-```
-
-Required secret:
-
-```bash
-wrangler secret put API_KEY_CRYPT_SECRET
-```
-
-`ADMIN_TOKEN` is now optional.
-
-- if omitted, the default value is `llmmerge-admin`
-- the admin page path becomes `/<default>`, which means `/llmmerge-admin`
-- overriding it with your own random value is still strongly recommended
-
-Optional static seed config:
-
-```env
-UPSTREAMS_JSON=[{"name":"nim-primary","base_url":"https://integrate.api.nvidia.com/v1","api_key":"nvapi-xxxxxxxx","models":["meta/llama-3.1-8b-instruct"],"paths":["/v1/chat/completions"],"weight":1}]
-CLIENTS_JSON=[{"name":"default-client","key":"sk-gw-demo-please-change","models":["*"],"upstreams":["nim-primary"]}]
-```
-
-## Admin Dashboard
-
-Access:
-
-```text
-https://your-domain.example/{ADMIN_TOKEN}
-```
-
-The admin page supports:
-
-- add, edit, and delete upstream entries
-- choose preset templates
-- fill note, internal name, Base URL, and API key
-- configure model allowlist, path allowlist, weight, priority, enabled or disabled state
+- add, edit, and delete upstreams
+- auto-save on upstream add / delete
+- manual save for normal field edits
+- import models from the current draft upstream or from an existing saved upstream
+- filter models by source and family
+- export and import upstream config files
+- inspect upstream health and latency
 - toggle `load_balance` / `failover`
-- refresh model cache
-- create and delete virtual client keys
+- create, refresh, and delete virtual client keys
+- view recent logs, 24h stats, current model, and token totals
 
-## Built-in Presets
+## 🚀 Deployment
 
-- NVIDIA NIM
-- DeepInfra
-- Together AI
-- Generic OpenAI-Compatible
+### 1. Create a Worker or Pages project
 
-## KV Keys Used
-
-- `gateway:config`
-- `client:index`
-- `client:id:*`
-- `client:token:*`
-- `cache:models:*`
-- `cooldown:upstream:*`
-
-## Routing Strategy
-
-Two switches are supported and can be combined:
-
-- `load_balance`
-  distributes traffic across healthy upstreams by weight
-- `failover`
-  retries the next candidate when an upstream fails
-
-If `load_balance` is disabled, upstreams are attempted by ascending `priority`.
-
-Retryable status codes by default:
-
-- `408`
-- `409`
-- `425`
-- `429`
-- `500`
-- `502`
-- `503`
-- `504`
-
-## Local Development
-
-1. Create `.dev.vars`
-2. Fill it based on [.dev.vars.example](D:/迁移文件/新建文件夹%20(3)/LLM-merge/.dev.vars.example)
-3. Create and bind a KV namespace named `KV` in Cloudflare
-4. Run:
+Workers:
 
 ```bash
-wrangler dev
+wrangler deploy
 ```
 
-## Deployment
+Pages: use Advanced Mode and point it at `_worker.js`. No frontend build step is needed.
 
-This repository is checked in for Pages Advanced Mode, but `wrangler.toml` is kept local-only on purpose.
+### 2. Bind KV
 
-- do not put production `vars` in `wrangler.toml`
-- do not put `pages_build_output_dir` in `wrangler.toml`
-- manage production Variables and Secrets in the Cloudflare dashboard so both stay editable there
-- use Git integration for Pages production deploys
-- use `wrangler pages dev .` for local development
-- the same runtime code still works on Workers, but use a Worker-specific config or CLI args if you want `wrangler deploy`
-
-Create KV:
+Create a KV namespace:
 
 ```bash
 wrangler kv namespace create KV
 ```
 
-Then bind that KV namespace to your Cloudflare Workers or Pages project with the binding name `KV`.
+Then bind it as:
 
-In other words:
+```text
+KV
+```
 
-- the namespace display name can be anything
-- the binding variable name must be `KV`
+The namespace display name can be anything. The code only reads `env.KV`.
 
-Set secrets:
+### 3. Set variables and secrets
+
+Recommended production secrets:
 
 ```bash
+wrangler secret put ADMIN_TOKEN
 wrangler secret put API_KEY_CRYPT_SECRET
 ```
 
-If you do not want to set `ADMIN_TOKEN` explicitly, you may skip it, and the default admin path will be:
+Local development:
+
+```bash
+copy .dev.vars.example .dev.vars
+```
+
+macOS / Linux:
+
+```bash
+cp .dev.vars.example .dev.vars
+```
+
+### 4. Open the dashboard
+
+After deploy:
+
+```text
+https://your-domain.example/{ADMIN_TOKEN}
+```
+
+If `ADMIN_TOKEN` is omitted, the default path is:
 
 ```text
 /llmmerge-admin
 ```
 
-Deploy:
+Using a random value is still strongly recommended.
 
-```bash
-git push
+## 🔧 Variables
+
+| Variable | Example | Required | Notes |
+| --- | --- | --- | --- |
+| `KV` | KV binding | Recommended | Cloudflare KV binding used by the dashboard and persistence layer |
+| `ADMIN_TOKEN` | `change-me-admin-token` | Recommended | Admin path segment; also accepts `ADMIN`, `admin`, `TOKEN`, `token` |
+| `API_KEY_CRYPT_SECRET` | `change-me-32-bytes-or-longer` | Recommended | Encryption secret for upstream API keys |
+| `REQUEST_TIMEOUT_MS` | `90000` | No | Upstream request timeout, default `30000` |
+| `UPSTREAM_COOLDOWN_TTL` | `60` | No | Cooldown seconds after a failed upstream, default `60` |
+| `MODEL_CACHE_TTL` | `3600` | No | Model list cache seconds, default `3600` |
+| `UPSTREAMS_JSON` | see below | No | Initial upstream seed config; KV wins once a saved config exists |
+| `CLIENTS_JSON` | see below | No | Initial client key seed config |
+
+## 🔌 Upstream config
+
+`UPSTREAMS_JSON` can be used as a seed, or you can add upstreams directly in the dashboard:
+
+```json
+[
+  {
+    "name": "nim-primary",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "api_key": "nvapi-xxxxxxxx",
+    "models": ["meta/llama-3.1-8b-instruct", "nvidia/nv-embed-v1"],
+    "paths": ["/v1/chat/completions", "/v1/embeddings"],
+    "weight": 3,
+    "priority": 1,
+    "enabled": true
+  }
+]
 ```
 
-## OpenAI SDK Example
+| Field | Meaning |
+| --- | --- |
+| `name` | Internal upstream name |
+| `base_url` | OpenAI-compatible API base URL |
+| `api_key` | Upstream API key; encrypted when saved through the dashboard |
+| `models` | Model allowlist; empty means no model restriction |
+| `paths` | Path allowlist such as `/v1/chat/completions` or `/v1/embeddings` |
+| `weight` | Load-balancing weight |
+| `priority` | Attempt order when load balancing is off; smaller is earlier |
+| `enabled` | Enabled or disabled |
+| `headers` | Optional extra request headers |
+| `note` | Optional note |
+| `account_id` | Account ID used by the Cloudflare Workers AI preset |
+
+Built-in presets:
+
+- NVIDIA NIM
+- DeepInfra
+- Together AI
+- DeepSeek
+- Cloudflare Workers AI
+- Custom OpenAI-compatible upstream
+
+## 🔑 Client keys
+
+`CLIENTS_JSON` example:
+
+```json
+[
+  {
+    "name": "default-client",
+    "key": "sk-gw-demo-please-change",
+    "models": ["*"],
+    "upstreams": ["nim-primary"]
+  }
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Client display name |
+| `key` | Client key used to call the gateway; must start with `sk-` |
+| `models` | Allowed models; empty or `*` means no restriction |
+| `upstreams` | Allowed upstreams; empty means no restriction |
+
+The dashboard can also generate `sk-gw-...` client keys.
+
+## 🧪 Usage
+
+### OpenAI SDK
 
 ```js
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: "sk-gw-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  apiKey: "sk-gw-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   baseURL: "https://your-domain.example/v1",
+});
+
+const completion = await client.chat.completions.create({
+  model: "meta/llama-3.1-8b-instruct",
+  messages: [{ role: "user", content: "hello" }],
 });
 ```
 
-## Intentionally Not Included Yet
+### Claude Code / Anthropic-style entry
 
-- full login system
-- fine-grained RBAC
-- precise billing and quota tracking
-- audit logs
+If the client lets you set a custom Anthropic Base URL, point it to:
+
+```text
+https://your-domain.example/v1
+```
+
+Then use a generated `sk-gw-...` key. `/v1/messages` is converted inside the Worker into an OpenAI Chat Completions request.
+
+## 📡 Endpoints
+
+Public endpoints:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Liveness check |
+| `GET` | `/v1/models` | Aggregated model list |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions-compatible proxy |
+| `POST` | `/v1/embeddings` | OpenAI Embeddings-compatible proxy |
+| `POST` | `/v1/messages` | Claude / Anthropic-style messages entry |
+
+Admin endpoints live under:
+
+```text
+/{ADMIN_TOKEN}/api/*
+```
+
+Common admin actions include reading and saving config, refreshing model cache, health checks, fetching upstream models, detecting upstream capability, creating and deleting client keys, and reading logs / stats.
+
+## 💾 KV keys
+
+| Key | Meaning |
+| --- | --- |
+| `gateway:config` | Saved gateway config |
+| `client:index` | Client key index |
+| `client:id:*` | Client records by ID |
+| `client:token:*` | Reverse lookup by client key |
+| `cache:models:*` | Upstream model cache |
+| `cooldown:upstream:*` | Upstream cooldown state |
+| `gateway:logs` | Recent request logs |
+| `gateway:stats:*` | Hourly aggregated stats |
+
+## 🔀 Routing
+
+- `load_balance` on: split traffic across healthy upstreams by `weight`
+- `load_balance` off: try upstreams by `priority`
+- `failover` on: retry the next candidate when an upstream fails
+- `failover` off: only try the current candidate
+
+Default retryable status codes:
+
+```text
+408, 409, 425, 429, 500, 502, 503, 504
+```
+
+## ⚠️ Notes
+
+- Never expose real upstream API keys in a public repo or frontend page.
+- `ADMIN_TOKEN` is only a hidden path, not authentication.
+- Do not rotate `API_KEY_CRYPT_SECRET` lightly once production config exists.
+- KV free quotas are limited; logs and stats are batched, but high-traffic setups still need attention.
+- Empty upstream `models` means no restriction, not disabled models.
+- Empty client `models` or `*` means no restriction.
+- Exported files contain plain API keys. Treat them as secrets and do not share them publicly.
+- Cloudflare Workers still have runtime limits; huge responses, very slow upstreams, or long streaming sessions can hit platform constraints.
+
+## 💤 Not included
+
+- Full login system
+- Fine-grained RBAC
+- Billing / quota accounting
+- Long-term audit logs
 - Responses API
-- image, audio, and file endpoints
-- dedicated Claude / Anthropic protocol gateway
+- Image, audio, and file endpoints
 
-These are possible later, but intentionally excluded from the minimal version.
+Keep it single-file, low-dependency, and easy to deploy. Add more only when real usage proves it is needed.
+
+## 🙏 Credit
+
+The README structure borrows from [FisheeHei/CF-Workers-SUB](https://github.com/FisheeHei/CF-Workers-SUB).

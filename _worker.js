@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-model-picker-subgroups";
+const VERSION = "v26-07-02-upstream-import-export";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -57,6 +57,15 @@ const PRESET_TEMPLATES = [
     base_url: "https://api.deepseek.com/v1",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
     requires_base_url: false,
+  },
+  {
+    id: "workers-ai",
+    name: "Cloudflare Workers AI",
+    base_url: "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1",
+    paths: [CHAT_PATH],
+    requires_base_url: false,
+    requires_account_id: true,
+    headers: { "cf-aig-gateway-id": "default" },
   },
   {
     id: "custom",
@@ -581,6 +590,11 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     }
   }
 
+  if (apiPath === "/api/upstreams/export" && request.method === "GET") {
+    const exported = await exportUpstreamGroup(app);
+    return withCorsResponse(json({ ok: true, ...exported }, 200));
+  }
+
 // ponytail: parallel health checks instead of sequential loop
   if (apiPath === "/api/health" && request.method === "POST") {
     const runtime = await loadRuntimeConfig(app);
@@ -671,6 +685,7 @@ async function buildGatewayConfigFromEnv(app) {
     const upstream = app.envUpstreams[index];
     const presetId = inferPresetId(upstream.base_url);
     const plaintextKey = upstream.api_key || app.env[upstream.api_key_env] || "";
+    const accountId = String(upstream.account_id || "").trim();
 
     upstreams.push({
       api_key_encrypted: plaintextKey
@@ -680,9 +695,11 @@ async function buildGatewayConfigFromEnv(app) {
         presetId,
         upstream.base_url,
         presetById(presetId)?.base_url,
+        accountId,
       ),
       enabled: upstream.enabled !== false,
-      headers: normalizeHeaders(upstream.headers),
+      headers: { ...presetDefaultHeaders(presetId), ...normalizeHeaders(upstream.headers) },
+      account_id: accountId,
       id: String(upstream.id || crypto.randomUUID()),
       models: normalizeStringArray(upstream.models),
       name: String(upstream.name || `upstream-${index + 1}`),
@@ -729,18 +746,23 @@ async function normalizeGatewayConfigPayload(payload, app) {
     const preset = presetById(item.preset) ? item.preset : "custom";
     const defaults = presetById(preset) || presetById("custom");
     const apiKeyValue = String(item.api_key_value || item.api_key_encrypted || item.api_key || "").trim();
+    const accountId = String(item.account_id || "").trim();
     const name = String(item.name || `upstream-${index + 1}`).trim();
-    const baseUrl = resolveBaseUrl(preset, item.base_url, defaults.base_url);
+    const baseUrl = resolveBaseUrl(preset, item.base_url, defaults.base_url, accountId);
 
     if (!name) throw httpError(400, "Each upstream needs a name.");
     if (!baseUrl) throw httpError(400, `Upstream ${name} is missing base_url.`);
     if (!apiKeyValue) throw httpError(400, `Upstream ${name} is missing api_key.`);
+    if (presetById(preset)?.requires_account_id && !accountId && !String(item.base_url || "").trim()) {
+      throw httpError(400, `Upstream ${name} is missing account_id.`);
+    }
 
     upstreams.push({
       api_key_encrypted: await ensureEncryptedValue(apiKeyValue, app.encryptionSecret),
       base_url: baseUrl,
+      account_id: accountId,
       enabled: item.enabled !== false,
-      headers: normalizeHeaders(item.headers),
+      headers: { ...presetDefaultHeaders(preset), ...normalizeHeaders(item.headers) },
       id: String(item.id || crypto.randomUUID()),
       models: normalizeStringArray(item.models),
       name,
@@ -780,6 +802,34 @@ function toPublicGatewayConfig(config) {
       api_key_value: upstream.api_key_encrypted || "",
     })),
     version: config.version || 1,
+  };
+}
+
+async function exportUpstreamGroup(app) {
+  const editable = await getEditableConfig(app);
+  const aesKey = await deriveAesKey(app.encryptionSecret);
+  const upstreams = await Promise.all(
+    editable.upstreams.map(async (upstream) => ({
+      account_id: String(upstream.account_id || "").trim(),
+      api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
+      base_url: upstream.base_url,
+      capability: upstream.capability || null,
+      enabled: upstream.enabled !== false,
+      headers: normalizeHeaders(upstream.headers),
+      models: normalizeStringArray(upstream.models),
+      name: upstream.name,
+      note: String(upstream.note || "").trim(),
+      paths: normalizeStringArray(upstream.paths),
+      preset: upstream.preset || "custom",
+      priority: parsePriority(upstream.priority, 1),
+      weight: parsePositiveInt(upstream.weight, 1),
+    }))
+  );
+
+  return {
+    exported_at: new Date().toISOString(),
+    upstreams,
+    version: editable.version || 1,
   };
 }
 
@@ -1545,8 +1595,24 @@ function normalizeHeaders(value) {
   return headers;
 }
 
-function resolveBaseUrl(presetId, inputBaseUrl, defaultBaseUrl) {
+function presetDefaultHeaders(presetId) {
   const preset = presetById(presetId);
+  return normalizeHeaders(preset?.headers || {});
+}
+
+function resolveBaseUrl(presetId, inputBaseUrl, defaultBaseUrl, accountId) {
+  const preset = presetById(presetId);
+  if (preset && preset.requires_account_id) {
+    const manual = String(inputBaseUrl || "").trim();
+    if (manual) {
+      return manual;
+    }
+    const account = String(accountId || "").trim();
+    return account
+      ? String(defaultBaseUrl || preset.base_url || "").replace("{ACCOUNT_ID}", account).trim()
+      : "";
+  }
+
   if (preset && preset.requires_base_url === false) {
     return String(defaultBaseUrl || preset.base_url || "").trim();
   }
@@ -1978,12 +2044,15 @@ function renderAdminPage(origin) {
     <div class="toolbar">
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
+      <button class="secondary" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
+      <button class="secondary" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
       <button class="secondary" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
       <button class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
       <span class="note" id="config-status"></span>
     </div>
     <div id="upstream-list"></div>
+    <input type="file" id="import-upstreams-file" accept=".json,application/json" hidden>
   </div>
 
   <div class="panel" id="log-panel">
@@ -2066,6 +2135,9 @@ function renderAdminPage(origin) {
       <div class="field span-6"><label>\u5185\u90e8\u540d\u79f0</label><input id="vendor-name" placeholder="my-upstream (\u53ef\u7701\u7565)"></div>
     </div>
     <div class="row">
+      <div class="field span-12" id="vendor-account-id-wrap" style="display:none"><label>Account ID</label><input id="vendor-account-id" class="mono" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
+    </div>
+    <div class="row">
       <div class="field span-6"><label>Base URL</label><input id="vendor-base-url" placeholder="https://..."></div>
       <div class="field span-6"><label>API Key</label><input id="vendor-api-key" class="mono" placeholder="nvapi-... \u6216 sk-..."></div>
     </div>
@@ -2092,6 +2164,22 @@ function renderAdminPage(origin) {
   function esc(value) { return text(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
   function presetById(id) { return state.presets.find((p) => p.id === id) || state.presets.find((p) => p.id === "custom") || state.presets[0]; }
   function baseUrlLocked(presetId) { const p = presetById(presetId); return !!p && p.requires_base_url === false; }
+  function presetNeedsAccountId(presetId) { const p = presetById(presetId); return !!p && p.requires_account_id; }
+  function presetBaseUrl(presetId, accountId) {
+    const preset = presetById(presetId);
+    if (!preset) return "";
+    if (preset.requires_account_id) {
+      const account = text(accountId).trim();
+      return account
+        ? text(preset.base_url || "").replace("{ACCOUNT_ID}", account).trim()
+        : text(preset.base_url || "").replace("{ACCOUNT_ID}", "ACCOUNT_ID").trim();
+    }
+    return text(preset.base_url || "").trim();
+  }
+  function presetHeaders(presetId) {
+    const preset = presetById(presetId);
+    return preset && preset.headers && typeof preset.headers === "object" && !Array.isArray(preset.headers) ? preset.headers : {};
+  }
 
   let toastTimer = null;
   function showToast(message) {
@@ -2117,6 +2205,76 @@ function renderAdminPage(origin) {
     const body = await response.text().catch(() => "(unreadable)"); throw new Error("Admin API \u8fd4\u56de\u7684\u4e0d\u662f JSON (status " + response.status + ", body=" + body.slice(0, 200) + ")");
   }
 
+  function normalizeImportList(value) {
+    if (Array.isArray(value)) {
+      return value.map((item) => text(item).trim()).filter(Boolean);
+    }
+    return splitList(value);
+  }
+
+  function normalizeImportedUpstreams(payload) {
+    const raw = Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload && payload.upstreams)
+        ? payload.upstreams
+        : [];
+
+    return raw.map(function(item, index) {
+      const headers = item && typeof item.headers === "object" && !Array.isArray(item.headers) ? item.headers : {};
+      return {
+        account_id: text(item && item.account_id).trim(),
+        api_key_value: text(item && (item.api_key || item.api_key_value)).trim(),
+        base_url: text(item && item.base_url).trim(),
+        capability: item && item.capability ? item.capability : null,
+        enabled: item && item.enabled !== false,
+        headers: headers,
+        models: normalizeImportList(item && item.models),
+        name: text(item && item.name).trim() || "upstream-" + (index + 1),
+        note: text(item && item.note).trim(),
+        paths: normalizeImportList(item && item.paths),
+        preset: text(item && item.preset).trim() || "custom",
+        priority: Number(item && item.priority || index + 1),
+        weight: Number(item && item.weight || 1),
+      };
+    }).filter((item) => item.base_url && item.api_key_value);
+  }
+
+  function downloadJsonFile(filename, data) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function exportUpstreams() {
+    const resp = await fetch(API_BASE + "/upstreams/export");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "导出上游配置失败");
+    return payload;
+  }
+
+  async function importUpstreamsFromFile(file) {
+    const textValue = await file.text();
+    const payload = JSON.parse(textValue);
+    const upstreams = normalizeImportedUpstreams(payload);
+    if (!upstreams.length) {
+      throw new Error("导入文件里没有可用的上游配置");
+    }
+    const currentUpstreams = Array.isArray(state.config && state.config.upstreams) ? state.config.upstreams : [];
+    if (currentUpstreams.length && !confirm("导入会覆盖当前上游配置，继续吗？")) {
+      return;
+    }
+    state.config.upstreams = upstreams;
+    renderUpstreams();
+    await saveConfig();
+    showToast("已导入 " + upstreams.length + " 个上游");
+  }
+
   function showError(error) {
     console.error(error);
     showToast(error.message || "Error");
@@ -2127,7 +2285,7 @@ function renderAdminPage(origin) {
     if (!state.draftPresetId && state.presets.length) state.draftPresetId = state.presets[0].id;
     renderPresets();
     applyVendorPreset();
-    ["vendor-note","vendor-name","vendor-api-key","vendor-models"].forEach((id) => byId(id).value = "");
+    ["vendor-note","vendor-name","vendor-api-key","vendor-models","vendor-account-id"].forEach((id) => byId(id).value = "");
     byId("vendor-weight").value = "1"; byId("vendor-enabled").value = "true";
     byId("vendor-modal").classList.add("open");
   }
@@ -2136,7 +2294,11 @@ function renderAdminPage(origin) {
   function renderPresets() {
     const sel = byId("vendor-preset");
     sel.innerHTML = state.presets.map((p) =>
-      '<option value="' + esc(p.id) + '">' + esc(p.name) + (p.requires_base_url === false ? ' (\u9884\u8bbe ' + esc(p.base_url || "") + ')' : ' (\u81ea\u5b9a\u4e49)') + '</option>'
+      '<option value="' + esc(p.id) + '">' + esc(p.name) + (
+        p.requires_account_id ? ' (REST + Account ID)' :
+        p.requires_base_url === false ? ' (\u9884\u8bbe ' + esc(p.base_url || "") + ')' :
+        ' (\u81ea\u5b9a\u4e49)'
+      ) + '</option>'
     ).join("");
     sel.value = state.draftPresetId || (state.presets[0] ? state.presets[0].id : "custom");
     if (!sel._wired) {
@@ -2148,11 +2310,16 @@ function renderAdminPage(origin) {
   function applyVendorPreset() {
     const baseInput = byId("vendor-base-url");
     const pathsInput = byId("vendor-paths");
+    const accountWrap = byId("vendor-account-id-wrap");
+    const accountInput = byId("vendor-account-id");
     const preset = presetById(state.draftPresetId);
     if (!preset) return;
     const locked = preset.requires_base_url === false;
+    const needsAccountId = !!preset.requires_account_id;
+    accountWrap.style.display = needsAccountId ? "" : "none";
     baseInput.readOnly = locked;
-    baseInput.value = locked ? (preset.base_url || "") : "";
+    baseInput.value = presetBaseUrl(preset.id, accountInput.value);
+    if (!needsAccountId) accountInput.value = "";
     pathsInput.value = (preset.paths || []).join(", ");
   }
 
@@ -2162,9 +2329,12 @@ function renderAdminPage(origin) {
     const name = byId("vendor-name").value.trim();
     const baseUrl = byId("vendor-base-url").value.trim();
     const apiKey = byId("vendor-api-key").value.trim();
+    const accountId = byId("vendor-account-id").value.trim();
     const suffix = Math.random().toString(36).slice(2, 7);
+    const preset = presetById(presetId);
 
     if (!apiKey) throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
+    if (preset && preset.requires_account_id && !accountId) throw new Error("Account ID \u4e0d\u80fd\u4e3a\u7a7a");
     if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
 
     state.config.upstreams.push({
@@ -2172,6 +2342,8 @@ function renderAdminPage(origin) {
       preset: presetId,
       note, name: name || presetId + "-" + suffix,
       base_url: baseUrl, api_key_value: apiKey,
+      account_id: accountId,
+      headers: presetHeaders(presetId),
       models: splitList(byId("vendor-models").value),
       paths: splitList(byId("vendor-paths").value),
       weight: Number(byId("vendor-weight").value || 1),
@@ -2180,6 +2352,7 @@ function renderAdminPage(origin) {
 
     renderUpstreams(); closeVendorModal();
     ["vendor-note","vendor-name","vendor-api-key","vendor-models"].forEach((id) => byId(id).value = "");
+    byId("vendor-account-id").value = "";
     byId("vendor-weight").value = "1"; byId("vendor-enabled").value = "true";
     renderPresets();
   }
@@ -2196,9 +2369,14 @@ function renderAdminPage(origin) {
       const p = presetById(item.preset);
       const badge = p ? p.name : (item.preset || "generic");
       const locked = baseUrlLocked(item.preset);
+      const needsAccountId = presetNeedsAccountId(item.preset);
+      const accountIdValue = text(item.account_id).trim();
       const presetOptions = state.presets.map((pr) =>
         '<option value="' + esc(pr.id) + '"' + (pr.id === item.preset ? ' selected' : '') + '>' + esc(pr.name) + '</option>'
       ).join("");
+      const accountRow = needsAccountId
+        ? '<div class="row"><div class="field span-12"><label>Account ID</label><input data-field="account_id" class="mono" value="' + esc(accountIdValue) + '" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div></div>'
+        : '<div class="row" style="display:none"><div class="field span-12"><label>Account ID</label><input data-field="account_id" class="mono" value="' + esc(accountIdValue) + '" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div></div>';
 
       return '<details class="upstream-card" data-id="' + esc(item.id) + '">' +
         '<summary>' +
@@ -2214,8 +2392,9 @@ function renderAdminPage(origin) {
             '<div class="field span-4"><label>\u5907\u6ce8</label><input data-field="note" value="' + esc(item.note) + '"></div>' +
             '<div class="field span-4"><label>\u5185\u90e8\u540d\u79f0</label><input data-field="name" value="' + esc(item.name) + '"></div>' +
           '</div>' +
+          accountRow +
           '<div class="row">' +
-            '<div class="field span-6"><label>Base URL' + (locked ? ' (\u9884\u8bbe)' : '') + '</label><input data-field="base_url" value="' + esc(item.base_url) + '"' + (locked ? ' readonly' : '') + '></div>' +
+            '<div class="field span-6"><label>Base URL' + (locked ? ' (\u9884\u8bbe)' : '') + '</label><input data-field="base_url" value="' + esc(item.base_url || presetBaseUrl(item.preset, accountIdValue)) + '"' + (locked ? ' readonly' : '') + '></div>' +
             '<div class="field span-6"><label>API Key (\u4fdd\u5b58\u540e\u663e\u793a\u5bc6\u6587)</label><input class="mono" data-field="api_key_value" value="' + esc(item.api_key_value) + '"></div>' +
           '</div>' +
           '<div class="row">' +
@@ -2269,16 +2448,31 @@ function renderAdminPage(origin) {
       sel.addEventListener("change", () => {
         const card = sel.closest(".upstream-card");
         const p = presetById(sel.value);
+        const needsAccountId = !!p && p.requires_account_id;
         const baseInput = card.querySelector('[data-field="base_url"]');
         const pathsInput = card.querySelector('[data-field="paths"]');
-        baseInput.readOnly = !!p && p.requires_base_url === false;
-        if (p && p.requires_base_url === false) baseInput.value = p.base_url || "";
+        const accountRow = card.querySelector('[data-field="account_id"]')?.closest(".row");
+        const accountInput = card.querySelector('[data-field="account_id"]');
+        if (accountRow) accountRow.style.display = needsAccountId ? "" : "none";
+        baseInput.readOnly = !!p && (p.requires_base_url === false || needsAccountId);
+        baseInput.value = presetBaseUrl(sel.value, accountInput ? accountInput.value : "");
         pathsInput.value = (p?.paths || []).join(", ");
+      });
+    });
+    host.querySelectorAll('[data-field="account_id"]').forEach((input) => {
+      input.addEventListener("input", () => {
+        const card = input.closest(".upstream-card");
+        const presetSel = card.querySelector('select[data-field="preset"]');
+        const p = presetById(presetSel.value);
+        if (!p || !p.requires_account_id) return;
+        const baseInput = card.querySelector('[data-field="base_url"]');
+        baseInput.value = presetBaseUrl(presetSel.value, input.value);
       });
     });
   }
 
   function collectConfig() {
+    const existingUpstreams = Array.isArray(state.config && state.config.upstreams) ? state.config.upstreams : [];
     return {
       settings: {
         request_timeout_ms: Number(byId("request-timeout").value || 30000),
@@ -2289,19 +2483,25 @@ function renderAdminPage(origin) {
         load_balance: byId("routing-load-balance").checked,
         failover: byId("routing-failover").checked,
       },
-      upstreams: [...document.querySelectorAll(".upstream-card")].map((card) => ({
-        id: card.dataset.id,
-        preset: card.querySelector('[data-field="preset"]').value,
-        note: card.querySelector('[data-field="note"]').value.trim(),
-        name: card.querySelector('[data-field="name"]').value.trim(),
-        base_url: card.querySelector('[data-field="base_url"]').value.trim(),
-        api_key_value: card.querySelector('[data-field="api_key_value"]').value.trim(),
-        weight: Number(card.querySelector('[data-field="weight"]').value || 1),
-        priority: Number(card.querySelector('[data-field="priority"]').value || 100),
-        enabled: card.querySelector('[data-field="enabled"]').value === "true",
-        paths: splitList(card.querySelector('[data-field="paths"]').value),
-        models: splitList(card.querySelector('[data-field="models"]').value),
-      })),
+      upstreams: [...document.querySelectorAll(".upstream-card")].map((card, index) => {
+        const prev = existingUpstreams.find((item) => String(item && item.id) === String(card.dataset.id)) || existingUpstreams[index] || {};
+        return {
+          capability: prev.capability || null,
+          account_id: card.querySelector('[data-field="account_id"]')?.value.trim() || prev.account_id || "",
+          id: card.dataset.id || prev.id,
+          headers: prev.headers || {},
+          preset: card.querySelector('[data-field="preset"]').value,
+          note: card.querySelector('[data-field="note"]').value.trim(),
+          name: card.querySelector('[data-field="name"]').value.trim(),
+          base_url: card.querySelector('[data-field="base_url"]').value.trim(),
+          api_key_value: card.querySelector('[data-field="api_key_value"]').value.trim(),
+          weight: Number(card.querySelector('[data-field="weight"]').value || 1),
+          priority: Number(card.querySelector('[data-field="priority"]').value || 100),
+          enabled: card.querySelector('[data-field="enabled"]').value === "true",
+          paths: splitList(card.querySelector('[data-field="paths"]').value),
+          models: splitList(card.querySelector('[data-field="models"]').value),
+        };
+      }),
     };
   }
 
@@ -2760,6 +2960,26 @@ function renderAdminPage(origin) {
       );
       byId("save-settings").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u4fdd\u5b58\u4e2d...", saveSettings).catch(showError)
+      );
+      byId("export-upstreams").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u5bfc\u51fa\u4e2d...", async () => {
+          const payload = await exportUpstreams();
+          const stamp = (payload.exported_at || new Date().toISOString()).slice(0, 10);
+          downloadJsonFile("llmmerge-upstreams-" + stamp + ".json", payload);
+          showToast("\u5df2\u5bfc\u51fa " + ((payload.upstreams || []).length || 0) + " \u4e2a\u4e0a\u6e38");
+        }).catch(showError)
+      );
+      byId("import-upstreams").addEventListener("click", () => {
+        const input = byId("import-upstreams-file");
+        input.value = "";
+        input.click();
+      });
+      byId("import-upstreams-file").addEventListener("change", (e) =>
+        withButtonBusy(byId("import-upstreams"), "\u5bfc\u5165\u4e2d...", async () => {
+          const file = e.target.files && e.target.files[0];
+          if (!file) return;
+          await importUpstreamsFromFile(file);
+        }).catch(showError)
       );
       byId("refresh-models").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", refreshModels).catch(showError)

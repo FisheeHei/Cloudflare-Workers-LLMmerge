@@ -39,7 +39,8 @@ const env = {
     },
   },
   UPSTREAMS_JSON: JSON.stringify([
-    { name: "nim", base_url: "https://integrate.api.nvidia.com/v1", api_key: "x", models: ["*"], paths: ["/v1/chat/completions"] },
+    { name: "nim", base_url: "https://integrate.api.nvidia.com/v1", api_key: "x", models: ["*"], paths: ["/v1/chat/completions"], headers: { "x-test": "1" } },
+    { name: "ai", base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1", api_key: "y", models: ["*"], paths: ["/v1/chat/completions"], preset: "workers-ai", account_id: "acc123" },
   ]),
   CLIENTS_JSON: JSON.stringify([{ name: "c", key: "sk-test", models: ["*"], upstreams: ["nim"] }]),
 };
@@ -82,5 +83,13 @@ const modelsResp = await worker.default.fetch(new Request("https://gw.test/llmme
 }), env);
 const models = await modelsResp.json();
 assert.deepEqual(models.models, ["deepseek-ai/deepseek-v4-pro", "google/codegemma-7b"]);
+
+const exportResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/upstreams/export"), env);
+const exported = await exportResp.json();
+assert.equal(exportResp.ok, true);
+assert.equal(exported.upstreams[0].api_key, "x");
+assert.deepEqual(exported.upstreams[0].headers, { "x-test": "1" });
+assert.equal(exported.upstreams[1].account_id, "acc123");
+assert.equal(exported.upstreams[1].base_url, "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1");
 
 console.log("ok");
