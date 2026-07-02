@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-cloudflare-rest-docs";
+const VERSION = "v26-07-02-cloudflare-model-picker";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2614,8 +2614,13 @@ function renderAdminPage(origin) {
     }).join(" ") || "Other";
   }
 
-  function modelSourceName(model) {
+  function modelDisplayName(model) {
     const value = text(model);
+    return value.startsWith("@cf/") ? value.slice(4) : value;
+  }
+
+  function modelSourceName(model) {
+    const value = modelDisplayName(model);
     const raw = value.includes("/") ? value.split("/")[0] : "";
     if (!raw) return "Other";
     const cleaned = raw.replace(/[-_](ai|labs?|inc|org)$/i, "");
@@ -2623,7 +2628,7 @@ function renderAdminPage(origin) {
   }
 
   function modelFamilyName(model) {
-    const value = text(model);
+    const value = modelDisplayName(model);
     const raw = value.includes("/") ? value.split("/").slice(1).join("/") : value;
     const parts = raw.split(/[\/_-]+/).filter(Boolean);
     if (!parts.length) return "Other";
@@ -2671,7 +2676,7 @@ function renderAdminPage(origin) {
       ? picker.models
       : (picker.family === "__all__" ? groups[picker.group].models : families[picker.family]);
     picker.visible = sourceModels.filter(function(model) {
-      return !query || model.toLowerCase().includes(query);
+      return !query || model.toLowerCase().includes(query) || modelDisplayName(model).toLowerCase().includes(query);
     });
 
     byId("model-picker-title").textContent = "\u9009\u62e9\u6a21\u578b - " + picker.title;
@@ -2690,7 +2695,7 @@ function renderAdminPage(origin) {
 
     byId("model-picker-list").innerHTML = picker.visible.length
       ? picker.visible.map(function(model) {
-          return '<label class="model-row"><input type="checkbox" class="model-pick" value="' + esc(model) + '"' + (picker.selected.has(model) ? ' checked' : '') + '><span class="mono">' + esc(model) + '</span></label>';
+          return '<label class="model-row" title="' + esc(model) + '"><input type="checkbox" class="model-pick" value="' + esc(model) + '"' + (picker.selected.has(model) ? ' checked' : '') + '><span class="mono">' + esc(modelDisplayName(model)) + '</span></label>';
         }).join("")
       : '<div class="note" style="padding:12px">\u6ca1\u6709\u5339\u914d\u7684\u6a21\u578b</div>';
 

@@ -41,7 +41,7 @@ The dashboard supports:
 - auto-save on upstream add / delete
 - manual save for normal field edits
 - import models from the current draft upstream or from an existing saved upstream
-- filter models by source and family
+- filter models by source and family; Workers AI hides `@cf/` in the picker display while keeping full model IDs in config
 - export and import upstream config files
 - inspect upstream health and latency
 - toggle `load_balance` / `failover`
