@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-stats-last-model";
+const VERSION = "v26-07-02-model-picker-subgroups";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -466,10 +466,11 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     const payload = parseJsonBody(await request.text());
     // ponytail: merge into existing so a partial payload never wipes upstreams
     const existing = await getEditableConfig(app);
+    const hasUpstreams = Object.prototype.hasOwnProperty.call(payload, "upstreams");
     const merged = {
       settings: { ...existing.settings, ...(payload.settings || {}) },
       routing: { ...existing.routing, ...(payload.routing || {}) },
-      upstreams: Array.isArray(payload.upstreams) && payload.upstreams.length
+      upstreams: hasUpstreams && Array.isArray(payload.upstreams)
         ? payload.upstreams
         : (existing.upstreams || []),
     };
@@ -550,13 +551,21 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "" }, 200));
   }
 
-      // ponytail: fetch model list from a specific upstream for picker
+      // ponytail: fetch model list from a saved or draft upstream for picker
   if (apiPath === "/api/fetch-models" && request.method === "POST") {
-    const runtime = await loadRuntimeConfig(app);
-    const fmatch = parseJsonBody(await request.text());
-    const uName = fmatch.name || "";
-    const ups = runtime.upstreams.find((u) => u.name === uName);
-    if (!ups) return withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404));
+    const payload = parseJsonBody(await request.text());
+    let ups = null;
+    const uName = payload.name || "";
+    if (uName) {
+      const runtime = await loadRuntimeConfig(app);
+      ups = runtime.upstreams.find((u) => u.name === uName);
+      if (!ups) return withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404));
+    } else {
+      const baseUrl = String(payload.base_url || "").trim();
+      const apiKey = String(payload.api_key || payload.api_key_value || "").trim();
+      if (!baseUrl || !apiKey) return withCorsResponse(json({ ok: false, error: "Base URL and API Key are required" }, 400));
+      ups = { name: "draft", base_url: baseUrl, api_key: apiKey, headers: normalizeHeaders(payload.headers) };
+    }
     try {
       const resp = await fetchWithTimeout(
         buildUpstreamUrl(ups.base_url, MODEL_PATH, ""),
@@ -1848,6 +1857,33 @@ function renderAdminPage(origin) {
     }
     .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, serif; }
     .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+    .model-picker-backdrop { z-index: 80; }
+    .model-picker-card { width: min(1280px, calc(100vw - 32px)); }
+    .picker-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .picker-head h3 { margin: 0; }
+    .model-picker-grid {
+      display: grid; grid-template-columns: 220px 260px minmax(0, 1fr); gap: 12px;
+      min-height: min(72vh, 760px);
+    }
+    .model-picker-groups, .model-picker-subgroups, .model-picker-list {
+      border: 1px solid #cfbea0; border-radius: 8px; background: #fffdfa;
+      overflow: auto; max-height: min(72vh, 760px);
+    }
+    .model-picker-groups, .model-picker-subgroups { padding: 8px; }
+    .model-group-btn {
+      width: 100%; display: flex; justify-content: space-between; gap: 8px;
+      border-radius: 8px; padding: 8px 10px; margin-bottom: 4px;
+      background: transparent; color: var(--ink); text-align: left;
+    }
+    .model-group-btn.active { background: #eadcc5; }
+    .model-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #f1e6d6; font-size: 13px; }
+    .model-row:last-child { border-bottom: 0; }
+    .model-row input { width: auto; }
+    .picker-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+    @media (max-width: 760px) {
+      .model-picker-grid { grid-template-columns: 1fr; }
+      .model-picker-groups, .model-picker-subgroups { max-height: 150px; }
+    }
 
     #toast {
       position: fixed; bottom: 32px; left: 50%; transform: translateX(-50%);
@@ -1998,7 +2034,27 @@ function renderAdminPage(origin) {
 
 <div id="toast"></div>
 
-<div id="model-picker" style="display:none;position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:90;background:var(--bg-raised);border:1px solid var(--line);border-radius:8px;width:400px;box-shadow:0 4px 24px rgba(0,0,0,.3)"></div>
+<div class="modal-backdrop model-picker-backdrop" id="model-picker-modal">
+  <div class="modal-card model-picker-card">
+    <div class="picker-head">
+      <h3 id="model-picker-title">\u9009\u62e9\u6a21\u578b</h3>
+      <button type="button" class="secondary small" id="model-picker-close">\u5173\u95ed</button>
+    </div>
+    <input id="model-picker-search" placeholder="\u641c\u7d22\u6a21\u578b">
+    <div class="model-picker-grid" style="margin-top:12px">
+      <div class="model-picker-groups" id="model-picker-groups"></div>
+      <div class="model-picker-subgroups" id="model-picker-subgroups"></div>
+      <div class="model-picker-list" id="model-picker-list"></div>
+    </div>
+    <div class="picker-actions">
+      <span class="note" id="picker-count">\u5df2\u9009 0</span>
+      <button type="button" class="small secondary" id="picker-select-visible">\u9009\u4e2d\u5f53\u524d</button>
+      <button type="button" class="small secondary" id="picker-clear-visible">\u6e05\u7a7a\u5f53\u524d</button>
+      <button type="button" class="small secondary" id="picker-cancel">\u53d6\u6d88</button>
+      <button type="button" class="small good" id="picker-apply">\u5e94\u7528</button>
+    </div>
+  </div>
+</div>
 <div class="modal-backdrop" id="vendor-modal">
   <div class="modal-card">
     <h3>\u6dfb\u52a0\u4e0a\u6e38</h3>
@@ -2014,7 +2070,7 @@ function renderAdminPage(origin) {
       <div class="field span-6"><label>API Key</label><input id="vendor-api-key" class="mono" placeholder="nvapi-... \u6216 sk-..."></div>
     </div>
     <div class="row">
-      <div class="field span-4"><label>\u6a21\u578b (\u9017\u53f7\u5206\u9694, \u7559\u7a7a=\u81ea\u52a8)</label><input id="vendor-models" placeholder="model-a, model-b"></div>
+      <div class="field span-4"><label>\u6a21\u578b (\u9017\u53f7\u5206\u9694, \u7559\u7a7a=\u81ea\u52a8)</label><input id="vendor-models" placeholder="model-a, model-b"><button type="button" class="small secondary" id="vendor-fetch-models">\u4ece\u5f53\u524d\u4e0a\u6e38\u5bfc\u5165</button></div>
       <div class="field span-4"><label>\u8def\u5f84 (\u9017\u53f7\u5206\u9694)</label><input id="vendor-paths" value="/v1/chat/completions, /v1/embeddings"></div>
       <div class="field span-2"><label>\u6743\u91cd</label><input id="vendor-weight" type="number" min="1" value="1"></div>
       <div class="field span-2"><label>\u542f\u7528</label><select id="vendor-enabled"><option value="true">\u662f</option><option value="false">\u5426</option></select></div>
@@ -2028,7 +2084,7 @@ function renderAdminPage(origin) {
 
 <script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0 };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
@@ -2190,7 +2246,8 @@ function renderAdminPage(origin) {
         await withButtonBusy(btn, "\u5220\u9664\u4e2d...", async () => {
           state.config.upstreams = state.config.upstreams.filter((u) => u.id !== card.dataset.id);
           renderUpstreams();
-          showToast("\u5df2\u5220\u9664\u4e0a\u6e38");
+          await saveConfig();
+          showToast("\u5df2\u5220\u9664\u5e76\u4fdd\u5b58");
         });
       });
     });
@@ -2329,45 +2386,158 @@ function renderAdminPage(origin) {
     showToast(upstreamName + ": " + (payload.capability === "openai" ? "OpenAI Compatible (chat+embeddings)" : "Claude Compatible (chat only)") + ", " + payload.latency_ms + "ms");
   }
 
-  async function fetchUpstreamModels(upstreamName) {
+  async function fetchModels(payload) {
     const resp = await fetch(API_BASE + "/fetch-models", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: upstreamName }),
+      body: JSON.stringify(payload),
     });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error || "获取模型失败");
-    return payload.models || [];
+    const data = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(data?.error?.message || data?.error || "\u83b7\u53d6\u6a21\u578b\u5931\u8d25");
+    return data.models || [];
   }
 
-  function showModelPicker(upstreamName, models, textarea) {
-    // Simple checkbox list: check what's already in textarea, show full list
-    var current = splitList(textarea.value);
-    var currentSet = new Set(current);
-    var html = '<div style="max-height:300px;overflow-y:auto;padding:8px">';
-    html += '<div style="margin-bottom:8px"><button class="small good" id="picker-apply">应用</button> <button class="small secondary" id="picker-cancel">取消</button> <span class="note" id="picker-count">已选 0</span></div>';
-    models.forEach(function(m) {
-      var checked = currentSet.has(m) ? ' checked' : '';
-      html += '<div style="font-size:13px;padding:2px 0"><label><input type="checkbox" class="model-pick" value="' + esc(m) + '"' + checked + '> ' + esc(m) + '</label></div>';
+  async function fetchUpstreamModels(upstreamName) {
+    return fetchModels({ name: upstreamName });
+  }
+
+  async function fetchDraftUpstreamModels() {
+    const baseUrl = byId("vendor-base-url").value.trim();
+    const apiKey = byId("vendor-api-key").value.trim();
+    if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
+    if (!apiKey) throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
+    return fetchModels({ base_url: baseUrl, api_key: apiKey });
+  }
+
+  function titleParts(parts) {
+    return parts.filter(Boolean).map(function(part) {
+      return part.charAt(0).toUpperCase() + part.slice(1);
+    }).join(" ") || "Other";
+  }
+
+  function modelSourceName(model) {
+    const value = text(model);
+    const raw = value.includes("/") ? value.split("/")[0] : "";
+    if (!raw) return "Other";
+    const cleaned = raw.replace(/[-_](ai|labs?|inc|org)$/i, "");
+    return titleParts(cleaned.split(/[-_.]+/));
+  }
+
+  function modelFamilyName(model) {
+    const value = text(model);
+    const raw = value.includes("/") ? value.split("/").slice(1).join("/") : value;
+    const parts = raw.split(/[\/_-]+/).filter(Boolean);
+    if (!parts.length) return "Other";
+    const second = parts[1] || "";
+    const family = second && !/^\d+(?:\.\d+)?[bkmt]?$/i.test(second) ? parts.slice(0, 2) : parts.slice(0, 1);
+    return titleParts(family);
+  }
+
+  function showModelPicker(upstreamName, models, target) {
+    const unique = Array.from(new Set((models || []).filter(Boolean))).sort();
+    state.modelPicker = {
+      title: upstreamName || "\u5f53\u524d\u4e0a\u6e38",
+      models: unique,
+      group: "__all__",
+      family: "__all__",
+      selected: new Set(splitList(target.value)),
+      target,
+      visible: unique,
+    };
+    byId("model-picker-search").value = "";
+    byId("model-picker-modal").classList.add("open");
+    renderModelPicker();
+  }
+
+  function renderModelPicker() {
+    const picker = state.modelPicker;
+    if (!picker) return;
+    const query = byId("model-picker-search").value.trim().toLowerCase();
+    const groups = {};
+    picker.models.forEach(function(model) {
+      const group = modelSourceName(model);
+      const family = modelFamilyName(model);
+      if (!groups[group]) groups[group] = { models: [], families: {} };
+      groups[group].models.push(model);
+      if (!groups[group].families[family]) groups[group].families[family] = [];
+      groups[group].families[family].push(model);
     });
-    html += '</div>';
-    var panel = byId("model-picker");
-    panel.innerHTML = html;
-    panel.style.display = "block";
-    // Update count
-    panel.querySelectorAll(".model-pick").forEach(function(cb) {
-      cb.addEventListener("change", function() {
-        var n = panel.querySelectorAll(".model-pick:checked").length;
-        byId("picker-count").textContent = "已选 " + n;
+
+    const groupNames = Object.keys(groups).sort();
+    if (picker.group !== "__all__" && !groups[picker.group]) picker.group = "__all__";
+    const families = picker.group === "__all__" ? {} : groups[picker.group].families;
+    const familyNames = Object.keys(families).sort();
+    if (picker.family !== "__all__" && !families[picker.family]) picker.family = "__all__";
+    const sourceModels = picker.group === "__all__"
+      ? picker.models
+      : (picker.family === "__all__" ? groups[picker.group].models : families[picker.family]);
+    picker.visible = sourceModels.filter(function(model) {
+      return !query || model.toLowerCase().includes(query);
+    });
+
+    byId("model-picker-title").textContent = "\u9009\u62e9\u6a21\u578b - " + picker.title;
+    byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
+    byId("model-picker-groups").innerHTML =
+      '<button type="button" class="model-group-btn' + (picker.group === "__all__" ? ' active' : '') + '" data-group="__all__"><span>\u5168\u90e8</span><span>' + picker.models.length + '</span></button>' +
+      groupNames.map(function(name) {
+        return '<button type="button" class="model-group-btn' + (picker.group === name ? ' active' : '') + '" data-group="' + esc(name) + '"><span>' + esc(name) + '</span><span>' + groups[name].models.length + '</span></button>';
+      }).join("");
+    byId("model-picker-subgroups").innerHTML = picker.group === "__all__"
+      ? '<div class="note" style="padding:8px">\u9009\u62e9\u6765\u6e90\u540e\u7ec6\u5206</div>'
+      : '<button type="button" class="model-group-btn' + (picker.family === "__all__" ? ' active' : '') + '" data-family="__all__"><span>\u5168\u90e8</span><span>' + groups[picker.group].models.length + '</span></button>' +
+        familyNames.map(function(name) {
+          return '<button type="button" class="model-group-btn' + (picker.family === name ? ' active' : '') + '" data-family="' + esc(name) + '"><span>' + esc(name) + '</span><span>' + families[name].length + '</span></button>';
+        }).join("");
+
+    byId("model-picker-list").innerHTML = picker.visible.length
+      ? picker.visible.map(function(model) {
+          return '<label class="model-row"><input type="checkbox" class="model-pick" value="' + esc(model) + '"' + (picker.selected.has(model) ? ' checked' : '') + '><span class="mono">' + esc(model) + '</span></label>';
+        }).join("")
+      : '<div class="note" style="padding:12px">\u6ca1\u6709\u5339\u914d\u7684\u6a21\u578b</div>';
+
+    byId("model-picker-groups").querySelectorAll(".model-group-btn").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        picker.group = btn.dataset.group;
+        picker.family = "__all__";
+        renderModelPicker();
       });
     });
-    byId("picker-cancel").addEventListener("click", function() { panel.style.display = "none"; });
-    byId("picker-apply").addEventListener("click", function() {
-      var picked = [];
-      panel.querySelectorAll(".model-pick:checked").forEach(function(cb) { picked.push(cb.value); });
-      textarea.value = picked.join("\\n");
-      panel.style.display = "none";
-      showToast("已导入 " + picked.length + " 个模型");
+    byId("model-picker-subgroups").querySelectorAll(".model-group-btn").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        picker.family = btn.dataset.family;
+        renderModelPicker();
+      });
     });
+    byId("model-picker-list").querySelectorAll(".model-pick").forEach(function(cb) {
+      cb.addEventListener("change", function() {
+        if (cb.checked) picker.selected.add(cb.value);
+        else picker.selected.delete(cb.value);
+        byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
+      });
+    });
+  }
+
+  function closeModelPicker() {
+    state.modelPicker = null;
+    byId("model-picker-modal").classList.remove("open");
+  }
+
+  function selectVisibleModels(selected) {
+    const picker = state.modelPicker;
+    if (!picker) return;
+    picker.visible.forEach(function(model) {
+      if (selected) picker.selected.add(model);
+      else picker.selected.delete(model);
+    });
+    renderModelPicker();
+  }
+
+  function applyModelPicker() {
+    const picker = state.modelPicker;
+    if (!picker || !picker.target) return;
+    const picked = Array.from(picker.selected).sort();
+    picker.target.value = picked.join(picker.target.tagName === "TEXTAREA" ? "\\n" : ", ");
+    closeModelPicker();
+    showToast("\u5df2\u5bfc\u5165 " + picked.length + " \u4e2a\u6a21\u578b");
   }
 
   async function loadStats() {
@@ -2560,14 +2730,29 @@ function renderAdminPage(origin) {
   async function boot() {
     try {
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
-      document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeVendorModal(); });
+      byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") state.modelPicker ? closeModelPicker() : closeVendorModal(); });
       byId("open-vendor-modal").addEventListener("click", openVendorModal);
       byId("close-vendor-modal").addEventListener("click", closeVendorModal);
+      byId("model-picker-close").addEventListener("click", closeModelPicker);
+      byId("picker-cancel").addEventListener("click", closeModelPicker);
+      byId("picker-apply").addEventListener("click", applyModelPicker);
+      byId("picker-select-visible").addEventListener("click", () => selectVisibleModels(true));
+      byId("picker-clear-visible").addEventListener("click", () => selectVisibleModels(false));
+      byId("model-picker-search").addEventListener("input", renderModelPicker);
+      byId("vendor-fetch-models").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u5bfc\u5165\u4e2d...", async () => {
+          const models = await fetchDraftUpstreamModels();
+          if (!models.length) throw new Error("\u8be5\u4e0a\u6e38\u65e0\u53ef\u7528\u6a21\u578b");
+          showModelPicker(byId("vendor-name").value.trim() || "\u5f53\u524d\u4e0a\u6e38", models, byId("vendor-models"));
+        }).catch(showError)
+      );
 
       byId("create-vendor").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u6dfb\u52a0\u4e2d...", async () => {
           createVendorFromModal();
-          showToast("\u4e0a\u6e38\u5df2\u6dfb\u52a0");
+          await saveConfig();
+          showToast("\u4e0a\u6e38\u5df2\u6dfb\u52a0\u5e76\u4fdd\u5b58");
         }).catch(showError)
       );
       byId("save-config").addEventListener("click", (e) =>

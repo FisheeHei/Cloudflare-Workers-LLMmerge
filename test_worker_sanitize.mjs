@@ -7,7 +7,16 @@ const worker = await import(`data:text/javascript;base64,${Buffer.from(code).toS
 const bodies = [];
 const kvPuts = [];
 const kvStore = new Map();
-globalThis.fetch = async (_url, init) => {
+globalThis.fetch = async (url, init) => {
+  if (String(url).endsWith("/models")) {
+    return new Response(JSON.stringify({ data: [
+      { id: "deepseek-ai/deepseek-v4-pro" },
+      { id: "google/codegemma-7b" },
+    ] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   bodies.push(JSON.parse(init.body));
   return new Response(JSON.stringify({ id: "ok", choices: [{ message: { content: "ok" } }] }), {
     status: 200,
@@ -65,5 +74,13 @@ const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerg
 const logs = await logsResp.json();
 assert.equal(logs.logs.length, 2);
 assert.equal(kvPuts.length, 0);
+
+const modelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ base_url: "https://draft.example/v1", api_key: "sk-draft" }),
+}), env);
+const models = await modelsResp.json();
+assert.deepEqual(models.models, ["deepseek-ai/deepseek-v4-pro", "google/codegemma-7b"]);
 
 console.log("ok");
