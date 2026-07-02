@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-02-light-health-check";
+const VERSION = "v26-07-02-workers-ai-fetch-fix";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -571,6 +571,14 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       const runtime = await loadRuntimeConfig(app);
       ups = runtime.upstreams.find((u) => u.name === uName);
       if (!ups) return withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404));
+      ups = {
+        ...ups,
+        account_id: String(payload.account_id || ups.account_id || "").trim(),
+        api_key: String(payload.api_key || payload.api_key_value || ups.api_key || "").trim(),
+        base_url: String(payload.base_url || ups.base_url || "").trim(),
+        headers: { ...normalizeHeaders(ups.headers), ...normalizeHeaders(payload.headers) },
+        preset: String(payload.preset || ups.preset || inferPresetId(payload.base_url || ups.base_url)).trim(),
+      };
     } else {
       const baseUrl = String(payload.base_url || "").trim();
       const apiKey = String(payload.api_key || payload.api_key_value || "").trim();
@@ -1079,7 +1087,7 @@ async function responseErrorMessage(response) {
 }
 
 function isWorkersAiUpstream(upstream) {
-  return String(upstream?.preset || "") === "workers-ai";
+  return String(upstream?.preset || "") === "workers-ai" || inferPresetId(upstream?.base_url) === "workers-ai";
 }
 
 function buildWorkersAiModelSearchUrl(upstream, page = 1, perPage = CLOUDFLARE_MODEL_SEARCH_PER_PAGE) {
@@ -2373,10 +2381,10 @@ function renderAdminPage(origin) {
   /* ---- Modal ---- */
   function openVendorModal() {
     if (!state.draftPresetId && state.presets.length) state.draftPresetId = state.presets[0].id;
-    renderPresets();
-    applyVendorPreset();
     ["vendor-note","vendor-name","vendor-api-key","vendor-models","vendor-account-id"].forEach((id) => byId(id).value = "");
     byId("vendor-weight").value = "1"; byId("vendor-enabled").value = "true";
+    renderPresets();
+    applyVendorPreset();
     byId("vendor-modal").classList.add("open");
   }
   function closeVendorModal() { byId("vendor-modal").classList.remove("open"); }
@@ -2527,7 +2535,7 @@ function renderAdminPage(origin) {
         var card = btn.closest(".upstream-card");
         var textarea = card ? card.querySelector('[data-field="models"]') : null;
         await withButtonBusy(btn, "\u5bfc\u5165\u4e2d...", async function() {
-          var models = await fetchUpstreamModels(name);
+          var models = await fetchUpstreamModels(name, card);
           if (!models.length) throw new Error("\u8be5\u4e0a\u6e38\u65e0\u53ef\u7528\u6a21\u578b");
           showModelPicker(name, models, textarea);
         });
@@ -2686,8 +2694,15 @@ function renderAdminPage(origin) {
     return data.models || [];
   }
 
-  async function fetchUpstreamModels(upstreamName) {
-    return fetchModels({ name: upstreamName });
+  async function fetchUpstreamModels(upstreamName, card) {
+    const payload = { name: upstreamName };
+    if (card) {
+      payload.account_id = card.querySelector('[data-field="account_id"]')?.value.trim() || "";
+      payload.api_key = card.querySelector('[data-field="api_key_value"]')?.value.trim() || "";
+      payload.base_url = card.querySelector('[data-field="base_url"]')?.value.trim() || "";
+      payload.preset = card.querySelector('[data-field="preset"]')?.value || "";
+    }
+    return fetchModels(payload);
   }
 
   async function fetchDraftUpstreamModels() {
@@ -2695,6 +2710,7 @@ function renderAdminPage(origin) {
     const apiKey = byId("vendor-api-key").value.trim();
     const presetId = state.draftPresetId || "custom";
     const accountId = byId("vendor-account-id").value.trim();
+    if (presetNeedsAccountId(presetId) && !accountId) throw new Error("Account ID \u4e0d\u80fd\u4e3a\u7a7a");
     if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
     if (!apiKey) throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
     return fetchModels({ account_id: accountId, base_url: baseUrl, api_key: apiKey, preset: presetId });
@@ -3037,6 +3053,7 @@ function renderAdminPage(origin) {
       byId("picker-select-visible").addEventListener("click", () => selectVisibleModels(true));
       byId("picker-clear-visible").addEventListener("click", () => selectVisibleModels(false));
       byId("model-picker-search").addEventListener("input", renderModelPicker);
+      byId("vendor-account-id").addEventListener("input", applyVendorPreset);
       byId("vendor-fetch-models").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5bfc\u5165\u4e2d...", async () => {
           const models = await fetchDraftUpstreamModels();

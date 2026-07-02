@@ -57,6 +57,7 @@ const env = {
   UPSTREAMS_JSON: JSON.stringify([
     { name: "nim", base_url: "https://integrate.api.nvidia.com/v1", api_key: "x", models: ["*"], paths: ["/v1/chat/completions"], headers: { "x-test": "1" } },
     { name: "ai", base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1", api_key: "y", models: ["*"], paths: ["/v1/chat/completions"], preset: "workers-ai", account_id: "acc123" },
+    { name: "ai-old", base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1", api_key: "z", models: ["*"], paths: ["/v1/chat/completions"] },
   ]),
   CLIENTS_JSON: JSON.stringify([{ name: "c", key: "sk-test", models: ["*"], upstreams: ["nim"] }]),
 };
@@ -110,6 +111,27 @@ assert.equal(workersModels.models.length, 102);
 assert.equal(workersModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), true);
 assert.equal(workersModels.models.includes("@cf/google/codegemma-7b"), true);
 assert.equal(fetchUrls.some((url) => url.includes("/ai/models/search") && url.includes("page=2")), true);
+
+const oldWorkersModelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "ai-old" }),
+}), env);
+const oldWorkersModels = await oldWorkersModelsResp.json();
+assert.equal(oldWorkersModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), true);
+
+const overrideModelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    account_id: "acc456",
+    base_url: "https://api.cloudflare.com/client/v4/accounts/acc456/ai/v1",
+    name: "nim",
+    preset: "workers-ai",
+  }),
+}), env);
+const overrideModels = await overrideModelsResp.json();
+assert.equal(overrideModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), true);
 
 const healthResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/health", {
   method: "POST",
