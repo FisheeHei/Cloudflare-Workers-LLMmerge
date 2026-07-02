@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-upstream-import-export";
+const VERSION = "v26-07-02-cloudflare-rest-docs";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -60,7 +60,7 @@ const PRESET_TEMPLATES = [
   },
   {
     id: "workers-ai",
-    name: "Cloudflare Workers AI",
+    name: "Cloudflare Workers AI (REST)",
     base_url: "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1",
     paths: [CHAT_PATH],
     requires_base_url: false,

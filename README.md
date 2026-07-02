@@ -122,8 +122,8 @@ https://your-domain.example/{ADMIN_TOKEN}
 | 字段 | 说明 |
 | --- | --- |
 | `name` | 上游内部名称，用于后台、日志和客户端限制 |
-| `base_url` | OpenAI 兼容 API 地址 |
-| `api_key` | 上游 API Key；通过后台保存后会加密 |
+| `base_url` | OpenAI 兼容 API 地址；Cloudflare Workers AI REST 模板会按 Account ID 生成 |
+| `api_key` | 上游 API Key；Cloudflare 模板这里填 API Token；通过后台保存后会加密 |
 | `models` | 模型白名单；空数组表示不限制模型 |
 | `paths` | 路径白名单，例如 `/v1/chat/completions`、`/v1/embeddings` |
 | `weight` | 负载均衡权重 |
@@ -131,7 +131,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `enabled` | 是否启用 |
 | `headers` | 可选的额外请求头 |
 | `note` | 可选备注 |
-| `account_id` | Cloudflare Workers AI 模板使用的 Account ID |
+| `account_id` | Cloudflare Workers AI REST 模板使用的 Account ID |
 
 内置上游模板：
 
@@ -139,8 +139,23 @@ https://your-domain.example/{ADMIN_TOKEN}
 - DeepInfra
 - Together AI
 - DeepSeek
-- Cloudflare Workers AI
+- Cloudflare Workers AI (REST)
 - 自定义 OpenAI 兼容上游
+
+Cloudflare Workers AI REST 模板按官方 AI Gateway REST API 配置：
+
+- Base URL：`https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1`
+- API Key：Cloudflare API Token，需要 `AI Gateway` 权限
+- Header：默认带 `cf-aig-gateway-id: default`；如果你使用其他 Gateway ID，在上游 `headers` 里修改
+- 模型名：Workers AI 使用 `@cf/author/model`，例如 `@cf/moonshotai/kimi-k2.6`
+- 模型目录：以 Cloudflare Model Catalog 为准；如果后台无法从 `/v1/models` 拉取，请手动填写模型名
+
+可以先用官方 verify 接口测试 API Token：
+
+```bash
+curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+  -H "Authorization: Bearer {API_TOKEN}"
+```
 
 ## 🔑 客户端 Key
 
@@ -280,6 +295,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 - KV 免费额度有限；日志和统计已做批量写入，但高流量场景仍需关注读写量。
 - 上游 `models` 为空表示不限制模型，不是禁用模型。
 - 客户端 `models` 为空或包含 `*` 表示不限制模型。
+- Cloudflare Workers AI REST 模型名需要使用 `@cf/...` 格式。
 - 导出文件包含明文 API Key，请妥善保管，不要公开分享。
 - Cloudflare Worker 有运行时限制；超大响应、很慢的上游或长时间流式输出都可能触发平台限制。
 

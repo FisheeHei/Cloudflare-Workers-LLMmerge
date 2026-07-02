@@ -148,8 +148,8 @@ Using a random value is still strongly recommended.
 | Field | Meaning |
 | --- | --- |
 | `name` | Internal upstream name |
-| `base_url` | OpenAI-compatible API base URL |
-| `api_key` | Upstream API key; encrypted when saved through the dashboard |
+| `base_url` | OpenAI-compatible API base URL; the Cloudflare Workers AI REST preset builds it from the Account ID |
+| `api_key` | Upstream API key; use a Cloudflare API token for the Cloudflare preset; encrypted when saved through the dashboard |
 | `models` | Model allowlist; empty means no model restriction |
 | `paths` | Path allowlist such as `/v1/chat/completions` or `/v1/embeddings` |
 | `weight` | Load-balancing weight |
@@ -157,7 +157,7 @@ Using a random value is still strongly recommended.
 | `enabled` | Enabled or disabled |
 | `headers` | Optional extra request headers |
 | `note` | Optional note |
-| `account_id` | Account ID used by the Cloudflare Workers AI preset |
+| `account_id` | Account ID used by the Cloudflare Workers AI REST preset |
 
 Built-in presets:
 
@@ -165,8 +165,23 @@ Built-in presets:
 - DeepInfra
 - Together AI
 - DeepSeek
-- Cloudflare Workers AI
+- Cloudflare Workers AI (REST)
 - Custom OpenAI-compatible upstream
+
+The Cloudflare Workers AI REST preset follows the official AI Gateway REST API:
+
+- Base URL: `https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1`
+- API Key: Cloudflare API token with `AI Gateway` permission
+- Header: includes `cf-aig-gateway-id: default` by default; edit upstream `headers` if you use another Gateway ID
+- Model IDs: Workers AI uses `@cf/author/model`, for example `@cf/moonshotai/kimi-k2.6`
+- Model list: use the Cloudflare Model Catalog as the source of truth; if `/v1/models` import fails, enter model IDs manually
+
+Verify the API token first with Cloudflare's official endpoint:
+
+```bash
+curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+  -H "Authorization: Bearer {API_TOKEN}"
+```
 
 ## 🔑 Client keys
 
@@ -274,6 +289,7 @@ Default retryable status codes:
 - KV free quotas are limited; logs and stats are batched, but high-traffic setups still need attention.
 - Empty upstream `models` means no restriction, not disabled models.
 - Empty client `models` or `*` means no restriction.
+- Cloudflare Workers AI REST model IDs must use the `@cf/...` format.
 - Exported files contain plain API keys. Treat them as secrets and do not share them publicly.
 - Cloudflare Workers still have runtime limits; huge responses, very slow upstreams, or long streaming sessions can hit platform constraints.
 
