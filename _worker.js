@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-02-cloudflare-health-check";
+const VERSION = "v26-07-02-light-health-check";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1028,8 +1028,10 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
   const started = Date.now();
   try {
     if (isWorkersAiUpstream(upstream)) {
-      const models = await fetchWorkersAiModelIds(upstream, timeoutMs);
-      return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: models.length };
+      const payload = await fetchWorkersAiModelPage(upstream, timeoutMs, 1, CLOUDFLARE_MODEL_SEARCH_PER_PAGE);
+      const rows = Array.isArray(payload?.result) ? payload.result : [];
+      const total = Number(payload?.result_info?.total_count || payload?.result_info?.count || rows.length);
+      return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: total };
     }
 
     let resp = await fetchWithTimeout(

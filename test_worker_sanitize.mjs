@@ -19,7 +19,7 @@ globalThis.fetch = async (url, init) => {
         { id: "google/codegemma-7b" },
         { name: "not-a-workers-ai-model" },
       ];
-    return new Response(JSON.stringify({ result }), {
+    return new Response(JSON.stringify({ result, result_info: { total_count: 102, total_pages: 2 } }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
