@@ -145,10 +145,10 @@ https://your-domain.example/{ADMIN_TOKEN}
 Cloudflare Workers AI REST 模板按官方 AI Gateway REST API 配置：
 
 - Base URL：`https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1`
-- API Key：Cloudflare API Token，需要 `AI Gateway` 权限
+- API Key：Cloudflare API Token；调用模型需要 `AI Gateway` 权限，导入模型目录需要 `Workers AI Read` 或 `Workers AI Write` 权限
 - Header：默认带 `cf-aig-gateway-id: default`；如果你使用其他 Gateway ID，在上游 `headers` 里修改
 - 模型名：Workers AI 使用 `@cf/author/model`，例如 `@cf/moonshotai/kimi-k2.6`
-- 模型目录：以 Cloudflare Model Catalog 为准；如果后台无法从 `/v1/models` 拉取，请手动填写模型名
+- 模型目录：后台通过 Cloudflare `/ai/models/search` 拉取，来源以 Cloudflare Model Catalog 为准
 
 可以先用官方 verify 接口测试 API Token：
 

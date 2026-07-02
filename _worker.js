@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-cloudflare-model-picker";
+const VERSION = "v26-07-02-cloudflare-model-search";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -573,20 +573,20 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       const baseUrl = String(payload.base_url || "").trim();
       const apiKey = String(payload.api_key || payload.api_key_value || "").trim();
       if (!baseUrl || !apiKey) return withCorsResponse(json({ ok: false, error: "Base URL and API Key are required" }, 400));
-      ups = { name: "draft", base_url: baseUrl, api_key: apiKey, headers: normalizeHeaders(payload.headers) };
+      ups = {
+        name: "draft",
+        account_id: String(payload.account_id || "").trim(),
+        base_url: baseUrl,
+        api_key: apiKey,
+        headers: normalizeHeaders(payload.headers),
+        preset: String(payload.preset || inferPresetId(baseUrl)).trim(),
+      };
     }
     try {
-      const resp = await fetchWithTimeout(
-        buildUpstreamUrl(ups.base_url, MODEL_PATH, ""),
-        { method: "GET", headers: buildUpstreamHeaders(null, ups) },
-        15000,
-      );
-      if (!resp.ok) return withCorsResponse(json({ ok: false, status: resp.status }, 502));
-      const body = await resp.json();
-      const models = Array.isArray(body.data) ? body.data.map((m) => m.id).filter(Boolean).sort() : [];
+      const models = await fetchUpstreamModelIds(ups, 15000);
       return withCorsResponse(json({ ok: true, models }, 200));
     } catch (err) {
-      return withCorsResponse(json({ ok: false, error: err.message }, 502));
+      return withCorsResponse(json({ ok: false, status: err.status || 502, error: err.message }, 502));
     }
   }
 
@@ -683,7 +683,7 @@ async function buildGatewayConfigFromEnv(app) {
 
   for (let index = 0; index < app.envUpstreams.length; index += 1) {
     const upstream = app.envUpstreams[index];
-    const presetId = inferPresetId(upstream.base_url);
+    const presetId = String(upstream.preset || inferPresetId(upstream.base_url)).trim() || "custom";
     const plaintextKey = upstream.api_key || app.env[upstream.api_key_env] || "";
     const accountId = String(upstream.account_id || "").trim();
 
@@ -950,23 +950,7 @@ async function getUpstreamModels(runtime, upstream) {
   }
 
   try {
-    const response = await fetchWithTimeout(
-      buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
-      {
-        method: "GET",
-        headers: buildUpstreamHeaders(null, upstream),
-      },
-      runtime.requestTimeoutMs,
-    );
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const payload = await response.json();
-    const models = Array.isArray(payload.data)
-      ? payload.data.map((item) => item?.id).filter(Boolean)
-      : [];
+    const models = await fetchUpstreamModelIds(upstream, runtime.requestTimeoutMs);
 
     await runtime.kv.put(
       cacheKey,
@@ -1000,23 +984,7 @@ async function getFreshModels(runtime, upstream) {
   }
 
   try {
-    const response = await fetchWithTimeout(
-      buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
-      {
-        method: "GET",
-        headers: buildUpstreamHeaders(null, upstream),
-      },
-      runtime.requestTimeoutMs,
-    );
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const payload = await response.json();
-    const models = Array.isArray(payload.data)
-      ? payload.data.map((item) => item?.id).filter(Boolean)
-      : [];
+    const models = await fetchUpstreamModelIds(upstream, runtime.requestTimeoutMs);
 
     await runtime.kv.put(
       modelsCacheKey(upstream.name),
@@ -1031,6 +999,67 @@ async function getFreshModels(runtime, upstream) {
   } catch {
     return [];
   }
+}
+
+async function fetchUpstreamModelIds(upstream, timeoutMs) {
+  const workersAi = isWorkersAiUpstream(upstream);
+  const url = workersAi
+    ? buildWorkersAiModelSearchUrl(upstream)
+    : buildUpstreamUrl(upstream.base_url, MODEL_PATH, "");
+  const response = await fetchWithTimeout(
+    url,
+    { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+    timeoutMs,
+  );
+  if (!response.ok) {
+    const err = new Error(`HTTP ${response.status}`);
+    err.status = response.status;
+    throw err;
+  }
+  const payload = await response.json();
+  return workersAi ? extractWorkersAiModelIds(payload) : extractOpenAiModelIds(payload);
+}
+
+function isWorkersAiUpstream(upstream) {
+  return String(upstream?.preset || "") === "workers-ai";
+}
+
+function buildWorkersAiModelSearchUrl(upstream) {
+  const accountId = String(upstream.account_id || accountIdFromCloudflareBaseUrl(upstream.base_url) || "").trim();
+  if (!accountId) {
+    throw httpError(400, "Cloudflare Account ID is required to fetch Workers AI models.");
+  }
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=1000`;
+}
+
+function accountIdFromCloudflareBaseUrl(baseUrl) {
+  const match = String(baseUrl || "").match(/\/accounts\/([^/]+)\/ai(?:\/|$)/i);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function extractOpenAiModelIds(payload) {
+  return Array.isArray(payload?.data)
+    ? Array.from(new Set(payload.data.map((item) => String(item?.id || "").trim()).filter(Boolean))).sort()
+    : [];
+}
+
+function extractWorkersAiModelIds(payload) {
+  const rows = Array.isArray(payload?.result) ? payload.result : [];
+  const models = rows
+    .map((item) => {
+      if (typeof item === "string") return normalizeWorkersAiModelId(item);
+      return normalizeWorkersAiModelId(item?.id || item?.name || item?.model || item?.model_id);
+    })
+    .filter(Boolean);
+  return Array.from(new Set(models)).sort();
+}
+
+function normalizeWorkersAiModelId(value) {
+  const raw = String(value || "").trim().replace(/^\/+/, "");
+  if (!raw) return "";
+  if (raw.startsWith("@cf/")) return raw;
+  if (raw.startsWith("cf/")) return `@${raw}`;
+  return raw.includes("/") ? `@cf/${raw}` : "";
 }
 
 async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {
@@ -1456,6 +1485,9 @@ function inferPresetId(baseUrl) {
   }
   if (value.includes("together.xyz")) {
     return "together";
+  }
+  if (value.includes("api.cloudflare.com/client/v4/accounts/") && value.includes("/ai/v1")) {
+    return "workers-ai";
   }
   if (value.includes("anthropic") || value.includes("claude")) {
     return "custom";
@@ -2603,9 +2635,11 @@ function renderAdminPage(origin) {
   async function fetchDraftUpstreamModels() {
     const baseUrl = byId("vendor-base-url").value.trim();
     const apiKey = byId("vendor-api-key").value.trim();
+    const presetId = state.draftPresetId || "custom";
+    const accountId = byId("vendor-account-id").value.trim();
     if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
     if (!apiKey) throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
-    return fetchModels({ base_url: baseUrl, api_key: apiKey });
+    return fetchModels({ account_id: accountId, base_url: baseUrl, api_key: apiKey, preset: presetId });
   }
 
   function titleParts(parts) {

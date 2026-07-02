@@ -171,10 +171,10 @@ Built-in presets:
 The Cloudflare Workers AI REST preset follows the official AI Gateway REST API:
 
 - Base URL: `https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1`
-- API Key: Cloudflare API token with `AI Gateway` permission
+- API Key: Cloudflare API token; model calls need `AI Gateway` permission, and model import needs `Workers AI Read` or `Workers AI Write`
 - Header: includes `cf-aig-gateway-id: default` by default; edit upstream `headers` if you use another Gateway ID
 - Model IDs: Workers AI uses `@cf/author/model`, for example `@cf/moonshotai/kimi-k2.6`
-- Model list: use the Cloudflare Model Catalog as the source of truth; if `/v1/models` import fails, enter model IDs manually
+- Model list: the dashboard fetches Cloudflare `/ai/models/search`; use the Cloudflare Model Catalog as the source of truth
 
 Verify the API token first with Cloudflare's official endpoint:
 

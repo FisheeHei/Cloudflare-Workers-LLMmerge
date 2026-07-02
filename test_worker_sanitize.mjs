@@ -8,6 +8,16 @@ const bodies = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
+  if (String(url).includes("/ai/models/search")) {
+    return new Response(JSON.stringify({ result: [
+      { name: "@cf/deepseek-ai/deepseek-v4-pro" },
+      { id: "google/codegemma-7b" },
+      { name: "not-a-workers-ai-model" },
+    ] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).endsWith("/models")) {
     return new Response(JSON.stringify({ data: [
       { id: "deepseek-ai/deepseek-v4-pro" },
@@ -83,6 +93,14 @@ const modelsResp = await worker.default.fetch(new Request("https://gw.test/llmme
 }), env);
 const models = await modelsResp.json();
 assert.deepEqual(models.models, ["deepseek-ai/deepseek-v4-pro", "google/codegemma-7b"]);
+
+const workersModelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "ai" }),
+}), env);
+const workersModels = await workersModelsResp.json();
+assert.deepEqual(workersModels.models, ["@cf/deepseek-ai/deepseek-v4-pro", "@cf/google/codegemma-7b"]);
 
 const exportResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/upstreams/export"), env);
 const exported = await exportResp.json();
