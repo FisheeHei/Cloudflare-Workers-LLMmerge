@@ -5,15 +5,21 @@ const code = fs.readFileSync("_worker.js", "utf8");
 const worker = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
 
 const bodies = [];
+const fetchUrls = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
+  fetchUrls.push(String(url));
   if (String(url).includes("/ai/models/search")) {
-    return new Response(JSON.stringify({ result: [
-      { name: "@cf/deepseek-ai/deepseek-v4-pro" },
-      { id: "google/codegemma-7b" },
-      { name: "not-a-workers-ai-model" },
-    ] }), {
+    const page = Number(new URL(String(url)).searchParams.get("page") || 1);
+    const result = page === 1
+      ? Array.from({ length: 100 }, (_, i) => ({ name: `@cf/test/page-one-${i}` }))
+      : [
+        { name: "@cf/deepseek-ai/deepseek-v4-pro" },
+        { id: "google/codegemma-7b" },
+        { name: "not-a-workers-ai-model" },
+      ];
+    return new Response(JSON.stringify({ result }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -100,7 +106,18 @@ const workersModelsResp = await worker.default.fetch(new Request("https://gw.tes
   body: JSON.stringify({ name: "ai" }),
 }), env);
 const workersModels = await workersModelsResp.json();
-assert.deepEqual(workersModels.models, ["@cf/deepseek-ai/deepseek-v4-pro", "@cf/google/codegemma-7b"]);
+assert.equal(workersModels.models.length, 102);
+assert.equal(workersModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), true);
+assert.equal(workersModels.models.includes("@cf/google/codegemma-7b"), true);
+assert.equal(fetchUrls.some((url) => url.includes("/ai/models/search") && url.includes("page=2")), true);
+
+const healthResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/health", {
+  method: "POST",
+}), env);
+const health = await healthResp.json();
+const aiHealth = health.results.find((item) => item.name === "ai");
+assert.equal(aiHealth.ok, true);
+assert.equal(aiHealth.model_count, 102);
 
 const exportResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/upstreams/export"), env);
 const exported = await exportResp.json();

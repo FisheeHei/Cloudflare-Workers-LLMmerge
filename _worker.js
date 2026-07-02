@@ -26,7 +26,9 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-cloudflare-model-search";
+const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
+const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
+const VERSION = "v26-07-02-cloudflare-health-check";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -586,7 +588,8 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       const models = await fetchUpstreamModelIds(ups, 15000);
       return withCorsResponse(json({ ok: true, models }, 200));
     } catch (err) {
-      return withCorsResponse(json({ ok: false, status: err.status || 502, error: err.message }, 502));
+      const status = err.status && err.status < 500 ? err.status : 502;
+      return withCorsResponse(json({ ok: false, status: err.status || status, error: err.message }, status));
     }
   }
 
@@ -599,31 +602,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   if (apiPath === "/api/health" && request.method === "POST") {
     const runtime = await loadRuntimeConfig(app);
     const results = await Promise.all(
-      runtime.upstreams.map(async (upstream) => {
-        const started = Date.now();
-        try {
-          let resp = await fetchWithTimeout(
-            buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
-            { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
-            10000,
-          );
-          if (resp.status === 401 || resp.status === 403) {
-            resp = await fetchWithTimeout(
-              buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
-              {
-                method: "POST",
-                headers: buildUpstreamHeaders(null, upstream),
-                body: JSON.stringify({ model: "health-check", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-              },
-              10000,
-            );
-          }
-          const latency = Date.now() - started;
-          return { name: upstream.name, ok: resp.ok || resp.status < 500, status: resp.status, latency_ms: latency };
-        } catch (err) {
-          return { name: upstream.name, ok: false, error: err.message, latency_ms: Date.now() - started };
-        }
-      })
+      runtime.upstreams.map((upstream) => checkUpstreamHealth(upstream, 10000))
     );
     return withCorsResponse(json({ ok: true, results }, 200));
   }
@@ -1003,33 +982,110 @@ async function getFreshModels(runtime, upstream) {
 
 async function fetchUpstreamModelIds(upstream, timeoutMs) {
   const workersAi = isWorkersAiUpstream(upstream);
-  const url = workersAi
-    ? buildWorkersAiModelSearchUrl(upstream)
-    : buildUpstreamUrl(upstream.base_url, MODEL_PATH, "");
+  if (workersAi) {
+    return fetchWorkersAiModelIds(upstream, timeoutMs);
+  }
+  const url = buildUpstreamUrl(upstream.base_url, MODEL_PATH, "");
   const response = await fetchWithTimeout(
     url,
     { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
     timeoutMs,
   );
   if (!response.ok) {
-    const err = new Error(`HTTP ${response.status}`);
-    err.status = response.status;
-    throw err;
+    throw await responseError(response, "OpenAI model list");
   }
   const payload = await response.json();
-  return workersAi ? extractWorkersAiModelIds(payload) : extractOpenAiModelIds(payload);
+  return extractOpenAiModelIds(payload);
+}
+
+async function fetchWorkersAiModelIds(upstream, timeoutMs) {
+  const seen = new Set();
+  for (let page = 1; page <= CLOUDFLARE_MODEL_SEARCH_MAX_PAGES; page += 1) {
+    const payload = await fetchWorkersAiModelPage(upstream, timeoutMs, page, CLOUDFLARE_MODEL_SEARCH_PER_PAGE);
+    const rows = Array.isArray(payload?.result) ? payload.result : [];
+    extractWorkersAiModelIds(payload).forEach((model) => seen.add(model));
+    const totalPages = Number(payload?.result_info?.total_pages || 0);
+    if (rows.length < CLOUDFLARE_MODEL_SEARCH_PER_PAGE || (totalPages && page >= totalPages)) {
+      break;
+    }
+  }
+  return Array.from(seen).sort();
+}
+
+async function fetchWorkersAiModelPage(upstream, timeoutMs, page, perPage) {
+  const response = await fetchWithTimeout(
+    buildWorkersAiModelSearchUrl(upstream, page, perPage),
+    { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+    timeoutMs,
+  );
+  if (!response.ok) {
+    throw await responseError(response, "Cloudflare Workers AI model search");
+  }
+  return response.json();
+}
+
+async function checkUpstreamHealth(upstream, timeoutMs) {
+  const started = Date.now();
+  try {
+    if (isWorkersAiUpstream(upstream)) {
+      const models = await fetchWorkersAiModelIds(upstream, timeoutMs);
+      return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: models.length };
+    }
+
+    let resp = await fetchWithTimeout(
+      buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
+      { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+      timeoutMs,
+    );
+    if (resp.status === 401 || resp.status === 403) {
+      resp = await fetchWithTimeout(
+        buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
+        {
+          method: "POST",
+          headers: buildUpstreamHeaders(null, upstream),
+          body: JSON.stringify({ model: "health-check", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+        },
+        timeoutMs,
+      );
+    }
+    return { name: upstream.name, ok: resp.ok || resp.status < 500, status: resp.status, latency_ms: Date.now() - started };
+  } catch (err) {
+    return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
+  }
+}
+
+async function responseError(response, label) {
+  const message = await responseErrorMessage(response);
+  const suffix = response.status === 401 || response.status === 403
+    ? " Check the API token permissions."
+    : "";
+  const err = new Error(`${label} HTTP ${response.status}${message ? `: ${message}` : ""}.${suffix}`);
+  err.status = response.status;
+  return err;
+}
+
+async function responseErrorMessage(response) {
+  try {
+    const payload = await response.clone().json();
+    if (Array.isArray(payload?.errors) && payload.errors.length) {
+      return payload.errors.map((item) => item?.message || item).filter(Boolean).join("; ");
+    }
+    return payload?.error?.message || payload?.message || "";
+  } catch {
+    return "";
+  }
 }
 
 function isWorkersAiUpstream(upstream) {
   return String(upstream?.preset || "") === "workers-ai";
 }
 
-function buildWorkersAiModelSearchUrl(upstream) {
+function buildWorkersAiModelSearchUrl(upstream, page = 1, perPage = CLOUDFLARE_MODEL_SEARCH_PER_PAGE) {
   const accountId = String(upstream.account_id || accountIdFromCloudflareBaseUrl(upstream.base_url) || "").trim();
   if (!accountId) {
     throw httpError(400, "Cloudflare Account ID is required to fetch Workers AI models.");
   }
-  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=1000`;
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=${perPage}&page=${page}`;
 }
 
 function accountIdFromCloudflareBaseUrl(baseUrl) {
