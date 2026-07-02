@@ -26,7 +26,7 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const VERSION = "v26-07-02-cache";
+const VERSION = "v26-07-02-diag";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2548,7 +2548,13 @@ function renderAdminPage(origin) {
       );
 
       // ponytail: parallel boot — config + clients fetch together
+      var hero = document.querySelector('.hero');
+      var bootSpan = document.createElement('span');
+      bootSpan.className = 'note';
+      bootSpan.textContent = ' 加载中...';
+      if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
       await Promise.all([loadConfig(), loadClients()]);
+      if (bootSpan.parentNode) bootSpan.remove();
       loadStats().catch(function(){}); // ponytail: don't block boot on stats
       loadLogs().catch(function(){});  // don't block on logs either
       // ponytail: only auto-refresh when stats panel is visible (save KV reads)
@@ -2562,7 +2568,17 @@ function renderAdminPage(origin) {
       }, 120000); // ponytail: 2min auto-refresh to save KV quota
 
 
-    } catch (error) { showError(error); }
+    } catch (error) {
+      showError(error);
+      // ponytail: visible fallback so user sees something is wrong
+      var hero = document.querySelector('.hero');
+      if (hero) {
+        var banner = document.createElement('div');
+        banner.style.cssText = 'margin-top:12px;padding:12px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;color:#991b1b;font-size:13px';
+        banner.textContent = '[Boot Error] ' + (error.message || 'Unknown') + ' — check browser console (F12)';
+        hero.appendChild(banner);
+      }
+    }
   }
 
   boot();
