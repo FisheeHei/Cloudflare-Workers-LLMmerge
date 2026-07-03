@@ -168,6 +168,17 @@ assert.deepEqual(exported.upstreams[0].headers, { "x-test": "1" });
 assert.equal(exported.upstreams[1].account_id, "acc123");
 assert.equal(exported.upstreams[1].base_url, "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1");
 
+const waitUntilTasks = [];
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [] }),
+}), env, { waitUntil(task) { waitUntilTasks.push(task); } });
+assert.equal(waitUntilTasks.length > 0, true);
+await Promise.all(waitUntilTasks);
+assert.equal(kvPuts.includes("gateway:logs"), true);
+assert.equal(kvPuts.some((key) => key.startsWith("gateway:stats:")), true);
+
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },

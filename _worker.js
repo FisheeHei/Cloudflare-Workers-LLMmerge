@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-03-failed-request-stats";
+const VERSION = "v26-07-03-persistent-request-stats";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -79,7 +79,7 @@ const PRESET_TEMPLATES = [
 ];
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       const pathname = normalizePathname(url.pathname);
@@ -178,7 +178,7 @@ export default {
             latency_ms: Date.now() - started,
             prompt_tokens: pt,
             completion_tokens: 0,
-          });
+          }, ctx);
           throw error;
         }
 
@@ -197,7 +197,7 @@ export default {
           prompt_tokens: pt,
           completion_tokens: ct,
         };
-        recordRequestLog(app, logEntry);
+        recordRequestLog(app, logEntry, ctx);
 
         const headers = new Headers(upstreamResp.headers);
         for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
@@ -266,7 +266,7 @@ export default {
             latency_ms: Date.now() - started,
             prompt_tokens: Math.max(1, Math.round(openaiBody.length / 4)),
             completion_tokens: 0,
-          });
+          }, ctx);
           throw error;
         }
 
@@ -312,7 +312,7 @@ export default {
           prompt_tokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
           completion_tokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
         };
-        recordRequestLog(app, msgLogEntry);
+        recordRequestLog(app, msgLogEntry, ctx);
 
         return new Response(JSON.stringify(anthropicResp), {
           status: openaiResp.ok ? 200 : openaiResp.status,
@@ -397,19 +397,27 @@ function recordStats(app, entry) {
     _pendingStats[hour] = emptyStatsBucket();
   }
   addStatsEntry(_pendingStats[hour], entry);
-  flushBatch(app);
 }
 
-function recordRequestLog(app, entry) {
+function recordRequestLog(app, entry, ctx) {
   appendLog(app, entry);
   recordStats(app, entry);
+  scheduleLogFlush(app, ctx);
 }
 
-async function flushBatch(app) {
+function scheduleLogFlush(app, ctx) {
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(flushBatch(app, true));
+  } else {
+    flushBatch(app);
+  }
+}
+
+async function flushBatch(app, force = false) {
   if (!app.kv) return;
   var now = Date.now();
   // ponytail: Free KV has tight write limits; dashboard reads merge pending memory instead.
-  if (now - _lastFlush < FLUSH_INTERVAL_MS && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
+  if (!force && now - _lastFlush < FLUSH_INTERVAL_MS && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
   _lastFlush = now;
   try { await _doFlush(app); } catch { /* flush failures must not break */ }
 }
