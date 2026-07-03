@@ -17,6 +17,7 @@ const CORS_HEADERS = {
 const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 const MODEL_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
+const RESPONSES_PATH = "/v1/responses";
 const EMBEDDINGS_PATH = "/v1/embeddings";
 const MESSAGES_PATH = "/v1/messages";
 const GATEWAY_CONFIG_KEY = "gateway:config";
@@ -30,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-nim-rpm-timer-pop";
+const VERSION = "v26-07-04-responses-api-shim";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -207,6 +208,10 @@ export default {
           statusText: upstreamResp.statusText,
           headers,
         });
+      }
+
+      if (pathname === RESPONSES_PATH && request.method === "POST") {
+        return await handleResponsesRequest(request, url, app, ctx);
       }
 
       // ponytail: translate Anthropic messages <-> OpenAI chat.completions for Claude Code compatibility.
@@ -1234,6 +1239,300 @@ function normalizeWorkersAiModelId(value) {
   if (raw.startsWith("@cf/")) return raw;
   if (raw.startsWith("cf/")) return `@${raw}`;
   return raw.includes("/") ? `@cf/${raw}` : "";
+}
+
+async function handleResponsesRequest(request, url, app, ctx) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await request.text());
+  const translated = translateResponsesRequest(payload);
+
+  try {
+    const proxyResponse = await proxyRequest({
+      client,
+      model: translated.model,
+      pathname: CHAT_PATH,
+      request,
+      bodyText: translated.bodyText,
+      runtime,
+      search: url.search,
+    });
+
+    const upstreamResp = proxyResponse.response;
+    const headers = new Headers(upstreamResp.headers);
+    headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
+    headers.set("x-llm-gateway-client", client.name || client.id || "client");
+    headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+    for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
+
+    if (!upstreamResp.ok) {
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx);
+      return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
+
+    if (translated.stream) {
+      headers.set("content-type", "text/event-stream; charset=utf-8");
+      headers.set("cache-control", "no-cache");
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx);
+      return new Response(streamResponsesFromChat(upstreamResp, translated.seed), { status: 200, headers });
+    }
+
+    const openaiPayload = parseJsonBody(await upstreamResp.text());
+    const choice = (openaiPayload.choices || [])[0] || {};
+    const text = chatContentToText((choice.message || {}).content || "");
+    const responsePayload = makeResponsesPayload(translated.seed, text, openaiPayload.usage);
+    headers.set("content-type", "application/json; charset=utf-8");
+    recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx);
+    return new Response(JSON.stringify(responsePayload), { status: 200, headers });
+  } catch (error) {
+    recordRequestLog(app, {
+      ts: new Date().toISOString(),
+      client: client.name || client.id || "client",
+      upstream: error.upstreamName || "none",
+      model: translated.model,
+      path: RESPONSES_PATH,
+      status: error.statusCode || 502,
+      latency_ms: Date.now() - started,
+      prompt_tokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+      completion_tokens: 0,
+    }, ctx);
+    throw error;
+  }
+}
+
+function translateResponsesRequest(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Request body must be a JSON object.");
+  }
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    throw httpError(400, "`model` is required.");
+  }
+  if (payload.previous_response_id) {
+    throw httpError(400, "`previous_response_id` is not supported by this gateway.");
+  }
+  if (payload.background === true) {
+    throw httpError(400, "`background` is not supported by this gateway.");
+  }
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    throw httpError(400, "Responses tools are not supported by this gateway.");
+  }
+
+  const messages = responsesInputToMessages(payload.input, payload.instructions);
+  if (messages.length === 0) {
+    throw httpError(400, "`input` is required.");
+  }
+
+  const chat = { model, messages, stream: payload.stream === true };
+  copyIfPresent(payload, chat, ["temperature", "top_p", "presence_penalty", "frequency_penalty", "stop", "seed", "user"]);
+  const maxTokens = payload.max_output_tokens ?? payload.max_tokens;
+  if (maxTokens != null) chat.max_tokens = maxTokens;
+  if (payload.text?.format?.type && payload.text.format.type !== "text") {
+    chat.response_format = payload.text.format;
+  }
+
+  const responseId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
+  const messageId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
+  return {
+    bodyText: JSON.stringify(chat),
+    model,
+    stream: chat.stream,
+    seed: {
+      createdAt: Math.floor(Date.now() / 1000),
+      id: responseId,
+      instructions: typeof payload.instructions === "string" ? payload.instructions : null,
+      maxOutputTokens: maxTokens ?? null,
+      messageId,
+      metadata: payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {},
+      model,
+      temperature: payload.temperature ?? null,
+      topP: payload.top_p ?? null,
+    },
+  };
+}
+
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (typeof instructions === "string" && instructions.trim()) {
+    messages.push({ role: "system", content: instructions });
+  }
+
+  const rows = Array.isArray(input) ? input : (input == null ? [] : [input]);
+  for (const item of rows) {
+    if (typeof item === "string") {
+      messages.push({ role: "user", content: item });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    if (item.role || item.type === "message") {
+      messages.push({
+        role: normalizeChatRole(item.role || "user"),
+        content: responsesContentToChatContent(item.content),
+      });
+      continue;
+    }
+    if (item.type === "input_text" || typeof item.text === "string") {
+      messages.push({ role: "user", content: String(item.text || "") });
+    }
+  }
+
+  return messages.filter((msg) => msg.content !== "" && msg.content != null);
+}
+
+function responsesContentToChatContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  const parts = [];
+  let hasMedia = false;
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const type = String(part.type || "");
+    if (type === "input_image" || part.image_url) {
+      const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+      if (url) {
+        hasMedia = true;
+        parts.push({ type: "image_url", image_url: { url } });
+      }
+      continue;
+    }
+    const text = part.text ?? part.content;
+    if (text != null) parts.push({ type: "text", text: String(text) });
+  }
+
+  return hasMedia ? parts : parts.map((part) => part.text || "").join("");
+}
+
+function normalizeChatRole(role) {
+  const value = String(role || "user");
+  return value === "developer" ? "system" : value;
+}
+
+function copyIfPresent(from, to, keys) {
+  for (const key of keys) {
+    if (from[key] != null) to[key] = from[key];
+  }
+}
+
+function makeResponsesPayload(seed, text, usage, status = "completed") {
+  const message = {
+    id: seed.messageId,
+    type: "message",
+    status,
+    role: "assistant",
+    content: [{ type: "output_text", text: text || "", annotations: [] }],
+  };
+  return {
+    id: seed.id,
+    object: "response",
+    created_at: seed.createdAt,
+    status,
+    error: null,
+    incomplete_details: null,
+    instructions: seed.instructions,
+    max_output_tokens: seed.maxOutputTokens,
+    model: seed.model,
+    output: status === "completed" ? [message] : [],
+    output_text: text || "",
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: false,
+    temperature: seed.temperature,
+    text: { format: { type: "text" } },
+    tool_choice: "none",
+    tools: [],
+    top_p: seed.topP,
+    truncation: "disabled",
+    usage: normalizeResponsesUsage(usage),
+    metadata: seed.metadata || {},
+  };
+}
+
+function normalizeResponsesUsage(usage) {
+  const input = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
+  const output = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? 0) || 0);
+  return {
+    input_tokens: input,
+    input_tokens_details: { cached_tokens: Number(usage?.prompt_tokens_details?.cached_tokens || usage?.input_tokens_details?.cached_tokens || 0) || 0 },
+    output_tokens: output,
+    output_tokens_details: { reasoning_tokens: Number(usage?.completion_tokens_details?.reasoning_tokens || usage?.output_tokens_details?.reasoning_tokens || 0) || 0 },
+    total_tokens: Math.max(0, Number(usage?.total_tokens || input + output) || 0),
+  };
+}
+
+function chatContentToText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => typeof part === "string" ? part : String(part?.text || part?.content || "")).join("");
+}
+
+function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx) {
+  recordRequestLog(app, {
+    ts: new Date().toISOString(),
+    client: client.name || client.id || "client",
+    upstream: upstreamName,
+    model,
+    path: RESPONSES_PATH,
+    status: status || 200,
+    latency_ms: Date.now() - started,
+    prompt_tokens: usage?.input_tokens || Math.max(1, Math.round(bodyText.length / 4)),
+    completion_tokens: usage?.output_tokens || 1,
+  }, ctx);
+}
+
+function streamResponsesFromChat(openaiResp, seed) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const write = (event) => writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+  const baseMessage = { id: seed.messageId, type: "message", status: "in_progress", role: "assistant", content: [] };
+
+  (async () => {
+    let buffer = "";
+    let text = "";
+    let usage = null;
+    try {
+      await write({ type: "response.created", response: makeResponsesPayload(seed, "", null, "in_progress") });
+      await write({ type: "response.output_item.added", output_index: 0, item: baseMessage });
+      await write({ type: "response.content_part.added", item_id: seed.messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+
+      const reader = openaiResp.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() || "";
+        for (const block of blocks) {
+          const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+          if (!data || data === "[DONE]") continue;
+          let chunk;
+          try { chunk = JSON.parse(data); } catch { continue; }
+          usage = chunk.usage || usage;
+          const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+          if (!delta) continue;
+          text += delta;
+          await write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: 0, content_index: 0, delta });
+        }
+      }
+
+      const donePart = { type: "output_text", text, annotations: [] };
+      await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: 0, content_index: 0, text });
+      await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: 0, content_index: 0, part: donePart });
+      await write({ type: "response.output_item.done", output_index: 0, item: { ...baseMessage, status: "completed", content: [donePart] } });
+      await write({ type: "response.completed", response: makeResponsesPayload(seed, text, usage) });
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+    } catch (error) {
+      await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
+    } finally {
+      await writer.close();
+    }
+  })();
+
+  return readable;
 }
 
 async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {

@@ -9,10 +9,34 @@ const fetchUrls = [];
 const speedHits = [];
 const hedgeHits = [];
 const nimHits = [];
+const responseHits = [];
+const responseStreamHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("responses-stream.example")) {
+    responseStreamHits.push(JSON.parse(init.body));
+    return new Response([
+      'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ].join(""), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }
+  if (String(url).includes("responses.example")) {
+    responseHits.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      id: "chatcmpl-resp",
+      choices: [{ message: { content: "hello" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("hedge-slow.example")) {
     hedgeHits.push("slow");
     await new Promise((resolve) => setTimeout(resolve, 180));
@@ -346,6 +370,53 @@ const runtimeStatus = await runtimeResp.json();
 assert.equal(runtimeStatus.nim_rpm["nim-limit"].count, 40);
 assert.equal(runtimeStatus.nim_rpm["nim-limit"].limit, 40);
 assert.equal(runtimeStatus.nim_rpm["nim-limit"].reset_in_ms > 0, true);
+
+const responsesStore = new Map();
+responsesStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "responses", base_url: "https://responses.example/v1", api_key_encrypted: "r", models: ["resp-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "responses-stream", base_url: "https://responses-stream.example/v1", api_key_encrypted: "s", models: ["stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const responsesEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = responsesStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { responsesStore.set(key, value); },
+    async delete(key) { responsesStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "responses-client", key: "sk-resp", models: ["*"], upstreams: ["responses", "responses-stream"] }]),
+};
+const responsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "resp-model", instructions: "be terse", input: "hi", max_output_tokens: 8 }),
+}), responsesEnv);
+const responsesPayload = await responsesResp.json();
+assert.equal(responsesResp.status, 200);
+assert.equal(responseHits[0].messages[0].role, "system");
+assert.equal(responseHits[0].messages[1].content, "hi");
+assert.equal(responseHits[0].max_tokens, 8);
+assert.equal(responsesPayload.object, "response");
+assert.equal(responsesPayload.output_text, "hello");
+assert.equal(responsesPayload.usage.input_tokens, 3);
+
+const responsesStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "stream-model", input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }], stream: true }),
+}), responsesEnv);
+assert.equal(responsesStreamResp.headers.get("content-type").includes("text/event-stream"), true);
+const responsesStreamText = await responsesStreamResp.text();
+assert.equal(responseStreamHits[0].stream, true);
+assert.equal(responsesStreamText.includes('"type":"response.output_text.delta"'), true);
+assert.equal(responsesStreamText.includes('"delta":"hel"'), true);
+assert.equal(responsesStreamText.includes('"type":"response.completed"'), true);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({
