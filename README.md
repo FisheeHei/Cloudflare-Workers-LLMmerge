@@ -94,7 +94,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `KV` | KV binding | 建议 | Cloudflare KV 绑定名，后台和持久化配置需要它 |
 | `ADMIN_TOKEN` | `change-me-admin-token` | 建议 | 后台路径。也兼容 `ADMIN`、`admin`、`TOKEN`、`token` |
 | `API_KEY_CRYPT_SECRET` | `change-me-32-bytes-or-longer` | 建议 | 上游 API Key 加密密钥，生产环境应固定且足够长 |
-| `REQUEST_TIMEOUT_MS` | `90000` | 否 | 上游请求超时，默认 `30000` |
+| `REQUEST_TIMEOUT_MS` | `180000` | 否 | 上游请求超时，默认 `180000` |
 | `UPSTREAM_COOLDOWN_TTL` | `60` | 否 | 上游失败后的冷却秒数，默认 `60` |
 | `MODEL_CACHE_TTL` | `3600` | 否 | 模型列表缓存秒数，默认 `3600` |
 | `UPSTREAMS_JSON` | 见下方示例 | 否 | 首次启动的上游种子配置；KV 已有配置时以 KV 为准 |

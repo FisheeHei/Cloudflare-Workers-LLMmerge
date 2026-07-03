@@ -153,6 +153,7 @@ assert.equal(adminPage.includes("picker-apply-same-preset"), true);
 assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
+assert.equal(adminPage.includes("180000"), true);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -528,6 +529,7 @@ const failResp = await worker.default.fetch(new Request("https://gw.test/v1/chat
   body: JSON.stringify({ model: "boom-model", messages: [] }),
 }), failEnv);
 assert.equal(failResp.status, 502);
+assert.equal(failResp.headers.get("retry-after"), "1");
 const failLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), failEnv);
 const failLogs = await failLogsResp.json();
 assert.equal(failLogs.logs.some((entry) => entry.upstream === "boom" && entry.status === 502), true);
