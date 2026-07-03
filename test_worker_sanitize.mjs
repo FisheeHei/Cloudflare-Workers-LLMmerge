@@ -26,6 +26,9 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("boom.example")) {
+    throw new Error("network down");
+  }
   if (String(url).includes("/ai/models/search")) {
     const page = Number(new URL(String(url)).searchParams.get("page") || 1);
     const result = page === 1
@@ -203,5 +206,35 @@ const beforeSpeedChoice = speedHits.length;
 const speedResp = await speedRequest("sk-both");
 assert.equal(speedResp.headers.get("x-llm-gateway-upstream"), "fast");
 assert.equal(speedHits[beforeSpeedChoice], "fast");
+
+const failStore = new Map();
+failStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "boom", base_url: "https://boom.example/v1", api_key_encrypted: "b", models: ["boom-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const failEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = failStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { failStore.set(key, value); },
+    async delete(key) { failStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "fail-client", key: "sk-fail", models: ["*"], upstreams: ["boom"] }]),
+};
+const failResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-fail", "content-type": "application/json" },
+  body: JSON.stringify({ model: "boom-model", messages: [] }),
+}), failEnv);
+assert.equal(failResp.status, 502);
+const failLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), failEnv);
+const failLogs = await failLogsResp.json();
+assert.equal(failLogs.logs.some((entry) => entry.upstream === "boom" && entry.status === 502), true);
 
 console.log("ok");

@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-03-latency-routing";
+const VERSION = "v26-07-03-failed-request-stats";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -154,21 +154,37 @@ export default {
         var cleanedBody = JSON.stringify(payload);
 
         const started = Date.now();
-        const proxyResponse = await proxyRequest({
-          client,
-          model,
-          pathname,
-          request,
-          bodyText: cleanedBody,
-          runtime,
-          search: url.search,
-        });
+        // ponytail: estimate input tokens from already-serialized body (no extra stringify)
+        var pt = Math.max(1, Math.round(cleanedBody.length / 4));
+        let proxyResponse;
+        try {
+          proxyResponse = await proxyRequest({
+            client,
+            model,
+            pathname,
+            request,
+            bodyText: cleanedBody,
+            runtime,
+            search: url.search,
+          });
+        } catch (error) {
+          recordRequestLog(app, {
+            ts: new Date().toISOString(),
+            client: client.name || client.id || "client",
+            upstream: error.upstreamName || "none",
+            model,
+            path: pathname,
+            status: error.statusCode || 502,
+            latency_ms: Date.now() - started,
+            prompt_tokens: pt,
+            completion_tokens: 0,
+          });
+          throw error;
+        }
 
         // ponytail: stream response directly, log with estimates to avoid blocking
         const upstreamResp = proxyResponse.response;
         const loggedStatus = upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502);
-        // ponytail: estimate input tokens from already-serialized body (no extra stringify)
-        var pt = Math.max(1, Math.round(cleanedBody.length / 4));
         var ct = 1;
         const logEntry = {
           ts: new Date().toISOString(),
@@ -181,9 +197,7 @@ export default {
           prompt_tokens: pt,
           completion_tokens: ct,
         };
-        appendLog(app, logEntry);
-        recordStats(app, logEntry);
-        flushBatch(app);
+        recordRequestLog(app, logEntry);
 
         const headers = new Headers(upstreamResp.headers);
         for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
@@ -231,14 +245,30 @@ export default {
           stop: anthropicPayload.stop_sequences,
         });
 
-        const proxyResponse = await proxyRequest({
-          client, model,
-          pathname: CHAT_PATH,
-          request,
-          bodyText: openaiBody,
-          runtime,
-          search: url.search,
-        });
+        let proxyResponse;
+        try {
+          proxyResponse = await proxyRequest({
+            client, model,
+            pathname: CHAT_PATH,
+            request,
+            bodyText: openaiBody,
+            runtime,
+            search: url.search,
+          });
+        } catch (error) {
+          recordRequestLog(app, {
+            ts: new Date().toISOString(),
+            client: client.name || client.id || "client",
+            upstream: error.upstreamName || "none",
+            model,
+            path: MESSAGES_PATH,
+            status: error.statusCode || 502,
+            latency_ms: Date.now() - started,
+            prompt_tokens: Math.max(1, Math.round(openaiBody.length / 4)),
+            completion_tokens: 0,
+          });
+          throw error;
+        }
 
         const openaiResp = proxyResponse.response;
         const respBody = await openaiResp.text();
@@ -282,9 +312,7 @@ export default {
           prompt_tokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
           completion_tokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
         };
-        appendLog(app, msgLogEntry);
-        recordStats(app, msgLogEntry);
-        flushBatch(app);
+        recordRequestLog(app, msgLogEntry);
 
         return new Response(JSON.stringify(anthropicResp), {
           status: openaiResp.ok ? 200 : openaiResp.status,
@@ -370,6 +398,11 @@ function recordStats(app, entry) {
   }
   addStatsEntry(_pendingStats[hour], entry);
   flushBatch(app);
+}
+
+function recordRequestLog(app, entry) {
+  appendLog(app, entry);
+  recordStats(app, entry);
 }
 
 async function flushBatch(app) {
@@ -1174,6 +1207,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 
       const shouldRetry = runtime.routing.failover !== false && RETRYABLE_STATUSES.has(response.status);
       if (shouldRetry) {
+        lastError = new Error(`HTTP ${response.status}`);
+        lastError.upstreamName = upstream.name;
         await markUpstreamFailure(runtime, upstream, response.status);
       } else {
         await clearUpstreamFailure(runtime, upstream);
@@ -1189,6 +1224,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
     } catch (error) {
       lastError = error;
+      lastError.upstreamName = upstream.name;
       await markUpstreamFailure(runtime, upstream, 599);
       if (isLast) {
         break;
@@ -1196,7 +1232,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     }
   }
 
-  throw httpError(502, lastError?.message || "All upstreams failed.");
+  const err = httpError(502, lastError?.message || "All upstreams failed.");
+  err.upstreamName = lastError?.upstreamName || "none";
+  throw err;
 }
 
 async function orderUpstreams(runtime, candidates) {
