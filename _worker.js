@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-models-same-preset";
+const VERSION = "v26-07-04-collapsible-logs";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2840,7 +2840,7 @@ function renderAdminPage(origin) {
 
 <script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
@@ -3666,6 +3666,7 @@ function renderAdminPage(origin) {
     const resp = await fetch(API_BASE + "/logs");
     const payload = await parseApiResponse(resp);
     const logs = payload.logs || [];
+    state.logs = logs;
     byId("live-log").innerHTML = logs.length
       ? logs.slice(0, 20).map((l) =>
           '<div class="log-row">' +
@@ -3689,14 +3690,18 @@ function renderAdminPage(origin) {
       byId("token-total").textContent = "";
       return;
     }
+    const visibleLogs = state.logExpanded ? logs : logs.slice(0, 5);
+    const toggle = logs.length > 5
+      ? '<button type="button" class="small secondary" id="toggle-log-expanded">' + (state.logExpanded ? '\u6536\u8d77' : '\u5c55\u5f00\u5168\u90e8 ' + logs.length + ' \u6761') + '</button>'
+      : "";
     const totalPrompt = logs.reduce((s, l) => s + (l.prompt_tokens || 0), 0);
     const totalCompletion = logs.reduce((s, l) => s + (l.completion_tokens || 0), 0);
     byId("token-total").textContent = "\u603b\u8ba1: " + totalPrompt + " input + " + totalCompletion + " output = " + (totalPrompt + totalCompletion) + " tokens (" + logs.length + " \u8bf7\u6c42)";
 
-    byId("log-list").innerHTML = '<table class="log-table"><thead><tr>' +
+    byId("log-list").innerHTML = toggle + '<table class="log-table"><thead><tr>' +
       '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Tokens</th>' +
     '</tr></thead><tbody>' +
-    logs.map((l) => '<tr>' +
+    visibleLogs.map((l) => '<tr>' +
       '<td>' + esc((l.ts || "").slice(11, 19)) + '</td>' +
       '<td>' + esc(l.client || "") + '</td>' +
       '<td>' + esc(l.upstream || "") + '</td>' +
@@ -3707,6 +3712,10 @@ function renderAdminPage(origin) {
       '<td>' + esc(l.prompt_tokens || 0) + '/' + esc(l.completion_tokens || 0) + '</td>' +
     '</tr>').join("") +
     '</tbody></table>';
+    byId("toggle-log-expanded")?.addEventListener("click", () => {
+      state.logExpanded = !state.logExpanded;
+      renderLogs(state.logs);
+    });
   }
 
   /* ---- Clients ---- */

@@ -140,6 +140,7 @@ const env = {
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPage.includes("apply-models-same-preset"), true);
+assert.equal(adminPage.includes("toggle-log-expanded"), true);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
