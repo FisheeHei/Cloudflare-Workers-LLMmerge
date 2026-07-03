@@ -27,11 +27,16 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
+const HK_TIME_ZONE = "Asia/Hong_Kong";
+const HK_TIME_ZONE_LABEL = "Hong Kong Standard Time (UTC+8)";
+const HK_UTC_OFFSET_MS = 8 * 3600 * 1000;
+const STDTIME_URL = "https://stdtime.gov.hk/";
+const STDTIME_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-mobile-layout";
+const VERSION = "v26-07-04-stdtime-hk";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -88,6 +93,7 @@ export default {
       const pathname = normalizePathname(url.pathname);
       const pathnameLower = pathname.toLowerCase();
       const app = createApp(env);
+      scheduleStdTimeSync(app, ctx);
       const adminRoute = matchAdminRoute(pathnameLower, app);
 
       if (request.method === "OPTIONS") {
@@ -104,7 +110,8 @@ export default {
               ok: true,
               mode: "openai-compatible-gateway",
               has_kv: Boolean(app.kv),
-              now: new Date().toISOString(),
+              now: hkNowIso(),
+              time_zone: HK_TIME_ZONE_LABEL,
             },
             200,
           ),
@@ -167,7 +174,7 @@ export default {
           });
         } catch (error) {
           recordRequestLog(app, {
-            ts: new Date().toISOString(),
+            ts: hkNowIso(),
             client: client.name || client.id || "client",
             upstream: error.upstreamName || "none",
             model,
@@ -251,7 +258,7 @@ export default {
           });
         } catch (error) {
           recordRequestLog(app, {
-            ts: new Date().toISOString(),
+            ts: hkNowIso(),
             client: client.name || client.id || "client",
             upstream: error.upstreamName || "none",
             model,
@@ -296,7 +303,7 @@ export default {
 
         const loggedStatusMsg = openaiResp.ok ? openaiResp.status : (openaiResp.status || 502);
         var msgLogEntry = {
-          ts: new Date().toISOString(),
+          ts: hkNowIso(),
           client: client.name || client.id || "client",
           upstream: proxyResponse.upstream.name,
           model,
@@ -348,6 +355,9 @@ var _nimMinuteCounters = {};
 var _runtimeCache = null;
 var _runtimeCacheTs = 0;
 var RUNTIME_CACHE_TTL_MS = 30000;
+var _stdTimeOffsetMs = 0;
+var _stdTimeSyncedAt = 0;
+var _stdTimeSyncing = null;
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -369,9 +379,57 @@ function createApp(env) {
     envClients: parseJsonEnvArray(env.CLIENTS_JSON, "CLIENTS_JSON"),
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
     kv: env.KV || null,
+    stdTimeUrl: String(env.STDTIME_URL || STDTIME_URL),
   };
   _cachedEnvRef = env;
   return _cachedApp;
+}
+
+function scheduleStdTimeSync(app, ctx) {
+  if (!ctx || typeof ctx.waitUntil !== "function") return;
+  if (_stdTimeSyncing || Date.now() - _stdTimeSyncedAt < STDTIME_SYNC_INTERVAL_MS) return;
+  _stdTimeSyncing = syncStdTime(app).finally(() => { _stdTimeSyncing = null; });
+  ctx.waitUntil(_stdTimeSyncing);
+}
+
+async function syncStdTime(app) {
+  const localStart = Date.now();
+  try {
+    const resp = await fetch(app.stdTimeUrl, {
+      method: "HEAD",
+      headers: { "cache-control": "no-cache" },
+      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(1500) : undefined,
+    });
+    const serverMs = Date.parse(resp.headers.get("date") || "");
+    if (Number.isFinite(serverMs)) {
+      _stdTimeOffsetMs = serverMs + Math.round((Date.now() - localStart) / 2) - Date.now();
+    }
+  } catch {}
+  _stdTimeSyncedAt = Date.now();
+}
+
+function hkNowMs() {
+  return Date.now() + _stdTimeOffsetMs;
+}
+
+function hkNowIso(ms = hkNowMs()) {
+  const d = new Date(ms + HK_UTC_OFFSET_MS);
+  return d.getUTCFullYear() + "-" +
+    String(d.getUTCMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getUTCDate()).padStart(2, "0") + "T" +
+    String(d.getUTCHours()).padStart(2, "0") + ":" +
+    String(d.getUTCMinutes()).padStart(2, "0") + ":" +
+    String(d.getUTCSeconds()).padStart(2, "0") + "." +
+    String(d.getUTCMilliseconds()).padStart(3, "0") + "+08:00";
+}
+
+function hkHourKey(value) {
+  const ms = typeof value === "number" ? value : Date.parse(value || hkNowIso());
+  const d = new Date((Number.isFinite(ms) ? ms : hkNowMs()) + HK_UTC_OFFSET_MS);
+  return d.getUTCFullYear() + "-" +
+    String(d.getUTCMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getUTCDate()).padStart(2, "0") + ":" +
+    String(d.getUTCHours()).padStart(2, "0");
 }
 
 // ponytail: in-memory batch for stats + logs, flush every 90s to KV
@@ -388,11 +446,7 @@ function appendLog(app, entry) {
 }
 
 function recordStats(app, entry) {
-  var now = new Date(entry.ts);
-  var hour = now.getFullYear() + "-" +
-    String(now.getMonth() + 1).padStart(2, "0") + "-" +
-    String(now.getDate()).padStart(2, "0") + ":" +
-    String(now.getHours()).padStart(2, "0");
+  var hour = hkHourKey(entry.ts);
   if (!_pendingStats[hour]) {
     _pendingStats[hour] = emptyStatsBucket();
   }
@@ -495,7 +549,7 @@ async function getMergedLogs(app) {
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
   const log = (usage) => recordRequestLog(app, {
-    ts: new Date().toISOString(),
+    ts: hkNowIso(),
     client: client.name || client.id || "client",
     upstream: proxyResponse.upstream.name,
     model,
@@ -696,14 +750,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   // ponytail: parallel KV reads for 24h stats instead of sequential loop
   if (apiPath === "/api/stats" && request.method === "GET") {
-    const now = new Date();
+    const now = hkNowMs();
     const hourKeys = [];
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
-      const t = new Date(now.getTime() - h * 3600000);
-      hourKeys.push(t.getFullYear() + "-" +
-        String(t.getMonth() + 1).padStart(2, "0") + "-" +
-        String(t.getDate()).padStart(2, "0") + ":" +
-        String(t.getHours()).padStart(2, "0"));
+      hourKeys.push(hkHourKey(now - h * 3600000));
     }
     const raws = app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null);
     const logs = await getMergedLogs(app);
@@ -711,7 +761,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       const raw = raws[i];
       return { hour, ...mergeStatsBucket(raw, _pendingStats[hour]) };
     });
-    return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "" }, 200));
+    return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: hkNowIso(), time_zone: HK_TIME_ZONE_LABEL }, 200));
   }
 
   if (apiPath === "/api/runtime" && request.method === "GET") {
@@ -996,7 +1046,7 @@ async function exportUpstreamGroup(app) {
   );
 
   return {
-    exported_at: new Date().toISOString(),
+    exported_at: hkNowIso(),
     upstreams,
     version: editable.version || 1,
   };
@@ -1137,7 +1187,7 @@ async function getUpstreamModels(runtime, upstream) {
     await runtime.kv.put(
       cacheKey,
       JSON.stringify({
-        fetched_at: new Date().toISOString(),
+        fetched_at: hkNowIso(),
         models,
       }),
       { expirationTtl: runtime.modelCacheTtl },
@@ -1171,7 +1221,7 @@ async function getFreshModels(runtime, upstream) {
     await runtime.kv.put(
       modelsCacheKey(upstream.name),
       JSON.stringify({
-        fetched_at: new Date().toISOString(),
+        fetched_at: hkNowIso(),
         models,
       }),
       { expirationTtl: runtime.modelCacheTtl },
@@ -1389,7 +1439,7 @@ async function handleResponsesRequest(request, url, app, ctx) {
     return new Response(JSON.stringify(responsePayload), { status: 200, headers });
   } catch (error) {
     recordRequestLog(app, {
-      ts: new Date().toISOString(),
+            ts: hkNowIso(),
       client: client.name || client.id || "client",
       upstream: error.upstreamName || "none",
       model: translated.model,
@@ -1441,7 +1491,7 @@ function translateResponsesRequest(payload) {
     model,
     stream: chat.stream,
     seed: {
-      createdAt: Math.floor(Date.now() / 1000),
+      createdAt: Math.floor(hkNowMs() / 1000),
       id: responseId,
       instructions: typeof payload.instructions === "string" ? payload.instructions : null,
       maxOutputTokens: maxTokens ?? null,
@@ -1572,7 +1622,7 @@ function chatContentToText(content) {
 
 function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx) {
   recordRequestLog(app, {
-    ts: new Date().toISOString(),
+          ts: hkNowIso(),
     client: client.name || client.id || "client",
     upstream: upstreamName,
     model,
@@ -1930,7 +1980,7 @@ async function markUpstreamFailure(runtime, upstream, status) {
     JSON.stringify({
       status,
       until: Date.now() + runtime.upstreamCooldownTtl * 1000,
-      updated_at: new Date().toISOString(),
+      updated_at: hkNowIso(),
     }),
     { expirationTtl: runtime.upstreamCooldownTtl },
   );
@@ -2061,8 +2111,8 @@ function normalizeClient(client) {
     name: client.name || client.id || "client",
     key: client.key,
     upstreams: normalizeStringArray(client.upstreams),
-    created_at: client.created_at || new Date().toISOString(),
-    updated_at: client.updated_at || new Date().toISOString(),
+    created_at: client.created_at || hkNowIso(),
+    updated_at: client.updated_at || hkNowIso(),
   };
 }
 
@@ -2076,7 +2126,7 @@ function buildClientRecord(payload) {
     throw httpError(400, "Client key must start with `sk-`.");
   }
 
-  const now = new Date().toISOString();
+  const now = hkNowIso();
   return normalizeClient({
     id: payload.id || crypto.randomUUID(),
     key,
@@ -2095,7 +2145,7 @@ async function saveClientRecord(kv, record) {
   const stored = {
     ...record,
     created_at: createdAt,
-    updated_at: new Date().toISOString(),
+    updated_at: hkNowIso(),
   };
 
   await kv.put(clientIdKey(stored.id), JSON.stringify(stored));
@@ -3844,17 +3894,7 @@ function renderAdminPage(origin) {
     if (!resp.ok) throw new Error(payload?.error?.message || "读取统计失败");
     const buckets = payload.buckets || [];
 
-    // ponytail: build 24h skeleton from server buckets (handles cross-day correctly)
-    var now = new Date();
-    var pad2 = function(n) { return String(n).padStart(2, "0"); };
-    var bucketMap = {};
-    buckets.forEach(function(b) { bucketMap[b.hour] = b; });
-    var skeleton = [];
-    for (var h = 23; h >= 0; h--) {
-      var t = new Date(now.getTime() - h * 3600000);
-      var key = t.getFullYear() + "-" + pad2(t.getMonth() + 1) + "-" + pad2(t.getDate()) + ":" + pad2(t.getHours());
-      skeleton.push(bucketMap[key] || { hour: key, total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, models: {} });
-    }
+    const skeleton = buckets;
 
     // Aggregate totals
     var total = 0, success = 0, fail = 0, pt = 0, ct = 0;
@@ -3910,7 +3950,7 @@ function renderAdminPage(origin) {
       return '<div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + b.hour.slice(-2) + '" title="' + b.hour + ': ' + b.prompt_tokens + ' in / ' + b.completion_tokens + ' out tokens">' + seg + '</div>';
     }).join("");
 
-    byId("stat-updated").textContent = new Date().toLocaleTimeString();
+    byId("stat-updated").textContent = (payload.now || "").slice(11, 19) + " HKT";
     showToast("统计已加载");
   }
 
@@ -4097,7 +4137,7 @@ function renderAdminPage(origin) {
       byId("export-upstreams").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5bfc\u51fa\u4e2d...", async () => {
           const payload = await exportUpstreams();
-          const stamp = (payload.exported_at || new Date().toISOString()).slice(0, 10);
+          const stamp = (payload.exported_at || "export").slice(0, 10);
           downloadJsonFile("llmmerge-upstreams-" + stamp + ".json", payload);
           showToast("\u5df2\u5bfc\u51fa " + ((payload.upstreams || []).length || 0) + " \u4e2a\u4e0a\u6e38");
         }).catch(showError)

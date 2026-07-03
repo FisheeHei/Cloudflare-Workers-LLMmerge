@@ -20,6 +20,12 @@ const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("stdtime.gov.hk")) {
+    return new Response(null, {
+      status: 200,
+      headers: { date: "Sat, 04 Jul 2026 04:00:00 GMT" },
+    });
+  }
   if (String(url).includes("usage-stream.example")) {
     usageHits.push("stream");
     return new Response([
@@ -196,6 +202,11 @@ assert.equal(adminPage.includes("system-prompt-modal"), true);
 assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
 
+const healthTimeResp = await worker.default.fetch(new Request("https://gw.test/health"), env);
+const healthTime = await healthTimeResp.json();
+assert.equal(healthTime.time_zone, "Hong Kong Standard Time (UTC+8)");
+assert.equal(healthTime.now.endsWith("+08:00"), true);
+
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
@@ -221,6 +232,8 @@ const statsResp = await worker.default.fetch(new Request("https://gw.test/llmmer
 const stats = await statsResp.json();
 assert.equal(stats.buckets.some((b) => b.total >= 2), true);
 assert.equal(stats.last_model, "minimax-m3");
+assert.equal(stats.time_zone, "Hong Kong Standard Time (UTC+8)");
+assert.equal(stats.now.endsWith("+08:00"), true);
 
 const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), env);
 const logs = await logsResp.json();

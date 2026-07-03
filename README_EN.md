@@ -121,6 +121,7 @@ Using a random value is still strongly recommended.
 | `ADMIN_TOKEN` | `change-me-admin-token` | Recommended | Admin path segment; also accepts `ADMIN`, `admin`, `TOKEN`, `token` |
 | `API_KEY_CRYPT_SECRET` | `change-me-32-bytes-or-longer` | Recommended | Encryption secret for upstream API keys |
 | `REQUEST_TIMEOUT_MS` | `180000` | No | Upstream first-byte/idle timeout, default `180000` |
+| `STDTIME_URL` | `https://stdtime.gov.hk/` | No | Hong Kong Standard Time calibration source; project time zone is `Asia/Hong_Kong` / UTC+8 |
 | `UPSTREAM_COOLDOWN_TTL` | `60` | No | Cooldown seconds after a failed upstream, default `60` |
 | `MODEL_CACHE_TTL` | `3600` | No | Model list cache seconds, default `3600` |
 | `UPSTREAMS_JSON` | see below | No | Initial upstream seed config; KV wins once a saved config exists |
