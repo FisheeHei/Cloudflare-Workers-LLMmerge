@@ -6,10 +6,26 @@ const worker = await import(`data:text/javascript;base64,${Buffer.from(code).toS
 
 const bodies = [];
 const fetchUrls = [];
+const speedHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("speed-slow.example")) {
+    speedHits.push("slow");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return new Response(JSON.stringify({ id: "slow", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("speed-fast.example")) {
+    speedHits.push("fast");
+    return new Response(JSON.stringify({ id: "fast", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("/ai/models/search")) {
     const page = Number(new URL(String(url)).searchParams.get("page") || 1);
     const result = page === 1
@@ -148,5 +164,44 @@ assert.equal(exported.upstreams[0].api_key, "x");
 assert.deepEqual(exported.upstreams[0].headers, { "x-test": "1" });
 assert.equal(exported.upstreams[1].account_id, "acc123");
 assert.equal(exported.upstreams[1].base_url, "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1");
+
+const speedStore = new Map();
+speedStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "slow", base_url: "https://speed-slow.example/v1", api_key_encrypted: "s", models: ["speed-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "fast", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["speed-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const speedEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = speedStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { speedStore.set(key, value); },
+    async delete(key) { speedStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([
+    { name: "slow-client", key: "sk-slow", models: ["*"], upstreams: ["slow"] },
+    { name: "fast-client", key: "sk-fast", models: ["*"], upstreams: ["fast"] },
+    { name: "both-client", key: "sk-both", models: ["*"], upstreams: ["slow", "fast"] },
+  ]),
+};
+async function speedRequest(key) {
+  return worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "speed-model", messages: [] }),
+  }), speedEnv);
+}
+await speedRequest("sk-slow");
+await speedRequest("sk-fast");
+const beforeSpeedChoice = speedHits.length;
+const speedResp = await speedRequest("sk-both");
+assert.equal(speedResp.headers.get("x-llm-gateway-upstream"), "fast");
+assert.equal(speedHits[beforeSpeedChoice], "fast");
 
 console.log("ok");

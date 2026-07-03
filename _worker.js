@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-02-workers-ai-fetch-fix";
+const VERSION = "v26-07-03-latency-routing";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -318,6 +318,8 @@ export default {
 // ponytail: cache createApp result per-isolate since env is stable across requests
 var _cachedApp = null;
 var _cachedEnvRef = null;
+// ponytail: per-isolate EWMA, KV-backed global scores only if cross-edge routing matters
+var _upstreamLatency = {};
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -1158,6 +1160,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const isLast = index === maxAttempts - 1;
 
     try {
+      const upstreamStarted = Date.now();
       const response = await fetchWithTimeout(
         buildUpstreamUrl(upstream.base_url, pathname, search),
         {
@@ -1167,12 +1170,14 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         },
         runtime.requestTimeoutMs,
       );
+      const upstreamLatency = Date.now() - upstreamStarted;
 
       const shouldRetry = runtime.routing.failover !== false && RETRYABLE_STATUSES.has(response.status);
       if (shouldRetry) {
         await markUpstreamFailure(runtime, upstream, response.status);
       } else {
         await clearUpstreamFailure(runtime, upstream);
+        rememberUpstreamLatency(upstream, upstreamLatency);
       }
 
       if (!shouldRetry || isLast) {
@@ -1220,12 +1225,12 @@ async function orderUpstreams(runtime, candidates) {
   });
 
   const orderedHealthy = runtime.routing.load_balance === false
-    ? prioritySort(healthy)
-    : weightedShuffle(healthy);
+    ? latencySort(prioritySort(healthy))
+    : latencySort(weightedShuffle(healthy));
 
   const orderedCooling = runtime.routing.load_balance === false
-    ? prioritySort(cooling)
-    : weightedShuffle(cooling);
+    ? latencySort(prioritySort(cooling))
+    : latencySort(weightedShuffle(cooling));
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
   if (runtime.routing.failover === false) {
@@ -1238,6 +1243,25 @@ async function orderUpstreams(runtime, candidates) {
 
 function prioritySort(items) {
   return [...items].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
+}
+
+function latencySort(items) {
+  return [...items].sort((a, b) => upstreamLatencyScore(a) - upstreamLatencyScore(b));
+}
+
+function upstreamLatencyScore(upstream) {
+  const score = Number(_upstreamLatency[upstream.name]);
+  return Number.isFinite(score) && score > 0 ? score : Number.POSITIVE_INFINITY;
+}
+
+function rememberUpstreamLatency(upstream, latencyMs) {
+  const name = String(upstream.name || "").trim();
+  const latency = Number(latencyMs);
+  if (!name || !Number.isFinite(latency) || latency < 0) return;
+  const previous = Number(_upstreamLatency[name]);
+  _upstreamLatency[name] = Number.isFinite(previous)
+    ? Math.round(previous * 0.7 + latency * 0.3)
+    : Math.max(1, Math.round(latency));
 }
 
 function weightedShuffle(items) {
