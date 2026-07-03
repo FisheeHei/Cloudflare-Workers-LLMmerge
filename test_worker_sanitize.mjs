@@ -13,10 +13,18 @@ const nimHits = [];
 const responseHits = [];
 const responseStreamHits = [];
 const paymentHits = [];
+const degradedHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("degraded.example")) {
+    degradedHits.push("degraded");
+    return new Response("Function id '52e1ddb6-c745-4802-93f5-ba012d04c336': DEGRADED function cannot be invoked", {
+      status: 400,
+      headers: { "content-type": "text/plain" },
+    });
+  }
   if (String(url).includes("payment-required.example")) {
     paymentHits.push("402");
     return new Response(JSON.stringify({ detail: [{ error: "You need positive balance to do inference." }] }), {
@@ -464,6 +472,35 @@ const paymentResp = await worker.default.fetch(new Request("https://gw.test/v1/c
 }), paymentEnv);
 assert.equal(paymentHits.length, 1);
 assert.equal(paymentResp.headers.get("x-llm-gateway-upstream"), "paid-fallback");
+
+const degradedStore = new Map();
+degradedStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "degraded", base_url: "https://degraded.example/v1", api_key_encrypted: "d", models: ["deepseek-v4-flash"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "degraded-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["deepseek-v4-flash"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const degradedEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = degradedStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { degradedStore.set(key, value); },
+    async delete(key) { degradedStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "degraded-client", key: "sk-degraded", models: ["*"], upstreams: ["degraded", "degraded-fallback"] }]),
+};
+const degradedResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-degraded", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-flash", messages: [] }),
+}), degradedEnv);
+assert.equal(degradedHits.length, 1);
+assert.equal(degradedResp.headers.get("x-llm-gateway-upstream"), "degraded-fallback");
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({

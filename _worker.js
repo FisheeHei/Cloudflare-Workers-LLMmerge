@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-picker-same-preset-models";
+const VERSION = "v26-07-04-degraded-failover";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1591,7 +1591,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       );
       const upstreamLatency = Date.now() - upstreamStarted;
 
-      const shouldRetry = runtime.routing.failover !== false && RETRYABLE_STATUSES.has(response.status);
+      const shouldRetry = runtime.routing.failover !== false && await isRetryableUpstreamResponse(response);
       if (shouldRetry) {
         lastError = new Error(`HTTP ${response.status}`);
         lastError.upstreamName = upstream.name;
@@ -1639,6 +1639,16 @@ function applyGlobalSystemPrompt(bodyText, prompt) {
   return JSON.stringify(payload);
 }
 
+async function isRetryableUpstreamResponse(response) {
+  if (RETRYABLE_STATUSES.has(response.status)) return true;
+  if (response.ok) return false;
+  try {
+    return (await response.clone().text()).includes("DEGRADED function cannot be invoked");
+  } catch {
+    return false;
+  }
+}
+
 async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runtime, search }) {
   const controllers = attempts.map(() => new AbortController());
   const hedgeDelayMs = Math.max(100, Math.floor(runtime.requestTimeoutMs / Math.max(2, attempts.length + 1)));
@@ -1679,7 +1689,8 @@ async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runti
     if (result.cancelled) continue;
     lastResult = result;
     if (result.limited) continue;
-    if (result.response && !RETRYABLE_STATUSES.has(result.response.status)) {
+    const retryable = result.response && await isRetryableUpstreamResponse(result.response);
+    if (result.response && !retryable) {
       done = true;
       controllers.forEach((controller, i) => { if (i !== result.index) controller.abort(); });
       await clearUpstreamFailure(runtime, result.upstream);
