@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-long-thinking-timeout";
+const VERSION = "v26-07-04-idle-timeout";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2301,17 +2301,71 @@ function getBearerToken(request) {
 }
 
 async function fetchWithTimeout(url, init, timeoutMs) {
-  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-    const signal = init?.signal && typeof AbortSignal.any === "function"
-      ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)])
-      : (init?.signal || AbortSignal.timeout(timeoutMs));
-    return fetch(url, {
-      ...init,
-      signal,
-    });
-  }
+  const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
+  const controller = new AbortController();
+  const upstreamSignal = init?.signal;
+  const abort = () => controller.abort(upstreamSignal?.reason || "timeout");
+  if (upstreamSignal?.aborted) abort();
+  else upstreamSignal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort("timeout"), timeout);
 
-  return fetch(url, init);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    clearTimeout(timer);
+    upstreamSignal?.removeEventListener("abort", abort);
+    return wrapIdleTimeout(response, timeout);
+  } catch (error) {
+    clearTimeout(timer);
+    upstreamSignal?.removeEventListener("abort", abort);
+    throw error;
+  }
+}
+
+function wrapIdleTimeout(response, timeoutMs) {
+  if (!response.body) return response;
+  const stream = response.body;
+  return new Response(new ReadableStream({
+    async start(controller) {
+      const reader = stream.getReader();
+      let closed = false;
+      let timer = null;
+      const stop = () => { if (timer) clearTimeout(timer); timer = null; };
+      const reset = () => {
+        stop();
+        timer = setTimeout(async () => {
+          if (closed) return;
+          closed = true;
+          try { await reader.cancel("idle timeout"); } catch {}
+          controller.error(new Error("Upstream idle timeout."));
+        }, timeoutMs);
+      };
+
+      reset();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          reset();
+          controller.enqueue(value);
+        }
+        if (!closed) {
+          closed = true;
+          stop();
+          controller.close();
+        }
+      } catch (error) {
+        if (!closed) {
+          closed = true;
+          stop();
+          controller.error(error);
+        }
+      }
+    },
+  }), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 function generateClientKey() {

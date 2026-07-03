@@ -14,10 +14,33 @@ const responseHits = [];
 const responseStreamHits = [];
 const paymentHits = [];
 const degradedHits = [];
+const longStreamHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("long-stream.example")) {
+    longStreamHits.push("stream");
+    const encoder = new TextEncoder();
+    return new Response(new ReadableStream({
+      start(controller) {
+        let sent = 0;
+        const timer = setInterval(() => {
+          if (init.signal?.aborted) {
+            clearInterval(timer);
+            controller.error(new Error("aborted"));
+            return;
+          }
+          sent += 1;
+          controller.enqueue(encoder.encode("x"));
+          if (sent >= 5) {
+            clearInterval(timer);
+            controller.close();
+          }
+        }, 30);
+      },
+    }), { status: 200, headers: { "content-type": "text/plain" } });
+  }
   if (String(url).includes("degraded.example")) {
     degradedHits.push("degraded");
     return new Response("Function id '52e1ddb6-c745-4802-93f5-ba012d04c336': DEGRADED function cannot be invoked", {
@@ -502,6 +525,34 @@ const degradedResp = await worker.default.fetch(new Request("https://gw.test/v1/
 }), degradedEnv);
 assert.equal(degradedHits.length, 1);
 assert.equal(degradedResp.headers.get("x-llm-gateway-upstream"), "degraded-fallback");
+
+const longStreamStore = new Map();
+longStreamStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 80, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "long-stream", base_url: "https://long-stream.example/v1", api_key_encrypted: "l", models: ["long-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const longStreamEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = longStreamStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { longStreamStore.set(key, value); },
+    async delete(key) { longStreamStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "long-stream-client", key: "sk-long-stream", models: ["*"], upstreams: ["long-stream"] }]),
+};
+const longStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-long-stream", "content-type": "application/json" },
+  body: JSON.stringify({ model: "long-model", messages: [] }),
+}), longStreamEnv);
+assert.equal(await longStreamResp.text(), "xxxxx");
+assert.equal(longStreamHits.length, 1);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({
