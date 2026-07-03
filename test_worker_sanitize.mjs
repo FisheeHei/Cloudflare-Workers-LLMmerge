@@ -15,10 +15,27 @@ const responseStreamHits = [];
 const paymentHits = [];
 const degradedHits = [];
 const longStreamHits = [];
+const usageHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("usage-stream.example")) {
+    usageHits.push("stream");
+    return new Response([
+      'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9,"total_tokens":16}}\n\n',
+      'data: [DONE]\n\n',
+    ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("usage.example")) {
+    usageHits.push("json");
+    return new Response(JSON.stringify({
+      id: "usage",
+      choices: [{ message: { content: "hello world" } }],
+      usage: { prompt_tokens: 11, completion_tokens: 22, total_tokens: 33 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).includes("long-stream.example")) {
     longStreamHits.push("stream");
     const encoder = new TextEncoder();
@@ -553,6 +570,43 @@ const longStreamResp = await worker.default.fetch(new Request("https://gw.test/v
 }), longStreamEnv);
 assert.equal(await longStreamResp.text(), "xxxxx");
 assert.equal(longStreamHits.length, 1);
+
+const usageStore = new Map();
+usageStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "usage-json", base_url: "https://usage.example/v1", api_key_encrypted: "u", models: ["usage-json"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "usage-stream", base_url: "https://usage-stream.example/v1", api_key_encrypted: "s", models: ["usage-stream"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const usageEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = usageStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { usageStore.set(key, value); },
+    async delete(key) { usageStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "usage-client", key: "sk-usage", models: ["*"], upstreams: ["usage-json", "usage-stream"] }]),
+};
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },
+  body: JSON.stringify({ model: "usage-json", messages: [] }),
+}), usageEnv);
+const usageStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },
+  body: JSON.stringify({ model: "usage-stream", messages: [], stream: true }),
+}), usageEnv);
+await usageStreamResp.text();
+const usageLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), usageEnv);
+const usageLogs = await usageLogsResp.json();
+assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-json" && entry.prompt_tokens === 11 && entry.completion_tokens === 22), true);
+assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-stream" && entry.prompt_tokens === 7 && entry.completion_tokens === 9), true);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({

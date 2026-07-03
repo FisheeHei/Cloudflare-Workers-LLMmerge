@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-idle-timeout";
+const VERSION = "v26-07-04-token-usage";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -180,33 +180,25 @@ export default {
           throw error;
         }
 
-        // ponytail: stream response directly, log with estimates to avoid blocking
         const upstreamResp = proxyResponse.response;
-        const loggedStatus = upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502);
-        var ct = 1;
-        const logEntry = {
-          ts: new Date().toISOString(),
-          client: client.name || client.id || "client",
-          upstream: proxyResponse.upstream.name,
-          model,
-          path: pathname,
-          status: loggedStatus,
-          latency_ms: Date.now() - started,
-          prompt_tokens: pt,
-          completion_tokens: ct,
-        };
-        recordRequestLog(app, logEntry, ctx);
-
         const headers = new Headers(upstreamResp.headers);
         for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
         headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
         headers.set("x-llm-gateway-client", client.name || client.id || "client");
         headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
 
-        return new Response(upstreamResp.body, {
-          status: upstreamResp.status,
-          statusText: upstreamResp.statusText,
+        return await buildLoggedProxyResponse({
+          app,
+          bodyText,
+          client,
+          ctx,
           headers,
+          model,
+          pathname,
+          requestPayload: payload,
+          proxyResponse,
+          started,
+          upstreamResp,
         });
       }
 
@@ -498,6 +490,114 @@ function mergeStatsBucket(base, delta) {
 async function getMergedLogs(app) {
   const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
   return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse();
+}
+
+async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, upstreamResp }) {
+  const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
+  const log = (usage) => recordRequestLog(app, {
+    ts: new Date().toISOString(),
+    client: client.name || client.id || "client",
+    upstream: proxyResponse.upstream.name,
+    model,
+    path: pathname,
+    status: upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502),
+    latency_ms: Date.now() - started,
+    prompt_tokens: usage.prompt_tokens,
+    completion_tokens: usage.completion_tokens,
+  }, ctx);
+
+  if (!upstreamResp.ok) {
+    log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 });
+    return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+  }
+
+  const contentType = upstreamResp.headers.get("content-type") || "";
+  if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
+    const body = trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log);
+    return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+  }
+
+  if (contentType.includes("application/json")) {
+    const textBody = await upstreamResp.text();
+    const payload = safeJson(textBody);
+    const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
+    log(usage);
+    return new Response(textBody, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+  }
+
+  log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 });
+  return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+}
+
+function trackOpenAiStreamUsage(body, fallbackPrompt, onDone) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let usage = null;
+  let outputText = "";
+  let logged = false;
+  const finish = () => {
+    if (logged) return;
+    logged = true;
+    onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)));
+  };
+
+  return new ReadableStream({
+    async start(controller) {
+      const reader = body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          readOpenAiStreamBlocks(buffer, (rest) => { buffer = rest; }, (chunk) => {
+            usage = chunk.usage || usage;
+            outputText += chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+          });
+          controller.enqueue(value);
+        }
+        if (buffer) readOpenAiStreamBlocks(buffer + "\n\n", (rest) => { buffer = rest; }, (chunk) => {
+          usage = chunk.usage || usage;
+          outputText += chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+        });
+        finish();
+        controller.close();
+      } catch (error) {
+        finish();
+        controller.error(error);
+      }
+    },
+  });
+}
+
+function readOpenAiStreamBlocks(text, setRest, onChunk) {
+  const blocks = text.split(/\r?\n\r?\n/);
+  setRest(blocks.pop() || "");
+  for (const block of blocks) {
+    const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+    if (!data || data === "[DONE]") continue;
+    const chunk = safeJson(data);
+    if (chunk) onChunk(chunk);
+  }
+}
+
+function safeJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function normalizeOpenAiLogUsage(usage, fallbackPrompt, fallbackCompletion) {
+  return {
+    prompt_tokens: Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? fallbackPrompt) || 0),
+    completion_tokens: Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? fallbackCompletion) || 0),
+  };
+}
+
+function estimateOpenAiCompletionTokens(payload) {
+  const text = (payload?.choices || []).map((choice) => chatContentToText(choice?.message?.content || choice?.text || "")).join("");
+  return estimateTokens(text);
+}
+
+function estimateTokens(text) {
+  return Math.max(0, Math.round(String(text || "").length / 4));
 }
 
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
