@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-03-manual-model-speed-test";
+const VERSION = "v26-07-03-compact-upstream-toolbar";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2009,8 +2009,18 @@ function renderAdminPage(origin) {
     .panel { padding: 20px; }
     .panel h2 { margin: 0 0 14px; font: 700 20px/1.2 Georgia, serif; }
 
-    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
+    .toolbar-spacer { flex: 1; }
+    .menu-wrap { position: relative; }
+    .menu {
+      position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+      display: none; min-width: 150px; padding: 6px;
+      background: #fffdfa; border: 1px solid #cfbea0; border-radius: 12px;
+      box-shadow: 0 12px 24px rgba(38,28,18,.12);
+    }
+    .menu-wrap.open .menu { display: grid; gap: 4px; }
+    .menu button { width: 100%; text-align: left; border-radius: 8px; }
 
     button {
       border: 0; border-radius: 999px; padding: 9px 16px;
@@ -2245,12 +2255,18 @@ function renderAdminPage(origin) {
     <div class="toolbar">
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
-      <button class="secondary" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
-      <button class="secondary" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
-      <button class="secondary" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
-      <button class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
-      <button class="secondary" id="speed-test">\u6a21\u578b\u6d4b\u901f</button>
+      <span class="toolbar-spacer"></span>
+      <div class="menu-wrap" id="upstream-actions">
+        <button type="button" class="secondary" id="upstream-actions-toggle">\u66f4\u591a\u64cd\u4f5c</button>
+        <div class="menu">
+          <button type="button" class="secondary small" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
+          <button type="button" class="secondary small" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
+          <button type="button" class="secondary small" id="speed-test">\u6a21\u578b\u6d4b\u901f</button>
+          <button type="button" class="secondary small" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
+          <button type="button" class="secondary small" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
+        </div>
+      </div>
       <span class="note" id="config-status"></span>
     </div>
     <div id="upstream-list"></div>
@@ -3169,6 +3185,11 @@ function renderAdminPage(origin) {
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
       document.addEventListener("keydown", (e) => { if (e.key === "Escape") state.modelPicker ? closeModelPicker() : closeVendorModal(); });
       byId("open-vendor-modal").addEventListener("click", openVendorModal);
+      byId("upstream-actions-toggle").addEventListener("click", (e) => {
+        e.stopPropagation();
+        byId("upstream-actions").classList.toggle("open");
+      });
+      document.addEventListener("click", () => byId("upstream-actions").classList.remove("open"));
       byId("close-vendor-modal").addEventListener("click", closeVendorModal);
       byId("model-picker-close").addEventListener("click", closeModelPicker);
       byId("picker-cancel").addEventListener("click", closeModelPicker);
