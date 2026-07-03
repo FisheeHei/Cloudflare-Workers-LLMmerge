@@ -14,6 +14,7 @@ const responseHits = [];
 const responseStreamHits = [];
 const paymentHits = [];
 const degradedHits = [];
+const missingFunctionHits = [];
 const longStreamHits = [];
 const usageHits = [];
 const kvPuts = [];
@@ -67,6 +68,13 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("degraded.example")) {
     degradedHits.push("degraded");
     return new Response("Function id '52e1ddb6-c745-4802-93f5-ba012d04c336': DEGRADED function cannot be invoked", {
+      status: 400,
+      headers: { "content-type": "text/plain" },
+    });
+  }
+  if (String(url).includes("missing-function.example")) {
+    missingFunctionHits.push("missing");
+    return new Response("Function id '52e1ddb6-c745-4802-93f5-ba012d04c336' version 'null': Specified function in account '6FqBGWPAdZEeL3QCvtuur-yTruZLNotqWzKfevWopTc' is not found", {
       status: 400,
       headers: { "content-type": "text/plain" },
     });
@@ -564,6 +572,35 @@ const degradedResp = await worker.default.fetch(new Request("https://gw.test/v1/
 }), degradedEnv);
 assert.equal(degradedHits.length, 1);
 assert.equal(degradedResp.headers.get("x-llm-gateway-upstream"), "degraded-fallback");
+
+const missingFunctionStore = new Map();
+missingFunctionStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "missing-function", base_url: "https://missing-function.example/v1", api_key_encrypted: "m", models: ["deepseek-v4-flash"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "missing-function-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["deepseek-v4-flash"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const missingFunctionEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = missingFunctionStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { missingFunctionStore.set(key, value); },
+    async delete(key) { missingFunctionStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "missing-function-client", key: "sk-missing-function", models: ["*"], upstreams: ["missing-function", "missing-function-fallback"] }]),
+};
+const missingFunctionResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-missing-function", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-flash", messages: [] }),
+}), missingFunctionEnv);
+assert.equal(missingFunctionHits.length, 1);
+assert.equal(missingFunctionResp.headers.get("x-llm-gateway-upstream"), "missing-function-fallback");
 
 const longStreamStore = new Map();
 longStreamStore.set("gateway:config", JSON.stringify({

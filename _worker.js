@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-stat-tooltips";
+const VERSION = "v26-07-04-nim-function-retry";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1814,7 +1814,9 @@ async function isRetryableUpstreamResponse(response) {
   if (RETRYABLE_STATUSES.has(response.status)) return true;
   if (response.ok) return false;
   try {
-    return (await response.clone().text()).includes("DEGRADED function cannot be invoked");
+    const body = await response.clone().text();
+    return body.includes("DEGRADED function cannot be invoked") ||
+      /Function id ['"][^'"]+['"].*Specified function .* is not found/i.test(body);
   } catch {
     return false;
   }
