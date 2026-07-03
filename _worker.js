@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-03-persistent-request-stats";
+const VERSION = "v26-07-03-manual-model-speed-test";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -658,6 +658,19 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, results }, 200));
   }
 
+  if (apiPath === "/api/speed-test" && request.method === "POST") {
+    const runtime = await loadRuntimeConfig(app);
+    const payload = parseJsonBody(await request.text());
+    const model = String(payload.model || "").trim();
+    if (!model) {
+      return withCorsResponse(json(openAiError("Model is required for speed test.", "invalid_request_error"), 400));
+    }
+    const targets = runtime.upstreams
+      .filter((upstream) => upstream.enabled !== false && upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, CHAT_PATH));
+    const results = await Promise.all(targets.map((upstream) => speedTestUpstream(runtime, upstream, model)));
+    return withCorsResponse(json({ ok: true, results }, 200));
+  }
+
 // ponytail: detect uses single getEditableConfig call, not loadRuntimeConfig + getEditableConfig
   const detectMatch = apiPath.match(/^\/api\/upstreams\/([^/]+)\/detect$/);
   if (detectMatch && request.method === "POST") {
@@ -1102,6 +1115,26 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
       );
     }
     return { name: upstream.name, ok: resp.ok || resp.status < 500, status: resp.status, latency_ms: Date.now() - started };
+  } catch (err) {
+    return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
+  }
+}
+
+async function speedTestUpstream(runtime, upstream, model) {
+  const started = Date.now();
+  try {
+    const resp = await fetchWithTimeout(
+      buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
+      {
+        method: "POST",
+        headers: buildUpstreamHeaders(null, upstream),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
+      },
+      Math.min(runtime.requestTimeoutMs, 15000),
+    );
+    const latency = Date.now() - started;
+    if (resp.ok) rememberUpstreamLatency(upstream, latency);
+    return { name: upstream.name, ok: resp.ok, status: resp.status, latency_ms: latency };
   } catch (err) {
     return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
   }
@@ -2217,6 +2250,7 @@ function renderAdminPage(origin) {
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
       <button class="secondary" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
       <button class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
+      <button class="secondary" id="speed-test">\u6a21\u578b\u6d4b\u901f</button>
       <span class="note" id="config-status"></span>
     </div>
     <div id="upstream-list"></div>
@@ -2743,6 +2777,25 @@ function renderAdminPage(origin) {
     showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
   }
 
+  async function speedTest() {
+    const models = splitList(prompt("\u8f93\u5165\u4e00\u4e2a\u8981\u6d4b\u901f\u7684\u6a21\u578b\u540d") || "");
+    if (!models.length) return;
+    const resp = await fetch(API_BASE + "/speed-test", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: models[0] }),
+    });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u6d4b\u901f\u5931\u8d25");
+    (payload.results || []).forEach((r) => {
+      const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
+      if (!dot) return;
+      dot.className = "health-dot " + (r.ok ? "ok" : "fail");
+      dot.title = (r.ok ? "\u6d4b\u901f " : "\u6d4b\u901f\u5931\u8d25 ") + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms";
+    });
+    const best = (payload.results || []).filter((r) => r.ok).sort((a,b) => a.latency_ms - b.latency_ms)[0];
+    showToast(best ? ("\u6700\u5feb: " + best.name + " " + best.latency_ms + "ms") : "\u6ca1\u6709\u4e0a\u6e38\u901a\u8fc7\u6d4b\u901f");
+  }
+
   async function detectCapability(upstreamName) {
     const resp = await fetch(API_BASE + "/upstreams/" + encodeURIComponent(upstreamName) + "/detect", { method: "POST" });
     const payload = await parseApiResponse(resp);
@@ -3170,6 +3223,9 @@ function renderAdminPage(origin) {
       );
       byId("check-health").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", checkHealth).catch(showError)
+      );
+      byId("speed-test").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u6d4b\u901f\u4e2d...", speedTest).catch(showError)
       );
       byId("load-stats").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadStats).catch(showError)
