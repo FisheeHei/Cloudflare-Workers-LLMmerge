@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-402-failover";
+const VERSION = "v26-07-04-models-same-preset";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3089,7 +3089,7 @@ function renderAdminPage(origin) {
             '<div class="field span-3"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '"></div>' +
           '</div>' +
           '<div class="row">' +
-            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea><button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:4px">\u4ece\u4e0a\u6e38\u5bfc\u5165\u6a21\u578b</button></div>' +
+            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea><label style="margin-top:6px"><input type="checkbox" class="apply-models-same-preset"> \u5e94\u7528\u5230\u540c\u7c7b\u578b\u5168\u90e8\u4e0a\u6e38</label><button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:4px">\u4ece\u4e0a\u6e38\u5bfc\u5165\u6a21\u578b</button></div>' +
           '</div>' +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
@@ -3158,6 +3158,34 @@ function renderAdminPage(origin) {
 
   function collectConfig() {
     const existingUpstreams = Array.isArray(state.config && state.config.upstreams) ? state.config.upstreams : [];
+    const cards = [...document.querySelectorAll(".upstream-card")];
+    const upstreams = cards.map((card, index) => {
+      const prev = existingUpstreams.find((item) => String(item && item.id) === String(card.dataset.id)) || existingUpstreams[index] || {};
+      return {
+        capability: prev.capability || null,
+        account_id: card.querySelector('[data-field="account_id"]')?.value.trim() || prev.account_id || "",
+        id: card.dataset.id || prev.id,
+        headers: prev.headers || {},
+        preset: card.querySelector('[data-field="preset"]').value,
+        note: card.querySelector('[data-field="note"]').value.trim(),
+        name: card.querySelector('[data-field="name"]').value.trim(),
+        base_url: card.querySelector('[data-field="base_url"]').value.trim(),
+        api_key_value: card.querySelector('[data-field="api_key_value"]').value.trim(),
+        weight: Number(card.querySelector('[data-field="weight"]').value || 1),
+        priority: Number(card.querySelector('[data-field="priority"]').value || 100),
+        enabled: card.querySelector('[data-field="enabled"]').value === "true",
+        paths: splitList(card.querySelector('[data-field="paths"]').value),
+        models: splitList(card.querySelector('[data-field="models"]').value),
+      };
+    });
+    cards.forEach((card, index) => {
+      if (!card.querySelector(".apply-models-same-preset")?.checked) return;
+      const preset = upstreams[index].preset;
+      const models = upstreams[index].models;
+      upstreams.forEach((item) => {
+        if (item.preset === preset) item.models = [...models];
+      });
+    });
     return {
       settings: {
         request_timeout_ms: Number(byId("request-timeout").value || 30000),
@@ -3170,25 +3198,7 @@ function renderAdminPage(origin) {
         hedge_enabled: byId("routing-hedge").checked,
         hedge_max: Number(byId("routing-hedge-max").value || 2),
       },
-      upstreams: [...document.querySelectorAll(".upstream-card")].map((card, index) => {
-        const prev = existingUpstreams.find((item) => String(item && item.id) === String(card.dataset.id)) || existingUpstreams[index] || {};
-        return {
-          capability: prev.capability || null,
-          account_id: card.querySelector('[data-field="account_id"]')?.value.trim() || prev.account_id || "",
-          id: card.dataset.id || prev.id,
-          headers: prev.headers || {},
-          preset: card.querySelector('[data-field="preset"]').value,
-          note: card.querySelector('[data-field="note"]').value.trim(),
-          name: card.querySelector('[data-field="name"]').value.trim(),
-          base_url: card.querySelector('[data-field="base_url"]').value.trim(),
-          api_key_value: card.querySelector('[data-field="api_key_value"]').value.trim(),
-          weight: Number(card.querySelector('[data-field="weight"]').value || 1),
-          priority: Number(card.querySelector('[data-field="priority"]').value || 100),
-          enabled: card.querySelector('[data-field="enabled"]').value === "true",
-          paths: splitList(card.querySelector('[data-field="paths"]').value),
-          models: splitList(card.querySelector('[data-field="models"]').value),
-        };
-      }),
+      upstreams,
     };
   }
 

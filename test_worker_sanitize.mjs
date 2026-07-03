@@ -137,6 +137,10 @@ const env = {
   CLIENTS_JSON: JSON.stringify([{ name: "c", key: "sk-test", models: ["*"], upstreams: ["nim"] }]),
 };
 
+const adminPageResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin"), env);
+const adminPage = await adminPageResp.text();
+assert.equal(adminPage.includes("apply-models-same-preset"), true);
+
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
