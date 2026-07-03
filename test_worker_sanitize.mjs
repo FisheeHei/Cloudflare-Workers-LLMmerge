@@ -179,6 +179,26 @@ await Promise.all(waitUntilTasks);
 assert.equal(kvPuts.includes("gateway:logs"), true);
 assert.equal(kvPuts.some((key) => key.startsWith("gateway:stats:")), true);
 
+const cachedConfigHits = speedHits.length;
+const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    routing: { failover: true, load_balance: false },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+    upstreams: [
+      { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["*"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    ],
+  }),
+}), env);
+assert.equal(saveConfigResp.status, 200);
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [] }),
+}), env);
+assert.equal(speedHits[cachedConfigHits], "fast");
+
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },

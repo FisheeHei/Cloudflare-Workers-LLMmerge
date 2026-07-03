@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-03-compact-upstream-toolbar";
+const VERSION = "v26-07-03-runtime-fast-path";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -149,13 +149,8 @@ export default {
           );
         }
 
-        // ponytail: strip Claude-only params that upstream OpenAI APIs reject
-        delete payload.thinking;
-        var cleanedBody = JSON.stringify(payload);
-
         const started = Date.now();
-        // ponytail: estimate input tokens from already-serialized body (no extra stringify)
-        var pt = Math.max(1, Math.round(cleanedBody.length / 4));
+        var pt = Math.max(1, Math.round(bodyText.length / 4));
         let proxyResponse;
         try {
           proxyResponse = await proxyRequest({
@@ -163,7 +158,7 @@ export default {
             model,
             pathname,
             request,
-            bodyText: cleanedBody,
+            bodyText,
             runtime,
             search: url.search,
           });
@@ -348,6 +343,10 @@ var _cachedApp = null;
 var _cachedEnvRef = null;
 // ponytail: per-isolate EWMA, KV-backed global scores only if cross-edge routing matters
 var _upstreamLatency = {};
+// ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
+var _runtimeCache = null;
+var _runtimeCacheTs = 0;
+var RUNTIME_CACHE_TTL_MS = 30000;
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -530,6 +529,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     };
     const normalized = await normalizeGatewayConfigPayload(merged, app);
     await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
+    invalidateRuntimeCache();
 
     return withCorsResponse(
       json(
@@ -701,6 +701,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
         target.capability = capability;
         target.paths = paths;
         await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(config));
+        invalidateRuntimeCache();
       }
       return withCorsResponse(json({ ok: true, capability, paths, latency_ms: latency }, 200));
     } catch (err) {
@@ -878,6 +879,11 @@ async function exportUpstreamGroup(app) {
 
 // ponytail: derive AES key once, decrypt all upstream keys in parallel
 async function loadRuntimeConfig(app) {
+  const now = Date.now();
+  if (_runtimeCache && _runtimeCache.app === app && now - _runtimeCacheTs < RUNTIME_CACHE_TTL_MS) {
+    return _runtimeCache.runtime;
+  }
+
   const editable = await getEditableConfig(app);
   const aesKey = await deriveAesKey(app.encryptionSecret);
 
@@ -890,7 +896,7 @@ async function loadRuntimeConfig(app) {
       }))
   );
 
-  return {
+  const runtime = {
     clients: app.envClients.map(normalizeClient),
     kv: app.kv,
     modelCacheTtl: editable.settings.model_cache_ttl,
@@ -900,6 +906,14 @@ async function loadRuntimeConfig(app) {
     upstreamCooldownTtl: editable.settings.upstream_cooldown_ttl,
     upstreams: decrypted,
   };
+  _runtimeCache = { app, runtime };
+  _runtimeCacheTs = now;
+  return runtime;
+}
+
+function invalidateRuntimeCache() {
+  _runtimeCache = null;
+  _runtimeCacheTs = 0;
 }
 
 // ponytail: LRU cache per-isolate for client tokens — saves KV read every proxy request
@@ -1391,6 +1405,12 @@ function buildUpstreamUrl(baseUrl, pathname, search) {
 function sanitizeProxyBody(bodyText, upstream) {
   if (!bodyText) return bodyText;
 
+  const baseUrl = String(upstream.base_url || "").toLowerCase();
+  const isNvidia = baseUrl.includes("integrate.api.nvidia.com");
+  if (!bodyText.includes('"thinking"') && (!isNvidia || (!bodyText.includes('"reasoning_split"') && !bodyText.includes('"enable_thinking"')))) {
+    return bodyText;
+  }
+
   let payload;
   try {
     payload = JSON.parse(bodyText);
@@ -1404,8 +1424,6 @@ function sanitizeProxyBody(bodyText, upstream) {
     changed = true;
   }
 
-  const baseUrl = String(upstream.base_url || "").toLowerCase();
-  const isNvidia = baseUrl.includes("integrate.api.nvidia.com");
   if (!isNvidia) return changed ? JSON.stringify(payload) : bodyText;
 
   if ("reasoning_split" in payload) {
