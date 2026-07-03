@@ -30,7 +30,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-nim-rpm-card";
+const VERSION = "v26-07-04-nim-rpm-timer-pop";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2227,6 +2227,7 @@ function renderAdminPage(origin) {
       border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap;
     }
     .upstream-card summary .card-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+    .nim-rpm-timer[hidden] { display: none; }
     .upstream-card .card-body { padding: 0 16px 14px; }
 
     .client-item {
@@ -2769,7 +2770,7 @@ function renderAdminPage(origin) {
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u2713' : '\u2717') + '</span>' +
-          (isNimConfig(item) ? '<span class="card-meta nim-rpm" data-upstream="' + esc(item.name) + '">NIM 0/40</span>' : '') +
+          (isNimConfig(item) ? '<span class="card-meta nim-rpm" data-upstream="' + esc(item.name) + '"><span class="nim-rpm-count">NIM 0/40</span><span class="nim-rpm-timer" hidden> · 60s</span></span>' : '') +
         '</summary>' +
         '<div class="card-body">' +
           '<div class="row">' +
@@ -2977,13 +2978,20 @@ function renderAdminPage(origin) {
     const nim = payload.nim_rpm || {};
     document.querySelectorAll(".nim-rpm").forEach(function(el) {
       const item = nim[el.dataset.upstream];
+      const countEl = el.querySelector(".nim-rpm-count");
+      const timerEl = el.querySelector(".nim-rpm-timer");
       if (!item) {
-        el.textContent = "NIM 0/40";
+        if (countEl) countEl.textContent = "NIM 0/40";
+        if (timerEl) timerEl.hidden = true;
         el.title = "\u5c1a\u672a\u5f00\u59cb\u8ba1\u65f6";
         return;
       }
       const seconds = Math.max(0, Math.ceil(Number(item.reset_in_ms || 0) / 1000));
-      el.textContent = "NIM " + item.count + "/" + item.limit + " · " + seconds + "s";
+      if (countEl) countEl.textContent = "NIM " + item.count + "/" + item.limit;
+      if (timerEl) {
+        timerEl.hidden = false;
+        timerEl.textContent = " · " + seconds + "s";
+      }
       el.title = seconds + "s \u540e\u6e05\u96f6";
     });
   }
