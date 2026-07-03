@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-nim-function-retry";
+const VERSION = "v26-07-04-model-tags";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2865,10 +2865,18 @@ function renderAdminPage(origin) {
     .model-row:last-child { border-bottom: 0; }
     .model-row input { width: auto; }
     .model-row.active { background: #f2e7d3; }
+    .model-row .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-left: auto; justify-content: flex-end; }
+    .model-tag { border: 1px solid #cfbea0; border-radius: 999px; padding: 1px 6px; color: var(--muted); font-size: 11px; white-space: nowrap; background: #fffdfa; }
+    .model-tag-filter { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .model-tag-filter button { padding: 5px 8px; font-size: 12px; }
+    .model-tag-filter button.active { background: #eadcc5; }
     .picker-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 12px; }
     @media (max-width: 760px) {
       .model-picker-grid { grid-template-columns: 1fr; }
       .model-picker-groups, .model-picker-subgroups { max-height: 150px; }
+      .model-row { align-items: flex-start; flex-wrap: wrap; }
+      .model-tags { margin-left: 26px; justify-content: flex-start; }
     }
 
     #toast {
@@ -3087,6 +3095,7 @@ function renderAdminPage(origin) {
       <button type="button" class="secondary small" id="model-picker-close">\u5173\u95ed</button>
     </div>
     <input id="model-picker-search" placeholder="\u641c\u7d22\u6a21\u578b">
+    <div class="model-tag-filter" id="model-tag-filter"></div>
     <div class="model-picker-grid" style="margin-top:12px">
       <div class="model-picker-groups" id="model-picker-groups"></div>
       <div class="model-picker-subgroups" id="model-picker-subgroups"></div>
@@ -3805,6 +3814,33 @@ function renderAdminPage(origin) {
     return titleParts(family);
   }
 
+  const MODEL_TAGS = [
+    { id: "chat", label: "\u804a\u5929" },
+    { id: "text", label: "\u5355\u6a21\u6001" },
+    { id: "vision", label: "\u591a\u6a21\u6001" },
+    { id: "tools", label: "\u5de5\u5177" },
+    { id: "thinking", label: "\u6df1\u5ea6\u601d\u8003" },
+  ];
+
+  function modelTags(model) {
+    const value = modelDisplayName(model).toLowerCase();
+    const tags = ["chat"];
+    const vision = /(^|[\/_.-])(vl|vision|visual|image|multimodal|omni|pixtral|gemini|gpt-4o|qwen2(?:\.5)?-vl)([\/_.-]|$)/i.test(value);
+    tags.push(vision ? "vision" : "text");
+    if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|llama-3|mistral|mixtral|deepseek)/i.test(value)) tags.push("tools");
+    if (/(^|[\/_.-])(r1|reason|reasoning|think|thinking|qwq|o1|o3|deepseek-v3\.1|deepseek-v4|deepseek-reasoner)([\/_.-]|$)/i.test(value)) tags.push("thinking");
+    return tags;
+  }
+
+  function renderModelTags(model) {
+    const tags = modelTags(model);
+    return '<span class="model-tags">' + MODEL_TAGS.filter(function(tag) {
+      return tags.includes(tag.id);
+    }).map(function(tag) {
+      return '<span class="model-tag">' + esc(tag.label) + '</span>';
+    }).join("") + '</span>';
+  }
+
   function showModelPicker(upstreamName, models, target, sourceCard) {
     const unique = Array.from(new Set((models || []).filter(Boolean))).sort();
     state.modelPicker = {
@@ -3812,6 +3848,7 @@ function renderAdminPage(origin) {
       models: unique,
       group: "__all__",
       family: "__all__",
+      tag: "__all__",
       selected: new Set(splitList(target.value)),
       sourceCard: sourceCard || null,
       target,
@@ -3846,12 +3883,19 @@ function renderAdminPage(origin) {
       ? picker.models
       : (picker.family === "__all__" ? groups[picker.group].models : families[picker.family]);
     picker.visible = sourceModels.filter(function(model) {
-      return !query || model.toLowerCase().includes(query) || modelDisplayName(model).toLowerCase().includes(query);
+      const tagOk = picker.tag === "__all__" || modelTags(model).includes(picker.tag);
+      const queryOk = !query || model.toLowerCase().includes(query) || modelDisplayName(model).toLowerCase().includes(query);
+      return tagOk && queryOk;
     });
 
     byId("model-picker-title").textContent = "\u9009\u62e9\u6a21\u578b - " + picker.title;
     byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
     byId("picker-same-preset-wrap").hidden = !picker.sourceCard;
+    byId("model-tag-filter").innerHTML =
+      '<button type="button" class="small secondary' + (picker.tag === "__all__" ? ' active' : '') + '" data-tag="__all__">\u5168\u90e8\u6807\u7b7e</button>' +
+      MODEL_TAGS.map(function(tag) {
+        return '<button type="button" class="small secondary' + (picker.tag === tag.id ? ' active' : '') + '" data-tag="' + esc(tag.id) + '">' + esc(tag.label) + '</button>';
+      }).join("");
     byId("model-picker-groups").innerHTML =
       '<button type="button" class="model-group-btn' + (picker.group === "__all__" ? ' active' : '') + '" data-group="__all__"><span>\u5168\u90e8</span><span>' + picker.models.length + '</span></button>' +
       groupNames.map(function(name) {
@@ -3866,10 +3910,16 @@ function renderAdminPage(origin) {
 
     byId("model-picker-list").innerHTML = picker.visible.length
       ? picker.visible.map(function(model) {
-          return '<label class="model-row" title="' + esc(model) + '"><input type="checkbox" class="model-pick" value="' + esc(model) + '"' + (picker.selected.has(model) ? ' checked' : '') + '><span class="mono">' + esc(modelDisplayName(model)) + '</span></label>';
+          return '<label class="model-row" title="' + esc(model) + '"><input type="checkbox" class="model-pick" value="' + esc(model) + '"' + (picker.selected.has(model) ? ' checked' : '') + '><span class="mono">' + esc(modelDisplayName(model)) + '</span>' + renderModelTags(model) + '</label>';
         }).join("")
       : '<div class="note" style="padding:12px">\u6ca1\u6709\u5339\u914d\u7684\u6a21\u578b</div>';
 
+    byId("model-tag-filter").querySelectorAll("[data-tag]").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        picker.tag = btn.dataset.tag;
+        renderModelPicker();
+      });
+    });
     byId("model-picker-groups").querySelectorAll(".model-group-btn").forEach(function(btn) {
       btn.addEventListener("click", function() {
         picker.group = btn.dataset.group;

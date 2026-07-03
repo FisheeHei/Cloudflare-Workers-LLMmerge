@@ -211,6 +211,8 @@ assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
 assert.equal(adminPage.includes("id=\"stat-tip\""), true);
 assert.equal(adminPage.includes("data-stat-kind"), true);
+assert.equal(adminPage.includes("model-tag-filter"), true);
+assert.equal(adminPage.includes("renderModelTags"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
 const configPayload = await configResp.json();
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
