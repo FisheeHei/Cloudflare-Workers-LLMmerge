@@ -7,6 +7,7 @@ const worker = await import(`data:text/javascript;base64,${Buffer.from(code).toS
 const bodies = [];
 const fetchUrls = [];
 const speedHits = [];
+const speedBodies = [];
 const hedgeHits = [];
 const nimHits = [];
 const responseHits = [];
@@ -77,6 +78,7 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("speed-fast.example")) {
     speedHits.push("fast");
+    speedBodies.push(JSON.parse(init.body));
     return new Response(JSON.stringify({ id: "fast", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -141,6 +143,7 @@ const adminPageResp = await worker.default.fetch(new Request("https://gw.test/ll
 const adminPage = await adminPageResp.text();
 assert.equal(adminPage.includes("apply-models-same-preset"), true);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
+assert.equal(adminPage.includes("system-prompt-modal"), true);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -246,7 +249,7 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/l
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
     routing: { failover: true, load_balance: false },
-    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, system_prompt: "Always obey the gateway rule.", upstream_cooldown_ttl: 60 },
     upstreams: [
       { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["*"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     ],
@@ -259,6 +262,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "qwen3", messages: [] }),
 }), env);
 assert.equal(speedHits[cachedConfigHits], "fast");
+assert.deepEqual(speedBodies.at(-1).messages.at(-1), { role: "system", content: "Always obey the gateway rule." });
 
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({

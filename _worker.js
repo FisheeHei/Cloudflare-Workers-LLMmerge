@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-collapsible-logs";
+const VERSION = "v26-07-04-global-system-prompt";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -787,6 +787,7 @@ async function buildGatewayConfigFromEnv(app) {
     settings: {
       model_cache_ttl: app.defaultModelCacheTtl,
       request_timeout_ms: app.defaultTimeoutMs,
+      system_prompt: String(app.env.SYSTEM_PROMPT || app.env.GLOBAL_SYSTEM_PROMPT || ""),
       upstream_cooldown_ttl: app.defaultCooldownTtl,
     },
     upstreams,
@@ -852,6 +853,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
     settings: {
       model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
       request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
+      system_prompt: String(settings.system_prompt || ""),
       upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
     },
     upstreams,
@@ -1536,6 +1538,10 @@ function streamResponsesFromChat(openaiResp, seed) {
 }
 
 async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {
+  if (pathname === CHAT_PATH) {
+    bodyText = applyGlobalSystemPrompt(bodyText, runtime.settings?.system_prompt);
+  }
+
   const candidates = runtime.upstreams.filter((upstream) => {
     if (!clientAllowsUpstream(client, upstream.name)) {
       return false;
@@ -1615,6 +1621,22 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   const err = httpError(502, lastError?.message || "All upstreams failed.");
   err.upstreamName = lastError?.upstreamName || "none";
   throw err;
+}
+
+function applyGlobalSystemPrompt(bodyText, prompt) {
+  const text = String(prompt || "");
+  if (!text.trim() || !bodyText) return bodyText;
+
+  let payload;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch {
+    return bodyText;
+  }
+
+  if (!Array.isArray(payload.messages)) return bodyText;
+  payload.messages = payload.messages.concat([{ role: "system", content: text }]);
+  return JSON.stringify(payload);
 }
 
 async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runtime, search }) {
@@ -2576,6 +2598,7 @@ function renderAdminPage(origin) {
     }
     .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, serif; }
     .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+    .system-prompt-textarea { min-height: min(55vh, 520px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
     .model-picker-backdrop { z-index: 80; }
     .model-picker-card { width: min(1280px, calc(100vw - 32px)); }
     .picker-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -2746,6 +2769,9 @@ function renderAdminPage(origin) {
         </div>
         <div class="field span-3"><label>\u6700\u9ad8\u8bf7\u6c42\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
       </div>
+      <div class="row">
+        <div class="field span-12"><label>\u9884\u7559\u9644\u52a0\u7cfb\u7edf\u63d0\u793a\u8bcd</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u7cfb\u7edf\u63d0\u793a\u8bcd</button><span class="note" id="system-prompt-status"></span></div>
+      </div>
       <button class="good small" id="save-settings">\u4fdd\u5b58\u8bbe\u7f6e</button>
       <span class="note" id="settings-status"></span>
     </div>
@@ -2834,6 +2860,16 @@ function renderAdminPage(origin) {
     <div class="modal-actions">
       <button class="secondary" id="close-vendor-modal">\u53d6\u6d88</button>
       <button class="good" id="create-vendor">\u6dfb\u52a0</button>
+    </div>
+  </div>
+</div>
+<div class="modal-backdrop" id="system-prompt-modal">
+  <div class="modal-card">
+    <h3>\u9884\u7559\u9644\u52a0\u7cfb\u7edf\u63d0\u793a\u8bcd</h3>
+    <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002\u6709\u5185\u5bb9\u65f6\uff0c\u6240\u6709 Chat/Responses/Messages \u8bf7\u6c42\u90fd\u4f1a\u8ffd\u52a0\u8fd9\u6bb5\u7cfb\u7edf\u63d0\u793a\u8bcd\u3002"></textarea>
+    <div class="modal-actions">
+      <button class="secondary" id="close-system-prompt-modal">\u5173\u95ed</button>
+      <button class="good" id="apply-system-prompt-modal">\u5e94\u7528</button>
     </div>
   </div>
 </div>
@@ -3191,6 +3227,7 @@ function renderAdminPage(origin) {
         request_timeout_ms: Number(byId("request-timeout").value || 30000),
         upstream_cooldown_ttl: Number(byId("cooldown-ttl").value || 60),
         model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
+        system_prompt: byId("system-prompt-input").value,
       },
       routing: {
         load_balance: byId("routing-load-balance").checked,
@@ -3213,6 +3250,8 @@ function renderAdminPage(origin) {
     byId("request-timeout").value = s.request_timeout_ms || "";
     byId("cooldown-ttl").value = s.upstream_cooldown_ttl || "";
     byId("model-cache-ttl").value = s.model_cache_ttl || "";
+    byId("system-prompt-input").value = s.system_prompt || "";
+    byId("system-prompt-status").textContent = s.system_prompt ? "\u5df2\u542f\u7528 (" + s.system_prompt.length + " \u5b57\u7b26)" : "\u672a\u542f\u7528";
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
     byId("routing-hedge").checked = r.hedge_enabled === true;
@@ -3251,6 +3290,15 @@ function renderAdminPage(origin) {
     await saveConfig();
     byId("settings-status").textContent = "\u2713 \u5df2\u4fdd\u5b58";
     setTimeout(() => byId("settings-status").textContent = "", 3000);
+  }
+
+  function openSystemPromptModal() {
+    byId("system-prompt-modal").classList.add("open");
+    byId("system-prompt-input").focus();
+  }
+
+  function closeSystemPromptModal() {
+    byId("system-prompt-modal").classList.remove("open");
   }
 
   async function refreshModels() {
@@ -3787,8 +3835,21 @@ function renderAdminPage(origin) {
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
       byId("speed-picker-modal").addEventListener("click", (e) => { if (e.target === byId("speed-picker-modal")) closeSpeedPicker(); });
-      document.addEventListener("keydown", (e) => { if (e.key === "Escape") state.speedPicker ? closeSpeedPicker() : state.modelPicker ? closeModelPicker() : closeVendorModal(); });
+      byId("system-prompt-modal").addEventListener("click", (e) => { if (e.target === byId("system-prompt-modal")) closeSystemPromptModal(); });
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        if (state.speedPicker) closeSpeedPicker();
+        else if (state.modelPicker) closeModelPicker();
+        else if (byId("system-prompt-modal").classList.contains("open")) closeSystemPromptModal();
+        else closeVendorModal();
+      });
       byId("open-vendor-modal").addEventListener("click", openVendorModal);
+      byId("open-system-prompt-modal").addEventListener("click", openSystemPromptModal);
+      byId("close-system-prompt-modal").addEventListener("click", closeSystemPromptModal);
+      byId("apply-system-prompt-modal").addEventListener("click", () => {
+        byId("system-prompt-status").textContent = byId("system-prompt-input").value ? "\u5f85\u4fdd\u5b58" : "\u672a\u542f\u7528";
+        closeSystemPromptModal();
+      });
       byId("upstream-actions-toggle").addEventListener("click", (e) => {
         e.stopPropagation();
         byId("upstream-actions").classList.toggle("open");
