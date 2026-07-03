@@ -241,6 +241,16 @@ const manualSpeedResp = await worker.default.fetch(new Request("https://gw.test/
 const manualSpeed = await manualSpeedResp.json();
 assert.equal(manualSpeedResp.status, 200);
 assert.equal(manualSpeed.results.filter((r) => r.ok).length, 2);
+const selectedSpeedStart = speedHits.length;
+const selectedSpeedResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ model: "speed-model", upstreams: ["fast"] }),
+}), speedEnv);
+const selectedSpeed = await selectedSpeedResp.json();
+assert.equal(selectedSpeedResp.status, 200);
+assert.deepEqual(selectedSpeed.results.map((r) => r.name), ["fast"]);
+assert.deepEqual(speedHits.slice(selectedSpeedStart), ["fast"]);
 const beforeSpeedChoice = speedHits.length;
 const speedResp = await speedRequest("sk-both");
 assert.equal(speedResp.headers.get("x-llm-gateway-upstream"), "fast");

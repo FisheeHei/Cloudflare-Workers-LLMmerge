@@ -28,7 +28,7 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-03-runtime-fast-path";
+const VERSION = "v26-07-03-speed-test-picker";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -665,8 +665,14 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     if (!model) {
       return withCorsResponse(json(openAiError("Model is required for speed test.", "invalid_request_error"), 400));
     }
+    const upstreamNames = new Set(normalizeStringArray(payload.upstreams));
     const targets = runtime.upstreams
-      .filter((upstream) => upstream.enabled !== false && upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, CHAT_PATH));
+      .filter((upstream) =>
+        upstream.enabled !== false &&
+        (!upstreamNames.size || upstreamNames.has(upstream.name)) &&
+        upstreamSupportsModel(upstream, model) &&
+        upstreamSupportsPath(upstream, CHAT_PATH)
+      );
     const results = await Promise.all(targets.map((upstream) => speedTestUpstream(runtime, upstream, model)));
     return withCorsResponse(json({ ok: true, results }, 200));
   }
@@ -2171,9 +2177,10 @@ function renderAdminPage(origin) {
       background: transparent; color: var(--ink); text-align: left;
     }
     .model-group-btn.active { background: #eadcc5; }
-    .model-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #f1e6d6; font-size: 13px; }
+    .model-row { width: 100%; display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 0; border-bottom: 1px solid #f1e6d6; background: transparent; color: var(--ink); text-align: left; font-size: 13px; }
     .model-row:last-child { border-bottom: 0; }
     .model-row input { width: auto; }
+    .model-row.active { background: #f2e7d3; }
     .picker-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 12px; }
     @media (max-width: 760px) {
       .model-picker-grid { grid-template-columns: 1fr; }
@@ -2360,6 +2367,25 @@ function renderAdminPage(origin) {
     </div>
   </div>
 </div>
+<div class="modal-backdrop model-picker-backdrop" id="speed-picker-modal">
+  <div class="modal-card model-picker-card">
+    <div class="picker-head">
+      <h3>\u6a21\u578b\u6d4b\u901f</h3>
+      <button type="button" class="secondary small" id="speed-picker-close">\u5173\u95ed</button>
+    </div>
+    <input id="speed-picker-search" placeholder="\u641c\u7d22\u6a21\u578b">
+    <div class="model-picker-grid" style="margin-top:12px">
+      <div class="model-picker-groups" id="speed-picker-upstreams"></div>
+      <div class="model-picker-subgroups" id="speed-picker-groups"></div>
+      <div class="model-picker-list" id="speed-picker-models"></div>
+    </div>
+    <div class="picker-actions">
+      <span class="note" id="speed-picker-status"></span>
+      <button type="button" class="small secondary" id="speed-picker-cancel">\u53d6\u6d88</button>
+      <button type="button" class="small good" id="speed-picker-run">\u5f00\u59cb\u6d4b\u901f</button>
+    </div>
+  </div>
+</div>
 <div class="modal-backdrop" id="vendor-modal">
   <div class="modal-card">
     <h3>\u6dfb\u52a0\u4e0a\u6e38</h3>
@@ -2392,7 +2418,7 @@ function renderAdminPage(origin) {
 
 <script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
@@ -2812,11 +2838,11 @@ function renderAdminPage(origin) {
   }
 
   async function speedTest() {
-    const models = splitList(prompt("\u8f93\u5165\u4e00\u4e2a\u8981\u6d4b\u901f\u7684\u6a21\u578b\u540d") || "");
-    if (!models.length) return;
+    const picker = state.speedPicker;
+    if (!picker || !picker.model || !picker.upstream) return;
     const resp = await fetch(API_BASE + "/speed-test", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: models[0] }),
+      body: JSON.stringify({ model: picker.model, upstreams: [picker.upstream] }),
     });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "\u6d4b\u901f\u5931\u8d25");
@@ -2828,6 +2854,7 @@ function renderAdminPage(origin) {
     });
     const best = (payload.results || []).filter((r) => r.ok).sort((a,b) => a.latency_ms - b.latency_ms)[0];
     showToast(best ? ("\u6700\u5feb: " + best.name + " " + best.latency_ms + "ms") : "\u6ca1\u6709\u4e0a\u6e38\u901a\u8fc7\u6d4b\u901f");
+    if (best) byId("speed-picker-status").textContent = best.name + " · " + best.latency_ms + "ms";
   }
 
   async function detectCapability(upstreamName) {
@@ -3008,6 +3035,87 @@ function renderAdminPage(origin) {
     picker.target.value = picked.join(picker.target.tagName === "TEXTAREA" ? "\\n" : ", ");
     closeModelPicker();
     showToast("\u5df2\u5bfc\u5165 " + picked.length + " \u4e2a\u6a21\u578b");
+  }
+
+  function openSpeedPicker() {
+    const upstreams = collectConfig().upstreams
+      .filter((upstream) => upstream.enabled !== false)
+      .map((upstream) => ({ ...upstream, models: (upstream.models || []).filter((model) => model && model !== "*") }))
+      .filter((upstream) => upstream.models.length);
+    if (!upstreams.length) throw new Error("\u6ca1\u6709\u53ef\u6d4b\u901f\u7684\u4e0a\u6e38\u6a21\u578b\uff0c\u5148\u7ed9\u4e0a\u6e38\u5bfc\u5165\u6216\u586b\u5199\u6a21\u578b");
+    state.speedPicker = {
+      upstreams,
+      upstream: upstreams[0].name,
+      group: "__all__",
+      model: upstreams[0].models[0],
+      visible: upstreams[0].models,
+    };
+    byId("speed-picker-search").value = "";
+    byId("speed-picker-status").textContent = "";
+    byId("speed-picker-modal").classList.add("open");
+    renderSpeedPicker();
+  }
+
+  function closeSpeedPicker() {
+    state.speedPicker = null;
+    byId("speed-picker-modal").classList.remove("open");
+  }
+
+  function renderSpeedPicker() {
+    const picker = state.speedPicker;
+    if (!picker) return;
+    const upstream = picker.upstreams.find((item) => item.name === picker.upstream) || picker.upstreams[0];
+    picker.upstream = upstream.name;
+    const groups = {};
+    upstream.models.forEach(function(model) {
+      const group = modelSourceName(model);
+      if (!groups[group]) groups[group] = [];
+      groups[group].push(model);
+    });
+    const groupNames = Object.keys(groups).sort();
+    if (picker.group !== "__all__" && !groups[picker.group]) picker.group = "__all__";
+    const sourceModels = picker.group === "__all__" ? upstream.models : groups[picker.group];
+    const query = byId("speed-picker-search").value.trim().toLowerCase();
+    picker.visible = sourceModels.filter(function(model) {
+      return !query || model.toLowerCase().includes(query) || modelDisplayName(model).toLowerCase().includes(query);
+    });
+    if (!picker.visible.includes(picker.model)) picker.model = picker.visible[0] || "";
+
+    byId("speed-picker-upstreams").innerHTML = picker.upstreams.map(function(item) {
+      return '<button type="button" class="model-group-btn' + (picker.upstream === item.name ? ' active' : '') + '" data-upstream="' + esc(item.name) + '"><span>' + esc(item.note || item.name) + '</span><span>' + item.models.length + '</span></button>';
+    }).join("");
+    byId("speed-picker-groups").innerHTML =
+      '<button type="button" class="model-group-btn' + (picker.group === "__all__" ? ' active' : '') + '" data-group="__all__"><span>\u5168\u90e8</span><span>' + upstream.models.length + '</span></button>' +
+      groupNames.map(function(name) {
+        return '<button type="button" class="model-group-btn' + (picker.group === name ? ' active' : '') + '" data-group="' + esc(name) + '"><span>' + esc(name) + '</span><span>' + groups[name].length + '</span></button>';
+      }).join("");
+    byId("speed-picker-models").innerHTML = picker.visible.length
+      ? picker.visible.map(function(model) {
+          return '<button type="button" class="model-row' + (picker.model === model ? ' active' : '') + '" data-model="' + esc(model) + '" title="' + esc(model) + '"><span class="mono">' + esc(modelDisplayName(model)) + '</span></button>';
+        }).join("")
+      : '<div class="note" style="padding:12px">\u6ca1\u6709\u5339\u914d\u7684\u6a21\u578b</div>';
+
+    byId("speed-picker-upstreams").querySelectorAll("[data-upstream]").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        picker.upstream = btn.dataset.upstream;
+        picker.group = "__all__";
+        const next = picker.upstreams.find((item) => item.name === picker.upstream);
+        picker.model = next && next.models[0] || "";
+        renderSpeedPicker();
+      });
+    });
+    byId("speed-picker-groups").querySelectorAll("[data-group]").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        picker.group = btn.dataset.group;
+        renderSpeedPicker();
+      });
+    });
+    byId("speed-picker-models").querySelectorAll("[data-model]").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        picker.model = btn.dataset.model;
+        renderSpeedPicker();
+      });
+    });
   }
 
   async function loadStats() {
@@ -3201,7 +3309,8 @@ function renderAdminPage(origin) {
     try {
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
-      document.addEventListener("keydown", (e) => { if (e.key === "Escape") state.modelPicker ? closeModelPicker() : closeVendorModal(); });
+      byId("speed-picker-modal").addEventListener("click", (e) => { if (e.target === byId("speed-picker-modal")) closeSpeedPicker(); });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") state.speedPicker ? closeSpeedPicker() : state.modelPicker ? closeModelPicker() : closeVendorModal(); });
       byId("open-vendor-modal").addEventListener("click", openVendorModal);
       byId("upstream-actions-toggle").addEventListener("click", (e) => {
         e.stopPropagation();
@@ -3210,6 +3319,12 @@ function renderAdminPage(origin) {
       document.addEventListener("click", () => byId("upstream-actions").classList.remove("open"));
       byId("close-vendor-modal").addEventListener("click", closeVendorModal);
       byId("model-picker-close").addEventListener("click", closeModelPicker);
+      byId("speed-picker-close").addEventListener("click", closeSpeedPicker);
+      byId("speed-picker-cancel").addEventListener("click", closeSpeedPicker);
+      byId("speed-picker-search").addEventListener("input", renderSpeedPicker);
+      byId("speed-picker-run").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u6d4b\u901f\u4e2d...", speedTest).catch(showError)
+      );
       byId("picker-cancel").addEventListener("click", closeModelPicker);
       byId("picker-apply").addEventListener("click", applyModelPicker);
       byId("picker-select-visible").addEventListener("click", () => selectVisibleModels(true));
@@ -3264,7 +3379,7 @@ function renderAdminPage(origin) {
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", checkHealth).catch(showError)
       );
       byId("speed-test").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "\u6d4b\u901f\u4e2d...", speedTest).catch(showError)
+        withButtonBusy(e.currentTarget, "\u6253\u5f00\u4e2d...", openSpeedPicker).catch(showError)
       );
       byId("load-stats").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadStats).catch(showError)
