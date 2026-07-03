@@ -27,9 +27,10 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const NVIDIA_NIM_RPM_LIMIT = 40;
+const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-hedge-nim-rpm";
+const VERSION = "v26-07-04-nim-rpm-window";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -344,7 +345,7 @@ var _cachedApp = null;
 var _cachedEnvRef = null;
 // ponytail: per-isolate EWMA, KV-backed global scores only if cross-edge routing matters
 var _upstreamLatency = {};
-// ponytail: per-isolate NIM RPM, resets by minute; KV not worth it for provider-side soft guard
+// ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
 var _runtimeCache = null;
@@ -1374,14 +1375,15 @@ function sleep(ms) {
 
 function takeNimMinuteSlot(upstream) {
   if (!isNvidiaNimUpstream(upstream)) return true;
-  const minute = new Date().toISOString().slice(0, 16);
+  const now = Date.now();
   for (const key of Object.keys(_nimMinuteCounters)) {
-    if (!key.endsWith(`:${minute}`)) delete _nimMinuteCounters[key];
+    if ((_nimMinuteCounters[key]?.resetAt || 0) <= now) delete _nimMinuteCounters[key];
   }
-  const key = `${upstream.name}:${minute}`;
-  const count = _nimMinuteCounters[key] || 0;
-  if (count >= NVIDIA_NIM_RPM_LIMIT) return false;
-  _nimMinuteCounters[key] = count + 1;
+  const key = String(upstream.name || "").trim();
+  const bucket = _nimMinuteCounters[key] || { count: 0, resetAt: now + NVIDIA_NIM_RPM_WINDOW_MS };
+  if (bucket.count >= NVIDIA_NIM_RPM_LIMIT) return false;
+  bucket.count += 1;
+  _nimMinuteCounters[key] = bucket;
   return true;
 }
 
