@@ -14,7 +14,7 @@ const CORS_HEADERS = {
   "access-control-max-age": "3600",
 };
 
-const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504]);
 const MODEL_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
 const RESPONSES_PATH = "/v1/responses";
@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-responses-api-shim";
+const VERSION = "v26-07-04-402-failover";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [

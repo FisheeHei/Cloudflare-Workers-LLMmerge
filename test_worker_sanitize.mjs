@@ -11,10 +11,18 @@ const hedgeHits = [];
 const nimHits = [];
 const responseHits = [];
 const responseStreamHits = [];
+const paymentHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("payment-required.example")) {
+    paymentHits.push("402");
+    return new Response(JSON.stringify({ detail: [{ error: "You need positive balance to do inference." }] }), {
+      status: 402,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("responses-stream.example")) {
     responseStreamHits.push(JSON.parse(init.body));
     return new Response([
@@ -417,6 +425,35 @@ assert.equal(responseStreamHits[0].stream, true);
 assert.equal(responsesStreamText.includes('"type":"response.output_text.delta"'), true);
 assert.equal(responsesStreamText.includes('"delta":"hel"'), true);
 assert.equal(responsesStreamText.includes('"type":"response.completed"'), true);
+
+const paymentStore = new Map();
+paymentStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "empty-balance", base_url: "https://payment-required.example/v1", api_key_encrypted: "p", models: ["paid-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "paid-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["paid-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const paymentEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = paymentStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { paymentStore.set(key, value); },
+    async delete(key) { paymentStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "payment-client", key: "sk-pay", models: ["*"], upstreams: ["empty-balance", "paid-fallback"] }]),
+};
+const paymentResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-pay", "content-type": "application/json" },
+  body: JSON.stringify({ model: "paid-model", messages: [] }),
+}), paymentEnv);
+assert.equal(paymentHits.length, 1);
+assert.equal(paymentResp.headers.get("x-llm-gateway-upstream"), "paid-fallback");
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({
