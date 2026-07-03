@@ -26,9 +26,10 @@ const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
+const NVIDIA_NIM_RPM_LIMIT = 40;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-03-speed-test-picker";
+const VERSION = "v26-07-04-hedge-nim-rpm";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -343,6 +344,8 @@ var _cachedApp = null;
 var _cachedEnvRef = null;
 // ponytail: per-isolate EWMA, KV-backed global scores only if cross-edge routing matters
 var _upstreamLatency = {};
+// ponytail: per-isolate NIM RPM, resets by minute; KV not worth it for provider-side soft guard
+var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
 var _runtimeCache = null;
 var _runtimeCacheTs = 0;
@@ -767,6 +770,8 @@ async function buildGatewayConfigFromEnv(app) {
   return {
     routing: {
       failover: true,
+      hedge_enabled: false,
+      hedge_max: 2,
       load_balance: true,
     },
     settings: {
@@ -830,6 +835,8 @@ async function normalizeGatewayConfigPayload(payload, app) {
   return {
     routing: {
       failover: routing.failover !== false,
+      hedge_enabled: routing.hedge_enabled === true,
+      hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
       load_balance: routing.load_balance !== false,
     },
     settings: {
@@ -1247,6 +1254,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 
   const attempts = await orderUpstreams(runtime, candidates);
   const maxAttempts = runtime.routing.failover === false ? 1 : attempts.length;
+  if (runtime.routing.hedge_enabled === true && maxAttempts > 1) {
+    return hedgedProxyRequest({ attempts: attempts.slice(0, Math.min(maxAttempts, runtime.routing.hedge_max || 2)), bodyText, pathname, request, runtime, search });
+  }
   let lastError = null;
 
   for (let index = 0; index < maxAttempts; index += 1) {
@@ -1254,6 +1264,11 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const isLast = index === maxAttempts - 1;
 
     try {
+      if (!takeNimMinuteSlot(upstream)) {
+        lastError = new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`);
+        lastError.upstreamName = upstream.name;
+        continue;
+      }
       const upstreamStarted = Date.now();
       const response = await fetchWithTimeout(
         buildUpstreamUrl(upstream.base_url, pathname, search),
@@ -1296,6 +1311,82 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   const err = httpError(502, lastError?.message || "All upstreams failed.");
   err.upstreamName = lastError?.upstreamName || "none";
   throw err;
+}
+
+async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runtime, search }) {
+  const controllers = attempts.map(() => new AbortController());
+  const hedgeDelayMs = Math.max(100, Math.floor(runtime.requestTimeoutMs / Math.max(2, attempts.length + 1)));
+  let done = false;
+
+  function launchLater(index) {
+    const upstream = attempts[index];
+    return sleep(index * hedgeDelayMs).then(async () => {
+      if (done) return { cancelled: true, upstream, index };
+      if (!takeNimMinuteSlot(upstream)) {
+        return { limited: true, error: new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`), upstream, index };
+      }
+      const started = Date.now();
+      try {
+        const response = await fetchWithTimeout(
+          buildUpstreamUrl(upstream.base_url, pathname, search),
+          {
+            method: request.method,
+            headers: buildUpstreamHeaders(request, upstream),
+            body: sanitizeProxyBody(bodyText, upstream),
+            signal: controllers[index].signal,
+          },
+          runtime.requestTimeoutMs,
+        );
+        return { response, upstream, index, latency: Date.now() - started };
+      } catch (error) {
+        return { error, upstream, index, latency: Date.now() - started };
+      }
+    });
+  }
+
+  const pending = attempts.map((_, index) => ({ index, promise: launchLater(index) }));
+  let lastResult = null;
+  while (pending.length) {
+    const raced = await Promise.race(pending.map((entry) => entry.promise.then((result) => ({ entry, result }))));
+    pending.splice(pending.indexOf(raced.entry), 1);
+    const result = raced.result;
+    if (result.cancelled) continue;
+    lastResult = result;
+    if (result.limited) continue;
+    if (result.response && !RETRYABLE_STATUSES.has(result.response.status)) {
+      done = true;
+      controllers.forEach((controller, i) => { if (i !== result.index) controller.abort(); });
+      await clearUpstreamFailure(runtime, result.upstream);
+      rememberUpstreamLatency(result.upstream, result.latency);
+      return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
+    }
+    await markUpstreamFailure(runtime, result.upstream, result.response ? result.response.status : 599);
+  }
+
+  const err = httpError(502, lastResult?.error?.message || "All hedged upstreams failed.");
+  err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
+  throw err;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function takeNimMinuteSlot(upstream) {
+  if (!isNvidiaNimUpstream(upstream)) return true;
+  const minute = new Date().toISOString().slice(0, 16);
+  for (const key of Object.keys(_nimMinuteCounters)) {
+    if (!key.endsWith(`:${minute}`)) delete _nimMinuteCounters[key];
+  }
+  const key = `${upstream.name}:${minute}`;
+  const count = _nimMinuteCounters[key] || 0;
+  if (count >= NVIDIA_NIM_RPM_LIMIT) return false;
+  _nimMinuteCounters[key] = count + 1;
+  return true;
+}
+
+function isNvidiaNimUpstream(upstream) {
+  return String(upstream?.preset || "") === "nvidia-nim" || String(upstream?.base_url || "").toLowerCase().includes("integrate.api.nvidia.com");
 }
 
 async function orderUpstreams(runtime, candidates) {
@@ -1855,9 +1946,12 @@ function getBearerToken(request) {
 
 async function fetchWithTimeout(url, init, timeoutMs) {
   if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    const signal = init?.signal && typeof AbortSignal.any === "function"
+      ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)])
+      : (init?.signal || AbortSignal.timeout(timeoutMs));
     return fetch(url, {
       ...init,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal,
     });
   }
 
@@ -2317,12 +2411,16 @@ function renderAdminPage(origin) {
         <div class="field span-4"><label>\u6a21\u578b\u7f13\u5b58 TTL (s, \u9ed8\u8ba43600)</label><input id="model-cache-ttl" type="number" min="1" placeholder="3600"></div>
       </div>
       <div class="row">
-        <div class="field span-6">
+        <div class="field span-3">
           <label><input type="checkbox" id="routing-load-balance"> \u8d1f\u8f7d\u5747\u8861 (\u9ed8\u8ba4\u5f00)</label>
         </div>
-        <div class="field span-6">
+        <div class="field span-3">
           <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb (\u9ed8\u8ba4\u5f00)</label>
         </div>
+        <div class="field span-3">
+          <label><input type="checkbox" id="routing-hedge"> Hedged Request</label>
+        </div>
+        <div class="field span-3"><label>\u6700\u9ad8\u8bf7\u6c42\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
       </div>
       <button class="good small" id="save-settings">\u4fdd\u5b58\u8bbe\u7f6e</button>
       <span class="note" id="settings-status"></span>
@@ -2744,6 +2842,8 @@ function renderAdminPage(origin) {
       routing: {
         load_balance: byId("routing-load-balance").checked,
         failover: byId("routing-failover").checked,
+        hedge_enabled: byId("routing-hedge").checked,
+        hedge_max: Number(byId("routing-hedge-max").value || 2),
       },
       upstreams: [...document.querySelectorAll(".upstream-card")].map((card, index) => {
         const prev = existingUpstreams.find((item) => String(item && item.id) === String(card.dataset.id)) || existingUpstreams[index] || {};
@@ -2776,6 +2876,8 @@ function renderAdminPage(origin) {
     byId("model-cache-ttl").value = s.model_cache_ttl || "";
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
+    byId("routing-hedge").checked = r.hedge_enabled === true;
+    byId("routing-hedge-max").value = r.hedge_max || 2;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
   }
 

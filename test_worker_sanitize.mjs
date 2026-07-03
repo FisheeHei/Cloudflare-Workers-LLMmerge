@@ -7,10 +7,34 @@ const worker = await import(`data:text/javascript;base64,${Buffer.from(code).toS
 const bodies = [];
 const fetchUrls = [];
 const speedHits = [];
+const hedgeHits = [];
+const nimHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("hedge-slow.example")) {
+    hedgeHits.push("slow");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    return new Response(JSON.stringify({ id: "hedge-slow", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-fast.example")) {
+    hedgeHits.push("fast");
+    return new Response(JSON.stringify({ id: "hedge-fast", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("nim-limit.example")) {
+    nimHits.push("nim");
+    return new Response(JSON.stringify({ id: "nim", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("speed-slow.example")) {
     speedHits.push("slow");
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -255,6 +279,68 @@ const beforeSpeedChoice = speedHits.length;
 const speedResp = await speedRequest("sk-both");
 assert.equal(speedResp.headers.get("x-llm-gateway-upstream"), "fast");
 assert.equal(speedHits[beforeSpeedChoice], "fast");
+
+const hedgeStore = new Map();
+hedgeStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "hedge-slow", base_url: "https://hedge-slow.example/v1", api_key_encrypted: "s", models: ["hedge-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "hedge-fast", base_url: "https://hedge-fast.example/v1", api_key_encrypted: "f", models: ["hedge-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const hedgeEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = hedgeStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { hedgeStore.set(key, value); },
+    async delete(key) { hedgeStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "hedge-client", key: "sk-hedge", models: ["*"], upstreams: ["hedge-slow", "hedge-fast"] }]),
+};
+const hedgeStart = hedgeHits.length;
+const hedgeResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-hedge", "content-type": "application/json" },
+  body: JSON.stringify({ model: "hedge-model", messages: [] }),
+}), hedgeEnv);
+assert.equal(hedgeResp.headers.get("x-llm-gateway-upstream"), "hedge-fast");
+assert.deepEqual(hedgeHits.slice(hedgeStart), ["slow", "fast"]);
+
+const nimStore = new Map();
+nimStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "nim-limit", preset: "nvidia-nim", base_url: "https://nim-limit.example/v1", api_key_encrypted: "n", models: ["nim-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "nim-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["nim-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const nimEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = nimStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { nimStore.set(key, value); },
+    async delete(key) { nimStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "nim-client", key: "sk-nim", models: ["*"], upstreams: ["nim-limit", "nim-fallback"] }]),
+};
+let nimResp = null;
+for (let i = 0; i < 41; i += 1) {
+  nimResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: "Bearer sk-nim", "content-type": "application/json" },
+    body: JSON.stringify({ model: "nim-model", messages: [] }),
+  }), nimEnv);
+}
+assert.equal(nimHits.length, 40);
+assert.equal(nimResp.headers.get("x-llm-gateway-upstream"), "nim-fallback");
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({
