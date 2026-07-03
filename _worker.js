@@ -31,7 +31,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-global-system-prompt";
+const VERSION = "v26-07-04-picker-same-preset-models";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2808,6 +2808,7 @@ function renderAdminPage(origin) {
     </div>
     <div class="picker-actions">
       <span class="note" id="picker-count">\u5df2\u9009 0</span>
+      <label class="note" id="picker-same-preset-wrap" hidden><input type="checkbox" id="picker-apply-same-preset"> \u5e94\u7528\u5230\u540c\u7c7b\u578b\u5168\u90e8\u4e0a\u6e38</label>
       <button type="button" class="small secondary" id="picker-select-visible">\u9009\u4e2d\u5f53\u524d</button>
       <button type="button" class="small secondary" id="picker-clear-visible">\u6e05\u7a7a\u5f53\u524d</button>
       <button type="button" class="small secondary" id="picker-cancel">\u53d6\u6d88</button>
@@ -3125,7 +3126,7 @@ function renderAdminPage(origin) {
             '<div class="field span-3"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '"></div>' +
           '</div>' +
           '<div class="row">' +
-            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea><label style="margin-top:6px"><input type="checkbox" class="apply-models-same-preset"> \u5e94\u7528\u5230\u540c\u7c7b\u578b\u5168\u90e8\u4e0a\u6e38</label><button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:4px">\u4ece\u4e0a\u6e38\u5bfc\u5165\u6a21\u578b</button></div>' +
+            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea><button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:4px">\u4ece\u4e0a\u6e38\u5bfc\u5165\u6a21\u578b</button></div>' +
           '</div>' +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
@@ -3160,7 +3161,7 @@ function renderAdminPage(origin) {
         await withButtonBusy(btn, "\u5bfc\u5165\u4e2d...", async function() {
           var models = await fetchUpstreamModels(name, card);
           if (!models.length) throw new Error("\u8be5\u4e0a\u6e38\u65e0\u53ef\u7528\u6a21\u578b");
-          showModelPicker(name, models, textarea);
+          showModelPicker(name, models, textarea, card);
         });
       });
     });
@@ -3213,14 +3214,6 @@ function renderAdminPage(origin) {
         paths: splitList(card.querySelector('[data-field="paths"]').value),
         models: splitList(card.querySelector('[data-field="models"]').value),
       };
-    });
-    cards.forEach((card, index) => {
-      if (!card.querySelector(".apply-models-same-preset")?.checked) return;
-      const preset = upstreams[index].preset;
-      const models = upstreams[index].models;
-      upstreams.forEach((item) => {
-        if (item.preset === preset) item.models = [...models];
-      });
     });
     return {
       settings: {
@@ -3445,7 +3438,7 @@ function renderAdminPage(origin) {
     return titleParts(family);
   }
 
-  function showModelPicker(upstreamName, models, target) {
+  function showModelPicker(upstreamName, models, target, sourceCard) {
     const unique = Array.from(new Set((models || []).filter(Boolean))).sort();
     state.modelPicker = {
       title: upstreamName || "\u5f53\u524d\u4e0a\u6e38",
@@ -3453,10 +3446,12 @@ function renderAdminPage(origin) {
       group: "__all__",
       family: "__all__",
       selected: new Set(splitList(target.value)),
+      sourceCard: sourceCard || null,
       target,
       visible: unique,
     };
     byId("model-picker-search").value = "";
+    byId("picker-apply-same-preset").checked = false;
     byId("model-picker-modal").classList.add("open");
     renderModelPicker();
   }
@@ -3489,6 +3484,7 @@ function renderAdminPage(origin) {
 
     byId("model-picker-title").textContent = "\u9009\u62e9\u6a21\u578b - " + picker.title;
     byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
+    byId("picker-same-preset-wrap").hidden = !picker.sourceCard;
     byId("model-picker-groups").innerHTML =
       '<button type="button" class="model-group-btn' + (picker.group === "__all__" ? ' active' : '') + '" data-group="__all__"><span>\u5168\u90e8</span><span>' + picker.models.length + '</span></button>' +
       groupNames.map(function(name) {
@@ -3549,6 +3545,14 @@ function renderAdminPage(origin) {
     if (!picker || !picker.target) return;
     const picked = Array.from(picker.selected).sort();
     picker.target.value = picked.join(picker.target.tagName === "TEXTAREA" ? "\\n" : ", ");
+    if (picker.sourceCard && byId("picker-apply-same-preset").checked) {
+      const preset = picker.sourceCard.querySelector('[data-field="preset"]')?.value || "";
+      document.querySelectorAll(".upstream-card").forEach(function(card) {
+        if (card.querySelector('[data-field="preset"]')?.value === preset) {
+          card.querySelector('[data-field="models"]').value = picked.join("\\n");
+        }
+      });
+    }
     closeModelPicker();
     showToast("\u5df2\u5bfc\u5165 " + picked.length + " \u4e2a\u6a21\u578b");
   }
