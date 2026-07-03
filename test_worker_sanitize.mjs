@@ -201,6 +201,8 @@ assert.equal(adminPage.includes("toggle-log-expanded"), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
 assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
+assert.equal(adminPage.includes("id=\"stat-tip\""), true);
+assert.equal(adminPage.includes("data-stat-kind"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
 const configPayload = await configResp.json();
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
@@ -239,6 +241,7 @@ assert.equal(stats.buckets.some((b) => b.total >= 2), true);
 assert.equal(stats.last_model, "minimax-m3");
 assert.equal(stats.time_zone, "Hong Kong Standard Time (UTC+8)");
 assert.equal(stats.now.endsWith("+08:00"), true);
+assert.equal(stats.buckets.some((b) => b.model_statuses?.["minimax-m3"]?.success >= 1), true);
 
 const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), env);
 const logs = await logsResp.json();

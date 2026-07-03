@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-openrouter-template";
+const VERSION = "v26-07-04-stat-tooltips";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -512,7 +512,7 @@ async function _doFlush(app) {
 }
 
 function emptyStatsBucket() {
-  return { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {} };
+  return { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {}, model_statuses: {} };
 }
 
 function addStatsEntry(bucket, entry) {
@@ -525,6 +525,11 @@ function addStatsEntry(bucket, entry) {
   bucket.upstreams[up] = (bucket.upstreams[up] || 0) + 1;
   var mdl = entry.model || "unknown";
   bucket.models[mdl] = (bucket.models[mdl] || 0) + 1;
+  if (!bucket.model_statuses) bucket.model_statuses = {};
+  var status = entry.status >= 200 && entry.status < 400 ? "success" : "fail";
+  var modelStatus = bucket.model_statuses[mdl] || { success: 0, fail: 0 };
+  modelStatus[status] += 1;
+  bucket.model_statuses[mdl] = modelStatus;
 }
 
 function mergeStatsBucket(base, delta) {
@@ -536,6 +541,7 @@ function mergeStatsBucket(base, delta) {
     completion_tokens: base.completion_tokens || 0,
     upstreams: { ...(base.upstreams || {}) },
     models: { ...(base.models || {}) },
+    model_statuses: { ...(base.model_statuses || {}) },
   } : emptyStatsBucket();
   if (!delta || typeof delta !== "object") return bucket;
   bucket.total += delta.total || 0;
@@ -545,6 +551,14 @@ function mergeStatsBucket(base, delta) {
   bucket.completion_tokens += delta.completion_tokens || 0;
   for (var u in (delta.upstreams || {})) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
   for (var m in (delta.models || {})) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
+  for (var sm in (delta.model_statuses || {})) {
+    var next = delta.model_statuses[sm] || {};
+    var prev = bucket.model_statuses[sm] || { success: 0, fail: 0 };
+    bucket.model_statuses[sm] = {
+      success: (prev.success || 0) + (next.success || 0),
+      fail: (prev.fail || 0) + (next.fail || 0),
+    };
+  }
   return bucket;
 }
 
@@ -2876,6 +2890,17 @@ function renderAdminPage(origin) {
     .chart-bar .bar::after { content: attr(data-h); display: none; position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 9px; color: var(--muted); }
     .chart-bar .bar:nth-child(6n)::after { display: block; }
     .chart-label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 8px 0 2px; } .chart-label:first-of-type { margin-top: 0; }
+    .stat-tip {
+      position: fixed; z-index: 120; width: min(260px, calc(100vw - 24px)); max-height: 260px; overflow: auto;
+      padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+      background: var(--panel); box-shadow: 0 12px 28px #00000022; pointer-events: none;
+      font-size: 12px; line-height: 1.35;
+    }
+    .stat-tip[hidden] { display: none; }
+    .stat-tip-title { font-weight: 700; color: var(--fg); margin-bottom: 6px; }
+    .stat-tip-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 2px 0; }
+    .stat-tip-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stat-tip-value { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
     .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
     .stats-grid-2col { grid-template-columns: repeat(2, 1fr); }
     .stat-box { background: var(--bg-raised); border-radius: 8px; padding: 10px 12px; text-align: center; }
@@ -2910,6 +2935,7 @@ function renderAdminPage(origin) {
       .chart-bar .bar { min-width: 0; }
       .chart-bar .bar::after { display: none; }
       .chart-bar .bar:nth-child(8n)::after { display: block; }
+      .stat-tip { max-height: 220px; }
       .modal-backdrop { align-items: stretch; }
       .modal-card { width: 100%; border-radius: 14px; }
       .picker-actions { justify-content: stretch; }
@@ -3050,6 +3076,7 @@ function renderAdminPage(origin) {
 </div>
 
 <div id="toast"></div>
+<div class="stat-tip" id="stat-tip" hidden></div>
 
 <div class="modal-backdrop model-picker-backdrop" id="model-picker-modal">
   <div class="modal-card model-picker-card">
@@ -3677,6 +3704,87 @@ function renderAdminPage(origin) {
     return value.startsWith("@cf/") ? value.slice(4) : value;
   }
 
+  function statModelSuffix(model) {
+    const value = modelDisplayName(model);
+    const parts = value.split("/");
+    return parts[parts.length - 1] || value;
+  }
+
+  function statTipHtml(bucket, kind) {
+    const hour = esc(bucket.hour || "");
+    if (kind === "tokens") {
+      return '<div class="stat-tip-title">时间段 ' + hour + '</div>' +
+        '<div class="stat-tip-row"><span>总 Input</span><span class="stat-tip-value">' + esc((bucket.prompt_tokens || 0).toLocaleString()) + '</span></div>' +
+        '<div class="stat-tip-row"><span>总 Output</span><span class="stat-tip-value">' + esc((bucket.completion_tokens || 0).toLocaleString()) + '</span></div>';
+    }
+
+    const statuses = bucket.model_statuses || {};
+    const statusEntries = Object.entries(statuses).sort(function(a, b) {
+      const av = (a[1]?.success || 0) + (a[1]?.fail || 0);
+      const bv = (b[1]?.success || 0) + (b[1]?.fail || 0);
+      return bv - av;
+    });
+    const fallbackEntries = Object.entries(bucket.models || {}).sort(function(a, b) { return b[1] - a[1]; });
+    const entries = (statusEntries.length ? statusEntries : fallbackEntries).slice(0, 8);
+    const more = (statusEntries.length || fallbackEntries.length) - entries.length;
+    const rows = entries.length ? entries.map(function(entry) {
+      const value = statusEntries.length
+        ? ((entry[1]?.success || 0) + ' 成 / ' + (entry[1]?.fail || 0) + ' 败')
+        : (entry[1] + ' 次');
+      return '<div class="stat-tip-row"><span class="stat-tip-model">' + esc(statModelSuffix(entry[0])) + '</span><span class="stat-tip-value">' + esc(value) + '</span></div>';
+    }).join("") : '<div class="stat-tip-row"><span>暂无模型</span><span class="stat-tip-value">-</span></div>';
+    return '<div class="stat-tip-title">时间段 ' + hour + '</div>' +
+      '<div class="stat-tip-row"><span>总成功/失败</span><span class="stat-tip-value">' + esc(bucket.success || 0) + ' / ' + esc(bucket.fail || 0) + '</span></div>' +
+      rows +
+      (more > 0 ? '<div class="stat-tip-row"><span>其他模型</span><span class="stat-tip-value">+' + esc(more) + '</span></div>' : '');
+  }
+
+  function placeStatTip(event, anchor) {
+    const tip = byId("stat-tip");
+    if (!tip || tip.hidden) return;
+    const rect = anchor ? anchor.getBoundingClientRect() : { left: 0, top: 0, width: 0, height: 0 };
+    const point = event && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
+      ? { x: event.clientX, y: event.clientY }
+      : { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    const gap = 12;
+    const tipRect = tip.getBoundingClientRect();
+    let x = point.x + gap;
+    let y = point.y + gap;
+    if (x + tipRect.width + gap > window.innerWidth) x = Math.max(gap, window.innerWidth - tipRect.width - gap);
+    if (y + tipRect.height + gap > window.innerHeight) y = Math.max(gap, point.y - tipRect.height - gap);
+    tip.style.left = x + "px";
+    tip.style.top = y + "px";
+  }
+
+  function showStatTip(event, bucket, kind, anchor) {
+    const tip = byId("stat-tip");
+    if (!tip || !bucket) return;
+    tip.innerHTML = statTipHtml(bucket, kind);
+    tip.hidden = false;
+    placeStatTip(event, anchor);
+  }
+
+  function hideStatTip() {
+    const tip = byId("stat-tip");
+    if (tip) tip.hidden = true;
+  }
+
+  function bindStatBars(buckets) {
+    document.querySelectorAll(".chart-bar .bar[data-stat-kind]").forEach(function(bar) {
+      const bucket = buckets[Number(bar.dataset.statIndex)];
+      const kind = bar.dataset.statKind;
+      bar.addEventListener("mouseenter", function(event) { showStatTip(event, bucket, kind, bar); });
+      bar.addEventListener("mousemove", function(event) { placeStatTip(event, bar); });
+      bar.addEventListener("mouseleave", hideStatTip);
+      bar.addEventListener("focus", function(event) { showStatTip(event, bucket, kind, bar); });
+      bar.addEventListener("blur", hideStatTip);
+      bar.addEventListener("click", function(event) {
+        event.stopPropagation();
+        showStatTip(event, bucket, kind, bar);
+      });
+    });
+  }
+
   function modelSourceName(model) {
     const value = modelDisplayName(model);
     const raw = value.includes("/") ? value.split("/")[0] : "";
@@ -3929,7 +4037,7 @@ function renderAdminPage(origin) {
     // Chart 1: Requests (green=success, red=fail)
     var maxReq = 1;
     skeleton.forEach(function(b) { if (b.total > maxReq) maxReq = b.total; });
-    byId("chart-requests").innerHTML = skeleton.map(function(b) {
+    byId("chart-requests").innerHTML = skeleton.map(function(b, i) {
       var barH = Math.max(2, Math.round(b.total / maxReq * 100));
       var seg = "";
       if (b.total > 0) {
@@ -3938,13 +4046,13 @@ function renderAdminPage(origin) {
         seg = '<div style="height:' + okH + 'px;background:var(--accent);border-radius:2px 2px 0 0"></div>';
         if (failH > 0) seg += '<div style="height:' + failH + 'px;background:#8d2f23"></div>';
       }
-      return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + b.hour.slice(-2) + '" title="' + b.hour + ': ' + b.success + ' ok / ' + b.total + ' total">' + seg + '</div>';
+      return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="requests" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.success + ' success / ' + b.fail + ' fail') + '">' + seg + '</div>';
     }).join("");
 
     // Chart 2: Tokens (indigo=input, violet=output)
     var maxTok = 1;
     skeleton.forEach(function(b) { var t = b.prompt_tokens + b.completion_tokens; if (t > maxTok) maxTok = t; });
-    byId("chart-tokens").innerHTML = skeleton.map(function(b) {
+    byId("chart-tokens").innerHTML = skeleton.map(function(b, i) {
       var tok = b.prompt_tokens + b.completion_tokens;
       var barH = Math.max(2, Math.round(tok / maxTok * 100));
       var seg = "";
@@ -3954,8 +4062,9 @@ function renderAdminPage(origin) {
         seg = '<div style="height:' + inH + 'px;background:#6366f1;border-radius:2px 2px 0 0"></div>';
         if (outH > 0) seg += '<div style="height:' + outH + 'px;background:#a78bfa"></div>';
       }
-      return '<div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + b.hour.slice(-2) + '" title="' + b.hour + ': ' + b.prompt_tokens + ' in / ' + b.completion_tokens + ' out tokens">' + seg + '</div>';
+      return '<div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="tokens" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.prompt_tokens + ' input / ' + b.completion_tokens + ' output tokens') + '">' + seg + '</div>';
     }).join("");
+    bindStatBars(skeleton);
 
     byId("stat-updated").textContent = (payload.now || "").slice(11, 19) + " HKT";
     showToast("统计已加载");
@@ -4089,6 +4198,7 @@ function renderAdminPage(origin) {
       byId("system-prompt-modal").addEventListener("click", (e) => { if (e.target === byId("system-prompt-modal")) closeSystemPromptModal(); });
       document.addEventListener("keydown", (e) => {
         if (e.key !== "Escape") return;
+        hideStatTip();
         if (state.speedPicker) closeSpeedPicker();
         else if (state.modelPicker) closeModelPicker();
         else if (byId("system-prompt-modal").classList.contains("open")) closeSystemPromptModal();
@@ -4105,7 +4215,7 @@ function renderAdminPage(origin) {
         e.stopPropagation();
         byId("upstream-actions").classList.toggle("open");
       });
-      document.addEventListener("click", () => byId("upstream-actions").classList.remove("open"));
+      document.addEventListener("click", () => { byId("upstream-actions").classList.remove("open"); hideStatTip(); });
       byId("close-vendor-modal").addEventListener("click", closeVendorModal);
       byId("model-picker-close").addEventListener("click", closeModelPicker);
       byId("speed-picker-close").addEventListener("click", closeSpeedPicker);
