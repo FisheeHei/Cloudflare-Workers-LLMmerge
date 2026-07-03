@@ -140,6 +140,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 - DeepInfra
 - Together AI
 - DeepSeek
+- OpenRouter
 - Cloudflare Workers AI (REST)
 - 自定义 OpenAI 兼容上游
 

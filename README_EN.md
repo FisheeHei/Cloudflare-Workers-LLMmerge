@@ -166,6 +166,7 @@ Built-in presets:
 - DeepInfra
 - Together AI
 - DeepSeek
+- OpenRouter
 - Cloudflare Workers AI (REST)
 - Custom OpenAI-compatible upstream
 

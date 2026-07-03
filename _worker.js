@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-stdtime-hk";
+const VERSION = "v26-07-04-openrouter-template";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -65,6 +65,13 @@ const PRESET_TEMPLATES = [
     id: "deepseek",
     name: "DeepSeek",
     base_url: "https://api.deepseek.com/v1",
+    paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: false,
+  },
+  {
+    id: "openrouter",
+    name: "OpenRouter",
+    base_url: "https://openrouter.ai/api/v1",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
     requires_base_url: false,
   },

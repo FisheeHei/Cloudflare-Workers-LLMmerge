@@ -201,6 +201,11 @@ assert.equal(adminPage.includes("toggle-log-expanded"), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
 assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
+const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
+const configPayload = await configResp.json();
+const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
+assert.equal(openRouterPreset.name, "OpenRouter");
+assert.equal(openRouterPreset.base_url, "https://openrouter.ai/api/v1");
 
 const healthTimeResp = await worker.default.fetch(new Request("https://gw.test/health"), env);
 const healthTime = await healthTimeResp.json();
