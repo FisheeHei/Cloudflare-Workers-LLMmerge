@@ -30,7 +30,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-nim-rpm-window";
+const VERSION = "v26-07-04-nim-rpm-card";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -607,6 +607,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       return { hour, ...mergeStatsBucket(raw, _pendingStats[hour]) };
     });
     return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "" }, 200));
+  }
+
+  if (apiPath === "/api/runtime" && request.method === "GET") {
+    return withCorsResponse(json({ ok: true, nim_rpm: getNimRpmSnapshot() }, 200));
   }
 
       // ponytail: fetch model list from a saved or draft upstream for picker
@@ -1385,6 +1389,24 @@ function takeNimMinuteSlot(upstream) {
   bucket.count += 1;
   _nimMinuteCounters[key] = bucket;
   return true;
+}
+
+function getNimRpmSnapshot() {
+  const now = Date.now();
+  const result = {};
+  for (const key of Object.keys(_nimMinuteCounters)) {
+    const bucket = _nimMinuteCounters[key];
+    if (!bucket || bucket.resetAt <= now) {
+      delete _nimMinuteCounters[key];
+      continue;
+    }
+    result[key] = {
+      count: bucket.count,
+      limit: NVIDIA_NIM_RPM_LIMIT,
+      reset_in_ms: bucket.resetAt - now,
+    };
+  }
+  return result;
 }
 
 function isNvidiaNimUpstream(upstream) {
@@ -2747,6 +2769,7 @@ function renderAdminPage(origin) {
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u2713' : '\u2717') + '</span>' +
+          (isNimConfig(item) ? '<span class="card-meta nim-rpm" data-upstream="' + esc(item.name) + '">NIM 0/40</span>' : '') +
         '</summary>' +
         '<div class="card-body">' +
           '<div class="row">' +
@@ -2869,6 +2892,10 @@ function renderAdminPage(origin) {
     };
   }
 
+  function isNimConfig(upstream) {
+    return upstream && (upstream.preset === "nvidia-nim" || text(upstream.base_url).toLowerCase().includes("integrate.api.nvidia.com"));
+  }
+
   /* ---- Settings ---- */
   function renderSettings() {
     var s = state.config && state.config.settings || {};
@@ -2892,6 +2919,7 @@ function renderAdminPage(origin) {
     state.gateway = payload.gateway || {};
     renderSettings();
     renderUpstreams();
+    loadRuntimeStatus().catch(function(){});
   }
 
   async function saveConfig() {
@@ -2903,6 +2931,7 @@ function renderAdminPage(origin) {
     if (!resp.ok) throw new Error(payload?.error?.message || "\u4fdd\u5b58\u5931\u8d25");
     state.config = payload.config;
     renderSettings(); renderUpstreams();
+    loadRuntimeStatus().catch(function(){});
     showToast("\u914d\u7f6e\u5df2\u4fdd\u5b58");
     byId("config-status").textContent = "\u2713 \u5df2\u4fdd\u5b58";
     setTimeout(() => byId("config-status").textContent = "", 3000);
@@ -2939,6 +2968,24 @@ function renderAdminPage(origin) {
     const ok = (payload.results || []).filter((r) => r.ok).length;
     const total = (payload.results || []).length;
     showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
+  }
+
+  async function loadRuntimeStatus() {
+    const resp = await fetch(API_BASE + "/runtime");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) return;
+    const nim = payload.nim_rpm || {};
+    document.querySelectorAll(".nim-rpm").forEach(function(el) {
+      const item = nim[el.dataset.upstream];
+      if (!item) {
+        el.textContent = "NIM 0/40";
+        el.title = "\u5c1a\u672a\u5f00\u59cb\u8ba1\u65f6";
+        return;
+      }
+      const seconds = Math.max(0, Math.ceil(Number(item.reset_in_ms || 0) / 1000));
+      el.textContent = "NIM " + item.count + "/" + item.limit + " · " + seconds + "s";
+      el.title = seconds + "s \u540e\u6e05\u96f6";
+    });
   }
 
   async function speedTest() {
@@ -3526,6 +3573,7 @@ function renderAdminPage(origin) {
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
       await Promise.all([loadConfig(), loadClients()]);
       if (bootSpan.parentNode) bootSpan.remove();
+      loadRuntimeStatus().catch(function(){});
       loadStats().catch(function(){}); // ponytail: don't block boot on stats
       loadLogs().catch(function(){});  // don't block on logs either
       // ponytail: only auto-refresh when stats panel is visible (save KV reads)
@@ -3537,6 +3585,7 @@ function renderAdminPage(origin) {
         if (statsVisible) loadStats().catch(function(){});
         if (logVisible) loadLogs().catch(function(){});
       }, 120000); // ponytail: 2min auto-refresh to save KV quota
+      setInterval(function() { loadRuntimeStatus().catch(function(){}); }, 5000);
 
 
     } catch (error) {

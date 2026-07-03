@@ -341,6 +341,11 @@ for (let i = 0; i < 41; i += 1) {
 }
 assert.equal(nimHits.length, 40);
 assert.equal(nimResp.headers.get("x-llm-gateway-upstream"), "nim-fallback");
+const runtimeResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), nimEnv);
+const runtimeStatus = await runtimeResp.json();
+assert.equal(runtimeStatus.nim_rpm["nim-limit"].count, 40);
+assert.equal(runtimeStatus.nim_rpm["nim-limit"].limit, 40);
+assert.equal(runtimeStatus.nim_rpm["nim-limit"].reset_in_ms > 0, true);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({
