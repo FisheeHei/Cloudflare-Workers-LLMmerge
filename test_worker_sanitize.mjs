@@ -194,6 +194,7 @@ assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
 assert.equal(adminPage.includes("180000"), true);
+assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
