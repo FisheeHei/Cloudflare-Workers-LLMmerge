@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-reasoning-compat";
+const VERSION = "v26-07-05-agentic-tags";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2994,7 +2994,7 @@ function renderAdminPage(origin) {
     .model-tag { border: 1px solid #cfbea0; border-radius: 999px; padding: 1px 6px; color: var(--muted); font-size: 11px; white-space: nowrap; background: #fffdfa; }
     .model-tag-filter { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
     .model-tag-filter button { padding: 5px 8px; font-size: 12px; }
-    .model-tag-filter button.active { background: #eadcc5; }
+    .model-tag-filter button.active { background: #1f8f61; color: white; }
     .picker-actions { display: flex; gap: 10px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 14px; }
     .picker-actions button.small { padding: 7px 13px; font-size: 13px; }
     @media (max-width: 760px) {
@@ -3954,8 +3954,9 @@ function renderAdminPage(origin) {
     { id: "chat", label: "\u804a\u5929" },
     { id: "text", label: "\u5355\u6a21\u6001" },
     { id: "vision", label: "\u591a\u6a21\u6001" },
-    { id: "tools", label: "\u5de5\u5177" },
+    { id: "tools", label: "\u5de5\u5177\u8c03\u7528" },
     { id: "thinking", label: "\u63a8\u7406" },
+    { id: "agentic", label: "Agentic" },
   ];
   const EXCLUSIVE_MODEL_TAGS = [["text", "vision"]];
 
@@ -3964,8 +3965,9 @@ function renderAdminPage(origin) {
     const tags = ["chat"];
     const vision = /(^|[\/_.-])(vl|vision|visual|image|multimodal|omni|pixtral|gemini|gpt-4o|qwen2(?:\.5)?-vl)([\/_.-]|$)/i.test(value);
     tags.push(vision ? "vision" : "text");
-    if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|llama-3|mistral|mixtral|deepseek)/i.test(value)) tags.push("tools");
+    if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|llama-3|mistral|mixtral|deepseek|codestral|coder|codegemma)/i.test(value)) tags.push("tools");
     if (/(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3)([\/_.-]|$)/i.test(value)) tags.push("thinking");
+    if (/(agent|agentic|computer-use|operator|claude|gpt-|gemini|qwen.*coder|coder|codegemma|codestral|deepseek-coder|devstral|swe|opus|sonnet)/i.test(value)) tags.push("agentic");
     return tags;
   }
 
@@ -4046,9 +4048,10 @@ function renderAdminPage(origin) {
     byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
     byId("picker-same-preset-wrap").hidden = !picker.sourceCard;
     byId("model-tag-filter").innerHTML =
-      '<button type="button" class="small secondary' + (!picker.tags.size ? ' active' : '') + '" data-tag="__all__">\u5168\u90e8\u6807\u7b7e</button>' +
+      '<button type="button" class="small secondary' + (!picker.tags.size ? ' active' : '') + '" data-tag="__all__">' + (!picker.tags.size ? '\u2705 ' : '') + '\u5168\u90e8\u6807\u7b7e</button>' +
       MODEL_TAGS.map(function(tag) {
-        return '<button type="button" class="small secondary' + (picker.tags.has(tag.id) ? ' active' : '') + '" data-tag="' + esc(tag.id) + '">' + esc(tag.label) + '</button>';
+        const active = picker.tags.has(tag.id);
+        return '<button type="button" class="small secondary' + (active ? ' active' : '') + '" data-tag="' + esc(tag.id) + '">' + (active ? '\u2705 ' : '') + esc(tag.label) + '</button>';
       }).join("");
     byId("model-picker-groups").innerHTML =
       '<button type="button" class="model-group-btn' + (picker.group === "__all__" ? ' active' : '') + '" data-group="__all__"><span>\u5168\u90e8</span><span>' + picker.models.length + '</span></button>' +
