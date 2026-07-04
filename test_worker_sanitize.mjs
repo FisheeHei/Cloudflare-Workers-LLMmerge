@@ -225,6 +225,8 @@ assert.equal(adminPage.includes("width: min(1216px"), true);
 assert.equal(adminPage.includes(".picker-actions button.small"), true);
 assert.equal(adminPage.includes("EXCLUSIVE_MODEL_TAGS"), true);
 assert.equal(adminPage.includes("toggleModelTag"), true);
+assert.equal(adminPage.includes("\u63a8\u7406"), true);
+assert.equal(adminPage.includes("\u6df1\u5ea6\u601d\u8003"), false);
 assert.equal(adminPage.includes("upstream-enable-toggle"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
 const configPayload = await configResp.json();
@@ -258,17 +260,38 @@ assert.equal("reasoning_split" in bodies[1], false);
 assert.equal("enable_thinking" in bodies[1], false);
 assert.equal("chat_template_kwargs" in bodies[1], false);
 
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-reasoner", messages: [], reasoningEffort: "high", reasoningSummary: "auto" }),
+}), env);
+
+assert.equal(bodies[2].reasoning_effort, "high");
+assert.equal(bodies[2].reasoning.summary, "auto");
+assert.equal("reasoningEffort" in bodies[2], false);
+assert.equal("reasoningSummary" in bodies[2], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-reasoner", messages: [], providerOptions: { openai: { reasoningEffort: "medium", reasoningSummary: "auto", reasoning: { effort: "medium" } } } }),
+}), env);
+
+assert.equal(bodies[3].reasoning_effort, "medium");
+assert.equal(bodies[3].reasoning.summary, "auto");
+assert.equal("providerOptions" in bodies[3], false);
+
 const statsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), env);
 const stats = await statsResp.json();
-assert.equal(stats.buckets.some((b) => b.total >= 2), true);
-assert.equal(stats.last_model, "minimax-m3");
+assert.equal(stats.buckets.some((b) => b.total >= 4), true);
+assert.equal(stats.last_model, "deepseek-reasoner");
 assert.equal(stats.time_zone, "Hong Kong Standard Time (UTC+8)");
 assert.equal(stats.now.endsWith("+08:00"), true);
 assert.equal(stats.buckets.some((b) => b.model_statuses?.["minimax-m3"]?.success >= 1), true);
 
 const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), env);
 const logs = await logsResp.json();
-assert.equal(logs.logs.length, 2);
+assert.equal(logs.logs.length, 4);
 assert.equal(kvPuts.length, 0);
 
 const aliasStore = new Map();
@@ -629,13 +652,16 @@ const responsesEnv = {
 const responsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
-  body: JSON.stringify({ model: "resp-model", instructions: "be terse", input: "hi", max_output_tokens: 8 }),
+  body: JSON.stringify({ model: "resp-model", instructions: "be terse", input: "hi", max_output_tokens: 8, reasoningEffort: "medium", reasoningSummary: "auto" }),
 }), responsesEnv);
 const responsesPayload = await responsesResp.json();
 assert.equal(responsesResp.status, 200);
 assert.equal(responseHits[0].messages[0].role, "system");
 assert.equal(responseHits[0].messages[1].content, "hi");
 assert.equal(responseHits[0].max_tokens, 8);
+assert.equal(responseHits[0].reasoning_effort, "medium");
+assert.equal("reasoningEffort" in responseHits[0], false);
+assert.equal("reasoningSummary" in responseHits[0], false);
 assert.equal(responsesPayload.object, "response");
 assert.equal(responsesPayload.output_text, "hello");
 assert.equal(responsesPayload.usage.input_tokens, 3);

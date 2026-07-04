@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-model-picker-tuning";
+const VERSION = "v26-07-05-reasoning-compat";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1556,6 +1556,7 @@ function translateResponsesRequest(payload) {
 
   const chat = { model, messages, stream: payload.stream === true };
   copyIfPresent(payload, chat, ["temperature", "top_p", "presence_penalty", "frequency_penalty", "stop", "seed", "user"]);
+  copyIfPresent(payload, chat, ["reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
   const maxTokens = payload.max_output_tokens ?? payload.max_tokens;
   if (maxTokens != null) chat.max_tokens = maxTokens;
   if (payload.text?.format?.type && payload.text.format.type !== "text") {
@@ -2090,7 +2091,15 @@ function sanitizeProxyBody(bodyText, upstream) {
 
   const baseUrl = String(upstream.base_url || "").toLowerCase();
   const isNvidia = baseUrl.includes("integrate.api.nvidia.com");
-  if (!bodyText.includes('"thinking"') && (!isNvidia || (!bodyText.includes('"reasoning_split"') && !bodyText.includes('"enable_thinking"')))) {
+  if (
+    !bodyText.includes('"thinking"') &&
+    !bodyText.includes('"reasoning"') &&
+    !bodyText.includes('"reasoningEffort"') &&
+    !bodyText.includes('"reasoningSummary"') &&
+    !bodyText.includes('"providerOptions"') &&
+    !bodyText.includes('"provider_options"') &&
+    (!isNvidia || (!bodyText.includes('"reasoning_split"') && !bodyText.includes('"enable_thinking"')))
+  ) {
     return bodyText;
   }
 
@@ -2102,6 +2111,62 @@ function sanitizeProxyBody(bodyText, upstream) {
   }
 
   let changed = false;
+  const providerOptions = payload.providerOptions || payload.provider_options;
+  const openaiOptions = providerOptions && typeof providerOptions === "object"
+    ? providerOptions.openai || providerOptions.openAI || providerOptions.gateway
+    : null;
+  if (openaiOptions && typeof openaiOptions === "object") {
+    if (openaiOptions.reasoningEffort != null && !("reasoning_effort" in payload)) {
+      payload.reasoning_effort = openaiOptions.reasoningEffort;
+      changed = true;
+    }
+    if (openaiOptions.reasoning_effort != null && !("reasoning_effort" in payload)) {
+      payload.reasoning_effort = openaiOptions.reasoning_effort;
+      changed = true;
+    }
+    if (openaiOptions.reasoning != null && !("reasoning" in payload)) {
+      payload.reasoning = openaiOptions.reasoning;
+      changed = true;
+    }
+    if (openaiOptions.reasoningSummary != null && !payload.reasoning?.summary) {
+      payload.reasoning = {
+        ...(payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {}),
+        summary: openaiOptions.reasoningSummary,
+      };
+      changed = true;
+    }
+  }
+  if ("providerOptions" in payload) {
+    delete payload.providerOptions;
+    changed = true;
+  }
+  if ("provider_options" in payload) {
+    delete payload.provider_options;
+    changed = true;
+  }
+  if (payload.reasoning && typeof payload.reasoning === "object" && payload.reasoning.effort != null && !("reasoning_effort" in payload)) {
+    payload.reasoning_effort = payload.reasoning.effort;
+    changed = true;
+  }
+  if ("reasoningSummary" in payload && !payload.reasoning?.summary) {
+    payload.reasoning = {
+      ...(payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {}),
+      summary: payload.reasoningSummary,
+    };
+    changed = true;
+  }
+  if ("reasoningEffort" in payload && !("reasoning_effort" in payload)) {
+    payload.reasoning_effort = payload.reasoningEffort;
+    changed = true;
+  }
+  if ("reasoningEffort" in payload) {
+    delete payload.reasoningEffort;
+    changed = true;
+  }
+  if ("reasoningSummary" in payload) {
+    delete payload.reasoningSummary;
+    changed = true;
+  }
   if ("thinking" in payload) {
     delete payload.thinking;
     changed = true;
@@ -3890,7 +3955,7 @@ function renderAdminPage(origin) {
     { id: "text", label: "\u5355\u6a21\u6001" },
     { id: "vision", label: "\u591a\u6a21\u6001" },
     { id: "tools", label: "\u5de5\u5177" },
-    { id: "thinking", label: "\u6df1\u5ea6\u601d\u8003" },
+    { id: "thinking", label: "\u63a8\u7406" },
   ];
   const EXCLUSIVE_MODEL_TAGS = [["text", "vision"]];
 
@@ -3900,7 +3965,7 @@ function renderAdminPage(origin) {
     const vision = /(^|[\/_.-])(vl|vision|visual|image|multimodal|omni|pixtral|gemini|gpt-4o|qwen2(?:\.5)?-vl)([\/_.-]|$)/i.test(value);
     tags.push(vision ? "vision" : "text");
     if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|llama-3|mistral|mixtral|deepseek)/i.test(value)) tags.push("tools");
-    if (/(^|[\/_.-])(r1|reason|reasoning|think|thinking|qwq|o1|o3|deepseek-v3\.1|deepseek-v4|deepseek-reasoner)([\/_.-]|$)/i.test(value)) tags.push("thinking");
+    if (/(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3)([\/_.-]|$)/i.test(value)) tags.push("thinking");
     return tags;
   }
 
