@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-model-tags";
+const VERSION = "v26-07-04-model-aliases";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -158,16 +158,18 @@ export default {
         const client = await requireClient(request, runtime);
         const bodyText = await request.text();
         const payload = parseJsonBody(bodyText);
-        const model = payload.model;
+        const requestedModel = payload.model;
 
-        if (!model || typeof model !== "string") {
+        if (!requestedModel || typeof requestedModel !== "string") {
           return withCorsResponse(
             json(openAiError("`model` is required.", "invalid_request_error"), 400),
           );
         }
+        const model = await resolveClientModelAlias(client, runtime, requestedModel);
+        const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
 
         const started = Date.now();
-        var pt = Math.max(1, Math.round(bodyText.length / 4));
+        var pt = Math.max(1, Math.round(proxyBodyText.length / 4));
         let proxyResponse;
         try {
           proxyResponse = await proxyRequest({
@@ -175,7 +177,7 @@ export default {
             model,
             pathname,
             request,
-            bodyText,
+            bodyText: proxyBodyText,
             runtime,
             search: url.search,
           });
@@ -203,7 +205,7 @@ export default {
 
         return await buildLoggedProxyResponse({
           app,
-          bodyText,
+          bodyText: proxyBodyText,
           client,
           ctx,
           headers,
@@ -227,13 +229,14 @@ export default {
         const client = await requireClient(request, runtime);
         const bodyText = await request.text();
         const anthropicPayload = parseJsonBody(bodyText);
-        const model = anthropicPayload.model;
+        const requestedModel = anthropicPayload.model;
 
-        if (!model || typeof model !== "string") {
+        if (!requestedModel || typeof requestedModel !== "string") {
           return withCorsResponse(
             json({ type: "error", error: { type: "invalid_request_error", message: "`model` is required." } }, 400),
           );
         }
+        const model = await resolveClientModelAlias(client, runtime, requestedModel);
 
         // Anthropic -> OpenAI request translation
         const openaiMessages = [];
@@ -1165,17 +1168,15 @@ async function listModels(client, runtime) {
         const models = await getUpstreamModels(runtime, upstream);
         return models
           .filter((model) => model && model !== "*" && clientAllowsModel(client, model))
-          .map((model) => ({ id: model, object: "model", owned_by: upstream.note || upstream.name || "gateway" }));
+          .map((model) => ({ model, upstream }));
       })
   );
 
-  const seen = new Set();
-  const rows = [];
-  for (const group of allResults) {
-    for (const row of group) {
-      if (!seen.has(row.id)) { seen.add(row.id); rows.push(row); }
-    }
-  }
+  const rows = aliasRowsForModels(allResults.flat()).map((row) => ({
+    id: row.alias,
+    object: "model",
+    owned_by: row.upstream.note || row.upstream.name || "gateway",
+  }));
 
   rows.sort((a, b) => a.id.localeCompare(b.id));
   return json(
@@ -1185,6 +1186,68 @@ async function listModels(client, runtime) {
     },
     200,
   );
+}
+
+async function resolveClientModelAlias(client, runtime, model) {
+  const value = String(model || "").trim();
+  if (!value || value.includes("@cf/")) return value;
+  if (value.includes("/")) {
+    const allResults = await Promise.all(
+      runtime.upstreams
+        .filter((upstream) => clientAllowsUpstream(client, upstream.name))
+        .map(async (upstream) => {
+          const models = await getUpstreamModels(runtime, upstream);
+          return models
+            .filter((item) => item && item !== "*" && clientAllowsModel(client, item))
+            .map((item) => ({ model: item, upstream }));
+        })
+    );
+    const hit = aliasRowsForModels(allResults.flat()).find((row) => row.alias === value);
+    if (hit) return hit.model;
+  }
+  return value;
+}
+
+function aliasRowsForModels(items) {
+  const seenPairs = new Set();
+  const normalized = items.filter((item) => {
+    const key = aliasPresetId(item.upstream) + "\n" + item.model;
+    if (seenPairs.has(key)) return false;
+    seenPairs.add(key);
+    return true;
+  });
+  const baseCounts = {};
+  normalized.forEach((item) => {
+    const base = modelAliasBase(item.upstream, item.model);
+    baseCounts[base] = (baseCounts[base] || 0) + 1;
+  });
+  return normalized.map((item) => {
+    const base = modelAliasBase(item.upstream, item.model);
+    return {
+      ...item,
+      alias: baseCounts[base] > 1 ? modelAliasWithSource(item.upstream, item.model) : base,
+    };
+  });
+}
+
+function aliasPresetId(upstream) {
+  return String(upstream?.preset || inferPresetId(upstream?.base_url) || "custom").trim() || "custom";
+}
+
+function modelAliasBase(upstream, model) {
+  return aliasPresetId(upstream) + "/" + modelSuffix(model);
+}
+
+function modelAliasWithSource(upstream, model) {
+  const clean = String(model || "").replace(/^@cf\//, "");
+  const parts = clean.split("/").filter(Boolean);
+  return aliasPresetId(upstream) + "/" + (parts.length > 1 ? parts.slice(-2).join("/") : modelSuffix(model));
+}
+
+function modelSuffix(model) {
+  const clean = String(model || "").replace(/^@cf\//, "");
+  const parts = clean.split("/").filter(Boolean);
+  return parts[parts.length - 1] || clean;
 }
 
 async function getUpstreamModels(runtime, upstream) {
@@ -1420,6 +1483,11 @@ async function handleResponsesRequest(request, url, app, ctx) {
   const client = await requireClient(request, runtime);
   const payload = parseJsonBody(await request.text());
   const translated = translateResponsesRequest(payload);
+  const resolvedModel = await resolveClientModelAlias(client, runtime, translated.model);
+  if (resolvedModel !== translated.model) {
+    translated.model = resolvedModel;
+    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
+  }
 
   try {
     const proxyResponse = await proxyRequest({
