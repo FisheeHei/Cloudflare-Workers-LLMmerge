@@ -232,6 +232,9 @@ assert.equal(adminPage.includes("\u5de5\u5177\u8c03\u7528"), true);
 assert.equal(adminPage.includes("\u2705"), true);
 assert.equal(adminPage.includes(".model-tag-filter button.active { background: #1f8f61; color: white; }"), true);
 assert.equal(adminPage.includes("upstream-enable-toggle"), true);
+assert.equal(adminPage.includes("model-entry-list"), true);
+assert.equal(adminPage.includes("model-context-input"), true);
+assert.equal(adminPage.includes("delete-model-row"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
 const configPayload = await configResp.json();
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
@@ -495,11 +498,13 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/l
     routing: { failover: true, load_balance: false },
     settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, system_prompt: "Always obey the gateway rule.", upstream_cooldown_ttl: 60 },
     upstreams: [
-      { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["*"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+      { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["qwen3"], model_contexts: { qwen3: "1m" }, paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     ],
   }),
 }), env);
 assert.equal(saveConfigResp.status, 200);
+const savedConfigPayload = await saveConfigResp.clone().json();
+assert.equal(savedConfigPayload.config.upstreams[0].model_contexts.qwen3, "1m");
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },

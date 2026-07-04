@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-agentic-tags";
+const VERSION = "v26-07-05-model-row-editor";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -924,6 +924,7 @@ async function buildGatewayConfigFromEnv(app) {
     const plaintextKey = upstream.api_key || app.env[upstream.api_key_env] || "";
     const accountId = String(upstream.account_id || "").trim();
 
+    const models = normalizeStringArray(upstream.models);
     upstreams.push({
       api_key_encrypted: plaintextKey
         ? await ensureEncryptedValue(plaintextKey, app.encryptionSecret)
@@ -938,7 +939,8 @@ async function buildGatewayConfigFromEnv(app) {
       headers: { ...presetDefaultHeaders(presetId), ...normalizeHeaders(upstream.headers) },
       account_id: accountId,
       id: String(upstream.id || crypto.randomUUID()),
-      models: normalizeStringArray(upstream.models),
+      models,
+      model_contexts: normalizeModelContexts(upstream.model_contexts, models),
       name: String(upstream.name || `upstream-${index + 1}`),
       note: String(upstream.note || upstream.name || ""),
       paths: normalizeStringArray(upstream.paths).length
@@ -997,6 +999,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
       throw httpError(400, `Upstream ${name} is missing account_id.`);
     }
 
+    const models = normalizeStringArray(item.models);
     upstreams.push({
       api_key_encrypted: await ensureEncryptedValue(apiKeyValue, app.encryptionSecret),
       base_url: baseUrl,
@@ -1004,7 +1007,8 @@ async function normalizeGatewayConfigPayload(payload, app) {
       enabled: item.enabled !== false,
       headers: { ...presetDefaultHeaders(preset), ...normalizeHeaders(item.headers) },
       id: String(item.id || crypto.randomUUID()),
-      models: normalizeStringArray(item.models),
+      models,
+      model_contexts: normalizeModelContexts(item.model_contexts, models),
       name,
       note: String(item.note || "").trim(),
       paths: normalizeStringArray(item.paths).length
@@ -1060,6 +1064,7 @@ async function exportUpstreamGroup(app) {
       enabled: upstream.enabled !== false,
       headers: normalizeHeaders(upstream.headers),
       models: normalizeStringArray(upstream.models),
+      model_contexts: normalizeModelContexts(upstream.model_contexts, upstream.models),
       name: upstream.name,
       note: String(upstream.note || "").trim(),
       paths: normalizeStringArray(upstream.paths),
@@ -2562,6 +2567,15 @@ function normalizeHeaders(value) {
   return headers;
 }
 
+function normalizeModelContexts(value, models = []) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const contexts = {};
+  for (const model of normalizeStringArray(models)) {
+    contexts[model] = String(source[model] || "1m").trim() || "1m";
+  }
+  return contexts;
+}
+
 function presetDefaultHeaders(presetId) {
   const preset = presetById(presetId);
   return normalizeHeaders(preset?.headers || {});
@@ -2917,6 +2931,15 @@ function renderAdminPage(origin) {
     .upstream-enable-toggle { padding: 5px 9px; }
     .nim-rpm-timer[hidden] { display: none; }
     .upstream-card .card-body { padding: 0 16px 14px; }
+    .model-entry-list { display: grid; gap: 6px; margin-top: 4px; }
+    .model-entry {
+      display: grid; grid-template-columns: minmax(0, 1fr) 90px auto;
+      gap: 6px; align-items: center; padding: 6px;
+      border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa;
+    }
+    .model-entry input { padding: 7px 9px; }
+    .model-entry .model-context-input { text-align: center; }
+    .model-entry-empty { padding: 8px; border: 1px dashed #cfbea0; border-radius: 8px; }
 
     .client-item {
       display: flex; align-items: center; gap: 12px;
@@ -3002,6 +3025,7 @@ function renderAdminPage(origin) {
       .model-picker-groups, .model-picker-subgroups { max-height: 150px; }
       .model-row { align-items: flex-start; flex-wrap: wrap; }
       .model-tags { margin-left: 26px; justify-content: flex-start; }
+      .model-entry { grid-template-columns: 1fr; }
     }
 
     #toast {
@@ -3353,6 +3377,15 @@ function renderAdminPage(origin) {
     return splitList(value);
   }
 
+  function normalizeModelContextMap(value, models) {
+    const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    const out = {};
+    (models || []).forEach(function(model) {
+      out[model] = text(source[model] || "1m").trim() || "1m";
+    });
+    return out;
+  }
+
   function normalizeImportedUpstreams(payload) {
     const raw = Array.isArray(payload)
       ? payload
@@ -3362,6 +3395,7 @@ function renderAdminPage(origin) {
 
     return raw.map(function(item, index) {
       const headers = item && typeof item.headers === "object" && !Array.isArray(item.headers) ? item.headers : {};
+      const models = normalizeImportList(item && item.models);
       return {
         account_id: text(item && item.account_id).trim(),
         api_key_value: text(item && (item.api_key || item.api_key_value)).trim(),
@@ -3369,7 +3403,8 @@ function renderAdminPage(origin) {
         capability: item && item.capability ? item.capability : null,
         enabled: item && item.enabled !== false,
         headers: headers,
-        models: normalizeImportList(item && item.models),
+        models: models,
+        model_contexts: normalizeModelContextMap(item && item.model_contexts, models),
         name: text(item && item.name).trim() || "upstream-" + (index + 1),
         note: text(item && item.note).trim(),
         paths: normalizeImportList(item && item.paths),
@@ -3478,6 +3513,7 @@ function renderAdminPage(origin) {
     if (preset && preset.requires_account_id && !accountId) throw new Error("Account ID \u4e0d\u80fd\u4e3a\u7a7a");
     if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
 
+    const models = splitList(byId("vendor-models").value);
     state.config.upstreams.push({
       id: crypto.randomUUID ? crypto.randomUUID() : "u-" + suffix,
       preset: presetId,
@@ -3485,7 +3521,8 @@ function renderAdminPage(origin) {
       base_url: baseUrl, api_key_value: apiKey,
       account_id: accountId,
       headers: presetHeaders(presetId),
-      models: splitList(byId("vendor-models").value),
+      models: models,
+      model_contexts: normalizeModelContextMap({}, models),
       paths: splitList(byId("vendor-paths").value),
       weight: Number(byId("vendor-weight").value || 1),
       priority: 100, enabled: byId("vendor-enabled").value === "true",
@@ -3499,6 +3536,75 @@ function renderAdminPage(origin) {
   }
 
   /* ---- Upstreams ---- */
+  function modelContextFor(upstream, model) {
+    const contexts = upstream && upstream.model_contexts && typeof upstream.model_contexts === "object" ? upstream.model_contexts : {};
+    return text(contexts[model] || "1m").trim() || "1m";
+  }
+
+  function modelEntryHtml(model, context) {
+    return '<div class="model-entry">' +
+      '<input class="mono model-name-input" value="' + esc(model || "") + '" placeholder="model-id">' +
+      '<input class="mono model-context-input" value="' + esc(context || "1m") + '" placeholder="1m" title="上下文">' +
+      '<button type="button" class="small danger delete-model-row">删除</button>' +
+    '</div>';
+  }
+
+  function modelEditorHtml(item) {
+    const models = Array.isArray(item.models) ? item.models : [];
+    const rows = models.length
+      ? models.map(function(model) { return modelEntryHtml(model, modelContextFor(item, model)); }).join("")
+      : '<div class="note model-entry-empty">留空=自动；也可以点“添加模型”手动填写。</div>';
+    return '<textarea data-field="models" hidden>' + esc(models.join("\\n")) + '</textarea>' +
+      '<div class="model-entry-list">' + rows + '</div>' +
+      '<button type="button" class="small secondary add-model-row" style="margin-top:6px">添加模型</button> ' +
+      '<button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:6px">从上游导入模型</button>';
+  }
+
+  function syncModelTextarea(card) {
+    const models = [...card.querySelectorAll(".model-entry")].map(function(row) {
+      return row.querySelector(".model-name-input").value.trim();
+    }).filter(Boolean);
+    card.querySelector('[data-field="models"]').value = models.join("\\n");
+  }
+
+  function addModelRow(card, model, context) {
+    const list = card.querySelector(".model-entry-list");
+    list.querySelector(".model-entry-empty")?.remove();
+    list.insertAdjacentHTML("beforeend", modelEntryHtml(model || "", context || "1m"));
+    bindModelEntry(list.lastElementChild);
+    syncModelTextarea(card);
+  }
+
+  function bindModelEntry(row) {
+    if (!row || row._wired) return;
+    row._wired = true;
+    row.querySelector(".model-name-input").addEventListener("input", function() {
+      syncModelTextarea(row.closest(".upstream-card"));
+    });
+    row.querySelector(".delete-model-row").addEventListener("click", function() {
+      const card = row.closest(".upstream-card");
+      row.remove();
+      if (!card.querySelector(".model-entry")) {
+        card.querySelector(".model-entry-list").innerHTML = '<div class="note model-entry-empty">留空=自动；也可以点“添加模型”手动填写。</div>';
+      }
+      syncModelTextarea(card);
+    });
+  }
+
+  function renderModelEditor(card) {
+    const textarea = card.querySelector('[data-field="models"]');
+    const models = splitList(textarea.value);
+    const prev = {};
+    card.querySelectorAll(".model-entry").forEach(function(row) {
+      const model = row.querySelector(".model-name-input").value.trim();
+      if (model) prev[model] = row.querySelector(".model-context-input").value.trim() || "1m";
+    });
+    card.querySelector(".model-entry-list").innerHTML = models.length
+      ? models.map(function(model) { return modelEntryHtml(model, prev[model] || "1m"); }).join("")
+      : '<div class="note model-entry-empty">留空=自动；也可以点“添加模型”手动填写。</div>';
+    card.querySelectorAll(".model-entry").forEach(bindModelEntry);
+  }
+
   function renderUpstreams() {
     const host = byId("upstream-list");
     if (!state.config.upstreams.length) {
@@ -3547,7 +3653,7 @@ function renderAdminPage(origin) {
             '<div class="field span-3"><label>\u8def\u5f84</label><input data-field="paths" value="' + esc((item.paths || []).join(", ")) + '"></div>' +
           '</div>' +
           '<div class="row">' +
-            '<div class="field span-12"><label>\u6a21\u578b (\u6bcf\u884c\u4e00\u4e2a, \u7559\u7a7a=\u81ea\u52a8)</label><textarea data-field="models">' + esc((item.models || []).join("\\n")) + '</textarea><button type="button" class="small secondary fetch-models-btn" data-upstream="' + esc(item.name) + '" style="margin-top:4px">\u4ece\u4e0a\u6e38\u5bfc\u5165\u6a21\u578b</button></div>' +
+            '<div class="field span-12"><label>\u6a21\u578b / \u4e0a\u4e0b\u6587 (\u7559\u7a7a=\u81ea\u52a8\uff0c\u9ed8\u8ba4 1m)</label>' + modelEditorHtml(item) + '</div>' +
           '</div>' +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
@@ -3569,6 +3675,13 @@ function renderAdminPage(origin) {
         const enabled = btn.dataset.enabled !== "true";
         card.querySelector('[data-field="enabled"]').value = enabled ? "true" : "false";
         await withButtonBusy(btn, enabled ? "\u542f\u7528\u4e2d..." : "\u505c\u7528\u4e2d...", saveConfig).catch(showError);
+      });
+    });
+    host.querySelectorAll(".model-entry").forEach(bindModelEntry);
+    host.querySelectorAll(".add-model-row").forEach((btn) => {
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        addModelRow(btn.closest(".upstream-card"), "", "1m");
       });
     });
     host.querySelectorAll(".delete-upstream").forEach((btn) => {
@@ -3629,6 +3742,13 @@ function renderAdminPage(origin) {
     const cards = [...document.querySelectorAll(".upstream-card")];
     const upstreams = cards.map((card, index) => {
       const prev = existingUpstreams.find((item) => String(item && item.id) === String(card.dataset.id)) || existingUpstreams[index] || {};
+      const modelRows = [...card.querySelectorAll(".model-entry")];
+      const models = modelRows.map((row) => row.querySelector(".model-name-input").value.trim()).filter(Boolean);
+      const modelContexts = {};
+      modelRows.forEach((row) => {
+        const model = row.querySelector(".model-name-input").value.trim();
+        if (model) modelContexts[model] = row.querySelector(".model-context-input").value.trim() || "1m";
+      });
       return {
         capability: prev.capability || null,
         account_id: card.querySelector('[data-field="account_id"]')?.value.trim() || prev.account_id || "",
@@ -3643,7 +3763,8 @@ function renderAdminPage(origin) {
         priority: Number(card.querySelector('[data-field="priority"]').value || 100),
         enabled: card.querySelector('[data-field="enabled"]').value === "true",
         paths: splitList(card.querySelector('[data-field="paths"]').value),
-        models: splitList(card.querySelector('[data-field="models"]').value),
+        models,
+        model_contexts: modelContexts,
       };
     });
     return {
@@ -4119,11 +4240,13 @@ function renderAdminPage(origin) {
     if (!picker || !picker.target) return;
     const picked = Array.from(picker.selected).sort();
     picker.target.value = picked.join(picker.target.tagName === "TEXTAREA" ? "\\n" : ", ");
+    if (picker.sourceCard) renderModelEditor(picker.sourceCard);
     if (picker.sourceCard && byId("picker-apply-same-preset").checked) {
       const preset = picker.sourceCard.querySelector('[data-field="preset"]')?.value || "";
       document.querySelectorAll(".upstream-card").forEach(function(card) {
         if (card.querySelector('[data-field="preset"]')?.value === preset) {
           card.querySelector('[data-field="models"]').value = picked.join("\\n");
+          renderModelEditor(card);
         }
       });
     }
