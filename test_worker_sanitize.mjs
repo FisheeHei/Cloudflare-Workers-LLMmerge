@@ -316,6 +316,43 @@ const qwenChatResp = await worker.default.fetch(new Request("https://gw.test/v1/
 assert.equal(qwenChatResp.headers.get("x-llm-gateway-upstream"), "nim-alias");
 assert.equal(speedBodies[qwenBodyStart].model, "qwen/qwen3-coder-480b-a35b-instruct");
 
+const fanoutStore = new Map();
+fanoutStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "qwen-local", preset: "nvidia-nim", base_url: "https://speed-fast.example/v1", api_key_encrypted: "q", models: ["qwen/qwen3-coder-480b-a35b-instruct"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    ...Array.from({ length: 40 }, (_, i) => ({ name: `dynamic-${i}`, base_url: `https://dynamic-${i}.example/v1`, api_key_encrypted: "d", models: [], paths: ["/v1/chat/completions"], priority: 100 + i, weight: 1, enabled: true })),
+  ],
+}));
+const fanoutEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = fanoutStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { fanoutStore.set(key, value); },
+    async delete(key) { fanoutStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "fanout-client", key: "sk-fanout", models: ["qwen3-coder-480b-a35b-instruct"], upstreams: [] }]),
+};
+const fanoutUrlStart = fetchUrls.length;
+const fanoutModelsResp = await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-fanout" },
+}), fanoutEnv);
+const fanoutModels = await fanoutModelsResp.json();
+assert.deepEqual(fanoutModels.data.map((item) => item.id), ["nvidia-nim/qwen3-coder-480b-a35b-instruct"]);
+const fanoutBodyStart = speedBodies.length;
+const fanoutChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-fanout", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3-coder-480b-a35b-instruct", messages: [] }),
+}), fanoutEnv);
+assert.equal(fanoutChatResp.headers.get("x-llm-gateway-upstream"), "qwen-local");
+assert.equal(speedBodies[fanoutBodyStart].model, "qwen/qwen3-coder-480b-a35b-instruct");
+assert.equal(fetchUrls.slice(fanoutUrlStart).some((url) => url.endsWith("/models")), false);
+
 const modelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
   method: "POST",
   headers: { "content-type": "application/json" },

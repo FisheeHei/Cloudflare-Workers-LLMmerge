@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-qwen-model-match";
+const VERSION = "v26-07-04-client-models-local";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1168,20 +1168,14 @@ async function requireClient(request, runtime) {
   throw httpError(401, "Invalid bearer token.");
 }
 
-// ponytail: parallel fetch, then deduplicate (avoids race condition in concurrent seen.add)
 async function listModels(client, runtime) {
-  const allResults = await Promise.all(
-    runtime.upstreams
-      .filter((upstream) => clientAllowsUpstream(client, upstream.name))
-      .map(async (upstream) => {
-        const models = await getUpstreamModels(runtime, upstream);
-        return models
-          .filter((model) => model && model !== "*" && clientAllowsModel(client, model))
-          .map((model) => ({ model, upstream }));
-      })
-  );
+  const allResults = runtime.upstreams
+    .filter((upstream) => clientAllowsUpstream(client, upstream.name))
+    .flatMap((upstream) => configuredUpstreamModels(upstream)
+      .filter((model) => model && model !== "*" && clientAllowsModel(client, model))
+      .map((model) => ({ model, upstream })));
 
-  const rows = aliasRowsForModels(allResults.flat()).map((row) => ({
+  const rows = aliasRowsForModels(allResults).map((row) => ({
     id: row.alias,
     object: "model",
     owned_by: row.upstream.note || row.upstream.name || "gateway",
@@ -1201,17 +1195,12 @@ async function resolveClientModelAlias(client, runtime, model) {
   const value = String(model || "").trim();
   if (!value || value.includes("@cf/")) return value;
   if (value.includes("/") || isQwenModel(value)) {
-    const allResults = await Promise.all(
-      runtime.upstreams
-        .filter((upstream) => clientAllowsUpstream(client, upstream.name))
-        .map(async (upstream) => {
-          const models = await getUpstreamModels(runtime, upstream);
-          return models
-            .filter((item) => item && item !== "*" && clientAllowsModel(client, item))
-            .map((item) => ({ model: item, upstream }));
-        })
-    );
-    const rows = aliasRowsForModels(allResults.flat());
+    const allResults = runtime.upstreams
+      .filter((upstream) => clientAllowsUpstream(client, upstream.name))
+      .flatMap((upstream) => configuredUpstreamModels(upstream)
+        .filter((item) => item && item !== "*" && clientAllowsModel(client, item))
+        .map((item) => ({ model: item, upstream })));
+    const rows = aliasRowsForModels(allResults);
     const hit = rows.find((row) => row.alias === value || row.model === value);
     if (hit) return hit.model;
     const fuzzy = rows.filter((row) =>
@@ -1264,6 +1253,10 @@ function modelSuffix(model) {
   return parts[parts.length - 1] || clean;
 }
 
+function configuredUpstreamModels(upstream) {
+  return Array.isArray(upstream.models) ? upstream.models : [];
+}
+
 function isQwenModel(model) {
   return String(model || "").toLowerCase().includes("qwen");
 }
@@ -1277,39 +1270,6 @@ function modelsMatch(left, right) {
   const lowerA = a.toLowerCase();
   const lowerB = b.toLowerCase();
   return lowerA === lowerB || modelSuffix(a).toLowerCase() === modelSuffix(b).toLowerCase();
-}
-
-async function getUpstreamModels(runtime, upstream) {
-  if (Array.isArray(upstream.models) && upstream.models.length > 0) {
-    return upstream.models;
-  }
-
-  if (!runtime.kv) {
-    return [];
-  }
-
-  const cacheKey = modelsCacheKey(upstream.name);
-  const cached = await runtime.kv.get(cacheKey, "json");
-  if (cached && Array.isArray(cached.models)) {
-    return cached.models;
-  }
-
-  try {
-    const models = await fetchUpstreamModelIds(upstream, runtime.requestTimeoutMs);
-
-    await runtime.kv.put(
-      cacheKey,
-      JSON.stringify({
-        fetched_at: hkNowIso(),
-        models,
-      }),
-      { expirationTtl: runtime.modelCacheTtl },
-    );
-
-    return models;
-  } catch {
-    return [];
-  }
 }
 
 // ponytail: parallel model refresh
