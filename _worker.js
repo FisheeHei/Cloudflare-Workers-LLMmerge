@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-upstream-toggle";
+const VERSION = "v26-07-04-qwen-model-match";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1200,7 +1200,7 @@ async function listModels(client, runtime) {
 async function resolveClientModelAlias(client, runtime, model) {
   const value = String(model || "").trim();
   if (!value || value.includes("@cf/")) return value;
-  if (value.includes("/")) {
+  if (value.includes("/") || isQwenModel(value)) {
     const allResults = await Promise.all(
       runtime.upstreams
         .filter((upstream) => clientAllowsUpstream(client, upstream.name))
@@ -1211,8 +1211,13 @@ async function resolveClientModelAlias(client, runtime, model) {
             .map((item) => ({ model: item, upstream }));
         })
     );
-    const hit = aliasRowsForModels(allResults.flat()).find((row) => row.alias === value);
+    const rows = aliasRowsForModels(allResults.flat());
+    const hit = rows.find((row) => row.alias === value || row.model === value);
     if (hit) return hit.model;
+    const fuzzy = rows.filter((row) =>
+      isQwenModel(row.model) && (modelsMatch(value, row.alias) || modelsMatch(value, row.model))
+    );
+    if (fuzzy.length === 1) return fuzzy[0].model;
   }
   return value;
 }
@@ -1257,6 +1262,21 @@ function modelSuffix(model) {
   const clean = String(model || "").replace(/^@cf\//, "");
   const parts = clean.split("/").filter(Boolean);
   return parts[parts.length - 1] || clean;
+}
+
+function isQwenModel(model) {
+  return String(model || "").toLowerCase().includes("qwen");
+}
+
+function modelsMatch(left, right) {
+  const a = String(left || "").trim();
+  const b = String(right || "").trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (!isQwenModel(a) && !isQwenModel(b)) return false;
+  const lowerA = a.toLowerCase();
+  const lowerB = b.toLowerCase();
+  return lowerA === lowerB || modelSuffix(a).toLowerCase() === modelSuffix(b).toLowerCase();
 }
 
 async function getUpstreamModels(runtime, upstream) {
@@ -2182,7 +2202,7 @@ function clientAllowsModel(client, model) {
   if (!Array.isArray(client.models) || client.models.length === 0) {
     return true;
   }
-  return client.models.includes("*") || client.models.includes(model);
+  return client.models.includes("*") || client.models.some((item) => modelsMatch(item, model));
 }
 
 function upstreamSupportsModel(upstream, model) {
