@@ -15,6 +15,7 @@ const responseStreamHits = [];
 const paymentHits = [];
 const degradedHits = [];
 const missingFunctionHits = [];
+const disabledHits = [];
 const longStreamHits = [];
 const usageHits = [];
 const kvPuts = [];
@@ -25,6 +26,13 @@ globalThis.fetch = async (url, init) => {
     return new Response(null, {
       status: 200,
       headers: { date: "Sat, 04 Jul 2026 04:00:00 GMT" },
+    });
+  }
+  if (String(url).includes("disabled.example")) {
+    disabledHits.push(String(url));
+    return new Response(JSON.stringify({ data: [{ id: "disabled-model" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
     });
   }
   if (String(url).includes("usage-stream.example")) {
@@ -213,6 +221,7 @@ assert.equal(adminPage.includes("id=\"stat-tip\""), true);
 assert.equal(adminPage.includes("data-stat-kind"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
+assert.equal(adminPage.includes("upstream-enable-toggle"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
 const configPayload = await configResp.json();
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
@@ -344,6 +353,42 @@ const health = await healthResp.json();
 const aiHealth = health.results.find((item) => item.name === "ai");
 assert.equal(aiHealth.ok, true);
 assert.equal(aiHealth.model_count, 102);
+
+const disabledStore = new Map();
+disabledStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "disabled", base_url: "https://disabled.example/v1", api_key_encrypted: "d", models: ["disabled-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: false },
+    { name: "enabled", base_url: "https://speed-fast.example/v1", api_key_encrypted: "e", models: ["disabled-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const disabledEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = disabledStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { disabledStore.set(key, value); },
+    async delete(key) { disabledStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "disabled-client", key: "sk-disabled", models: ["*"], upstreams: ["disabled", "enabled"] }]),
+};
+const disabledHitStart = disabledHits.length;
+const disabledCallResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-disabled", "content-type": "application/json" },
+  body: JSON.stringify({ model: "disabled-model", messages: [] }),
+}), disabledEnv);
+assert.equal(disabledCallResp.headers.get("x-llm-gateway-upstream"), "enabled");
+assert.equal(disabledHits.length, disabledHitStart);
+const disabledHealthResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/health", {
+  method: "POST",
+}), disabledEnv);
+const disabledHealth = await disabledHealthResp.json();
+assert.equal(disabledHealth.results.some((item) => item.name === "disabled" && item.ok), true);
+assert.equal(disabledHits.length, disabledHitStart + 1);
 
 const exportResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/upstreams/export"), env);
 const exported = await exportResp.json();

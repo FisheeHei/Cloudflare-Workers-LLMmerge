@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-model-aliases";
+const VERSION = "v26-07-04-upstream-toggle";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -838,9 +838,9 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
 // ponytail: parallel health checks instead of sequential loop
   if (apiPath === "/api/health" && request.method === "POST") {
-    const runtime = await loadRuntimeConfig(app);
+    const upstreams = await loadHealthUpstreams(app);
     const results = await Promise.all(
-      runtime.upstreams.map((upstream) => checkUpstreamHealth(upstream, 10000))
+      upstreams.map((upstream) => checkUpstreamHealth(upstream, 10000))
     );
     return withCorsResponse(json({ ok: true, results }, 200));
   }
@@ -1108,6 +1108,15 @@ async function loadRuntimeConfig(app) {
   _runtimeCache = { app, runtime };
   _runtimeCacheTs = now;
   return runtime;
+}
+
+async function loadHealthUpstreams(app) {
+  const editable = await getEditableConfig(app);
+  const aesKey = await deriveAesKey(app.encryptionSecret);
+  return Promise.all(editable.upstreams.map(async (upstream) => ({
+    ...upstream,
+    api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
+  })));
 }
 
 function invalidateRuntimeCache() {
@@ -2830,6 +2839,7 @@ function renderAdminPage(origin) {
       border: 1px solid #cfbea0; background: #fff9ef;
       border-radius: 16px; margin-bottom: 10px; overflow: hidden;
     }
+    .upstream-card.disabled { background: #f4efe7; border-color: #d8cbb8; opacity: .82; }
     .upstream-card summary {
       display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
       padding: 14px 16px; cursor: pointer; user-select: none;
@@ -2859,6 +2869,7 @@ function renderAdminPage(origin) {
       border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap;
     }
     .upstream-card summary .card-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+    .upstream-enable-toggle { padding: 5px 9px; }
     .nim-rpm-timer[hidden] { display: none; }
     .upstream-card .card-body { padding: 0 16px 14px; }
 
@@ -3462,14 +3473,15 @@ function renderAdminPage(origin) {
         ? '<div class="row"><div class="field span-12"><label>Account ID</label><input data-field="account_id" class="mono" value="' + esc(accountIdValue) + '" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div></div>'
         : '<div class="row" style="display:none"><div class="field span-12"><label>Account ID</label><input data-field="account_id" class="mono" value="' + esc(accountIdValue) + '" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div></div>';
 
-      return '<details class="upstream-card" data-id="' + esc(item.id) + '">' +
+      return '<details class="upstream-card' + (item.enabled ? '' : ' disabled') + '" data-id="' + esc(item.id) + '">' +
         '<summary>' +
           '<span class="card-badge">' + esc(badge) + '</span>' +
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
-          '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u2713' : '\u2717') + '</span>' +
+          '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u5df2\u542f\u7528' : '\u5df2\u505c\u7528') + '</span>' +
           (isNimConfig(item) ? '<span class="card-meta nim-rpm" data-upstream="' + esc(item.name) + '"><span class="nim-rpm-count">NIM 0/40</span><span class="nim-rpm-timer" hidden> · 60s</span></span>' : '') +
+          '<button type="button" class="small upstream-enable-toggle ' + (item.enabled ? 'secondary' : 'good') + '" data-enabled="' + (item.enabled ? 'true' : 'false') + '">' + (item.enabled ? '\u505c\u7528' : '\u542f\u7528') + '</button>' +
         '</summary>' +
         '<div class="card-body">' +
           '<div class="row">' +
@@ -3501,6 +3513,16 @@ function renderAdminPage(origin) {
       btn.addEventListener("click", async (event) => {
         event.preventDefault();
         await withButtonBusy(btn, "\u68c0\u6d4b\u4e2d...", () => detectCapability(btn.dataset.upstream));
+      });
+    });
+    host.querySelectorAll(".upstream-enable-toggle").forEach((btn) => {
+      btn.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const card = btn.closest(".upstream-card");
+        const enabled = btn.dataset.enabled !== "true";
+        card.querySelector('[data-field="enabled"]').value = enabled ? "true" : "false";
+        await withButtonBusy(btn, enabled ? "\u542f\u7528\u4e2d..." : "\u505c\u7528\u4e2d...", saveConfig).catch(showError);
       });
     });
     host.querySelectorAll(".delete-upstream").forEach((btn) => {
