@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-04-client-models-local";
+const VERSION = "v26-07-05-model-picker-tuning";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2902,16 +2902,16 @@ function renderAdminPage(origin) {
     .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
     .system-prompt-textarea { min-height: min(55vh, 520px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
     .model-picker-backdrop { z-index: 80; }
-    .model-picker-card { width: min(1280px, calc(100vw - 32px)); }
+    .model-picker-card { width: min(1216px, calc(100vw - 48px)); }
     .picker-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
     .picker-head h3 { margin: 0; }
     .model-picker-grid {
       display: grid; grid-template-columns: 220px 260px minmax(0, 1fr); gap: 12px;
-      min-height: min(72vh, 760px);
+      min-height: min(68vh, 722px);
     }
     .model-picker-groups, .model-picker-subgroups, .model-picker-list {
       border: 1px solid #cfbea0; border-radius: 8px; background: #fffdfa;
-      overflow: auto; max-height: min(72vh, 760px);
+      overflow: auto; max-height: min(68vh, 722px);
     }
     .model-picker-groups, .model-picker-subgroups { padding: 8px; }
     .model-group-btn {
@@ -2930,7 +2930,8 @@ function renderAdminPage(origin) {
     .model-tag-filter { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
     .model-tag-filter button { padding: 5px 8px; font-size: 12px; }
     .model-tag-filter button.active { background: #eadcc5; }
-    .picker-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+    .picker-actions { display: flex; gap: 10px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+    .picker-actions button.small { padding: 7px 13px; font-size: 13px; }
     @media (max-width: 760px) {
       .model-picker-grid { grid-template-columns: 1fr; }
       .model-picker-groups, .model-picker-subgroups { max-height: 150px; }
@@ -3891,6 +3892,7 @@ function renderAdminPage(origin) {
     { id: "tools", label: "\u5de5\u5177" },
     { id: "thinking", label: "\u6df1\u5ea6\u601d\u8003" },
   ];
+  const EXCLUSIVE_MODEL_TAGS = [["text", "vision"]];
 
   function modelTags(model) {
     const value = modelDisplayName(model).toLowerCase();
@@ -3918,7 +3920,7 @@ function renderAdminPage(origin) {
       models: unique,
       group: "__all__",
       family: "__all__",
-      tag: "__all__",
+      tags: new Set(),
       selected: new Set(splitList(target.value)),
       sourceCard: sourceCard || null,
       target,
@@ -3930,9 +3932,25 @@ function renderAdminPage(origin) {
     renderModelPicker();
   }
 
+  function toggleModelTag(picker, tag) {
+    if (tag === "__all__") {
+      picker.tags.clear();
+      return;
+    }
+    if (picker.tags.has(tag)) {
+      picker.tags.delete(tag);
+      return;
+    }
+    EXCLUSIVE_MODEL_TAGS.forEach(function(group) {
+      if (group.includes(tag)) group.forEach(function(item) { picker.tags.delete(item); });
+    });
+    picker.tags.add(tag);
+  }
+
   function renderModelPicker() {
     const picker = state.modelPicker;
     if (!picker) return;
+    if (!picker.tags) picker.tags = new Set();
     const query = byId("model-picker-search").value.trim().toLowerCase();
     const groups = {};
     picker.models.forEach(function(model) {
@@ -3953,7 +3971,8 @@ function renderAdminPage(origin) {
       ? picker.models
       : (picker.family === "__all__" ? groups[picker.group].models : families[picker.family]);
     picker.visible = sourceModels.filter(function(model) {
-      const tagOk = picker.tag === "__all__" || modelTags(model).includes(picker.tag);
+      const tags = modelTags(model);
+      const tagOk = !picker.tags.size || Array.from(picker.tags).every(function(tag) { return tags.includes(tag); });
       const queryOk = !query || model.toLowerCase().includes(query) || modelDisplayName(model).toLowerCase().includes(query);
       return tagOk && queryOk;
     });
@@ -3962,9 +3981,9 @@ function renderAdminPage(origin) {
     byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
     byId("picker-same-preset-wrap").hidden = !picker.sourceCard;
     byId("model-tag-filter").innerHTML =
-      '<button type="button" class="small secondary' + (picker.tag === "__all__" ? ' active' : '') + '" data-tag="__all__">\u5168\u90e8\u6807\u7b7e</button>' +
+      '<button type="button" class="small secondary' + (!picker.tags.size ? ' active' : '') + '" data-tag="__all__">\u5168\u90e8\u6807\u7b7e</button>' +
       MODEL_TAGS.map(function(tag) {
-        return '<button type="button" class="small secondary' + (picker.tag === tag.id ? ' active' : '') + '" data-tag="' + esc(tag.id) + '">' + esc(tag.label) + '</button>';
+        return '<button type="button" class="small secondary' + (picker.tags.has(tag.id) ? ' active' : '') + '" data-tag="' + esc(tag.id) + '">' + esc(tag.label) + '</button>';
       }).join("");
     byId("model-picker-groups").innerHTML =
       '<button type="button" class="model-group-btn' + (picker.group === "__all__" ? ' active' : '') + '" data-group="__all__"><span>\u5168\u90e8</span><span>' + picker.models.length + '</span></button>' +
@@ -3986,7 +4005,7 @@ function renderAdminPage(origin) {
 
     byId("model-tag-filter").querySelectorAll("[data-tag]").forEach(function(btn) {
       btn.addEventListener("click", function() {
-        picker.tag = btn.dataset.tag;
+        toggleModelTag(picker, btn.dataset.tag);
         renderModelPicker();
       });
     });
