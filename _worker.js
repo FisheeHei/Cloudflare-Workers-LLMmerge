@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-prompt-context-split";
+const VERSION = "v26-07-05-kv-config-compat";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -907,12 +907,70 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
 async function getEditableConfig(app) {
   const stored = app.kv ? await app.kv.get(GATEWAY_CONFIG_KEY, "json") : null;
-  // ponytail: KV data is already normalized; skip re-normalization
-  if (stored && typeof stored === "object" && Array.isArray(stored.upstreams)) {
-    return stored;
+  const config = unwrapGatewayConfig(stored);
+  if (config) {
+    return repairStoredGatewayConfig(config, app);
   }
 
   return buildGatewayConfigFromEnv(app);
+}
+
+function unwrapGatewayConfig(value) {
+  if (typeof value === "string") return unwrapGatewayConfig(safeJson(value));
+  if (Array.isArray(value)) return { upstreams: value };
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value.upstreams)) return value;
+  return unwrapGatewayConfig(value.config || value.gateway_config || value.gatewayConfig);
+}
+
+async function repairStoredGatewayConfig(config, app) {
+  const settings = config.settings && typeof config.settings === "object" ? config.settings : {};
+  const routing = config.routing && typeof config.routing === "object" ? config.routing : {};
+  const upstreamEntries = Array.isArray(config.upstreams) ? config.upstreams : [];
+  const upstreams = await Promise.all(upstreamEntries.map(async (item, index) => {
+    const preset = presetById(item?.preset) ? item.preset : "custom";
+    const defaults = presetById(preset) || presetById("custom");
+    const accountId = String(item?.account_id || "").trim();
+    const models = normalizeStringArray(item?.models);
+    const paths = normalizeStringArray(item?.paths);
+    const apiKeyValue = String(item?.api_key_encrypted || item?.api_key_value || item?.api_key || "").trim();
+    return {
+      api_key_encrypted: apiKeyValue ? await ensureEncryptedValue(apiKeyValue, app.encryptionSecret) : "",
+      base_url: String(item?.base_url || resolveBaseUrl(preset, "", defaults.base_url, accountId)).trim(),
+      account_id: accountId,
+      enabled: item?.enabled !== false,
+      headers: { ...presetDefaultHeaders(preset), ...normalizeHeaders(item?.headers) },
+      id: String(item?.id || crypto.randomUUID()),
+      models,
+      model_contexts: normalizeModelContexts(item?.model_contexts, models),
+      name: String(item?.name || `upstream-${index + 1}`).trim(),
+      note: String(item?.note || "").trim(),
+      paths: paths.length ? paths : [...defaults.paths],
+      preset,
+      priority: parsePriority(item?.priority, index + 1),
+      weight: parsePositiveInt(item?.weight, 1),
+      capability: item?.capability || null,
+    };
+  }));
+  const validUpstreams = upstreams.filter((item) => item.name && item.base_url && item.api_key_encrypted);
+
+  return {
+    routing: {
+      failover: routing.failover !== false,
+      hedge_enabled: routing.hedge_enabled === true,
+      hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
+      load_balance: routing.load_balance !== false,
+    },
+    settings: {
+      model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
+      request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
+      system_prompt: String(settings.system_prompt || ""),
+      global_context: String(settings.global_context || settings.context_prompt || ""),
+      upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
+    },
+    upstreams: validUpstreams,
+    version: config.version || 1,
+  };
 }
 
 async function buildGatewayConfigFromEnv(app) {

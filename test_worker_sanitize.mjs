@@ -18,6 +18,7 @@ const missingFunctionHits = [];
 const disabledHits = [];
 const longStreamHits = [];
 const usageHits = [];
+const wrappedHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
@@ -134,6 +135,13 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("nim-limit.example")) {
     nimHits.push("nim");
     return new Response(JSON.stringify({ id: "nim", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("kv-wrapped.example")) {
+    wrappedHits.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ id: "wrapped", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -303,6 +311,39 @@ const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerg
 const logs = await logsResp.json();
 assert.equal(logs.logs.length, 4);
 assert.equal(kvPuts.length, 0);
+
+const wrappedKvConfig = {
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "kv-wrapped", base_url: "https://kv-wrapped.example/v1", api_key_encrypted: "wrapped-key", models: ["wrapped-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1 },
+  ],
+};
+const wrappedStore = new Map([["gateway:config", JSON.stringify({ ok: true, config: wrappedKvConfig })]]);
+const wrappedEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = wrappedStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { wrappedStore.set(key, value); },
+    async delete(key) { wrappedStore.delete(key); },
+  },
+  UPSTREAMS_JSON: JSON.stringify([{ name: "env-only", base_url: "https://boom.example/v1", api_key: "env", models: ["env-model"], paths: ["/v1/chat/completions"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "wrapped-client", key: "sk-wrapped", models: ["*"], upstreams: ["kv-wrapped"] }]),
+};
+const wrappedConfigResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), wrappedEnv);
+const wrappedConfigPayload = await wrappedConfigResp.json();
+assert.equal(wrappedConfigPayload.config.upstreams[0].name, "kv-wrapped");
+const wrappedHitStart = wrappedHits.length;
+const wrappedChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-wrapped", "content-type": "application/json" },
+  body: JSON.stringify({ model: "wrapped-model", messages: [] }),
+}), wrappedEnv);
+assert.equal(wrappedChatResp.status, 200);
+assert.equal(wrappedHits.length, wrappedHitStart + 1);
 
 const aliasStore = new Map();
 aliasStore.set("gateway:config", JSON.stringify({
