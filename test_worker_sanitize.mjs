@@ -19,6 +19,7 @@ const disabledHits = [];
 const longStreamHits = [];
 const usageHits = [];
 const wrappedHits = [];
+const appErrorHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
@@ -92,6 +93,13 @@ globalThis.fetch = async (url, init) => {
     paymentHits.push("402");
     return new Response(JSON.stringify({ detail: [{ error: "You need positive balance to do inference." }] }), {
       status: 402,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("app-error.example")) {
+    appErrorHits.push("200-error");
+    return new Response(JSON.stringify({ error: { message: "Internal server error" } }), {
+      status: 200,
       headers: { "content-type": "application/json" },
     });
   }
@@ -811,6 +819,35 @@ const paymentResp = await worker.default.fetch(new Request("https://gw.test/v1/c
 }), paymentEnv);
 assert.equal(paymentHits.length, 1);
 assert.equal(paymentResp.headers.get("x-llm-gateway-upstream"), "paid-fallback");
+
+const appErrorStore = new Map();
+appErrorStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "app-error", base_url: "https://app-error.example/v1", api_key_encrypted: "e", models: ["minimax-m3"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "app-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["minimax-m3"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const appErrorEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = appErrorStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { appErrorStore.set(key, value); },
+    async delete(key) { appErrorStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "app-error-client", key: "sk-app-error", models: ["*"], upstreams: ["app-error", "app-fallback"] }]),
+};
+const appErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-app-error", "content-type": "application/json" },
+  body: JSON.stringify({ model: "minimax-m3", messages: [] }),
+}), appErrorEnv);
+assert.equal(appErrorHits.length, 1);
+assert.equal(appErrorResp.headers.get("x-llm-gateway-upstream"), "app-fallback");
 
 const degradedStore = new Map();
 degradedStore.set("gateway:config", JSON.stringify({

@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-prompt-scope-layout";
+const VERSION = "v26-07-05-app-error-status";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -572,13 +572,13 @@ async function getMergedLogs(app) {
 
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
-  const log = (usage) => recordRequestLog(app, {
+  const log = (usage, statusOverride) => recordRequestLog(app, {
     ts: hkNowIso(),
     client: client.name || client.id || "client",
     upstream: proxyResponse.upstream.name,
     model,
     path: pathname,
-    status: upstreamResp.ok ? upstreamResp.status : (upstreamResp.status || 502),
+    status: statusOverride || (upstreamResp.status || 502),
     latency_ms: Date.now() - started,
     prompt_tokens: usage.prompt_tokens,
     completion_tokens: usage.completion_tokens,
@@ -598,6 +598,10 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   if (contentType.includes("application/json")) {
     const textBody = await upstreamResp.text();
     const payload = safeJson(textBody);
+    if (upstreamApplicationErrorMessage(payload || textBody)) {
+      log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
+      return new Response(textBody, { status: 502, statusText: "Bad Gateway", headers });
+    }
     const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
     log(usage);
     return new Response(textBody, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
@@ -613,10 +617,11 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone) {
   let usage = null;
   let outputText = "";
   let logged = false;
+  let failureStatus = 0;
   const finish = () => {
     if (logged) return;
     logged = true;
-    onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)));
+    onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)), failureStatus || 0);
   };
 
   return new ReadableStream({
@@ -628,12 +633,14 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone) {
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           readOpenAiStreamBlocks(buffer, (rest) => { buffer = rest; }, (chunk) => {
+            if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
             usage = chunk.usage || usage;
             outputText += chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
           });
           controller.enqueue(value);
         }
         if (buffer) readOpenAiStreamBlocks(buffer + "\n\n", (rest) => { buffer = rest; }, (chunk) => {
+          if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
           usage = chunk.usage || usage;
           outputText += chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
         });
@@ -1962,14 +1969,28 @@ function promptAppliesToClient(scope, client) {
 
 async function isRetryableUpstreamResponse(response) {
   if (RETRYABLE_STATUSES.has(response.status)) return true;
-  if (response.ok) return false;
+  const contentType = response.headers.get("content-type") || "";
+  if (response.ok && !contentType.includes("application/json")) return false;
   try {
     const body = await response.clone().text();
-    return body.includes("DEGRADED function cannot be invoked") ||
+    return upstreamApplicationErrorMessage(safeJson(body) || body) ||
+      body.includes("DEGRADED function cannot be invoked") ||
       /Function id ['"][^'"]+['"].*Specified function .* is not found/i.test(body);
   } catch {
     return false;
   }
+}
+
+function upstreamApplicationErrorMessage(value) {
+  if (!value) return "";
+  if (typeof value === "string") {
+    return /internal server error|server_error|resourceexhausted|resource exhausted/i.test(value) ? value : "";
+  }
+  if (typeof value !== "object") return "";
+  const message = value.error?.message || value.error || value.message || value.detail || value.details || "";
+  if (typeof message === "string") return upstreamApplicationErrorMessage(message);
+  if (Array.isArray(message)) return message.map(upstreamApplicationErrorMessage).find(Boolean) || "";
+  return "";
 }
 
 async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runtime, search }) {
