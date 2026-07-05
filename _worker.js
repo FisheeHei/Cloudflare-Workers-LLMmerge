@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-prompt-client-scope";
+const VERSION = "v26-07-05-prompt-scope-layout";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3082,7 +3082,9 @@ function renderAdminPage(origin) {
     .prompt-modal-card { width: min(1120px, calc(100vw - 32px)); }
     .prompt-edit-grid { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 10px; align-items: stretch; }
     .prompt-client-scope { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; max-height: 180px; overflow: auto; }
-    .prompt-client-scope label { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 0 0 6px; color: var(--ink); }
+    .prompt-client-scope label { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 6px; align-items: center; font-size: 12px; margin: 0 0 6px; color: var(--ink); line-height: 1.25; }
+    .prompt-client-scope input { margin: 0; justify-self: center; }
+    .prompt-client-scope span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .prompt-splitter-row { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 10px; align-items: start; }
     .model-picker-backdrop { z-index: 80; }
     .model-picker-card { width: min(1216px, calc(100vw - 48px)); }
@@ -3981,11 +3983,11 @@ function renderAdminPage(origin) {
     const ids = new Set(selected || []);
     const clients = state.clients || [];
     if (!clients.length) return '<div class="note">\u7a7a\u9009 = \u5168\u90e8\u5ba2\u6237\u7aef</div>';
-    return '<label><input type="checkbox" value="__all__"' + (ids.size ? '' : ' checked') + '> \u5168\u90e8\u5ba2\u6237\u7aef</label>' +
+    return '<label><input type="checkbox" value="__all__"' + (ids.size ? '' : ' checked') + '><span>\u5168\u90e8\u5ba2\u6237\u7aef</span></label>' +
       clients.map(function(c) {
         const id = text(c.id || c.name || c.key).trim();
         const label = text(c.name || c.id || "client");
-        return '<label><input type="checkbox" value="' + esc(id) + '"' + (ids.has(id) ? ' checked' : '') + '> ' + esc(label) + '</label>';
+        return '<label><input type="checkbox" value="' + esc(id) + '"' + (ids.has(id) ? ' checked' : '') + '><span title="' + esc(label) + '">' + esc(label) + '</span></label>';
       }).join("");
   }
 
