@@ -226,6 +226,8 @@ assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
 assert.equal(adminPage.includes("global-context-input"), true);
+assert.equal(adminPage.includes("system-prompt-client-scope"), true);
+assert.equal(adminPage.includes("global-context-client-scope"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("180000"), true);
@@ -561,6 +563,51 @@ assert.equal(speedHits[cachedConfigHits], "fast");
 assert.deepEqual(speedBodies.at(-1).messages[0], { role: "system", content: "Always obey the gateway rule." });
 assert.equal(speedBodies.at(-1).messages[1].role, "user");
 assert.equal(speedBodies.at(-1).messages[1].content.includes("Project context should guide details."), true);
+
+const scopedStore = new Map();
+scopedStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: {
+    model_cache_ttl: 3600,
+    request_timeout_ms: 30000,
+    system_prompt: "Scoped system.",
+    system_prompt_clients: ["scoped-client"],
+    global_context: "Scoped context.",
+    global_context_clients: ["scoped-client"],
+    upstream_cooldown_ttl: 60,
+  },
+  upstreams: [
+    { name: "scoped", base_url: "https://speed-fast.example/v1", api_key_encrypted: "s", models: ["scoped-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const scopedEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = scopedStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { scopedStore.set(key, value); },
+    async delete(key) { scopedStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([
+    { id: "scoped-client", name: "scoped-client", key: "sk-scoped", models: ["*"], upstreams: ["scoped"] },
+    { id: "plain-client", name: "plain-client", key: "sk-plain", models: ["*"], upstreams: ["scoped"] },
+  ]),
+};
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-scoped", "content-type": "application/json" },
+  body: JSON.stringify({ model: "scoped-model", messages: [] }),
+}), scopedEnv);
+assert.equal(speedBodies.at(-1).messages[0].content, "Scoped system.");
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped context."), true);
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-plain", "content-type": "application/json" },
+  body: JSON.stringify({ model: "scoped-model", messages: [] }),
+}), scopedEnv);
+assert.deepEqual(speedBodies.at(-1).messages, []);
 
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({

@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-admin-script-fix";
+const VERSION = "v26-07-05-prompt-client-scope";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -965,7 +965,9 @@ async function repairStoredGatewayConfig(config, app) {
       model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
       request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
       system_prompt: String(settings.system_prompt || ""),
+      system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
       global_context: String(settings.global_context || settings.context_prompt || ""),
+      global_context_clients: normalizeStringArray(settings.global_context_clients),
       upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
     },
     upstreams: validUpstreams,
@@ -1022,7 +1024,9 @@ async function buildGatewayConfigFromEnv(app) {
       model_cache_ttl: app.defaultModelCacheTtl,
       request_timeout_ms: app.defaultTimeoutMs,
       system_prompt: String(app.env.SYSTEM_PROMPT || app.env.GLOBAL_SYSTEM_PROMPT || ""),
+      system_prompt_clients: [],
       global_context: String(app.env.GLOBAL_CONTEXT || app.env.GLOBAL_SYSTEM_CONTEXT || ""),
+      global_context_clients: [],
       upstream_cooldown_ttl: app.defaultCooldownTtl,
     },
     upstreams,
@@ -1091,7 +1095,9 @@ async function normalizeGatewayConfigPayload(payload, app) {
       model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
       request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
       system_prompt: String(settings.system_prompt || ""),
+      system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
       global_context: String(settings.global_context || settings.context_prompt || ""),
+      global_context_clients: normalizeStringArray(settings.global_context_clients),
       upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
     },
     upstreams,
@@ -1833,7 +1839,7 @@ function streamResponsesFromChat(openaiResp, seed) {
 
 async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {
   if (pathname === CHAT_PATH) {
-    bodyText = applyGatewayPromptContext(bodyText, runtime.settings);
+    bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
 
   const candidates = runtime.upstreams.filter((upstream) => {
@@ -1917,9 +1923,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   throw err;
 }
 
-function applyGatewayPromptContext(bodyText, settings) {
-  const systemText = String(settings?.system_prompt || "").trim();
-  const contextText = String(settings?.global_context || "").trim();
+function applyGatewayPromptContext(bodyText, settings, client) {
+  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client) ? String(settings?.system_prompt || "").trim() : "";
+  const contextText = promptAppliesToClient(settings?.global_context_clients, client) ? String(settings?.global_context || "").trim() : "";
   if ((!systemText && !contextText) || !bodyText) return bodyText;
 
   let payload;
@@ -1945,6 +1951,13 @@ function applyGatewayPromptContext(bodyText, settings) {
   }
   if (injected.length) payload.messages = injected.concat(payload.messages);
   return JSON.stringify(payload);
+}
+
+function promptAppliesToClient(scope, client) {
+  const list = normalizeStringArray(scope);
+  if (!list.length) return true;
+  const ids = new Set([client?.id, client?.name, client?.key].map((item) => String(item || "").trim()).filter(Boolean));
+  return list.some((item) => ids.has(item));
 }
 
 async function isRetryableUpstreamResponse(response) {
@@ -3066,6 +3079,11 @@ function renderAdminPage(origin) {
     .context-prompt-textarea { min-height: min(32vh, 360px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
     .prompt-splitter-textarea { min-height: 140px; font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
     .prompt-modal-grid { display: grid; gap: 12px; }
+    .prompt-modal-card { width: min(1120px, calc(100vw - 32px)); }
+    .prompt-edit-grid { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 10px; align-items: stretch; }
+    .prompt-client-scope { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; max-height: 180px; overflow: auto; }
+    .prompt-client-scope label { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 0 0 6px; color: var(--ink); }
+    .prompt-splitter-row { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 10px; align-items: start; }
     .model-picker-backdrop { z-index: 80; }
     .model-picker-card { width: min(1216px, calc(100vw - 48px)); }
     .picker-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -3174,6 +3192,7 @@ function renderAdminPage(origin) {
       .stat-tip { max-height: 220px; }
       .modal-backdrop { align-items: stretch; }
       .modal-card { width: 100%; border-radius: 14px; }
+      .prompt-edit-grid, .prompt-splitter-row { grid-template-columns: 1fr; }
       .picker-actions { justify-content: stretch; }
       .picker-actions button, .picker-actions label { flex: 1 1 140px; }
     }
@@ -3386,21 +3405,35 @@ function renderAdminPage(origin) {
   </div>
 </div>
 <div class="modal-backdrop" id="system-prompt-modal">
-  <div class="modal-card">
+  <div class="modal-card prompt-modal-card">
     <h3>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</h3>
     <div class="prompt-modal-grid">
       <div class="field">
         <label>\u7cfb\u7edf\u63d0\u793a\u8bcd</label>
-        <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7b80\u77ed\u3001\u5fc5\u987b\u7167\u505a\u7684\u6700\u9ad8\u6307\u4ee4\u3002\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002"></textarea>
+        <div class="prompt-edit-grid">
+          <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7b80\u77ed\u3001\u5fc5\u987b\u7167\u505a\u7684\u6700\u9ad8\u6307\u4ee4\u3002\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002"></textarea>
+          <div>
+            <label>\u751f\u6548\u5ba2\u6237\u7aef Key</label>
+            <div class="prompt-client-scope" id="system-prompt-client-scope"></div>
+          </div>
+        </div>
       </div>
       <div class="field">
         <label>\u5168\u5c40\u4e0a\u4e0b\u6587</label>
-        <textarea id="global-context-input" class="context-prompt-textarea" placeholder="\u66f4\u957f\u7684\u80cc\u666f\u3001\u504f\u597d\u548c\u7ec6\u5316\u8981\u6c42\u3002\u4f1a\u4f5c\u4e3a\u53c2\u8003\u4e0a\u4e0b\u6587\u9644\u52a0\u5230 Chat/Responses/Messages \u8bf7\u6c42\u3002"></textarea>
+        <div class="prompt-edit-grid">
+          <textarea id="global-context-input" class="context-prompt-textarea" placeholder="\u66f4\u957f\u7684\u80cc\u666f\u3001\u504f\u597d\u548c\u7ec6\u5316\u8981\u6c42\u3002\u4f1a\u4f5c\u4e3a\u53c2\u8003\u4e0a\u4e0b\u6587\u9644\u52a0\u5230 Chat/Responses/Messages \u8bf7\u6c42\u3002"></textarea>
+          <div>
+            <label>\u751f\u6548\u5ba2\u6237\u7aef Key</label>
+            <div class="prompt-client-scope" id="global-context-client-scope"></div>
+          </div>
+        </div>
       </div>
       <div class="field">
         <label>\u5927\u6587\u672c\u62c6\u5206</label>
-        <textarea id="prompt-splitter-input" class="prompt-splitter-textarea" placeholder="\u53ef\u4ee5\u628a\u4e00\u6574\u6bb5\u63d0\u793a\u8bcd\u7c98\u8d34\u5230\u8fd9\u91cc\uff0c\u6309\u6bb5\u843d\u62c6\u5206\u5230\u4e0a\u9762\u4e24\u4e2a\u6846\u3002"></textarea>
-        <button type="button" class="secondary small" id="split-prompt-context">\u62c6\u5206\u5230\u63d0\u793a\u8bcd / \u4e0a\u4e0b\u6587</button>
+        <div class="prompt-splitter-row">
+          <textarea id="prompt-splitter-input" class="prompt-splitter-textarea" placeholder="\u53ef\u4ee5\u628a\u4e00\u6574\u6bb5\u63d0\u793a\u8bcd\u7c98\u8d34\u5230\u8fd9\u91cc\uff0c\u6309\u6bb5\u843d\u62c6\u5206\u5230\u4e0a\u9762\u4e24\u4e2a\u6846\u3002"></textarea>
+          <button type="button" class="secondary small" id="split-prompt-context">\u62c6\u5206\u5230\u63d0\u793a\u8bcd / \u4e0a\u4e0b\u6587</button>
+        </div>
       </div>
     </div>
     <div class="modal-actions">
@@ -3864,7 +3897,9 @@ function renderAdminPage(origin) {
         upstream_cooldown_ttl: Number(byId("cooldown-ttl").value || 60),
         model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
         system_prompt: byId("system-prompt-input").value,
+        system_prompt_clients: selectedPromptClients("system-prompt-client-scope"),
         global_context: byId("global-context-input").value,
+        global_context_clients: selectedPromptClients("global-context-client-scope"),
       },
       routing: {
         load_balance: byId("routing-load-balance").checked,
@@ -3889,6 +3924,7 @@ function renderAdminPage(origin) {
     byId("model-cache-ttl").value = s.model_cache_ttl || "";
     byId("system-prompt-input").value = s.system_prompt || "";
     byId("global-context-input").value = s.global_context || "";
+    renderPromptClientScopes();
     renderPromptContextStatus();
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
@@ -3931,6 +3967,8 @@ function renderAdminPage(origin) {
   }
 
   function openSystemPromptModal() {
+    renderPromptClientScopes();
+    renderPromptContextStatus();
     byId("system-prompt-modal").classList.add("open");
     byId("system-prompt-input").focus();
   }
@@ -3939,14 +3977,63 @@ function renderAdminPage(origin) {
     byId("system-prompt-modal").classList.remove("open");
   }
 
+  function clientScopeHtml(selected) {
+    const ids = new Set(selected || []);
+    const clients = state.clients || [];
+    if (!clients.length) return '<div class="note">\u7a7a\u9009 = \u5168\u90e8\u5ba2\u6237\u7aef</div>';
+    return '<label><input type="checkbox" value="__all__"' + (ids.size ? '' : ' checked') + '> \u5168\u90e8\u5ba2\u6237\u7aef</label>' +
+      clients.map(function(c) {
+        const id = text(c.id || c.name || c.key).trim();
+        const label = text(c.name || c.id || "client");
+        return '<label><input type="checkbox" value="' + esc(id) + '"' + (ids.has(id) ? ' checked' : '') + '> ' + esc(label) + '</label>';
+      }).join("");
+  }
+
+  function bindPromptScope(host) {
+    const all = host.querySelector('input[value="__all__"]');
+    if (all) {
+      all.addEventListener("change", function() {
+        if (all.checked) host.querySelectorAll('input:not([value="__all__"])').forEach((input) => { input.checked = false; });
+        renderPromptContextStatus("\u5f85\u4fdd\u5b58");
+      });
+    }
+    host.querySelectorAll('input:not([value="__all__"])').forEach(function(input) {
+      input.addEventListener("change", function() {
+        if (input.checked && all) all.checked = false;
+        if (all && !host.querySelector('input:not([value="__all__"]):checked')) all.checked = true;
+        renderPromptContextStatus("\u5f85\u4fdd\u5b58");
+      });
+    });
+  }
+
+  function renderPromptClientScopes() {
+    const s = state.config && state.config.settings || {};
+    const systemHost = byId("system-prompt-client-scope");
+    const contextHost = byId("global-context-client-scope");
+    if (!systemHost || !contextHost) return;
+    systemHost.innerHTML = clientScopeHtml(s.system_prompt_clients || []);
+    contextHost.innerHTML = clientScopeHtml(s.global_context_clients || []);
+    bindPromptScope(systemHost);
+    bindPromptScope(contextHost);
+  }
+
+  function selectedPromptClients(id) {
+    const host = byId(id);
+    if (!host) return [];
+    if (host.querySelector('input[value="__all__"]:checked')) return [];
+    return [...host.querySelectorAll('input:not([value="__all__"]):checked')].map((input) => input.value).filter(Boolean);
+  }
+
   function renderPromptContextStatus(prefix) {
     const systemLen = byId("system-prompt-input").value.length;
     const contextLen = byId("global-context-input").value.length;
+    const systemScope = selectedPromptClients("system-prompt-client-scope").length || "\u5168\u90e8";
+    const contextScope = selectedPromptClients("global-context-client-scope").length || "\u5168\u90e8";
     if (!systemLen && !contextLen) {
       byId("system-prompt-status").textContent = "\u672a\u542f\u7528";
       return;
     }
-    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / \u4e0a\u4e0b\u6587 " + contextLen + " \u5b57\u7b26)";
+    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef)";
   }
 
   function splitPromptContextDraft() {
@@ -4584,6 +4671,7 @@ function renderAdminPage(origin) {
     if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u5931\u8d25");
     state.clients = payload;
     renderClients();
+    renderPromptClientScopes();
   }
 
   function renderClients() {
