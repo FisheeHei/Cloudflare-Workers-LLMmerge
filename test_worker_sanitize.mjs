@@ -43,7 +43,7 @@ globalThis.fetch = async (url, init) => {
       'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n',
       'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9,"total_tokens":16}}\n\n',
       'data: [DONE]\n\n',
-    ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    ].join(""), { status: 200, headers: { "content-type": "text/event-stream", "content-length": "999", "content-encoding": "gzip" } });
   }
   if (String(url).includes("usage.example")) {
     usageHits.push("json");
@@ -703,6 +703,14 @@ const hedgeResp = await worker.default.fetch(new Request("https://gw.test/v1/cha
 }), hedgeEnv);
 assert.equal(hedgeResp.headers.get("x-llm-gateway-upstream"), "hedge-fast");
 assert.deepEqual(hedgeHits.slice(hedgeStart), ["slow", "fast"]);
+const hedgeSecondStart = hedgeHits.length;
+const hedgeResp2 = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-hedge", "content-type": "application/json" },
+  body: JSON.stringify({ model: "hedge-model", messages: [] }),
+}), hedgeEnv);
+assert.equal(hedgeResp2.headers.get("x-llm-gateway-upstream"), "hedge-fast");
+assert.equal(hedgeHits[hedgeSecondStart], "slow");
 
 const nimStore = new Map();
 nimStore.set("gateway:config", JSON.stringify({
@@ -966,6 +974,8 @@ const usageStreamResp = await worker.default.fetch(new Request("https://gw.test/
   headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },
   body: JSON.stringify({ model: "usage-stream", messages: [], stream: true }),
 }), usageEnv);
+assert.equal(usageStreamResp.headers.get("content-length"), null);
+assert.equal(usageStreamResp.headers.get("content-encoding"), null);
 await usageStreamResp.text();
 const usageLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), usageEnv);
 const usageLogs = await usageLogsResp.json();

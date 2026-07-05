@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-app-error-status";
+const VERSION = "v26-07-05-hedge-rotate";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -359,6 +359,8 @@ var _cachedApp = null;
 var _cachedEnvRef = null;
 // ponytail: per-isolate EWMA, KV-backed global scores only if cross-edge routing matters
 var _upstreamLatency = {};
+// ponytail: per-isolate only; DO/KV if strict global rotation ever matters
+var _lastSuccessfulUpstreamName = "";
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -1872,7 +1874,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   const attempts = await orderUpstreams(runtime, candidates);
   const maxAttempts = runtime.routing.failover === false ? 1 : attempts.length;
   if (runtime.routing.hedge_enabled === true && maxAttempts > 1) {
-    return hedgedProxyRequest({ attempts: attempts.slice(0, Math.min(maxAttempts, runtime.routing.hedge_max || 2)), bodyText, pathname, request, runtime, search });
+    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, runtime.routing.hedge_max || 2)));
+    return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, pathname, request, runtime, search });
   }
   let lastError = null;
 
@@ -1906,6 +1909,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       } else {
         await clearUpstreamFailure(runtime, upstream);
         rememberUpstreamLatency(upstream, upstreamLatency);
+        rememberSuccessfulUpstream(upstream);
       }
 
       if (!shouldRetry || isLast) {
@@ -2039,6 +2043,7 @@ async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runti
       controllers.forEach((controller, i) => { if (i !== result.index) controller.abort(); });
       await clearUpstreamFailure(runtime, result.upstream);
       rememberUpstreamLatency(result.upstream, result.latency);
+      rememberSuccessfulUpstream(result.upstream);
       return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
     }
     await markUpstreamFailure(runtime, result.upstream, result.response ? result.response.status : 599);
@@ -2142,6 +2147,15 @@ function latencySort(items) {
 function upstreamLatencyScore(upstream) {
   const score = Number(_upstreamLatency[upstream.name]);
   return Number.isFinite(score) && score > 0 ? score : Number.POSITIVE_INFINITY;
+}
+
+function avoidLastSuccessfulUpstream(items) {
+  if (items.length <= 1 || !_lastSuccessfulUpstreamName || items[0]?.name !== _lastSuccessfulUpstreamName) return items;
+  return items.slice(1).concat(items[0]);
+}
+
+function rememberSuccessfulUpstream(upstream) {
+  _lastSuccessfulUpstreamName = String(upstream?.name || "").trim();
 }
 
 function rememberUpstreamLatency(upstream, latencyMs) {
@@ -2781,8 +2795,14 @@ function wrapIdleTimeout(response, timeoutMs) {
   }), {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers: responseBodyHeaders(response.headers),
   });
+}
+
+function responseBodyHeaders(headers) {
+  const safe = new Headers(headers);
+  ["content-length", "content-encoding", "transfer-encoding"].forEach((name) => safe.delete(name));
+  return safe;
 }
 
 function generateClientKey() {
