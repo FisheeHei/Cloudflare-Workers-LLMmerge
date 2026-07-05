@@ -52,7 +52,7 @@ globalThis.fetch = async (url, init) => {
       id: "usage",
       choices: [{ message: { content: "hello world" } }],
       usage: { prompt_tokens: 11, completion_tokens: 22, total_tokens: 33 },
-    }), { status: 200, headers: { "content-type": "application/json" } });
+    }), { status: 200, headers: { "content-type": "application/json", "content-length": "999", "content-encoding": "gzip" } });
   }
   if (String(url).includes("long-stream.example")) {
     longStreamHits.push("stream");
@@ -826,6 +826,8 @@ const responsesResp = await worker.default.fetch(new Request("https://gw.test/v1
 }), responsesEnv);
 const responsesPayload = await responsesResp.json();
 assert.equal(responsesResp.status, 200);
+assert.equal(responsesResp.headers.get("content-length"), null);
+assert.equal(responsesResp.headers.get("content-encoding"), null);
 assert.equal(responseHits[0].messages[0].role, "system");
 assert.equal(responseHits[0].messages[1].content, "hi");
 assert.equal(responseHits[0].max_tokens, 8);
@@ -1024,6 +1026,20 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },
   body: JSON.stringify({ model: "usage-json", messages: [] }),
 }), usageEnv);
+const usageJsonResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },
+  body: JSON.stringify({ model: "usage-json", messages: [] }),
+}), usageEnv);
+assert.equal(usageJsonResp.headers.get("content-length"), null);
+assert.equal(usageJsonResp.headers.get("content-encoding"), null);
+const messagesResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },
+  body: JSON.stringify({ model: "usage-json", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+}), usageEnv);
+assert.equal(messagesResp.headers.get("content-length"), null);
+assert.equal(messagesResp.headers.get("content-encoding"), null);
 const usageStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },

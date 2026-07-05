@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-stat-hit-area";
+const VERSION = "v26-07-05-safe-proxy-headers";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -197,7 +197,7 @@ export default {
         }
 
         const upstreamResp = proxyResponse.response;
-        const headers = new Headers(upstreamResp.headers);
+        const headers = responseBodyHeaders(upstreamResp.headers);
         for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
         headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
         headers.set("x-llm-gateway-client", client.name || client.id || "client");
@@ -302,7 +302,7 @@ export default {
           } : { input_tokens: 0, output_tokens: 0 },
         };
 
-        const headers = new Headers(openaiResp.headers);
+        const headers = responseBodyHeaders(openaiResp.headers);
         headers.set("content-type", "application/json; charset=utf-8");
         headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
         headers.set("x-llm-gateway-client", client.name || client.id || "client");
@@ -1574,7 +1574,7 @@ async function handleResponsesRequest(request, url, app, ctx) {
     });
 
     const upstreamResp = proxyResponse.response;
-    const headers = new Headers(upstreamResp.headers);
+    const headers = responseBodyHeaders(upstreamResp.headers);
     headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
     headers.set("x-llm-gateway-client", client.name || client.id || "client");
     headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
@@ -2217,7 +2217,7 @@ function releaseUpstreamWhenBodyCloses(response, upstream) {
       try { await reader.cancel(reason); } catch {}
     },
   });
-  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: responseBodyHeaders(response.headers) });
 }
 
 function rememberUpstreamLatency(upstream, latencyMs) {
