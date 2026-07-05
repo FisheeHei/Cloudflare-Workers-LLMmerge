@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-soft-fast";
+const VERSION = "v26-07-05-stat-hit-area";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3244,11 +3244,12 @@ function renderAdminPage(origin) {
     .log-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
     .log-table .ok { color: var(--accent-2); }
     .log-table .err { color: #8d2f23; }
-    .chart-bar { display: flex; align-items: flex-end; gap: 2px; height: 110px; padding: 4px 0; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
-    .chart-bar .bar { flex: 1; min-width: 8px; background: var(--accent); border-radius: 2px 2px 0 0; position: relative; cursor: default; }
+    .chart-bar { display: flex; align-items: stretch; gap: 2px; height: 110px; padding: 4px 0; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
+    .chart-bar .bar-hit { flex: 1; min-width: 8px; display: flex; align-items: flex-end; position: relative; cursor: default; }
+    .chart-bar .bar { width: 100%; background: var(--accent); border-radius: 2px 2px 0 0; position: relative; pointer-events: none; }
     .chart-bar .bar.fail { background: #8d2f23; }
-    .chart-bar .bar::after { content: attr(data-h); display: none; position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 9px; color: var(--muted); }
-    .chart-bar .bar:nth-child(6n)::after { display: block; }
+    .chart-bar .bar-hit::after { content: attr(data-h); display: none; position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%); font-size: 9px; color: var(--muted); }
+    .chart-bar .bar-hit:nth-child(6n)::after { display: block; }
     .chart-label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 8px 0 2px; } .chart-label:first-of-type { margin-top: 0; }
     .stat-tip {
       position: fixed; z-index: 120; width: min(260px, calc(100vw - 24px)); max-height: 260px; overflow: auto;
@@ -3292,9 +3293,9 @@ function renderAdminPage(origin) {
       .upstream-card .card-body { padding: 0 12px 12px; }
       .client-item, .live-log .log-row { align-items: flex-start; flex-wrap: wrap; }
       .client-create input { flex-basis: 100%; }
-      .chart-bar .bar { min-width: 0; }
-      .chart-bar .bar::after { display: none; }
-      .chart-bar .bar:nth-child(8n)::after { display: block; }
+      .chart-bar .bar-hit { min-width: 0; }
+      .chart-bar .bar-hit::after { display: none; }
+      .chart-bar .bar-hit:nth-child(8n)::after { display: block; }
       .stat-tip { max-height: 220px; }
       .modal-backdrop { align-items: stretch; }
       .modal-card { width: 100%; border-radius: 14px; }
@@ -4377,7 +4378,7 @@ function renderAdminPage(origin) {
   }
 
   function bindStatBars(buckets) {
-    document.querySelectorAll(".chart-bar .bar[data-stat-kind]").forEach(function(bar) {
+    document.querySelectorAll(".chart-bar .bar-hit[data-stat-kind]").forEach(function(bar) {
       const bucket = buckets[Number(bar.dataset.statIndex)];
       const kind = bar.dataset.statKind;
       bar.addEventListener("mouseenter", function(event) { showStatTip(event, bucket, kind, bar); });
@@ -4717,7 +4718,7 @@ function renderAdminPage(origin) {
         seg = '<div style="height:' + okH + 'px;background:var(--accent);border-radius:2px 2px 0 0"></div>';
         if (failH > 0) seg += '<div style="height:' + failH + 'px;background:#8d2f23"></div>';
       }
-      return '<div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="requests" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.success + ' success / ' + b.fail + ' fail') + '">' + seg + '</div>';
+      return '<div class="bar-hit" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="requests" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.success + ' success / ' + b.fail + ' fail') + '"><div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end">' + seg + '</div></div>';
     }).join("");
 
     // Chart 2: Tokens (indigo=input, violet=output)
@@ -4733,7 +4734,7 @@ function renderAdminPage(origin) {
         seg = '<div style="height:' + inH + 'px;background:#6366f1;border-radius:2px 2px 0 0"></div>';
         if (outH > 0) seg += '<div style="height:' + outH + 'px;background:#a78bfa"></div>';
       }
-      return '<div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="tokens" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.prompt_tokens + ' input / ' + b.completion_tokens + ' output tokens') + '">' + seg + '</div>';
+      return '<div class="bar-hit" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="tokens" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.prompt_tokens + ' input / ' + b.completion_tokens + ' output tokens') + '"><div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end">' + seg + '</div></div>';
     }).join("");
     bindStatBars(skeleton);
 

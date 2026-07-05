@@ -260,6 +260,7 @@ assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
 assert.equal(adminPage.includes("id=\"stat-tip\""), true);
 assert.equal(adminPage.includes("data-stat-kind"), true);
+assert.equal(adminPage.includes("bar-hit"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
 assert.equal(adminPage.includes("width: min(1216px"), true);
