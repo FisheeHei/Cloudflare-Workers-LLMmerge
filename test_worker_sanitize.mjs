@@ -203,6 +203,12 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("open.bigmodel.cn")) {
+    return new Response(JSON.stringify({ id: "glm", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).endsWith("/models")) {
     return new Response(JSON.stringify({ data: [
       { id: "deepseek-ai/deepseek-v4-pro" },
@@ -282,6 +288,40 @@ const configPayload = await configResp.json();
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
 assert.equal(openRouterPreset.name, "OpenRouter");
 assert.equal(openRouterPreset.base_url, "https://openrouter.ai/api/v1");
+const zhipuPreset = configPayload.presets.find((item) => item.id === "zhipu");
+assert.equal(zhipuPreset.name, "GLM / \u667a\u8c31 AI");
+assert.equal(zhipuPreset.base_url, "https://open.bigmodel.cn/api/paas/v4");
+const zhipuCodingPreset = configPayload.presets.find((item) => item.id === "zhipu-coding");
+assert.equal(zhipuCodingPreset.base_url, "https://open.bigmodel.cn/api/coding/paas/v4");
+
+const zhipuStore = new Map();
+zhipuStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "glm", preset: "zhipu", base_url: "https://open.bigmodel.cn/api/paas/v4", api_key_encrypted: "g", models: ["glm-4.6"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const zhipuEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = zhipuStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { zhipuStore.set(key, value); },
+    async delete(key) { zhipuStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "glm-client", key: "sk-glm", models: ["*"], upstreams: ["glm"] }]),
+};
+const zhipuUrlStart = fetchUrls.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-glm", "content-type": "application/json" },
+  body: JSON.stringify({ model: "glm-4.6", messages: [] }),
+}), zhipuEnv);
+assert.equal(fetchUrls.slice(zhipuUrlStart).some((url) => url.includes("/api/paas/v4/chat/completions")), true);
+assert.equal(fetchUrls.slice(zhipuUrlStart).some((url) => url.includes("/api/paas/v4/v1/chat/completions")), false);
 
 const healthTimeResp = await worker.default.fetch(new Request("https://gw.test/health"), env);
 const healthTime = await healthTimeResp.json();
@@ -330,17 +370,28 @@ assert.equal(bodies[3].reasoning_effort, "medium");
 assert.equal(bodies[3].reasoning.summary, "auto");
 assert.equal("providerOptions" in bodies[3], false);
 
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "glm-4.6", messages: [], reasoning: { effort: "high" }, reasoningEffort: "high", thinking: {} }),
+}), env);
+
+assert.equal("reasoning" in bodies[4], false);
+assert.equal("reasoning_effort" in bodies[4], false);
+assert.equal("reasoningEffort" in bodies[4], false);
+assert.equal("thinking" in bodies[4], false);
+
 const statsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), env);
 const stats = await statsResp.json();
-assert.equal(stats.buckets.some((b) => b.total >= 4), true);
-assert.equal(stats.last_model, "deepseek-reasoner");
+assert.equal(stats.buckets.some((b) => b.total >= 5), true);
+assert.equal(stats.last_model, "glm-4.6");
 assert.equal(stats.time_zone, "Hong Kong Standard Time (UTC+8)");
 assert.equal(stats.now.endsWith("+08:00"), true);
 assert.equal(stats.buckets.some((b) => b.model_statuses?.["minimax-m3"]?.success >= 1), true);
 
 const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), env);
 const logs = await logsResp.json();
-assert.equal(logs.logs.length, 4);
+assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
 assert.equal(kvPuts.length, 0);
 
 const wrappedKvConfig = {

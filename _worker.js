@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-safe-proxy-headers";
+const VERSION = "v26-07-05-glm-zhipu";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -73,6 +73,20 @@ const PRESET_TEMPLATES = [
     name: "OpenRouter",
     base_url: "https://openrouter.ai/api/v1",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: false,
+  },
+  {
+    id: "zhipu",
+    name: "GLM / \u667a\u8c31 AI",
+    base_url: "https://open.bigmodel.cn/api/paas/v4",
+    paths: [CHAT_PATH],
+    requires_base_url: false,
+  },
+  {
+    id: "zhipu-coding",
+    name: "GLM / \u667a\u8c31 Coding",
+    base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
+    paths: [CHAT_PATH],
     requires_base_url: false,
   },
   {
@@ -2268,7 +2282,7 @@ function buildUpstreamUrl(baseUrl, pathname, search) {
   const base = String(baseUrl).replace(/\/+$/, "");
   let path = pathname;
 
-  if (base.endsWith("/v1") && path.startsWith("/v1/")) {
+  if ((base.endsWith("/v1") || base.endsWith("/v4")) && path.startsWith("/v1/")) {
     path = path.slice(3);
   }
 
@@ -2300,6 +2314,8 @@ function sanitizeProxyBody(bodyText, upstream) {
   }
 
   let changed = false;
+  const modelName = String(payload.model || "").toLowerCase();
+  const isGlm = /(^|[\/_.-])glm([\/_.-]|$)/i.test(modelName);
   const providerOptions = payload.providerOptions || payload.provider_options;
   const openaiOptions = providerOptions && typeof providerOptions === "object"
     ? providerOptions.openai || providerOptions.openAI || providerOptions.gateway
@@ -2333,7 +2349,7 @@ function sanitizeProxyBody(bodyText, upstream) {
     delete payload.provider_options;
     changed = true;
   }
-  if (payload.reasoning && typeof payload.reasoning === "object" && payload.reasoning.effort != null && !("reasoning_effort" in payload)) {
+  if (!isGlm && payload.reasoning && typeof payload.reasoning === "object" && payload.reasoning.effort != null && !("reasoning_effort" in payload)) {
     payload.reasoning_effort = payload.reasoning.effort;
     changed = true;
   }
@@ -2344,7 +2360,7 @@ function sanitizeProxyBody(bodyText, upstream) {
     };
     changed = true;
   }
-  if ("reasoningEffort" in payload && !("reasoning_effort" in payload)) {
+  if (!isGlm && "reasoningEffort" in payload && !("reasoning_effort" in payload)) {
     payload.reasoning_effort = payload.reasoningEffort;
     changed = true;
   }
@@ -2361,6 +2377,17 @@ function sanitizeProxyBody(bodyText, upstream) {
     changed = true;
   }
 
+  if (isNvidia && isGlm) {
+    if ("reasoning" in payload) {
+      delete payload.reasoning;
+      changed = true;
+    }
+    if ("reasoning_effort" in payload) {
+      delete payload.reasoning_effort;
+      changed = true;
+    }
+  }
+
   if (!isNvidia) return changed ? JSON.stringify(payload) : bodyText;
 
   if ("reasoning_split" in payload) {
@@ -2371,8 +2398,7 @@ function sanitizeProxyBody(bodyText, upstream) {
   if ("enable_thinking" in payload) {
     const enableThinking = payload.enable_thinking;
     delete payload.enable_thinking;
-    const model = String(payload.model || "").toLowerCase();
-    if (model.includes("qwen")) {
+    if (modelName.includes("qwen")) {
       payload.chat_template_kwargs = {
         ...(payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object"
           ? payload.chat_template_kwargs
@@ -2612,6 +2638,12 @@ function inferPresetId(baseUrl) {
   }
   if (value.includes("api.cloudflare.com/client/v4/accounts/") && value.includes("/ai/v1")) {
     return "workers-ai";
+  }
+  if (value.includes("open.bigmodel.cn/api/coding/paas/v4")) {
+    return "zhipu-coding";
+  }
+  if (value.includes("open.bigmodel.cn/api/paas/v4")) {
+    return "zhipu";
   }
   if (value.includes("anthropic") || value.includes("claude")) {
     return "custom";
@@ -4426,9 +4458,9 @@ function renderAdminPage(origin) {
     const tags = ["chat"];
     const vision = /(^|[\/_.-])(vl|vision|visual|image|multimodal|omni|pixtral|gemini|gpt-4o|qwen2(?:\.5)?-vl)([\/_.-]|$)/i.test(value);
     tags.push(vision ? "vision" : "text");
-    if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|llama-3|mistral|mixtral|deepseek|codestral|coder|codegemma)/i.test(value)) tags.push("tools");
-    if (/(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3)([\/_.-]|$)/i.test(value)) tags.push("thinking");
-    if (/(agent|agentic|computer-use|operator|claude|gpt-|gemini|qwen.*coder|coder|codegemma|codestral|deepseek-coder|devstral|swe|opus|sonnet)/i.test(value)) tags.push("agentic");
+    if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|glm|llama-3|mistral|mixtral|deepseek|codestral|coder|codegemma)/i.test(value)) tags.push("tools");
+    if (/(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3|glm)([\/_.-]|$)/i.test(value)) tags.push("thinking");
+    if (/(agent|agentic|computer-use|operator|claude|gpt-|gemini|qwen.*coder|glm|coder|codegemma|codestral|deepseek-coder|devstral|swe|opus|sonnet)/i.test(value)) tags.push("agentic");
     return tags;
   }
 
