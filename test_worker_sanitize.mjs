@@ -9,6 +9,7 @@ const fetchUrls = [];
 const speedHits = [];
 const speedBodies = [];
 const hedgeHits = [];
+const softFastHits = [];
 const nimHits = [];
 const responseHits = [];
 const responseStreamHits = [];
@@ -140,6 +141,21 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("soft-fast-slow.example")) {
+    softFastHits.push("slow");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    return new Response(JSON.stringify({ id: "soft-fast-slow", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("soft-fast-fast.example")) {
+    softFastHits.push("fast");
+    return new Response(JSON.stringify({ id: "soft-fast-fast", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("nim-limit.example")) {
     nimHits.push("nim");
     return new Response(JSON.stringify({ id: "nim", choices: [{ message: { content: "ok" } }] }), {
@@ -229,6 +245,8 @@ const adminPageResp = await worker.default.fetch(new Request("https://gw.test/ll
 const adminPage = await adminPageResp.text();
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
+assert.equal(adminPage.includes("routing-fast"), true);
+assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("picker-apply-same-preset"), true);
 assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
@@ -712,6 +730,36 @@ const hedgeResp2 = await worker.default.fetch(new Request("https://gw.test/v1/ch
 assert.equal(hedgeResp2.headers.get("x-llm-gateway-upstream"), "hedge-fast");
 assert.equal(hedgeHits[hedgeSecondStart], "slow");
 
+const softFastStore = new Map();
+softFastStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, fast_routing: true, hedge_enabled: false, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "soft-fast-slow", base_url: "https://soft-fast-slow.example/v1", api_key_encrypted: "s", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "soft-fast-fast", base_url: "https://soft-fast-fast.example/v1", api_key_encrypted: "f", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const softFastEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = softFastStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { softFastStore.set(key, value); },
+    async delete(key) { softFastStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "soft-fast-client", key: "sk-soft-fast", models: ["*"], upstreams: ["soft-fast-slow", "soft-fast-fast"] }]),
+};
+const softFastStart = softFastHits.length;
+const softFastResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-soft-fast", "content-type": "application/json" },
+  body: JSON.stringify({ model: "soft-fast-model", messages: [] }),
+}), softFastEnv);
+assert.equal(softFastResp.headers.get("x-llm-gateway-upstream"), "soft-fast-fast");
+assert.deepEqual(softFastHits.slice(softFastStart), ["slow", "fast"]);
+
 const nimStore = new Map();
 nimStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
@@ -940,7 +988,13 @@ const longStreamResp = await worker.default.fetch(new Request("https://gw.test/v
   headers: { authorization: "Bearer sk-long-stream", "content-type": "application/json" },
   body: JSON.stringify({ model: "long-model", messages: [] }),
 }), longStreamEnv);
+const longActiveRuntimeResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), longStreamEnv);
+const longActiveRuntime = await longActiveRuntimeResp.json();
+assert.equal(longActiveRuntime.active_upstreams["long-stream"] > 0, true);
 assert.equal(await longStreamResp.text(), "xxxxx");
+const longIdleRuntimeResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), longStreamEnv);
+const longIdleRuntime = await longIdleRuntimeResp.json();
+assert.equal(longIdleRuntime.active_upstreams["long-stream"], undefined);
 assert.equal(longStreamHits.length, 1);
 
 const usageStore = new Map();

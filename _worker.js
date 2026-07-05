@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-hedge-rotate";
+const VERSION = "v26-07-05-soft-fast";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -361,6 +361,7 @@ var _cachedEnvRef = null;
 var _upstreamLatency = {};
 // ponytail: per-isolate only; DO/KV if strict global rotation ever matters
 var _lastSuccessfulUpstreamName = "";
+var _activeUpstreams = {};
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -798,7 +799,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/runtime" && request.method === "GET") {
-    return withCorsResponse(json({ ok: true, nim_rpm: getNimRpmSnapshot() }, 200));
+    return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
   }
 
       // ponytail: fetch model list from a saved or draft upstream for picker
@@ -966,6 +967,7 @@ async function repairStoredGatewayConfig(config, app) {
   return {
     routing: {
       failover: routing.failover !== false,
+      fast_routing: routing.fast_routing === true,
       hedge_enabled: routing.hedge_enabled === true,
       hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
       load_balance: routing.load_balance !== false,
@@ -1025,6 +1027,7 @@ async function buildGatewayConfigFromEnv(app) {
   return {
     routing: {
       failover: true,
+      fast_routing: false,
       hedge_enabled: false,
       hedge_max: 2,
       load_balance: true,
@@ -1096,6 +1099,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
   return {
     routing: {
       failover: routing.failover !== false,
+      fast_routing: routing.fast_routing === true,
       hedge_enabled: routing.hedge_enabled === true,
       hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
       load_balance: routing.load_balance !== false,
@@ -1873,8 +1877,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 
   const attempts = await orderUpstreams(runtime, candidates);
   const maxAttempts = runtime.routing.failover === false ? 1 : attempts.length;
-  if (runtime.routing.hedge_enabled === true && maxAttempts > 1) {
-    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, runtime.routing.hedge_max || 2)));
+  if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
+    const limit = runtime.routing.fast_routing === true ? Math.min(2, runtime.routing.hedge_max || 2) : (runtime.routing.hedge_max || 2);
+    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, limit)));
     return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, pathname, request, runtime, search });
   }
   let lastError = null;
@@ -1890,7 +1895,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         continue;
       }
       const upstreamStarted = Date.now();
-      const response = await fetchWithTimeout(
+      noteActiveUpstream(upstream, 1);
+      let response = await fetchWithTimeout(
         buildUpstreamUrl(upstream.base_url, pathname, search),
         {
           method: request.method,
@@ -1903,6 +1909,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 
       const shouldRetry = runtime.routing.failover !== false && await isRetryableUpstreamResponse(response);
       if (shouldRetry) {
+        noteActiveUpstream(upstream, -1);
         lastError = new Error(`HTTP ${response.status}`);
         lastError.upstreamName = upstream.name;
         await markUpstreamFailure(runtime, upstream, response.status);
@@ -1910,6 +1917,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         await clearUpstreamFailure(runtime, upstream);
         rememberUpstreamLatency(upstream, upstreamLatency);
         rememberSuccessfulUpstream(upstream);
+        response = releaseUpstreamWhenBodyCloses(response, upstream);
       }
 
       if (!shouldRetry || isLast) {
@@ -1920,6 +1928,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         };
       }
     } catch (error) {
+      noteActiveUpstream(upstream, -1);
       lastError = error;
       lastError.upstreamName = upstream.name;
       await markUpstreamFailure(runtime, upstream, 599);
@@ -1999,7 +2008,9 @@ function upstreamApplicationErrorMessage(value) {
 
 async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runtime, search }) {
   const controllers = attempts.map(() => new AbortController());
-  const hedgeDelayMs = Math.max(100, Math.floor(runtime.requestTimeoutMs / Math.max(2, attempts.length + 1)));
+  const hedgeDelayMs = runtime.routing.fast_routing === true
+    ? Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)))
+    : Math.max(100, Math.floor(runtime.requestTimeoutMs / Math.max(2, attempts.length + 1)));
   let done = false;
 
   function launchLater(index) {
@@ -2010,6 +2021,7 @@ async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runti
         return { limited: true, error: new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`), upstream, index };
       }
       const started = Date.now();
+      noteActiveUpstream(upstream, 1);
       try {
         const response = await fetchWithTimeout(
           buildUpstreamUrl(upstream.base_url, pathname, search),
@@ -2023,6 +2035,7 @@ async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runti
         );
         return { response, upstream, index, latency: Date.now() - started };
       } catch (error) {
+        noteActiveUpstream(upstream, -1);
         return { error, upstream, index, latency: Date.now() - started };
       }
     });
@@ -2044,8 +2057,10 @@ async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runti
       await clearUpstreamFailure(runtime, result.upstream);
       rememberUpstreamLatency(result.upstream, result.latency);
       rememberSuccessfulUpstream(result.upstream);
+      result.response = releaseUpstreamWhenBodyCloses(result.response, result.upstream);
       return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
     }
+    if (result.response) noteActiveUpstream(result.upstream, -1);
     await markUpstreamFailure(runtime, result.upstream, result.response ? result.response.status : 599);
   }
 
@@ -2156,6 +2171,53 @@ function avoidLastSuccessfulUpstream(items) {
 
 function rememberSuccessfulUpstream(upstream) {
   _lastSuccessfulUpstreamName = String(upstream?.name || "").trim();
+}
+
+function noteActiveUpstream(upstream, delta) {
+  const name = String(upstream?.name || "").trim();
+  if (!name) return;
+  const next = Math.max(0, Number(_activeUpstreams[name] || 0) + delta);
+  if (next) _activeUpstreams[name] = next;
+  else delete _activeUpstreams[name];
+}
+
+function getActiveUpstreamSnapshot() {
+  return { ..._activeUpstreams };
+}
+
+function releaseUpstreamWhenBodyCloses(response, upstream) {
+  if (!response.body) {
+    noteActiveUpstream(upstream, -1);
+    return response;
+  }
+  const reader = response.body.getReader();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    noteActiveUpstream(upstream, -1);
+  };
+  const body = new ReadableStream({
+    async start(controller) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        release();
+        controller.close();
+      } catch (error) {
+        release();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      release();
+      try { await reader.cancel(reason); } catch {}
+    },
+  });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 
 function rememberUpstreamLatency(upstream, latencyMs) {
@@ -3042,6 +3104,7 @@ function renderAdminPage(origin) {
       background: #eadcc5; color: #3a2b1f; padding: 3px 10px;
       border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
     }
+    .upstream-status-emoji { width: 22px; text-align: center; font-size: 16px; line-height: 1; }
     .upstream-card summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .health-dot {
       width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
@@ -3348,6 +3411,11 @@ function renderAdminPage(origin) {
         <div class="field span-3">
           <label><input type="checkbox" id="routing-hedge"> Hedged Request</label>
         </div>
+        <div class="field span-3">
+          <label><input type="checkbox" id="routing-fast"> Gateway Soft Fast</label>
+        </div>
+      </div>
+      <div class="row">
         <div class="field span-3"><label>\u6700\u9ad8\u8bf7\u6c42\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
       </div>
       <div class="row">
@@ -3796,6 +3864,7 @@ function renderAdminPage(origin) {
         '<summary>' +
           '<span class="card-badge">' + esc(badge) + '</span>' +
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
+          '<span class="upstream-status-emoji" data-upstream="' + esc(item.name) + '" title="' + (item.enabled ? '' : '\u5df2\u505c\u7528') + '">' + (item.enabled ? '' : '\u26d4') + '</span>' +
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u5df2\u542f\u7528' : '\u5df2\u505c\u7528') + '</span>' +
@@ -3948,6 +4017,7 @@ function renderAdminPage(origin) {
         load_balance: byId("routing-load-balance").checked,
         failover: byId("routing-failover").checked,
         hedge_enabled: byId("routing-hedge").checked,
+        fast_routing: byId("routing-fast").checked,
         hedge_max: Number(byId("routing-hedge-max").value || 2),
       },
       upstreams,
@@ -3972,6 +4042,7 @@ function renderAdminPage(origin) {
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
     byId("routing-hedge").checked = r.hedge_enabled === true;
+    byId("routing-fast").checked = r.fast_routing === true;
     byId("routing-hedge-max").value = r.hedge_max || 2;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
   }
@@ -4126,6 +4197,25 @@ function renderAdminPage(origin) {
     const resp = await fetch(API_BASE + "/runtime");
     const payload = await parseApiResponse(resp);
     if (!resp.ok) return;
+    const active = payload.active_upstreams || {};
+    const last = payload.last_successful_upstream || "";
+    document.querySelectorAll(".upstream-status-emoji").forEach(function(el) {
+      const card = el.closest(".upstream-card");
+      const name = el.dataset.upstream;
+      if (card && card.classList.contains("disabled")) {
+        el.textContent = "\u26d4";
+        el.title = "\u5df2\u505c\u7528";
+      } else if (Number(active[name] || 0) > 0) {
+        el.textContent = "\u26a1";
+        el.title = "\u6b63\u5728\u8bf7\u6c42: " + active[name];
+      } else if (name && name === last) {
+        el.textContent = "\u2705";
+        el.title = "\u4e0a\u6b21\u6210\u529f\u4f7f\u7528";
+      } else {
+        el.textContent = "";
+        el.title = "";
+      }
+    });
     const nim = payload.nim_rpm || {};
     document.querySelectorAll(".nim-rpm").forEach(function(el) {
       const item = nim[el.dataset.upstream];
