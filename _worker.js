@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-model-row-editor";
+const VERSION = "v26-07-05-prompt-context-split";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -964,6 +964,7 @@ async function buildGatewayConfigFromEnv(app) {
       model_cache_ttl: app.defaultModelCacheTtl,
       request_timeout_ms: app.defaultTimeoutMs,
       system_prompt: String(app.env.SYSTEM_PROMPT || app.env.GLOBAL_SYSTEM_PROMPT || ""),
+      global_context: String(app.env.GLOBAL_CONTEXT || app.env.GLOBAL_SYSTEM_CONTEXT || ""),
       upstream_cooldown_ttl: app.defaultCooldownTtl,
     },
     upstreams,
@@ -1032,6 +1033,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
       model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
       request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
       system_prompt: String(settings.system_prompt || ""),
+      global_context: String(settings.global_context || settings.context_prompt || ""),
       upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
     },
     upstreams,
@@ -1773,7 +1775,7 @@ function streamResponsesFromChat(openaiResp, seed) {
 
 async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {
   if (pathname === CHAT_PATH) {
-    bodyText = applyGlobalSystemPrompt(bodyText, runtime.settings?.system_prompt);
+    bodyText = applyGatewayPromptContext(bodyText, runtime.settings);
   }
 
   const candidates = runtime.upstreams.filter((upstream) => {
@@ -1857,9 +1859,10 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   throw err;
 }
 
-function applyGlobalSystemPrompt(bodyText, prompt) {
-  const text = String(prompt || "");
-  if (!text.trim() || !bodyText) return bodyText;
+function applyGatewayPromptContext(bodyText, settings) {
+  const systemText = String(settings?.system_prompt || "").trim();
+  const contextText = String(settings?.global_context || "").trim();
+  if ((!systemText && !contextText) || !bodyText) return bodyText;
 
   let payload;
   try {
@@ -1869,7 +1872,20 @@ function applyGlobalSystemPrompt(bodyText, prompt) {
   }
 
   if (!Array.isArray(payload.messages)) return bodyText;
-  payload.messages = payload.messages.concat([{ role: "system", content: text }]);
+  const injected = [];
+  if (systemText) {
+    injected.push({ role: "system", content: systemText });
+  }
+  if (contextText) {
+    const contextMessage = {
+      role: "user",
+      content: "Global reference context. Use it when relevant, but do not mention it unless the user asks.\n\n" + contextText,
+    };
+    const systemEnd = payload.messages.findIndex((msg) => !["system", "developer"].includes(String(msg?.role || "")));
+    const insertAt = systemEnd < 0 ? payload.messages.length : systemEnd;
+    payload.messages.splice(insertAt, 0, contextMessage);
+  }
+  if (injected.length) payload.messages = injected.concat(payload.messages);
   return JSON.stringify(payload);
 }
 
@@ -2988,7 +3004,10 @@ function renderAdminPage(origin) {
     }
     .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, serif; }
     .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
-    .system-prompt-textarea { min-height: min(55vh, 520px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
+    .system-prompt-textarea { min-height: min(24vh, 260px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
+    .context-prompt-textarea { min-height: min(32vh, 360px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
+    .prompt-splitter-textarea { min-height: 140px; font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
+    .prompt-modal-grid { display: grid; gap: 12px; }
     .model-picker-backdrop { z-index: 80; }
     .model-picker-card { width: min(1216px, calc(100vw - 48px)); }
     .picker-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -3212,7 +3231,7 @@ function renderAdminPage(origin) {
         <div class="field span-3"><label>\u6700\u9ad8\u8bf7\u6c42\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
       </div>
       <div class="row">
-        <div class="field span-12"><label>\u9884\u7559\u9644\u52a0\u7cfb\u7edf\u63d0\u793a\u8bcd</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u7cfb\u7edf\u63d0\u793a\u8bcd</button><span class="note" id="system-prompt-status"></span></div>
+        <div class="field span-12"><label>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u63d0\u793a\u8bcd\u4e0e\u4e0a\u4e0b\u6587</button><span class="note" id="system-prompt-status"></span></div>
       </div>
       <button class="good small" id="save-settings">\u4fdd\u5b58\u8bbe\u7f6e</button>
       <span class="note" id="settings-status"></span>
@@ -3310,8 +3329,22 @@ function renderAdminPage(origin) {
 </div>
 <div class="modal-backdrop" id="system-prompt-modal">
   <div class="modal-card">
-    <h3>\u9884\u7559\u9644\u52a0\u7cfb\u7edf\u63d0\u793a\u8bcd</h3>
-    <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002\u6709\u5185\u5bb9\u65f6\uff0c\u6240\u6709 Chat/Responses/Messages \u8bf7\u6c42\u90fd\u4f1a\u8ffd\u52a0\u8fd9\u6bb5\u7cfb\u7edf\u63d0\u793a\u8bcd\u3002"></textarea>
+    <h3>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</h3>
+    <div class="prompt-modal-grid">
+      <div class="field">
+        <label>\u7cfb\u7edf\u63d0\u793a\u8bcd</label>
+        <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7b80\u77ed\u3001\u5fc5\u987b\u7167\u505a\u7684\u6700\u9ad8\u6307\u4ee4\u3002\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002"></textarea>
+      </div>
+      <div class="field">
+        <label>\u5168\u5c40\u4e0a\u4e0b\u6587</label>
+        <textarea id="global-context-input" class="context-prompt-textarea" placeholder="\u66f4\u957f\u7684\u80cc\u666f\u3001\u504f\u597d\u548c\u7ec6\u5316\u8981\u6c42\u3002\u4f1a\u4f5c\u4e3a\u53c2\u8003\u4e0a\u4e0b\u6587\u9644\u52a0\u5230 Chat/Responses/Messages \u8bf7\u6c42\u3002"></textarea>
+      </div>
+      <div class="field">
+        <label>\u5927\u6587\u672c\u62c6\u5206</label>
+        <textarea id="prompt-splitter-input" class="prompt-splitter-textarea" placeholder="\u53ef\u4ee5\u628a\u4e00\u6574\u6bb5\u63d0\u793a\u8bcd\u7c98\u8d34\u5230\u8fd9\u91cc\uff0c\u6309\u6bb5\u843d\u62c6\u5206\u5230\u4e0a\u9762\u4e24\u4e2a\u6846\u3002"></textarea>
+        <button type="button" class="secondary small" id="split-prompt-context">\u62c6\u5206\u5230\u63d0\u793a\u8bcd / \u4e0a\u4e0b\u6587</button>
+      </div>
+    </div>
     <div class="modal-actions">
       <button class="secondary" id="close-system-prompt-modal">\u5173\u95ed</button>
       <button class="good" id="apply-system-prompt-modal">\u5e94\u7528</button>
@@ -3773,6 +3806,7 @@ function renderAdminPage(origin) {
         upstream_cooldown_ttl: Number(byId("cooldown-ttl").value || 60),
         model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
         system_prompt: byId("system-prompt-input").value,
+        global_context: byId("global-context-input").value,
       },
       routing: {
         load_balance: byId("routing-load-balance").checked,
@@ -3796,7 +3830,8 @@ function renderAdminPage(origin) {
     byId("cooldown-ttl").value = s.upstream_cooldown_ttl || "";
     byId("model-cache-ttl").value = s.model_cache_ttl || "";
     byId("system-prompt-input").value = s.system_prompt || "";
-    byId("system-prompt-status").textContent = s.system_prompt ? "\u5df2\u542f\u7528 (" + s.system_prompt.length + " \u5b57\u7b26)" : "\u672a\u542f\u7528";
+    byId("global-context-input").value = s.global_context || "";
+    renderPromptContextStatus();
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
     byId("routing-hedge").checked = r.hedge_enabled === true;
@@ -3844,6 +3879,32 @@ function renderAdminPage(origin) {
 
   function closeSystemPromptModal() {
     byId("system-prompt-modal").classList.remove("open");
+  }
+
+  function renderPromptContextStatus(prefix) {
+    const systemLen = byId("system-prompt-input").value.length;
+    const contextLen = byId("global-context-input").value.length;
+    if (!systemLen && !contextLen) {
+      byId("system-prompt-status").textContent = "\u672a\u542f\u7528";
+      return;
+    }
+    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / \u4e0a\u4e0b\u6587 " + contextLen + " \u5b57\u7b26)";
+  }
+
+  function splitPromptContextDraft() {
+    const raw = byId("prompt-splitter-input").value.trim();
+    if (!raw) return;
+    const rulePattern = /\b(must|always|never|required|forbidden|highest|priority|mandatory|strictly|do not|don't|cannot|should)\b|[\u5fc5][\u987b\u9700]|\u6c38\u8fdc|\u7981\u6b62|\u4e0d\u5141\u8bb8|\u4e0d\u5f97|\u6700\u9ad8|\u4f18\u5148|\u65e0\u6761\u4ef6|\u7167\u505a/i;
+    const blocks = raw.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
+    const systemParts = [];
+    const contextParts = [];
+    blocks.forEach((part) => {
+      if (rulePattern.test(part) && part.length <= 1200) systemParts.push(part);
+      else contextParts.push(part);
+    });
+    if (systemParts.length) byId("system-prompt-input").value = systemParts.join("\n\n");
+    if (contextParts.length) byId("global-context-input").value = contextParts.join("\n\n");
+    renderPromptContextStatus("\u5df2\u62c6\u5206\uff0c\u5f85\u4fdd\u5b58");
   }
 
   async function refreshModels() {
@@ -4539,8 +4600,9 @@ function renderAdminPage(origin) {
       byId("open-vendor-modal").addEventListener("click", openVendorModal);
       byId("open-system-prompt-modal").addEventListener("click", openSystemPromptModal);
       byId("close-system-prompt-modal").addEventListener("click", closeSystemPromptModal);
+      byId("split-prompt-context").addEventListener("click", splitPromptContextDraft);
       byId("apply-system-prompt-modal").addEventListener("click", () => {
-        byId("system-prompt-status").textContent = byId("system-prompt-input").value ? "\u5f85\u4fdd\u5b58" : "\u672a\u542f\u7528";
+        renderPromptContextStatus("\u5f85\u4fdd\u5b58");
         closeSystemPromptModal();
       });
       byId("upstream-actions-toggle").addEventListener("click", (e) => {

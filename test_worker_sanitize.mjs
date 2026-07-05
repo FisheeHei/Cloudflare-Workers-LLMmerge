@@ -215,6 +215,9 @@ assert.equal(adminPage.includes("picker-apply-same-preset"), true);
 assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
+assert.equal(adminPage.includes("global-context-input"), true);
+assert.equal(adminPage.includes("prompt-splitter-input"), true);
+assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
 assert.equal(adminPage.includes("id=\"stat-tip\""), true);
@@ -496,7 +499,7 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/l
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
     routing: { failover: true, load_balance: false },
-    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, system_prompt: "Always obey the gateway rule.", upstream_cooldown_ttl: 60 },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, system_prompt: "Always obey the gateway rule.", global_context: "Project context should guide details.", upstream_cooldown_ttl: 60 },
     upstreams: [
       { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["qwen3"], model_contexts: { qwen3: "1m" }, paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     ],
@@ -505,13 +508,16 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/l
 assert.equal(saveConfigResp.status, 200);
 const savedConfigPayload = await saveConfigResp.clone().json();
 assert.equal(savedConfigPayload.config.upstreams[0].model_contexts.qwen3, "1m");
+assert.equal(savedConfigPayload.config.settings.global_context, "Project context should guide details.");
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
   body: JSON.stringify({ model: "qwen3", messages: [] }),
 }), env);
 assert.equal(speedHits[cachedConfigHits], "fast");
-assert.deepEqual(speedBodies.at(-1).messages.at(-1), { role: "system", content: "Always obey the gateway rule." });
+assert.deepEqual(speedBodies.at(-1).messages[0], { role: "system", content: "Always obey the gateway rule." });
+assert.equal(speedBodies.at(-1).messages[1].role, "user");
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Project context should guide details."), true);
 
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({
