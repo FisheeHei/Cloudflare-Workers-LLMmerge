@@ -219,6 +219,8 @@ const env = {
 
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin"), env);
 const adminPage = await adminPageResp.text();
+const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
+assert.doesNotThrow(() => new Function(adminScript));
 assert.equal(adminPage.includes("picker-apply-same-preset"), true);
 assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);

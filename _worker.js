@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-kv-config-compat";
+const VERSION = "v26-07-05-admin-script-fix";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3952,16 +3952,16 @@ function renderAdminPage(origin) {
   function splitPromptContextDraft() {
     const raw = byId("prompt-splitter-input").value.trim();
     if (!raw) return;
-    const rulePattern = /\b(must|always|never|required|forbidden|highest|priority|mandatory|strictly|do not|don't|cannot|should)\b|[\u5fc5][\u987b\u9700]|\u6c38\u8fdc|\u7981\u6b62|\u4e0d\u5141\u8bb8|\u4e0d\u5f97|\u6700\u9ad8|\u4f18\u5148|\u65e0\u6761\u4ef6|\u7167\u505a/i;
-    const blocks = raw.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
+    const rulePattern = /\\b(must|always|never|required|forbidden|highest|priority|mandatory|strictly|do not|don't|cannot|should)\\b|[\u5fc5][\u987b\u9700]|\u6c38\u8fdc|\u7981\u6b62|\u4e0d\u5141\u8bb8|\u4e0d\u5f97|\u6700\u9ad8|\u4f18\u5148|\u65e0\u6761\u4ef6|\u7167\u505a/i;
+    const blocks = raw.split(/\\n\\s*\\n/).map((part) => part.trim()).filter(Boolean);
     const systemParts = [];
     const contextParts = [];
     blocks.forEach((part) => {
       if (rulePattern.test(part) && part.length <= 1200) systemParts.push(part);
       else contextParts.push(part);
     });
-    if (systemParts.length) byId("system-prompt-input").value = systemParts.join("\n\n");
-    if (contextParts.length) byId("global-context-input").value = contextParts.join("\n\n");
+    if (systemParts.length) byId("system-prompt-input").value = systemParts.join("\\n\\n");
+    if (contextParts.length) byId("global-context-input").value = contextParts.join("\\n\\n");
     renderPromptContextStatus("\u5df2\u62c6\u5206\uff0c\u5f85\u4fdd\u5b58");
   }
 
