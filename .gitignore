@@ -1,3 +1,14 @@
 .dev.vars
 .env
 .wrangler
+
+# Local scratch files from one-off Worker/admin debugging.
+_admin_full.html
+_as.js
+_css.py
+_css2.py
+_log.py
+_rendered_js.js
+_worker.js.bak
+_worker_before_admin.js
+_worker_new.js

@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-admin-modular";
+const VERSION = "v26-07-06-log-cleanup";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -198,17 +198,16 @@ export default {
             search: url.search,
           });
         } catch (error) {
-          recordRequestLog(app, {
-            ts: hkNowIso(),
-            client: client.name || client.id || "client",
+          recordRequestLog(app, makeRequestLogEntry({
+            client,
             upstream: error.upstreamName || "none",
             model,
             path: pathname,
             status: error.statusCode || 502,
-            latency_ms: Date.now() - started,
-            prompt_tokens: pt,
-            completion_tokens: 0,
-          }, ctx);
+            started,
+            promptTokens: pt,
+            completionTokens: 0,
+          }), ctx);
           throw error;
         }
 
@@ -283,17 +282,16 @@ export default {
             search: url.search,
           });
         } catch (error) {
-          recordRequestLog(app, {
-            ts: hkNowIso(),
-            client: client.name || client.id || "client",
+          recordRequestLog(app, makeRequestLogEntry({
+            client,
             upstream: error.upstreamName || "none",
             model,
             path: MESSAGES_PATH,
             status: error.statusCode || 502,
-            latency_ms: Date.now() - started,
-            prompt_tokens: Math.max(1, Math.round(openaiBody.length / 4)),
-            completion_tokens: 0,
-          }, ctx);
+            started,
+            promptTokens: Math.max(1, Math.round(openaiBody.length / 4)),
+            completionTokens: 0,
+          }), ctx);
           throw error;
         }
 
@@ -328,17 +326,16 @@ export default {
         }
 
         const loggedStatusMsg = openaiResp.ok ? openaiResp.status : (openaiResp.status || 502);
-        var msgLogEntry = {
-          ts: hkNowIso(),
-          client: client.name || client.id || "client",
+        var msgLogEntry = makeRequestLogEntry({
+          client,
           upstream: proxyResponse.upstream.name,
           model,
           path: MESSAGES_PATH,
           status: loggedStatusMsg,
-          latency_ms: Date.now() - started,
-          prompt_tokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
-          completion_tokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
-        };
+          started,
+          promptTokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
+          completionTokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
+        });
         recordRequestLog(app, msgLogEntry, ctx);
 
         return new Response(JSON.stringify(anthropicResp), {
@@ -489,6 +486,21 @@ function recordRequestLog(app, entry, ctx) {
   scheduleLogFlush(app, ctx);
 }
 
+function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path, promptTokens, started, status, upstream }) {
+  return {
+    ts: hkNowIso(),
+    client: client?.name || client?.id || "client",
+    upstream: upstream || "unknown",
+    model,
+    path,
+    status: status || 200,
+    latency_ms: Date.now() - started,
+    prompt_tokens: promptTokens || 0,
+    completion_tokens: completionTokens || 0,
+    ...extra,
+  };
+}
+
 function scheduleLogFlush(app, ctx) {
   if (ctx && typeof ctx.waitUntil === "function") {
     ctx.waitUntil(flushBatch(app, true));
@@ -592,18 +604,17 @@ async function getMergedLogs(app) {
 
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
-  const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, {
-    ts: hkNowIso(),
-    client: client.name || client.id || "client",
+  const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
+    client,
     upstream: proxyResponse.upstream.name,
     model,
     path: pathname,
     status: statusOverride || (upstreamResp.status || 502),
-    latency_ms: Date.now() - started,
-    prompt_tokens: usage.prompt_tokens,
-    completion_tokens: usage.completion_tokens,
-    ...extra,
-  }, ctx);
+    started,
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    extra,
+  }), ctx);
 
   if (!upstreamResp.ok) {
     log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 });
@@ -1666,17 +1677,16 @@ async function handleResponsesRequest(request, url, app, ctx) {
     recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx);
     return new Response(JSON.stringify(responsePayload), { status: 200, headers });
   } catch (error) {
-    recordRequestLog(app, {
-            ts: hkNowIso(),
-      client: client.name || client.id || "client",
+    recordRequestLog(app, makeRequestLogEntry({
+      client,
       upstream: error.upstreamName || "none",
       model: translated.model,
       path: RESPONSES_PATH,
       status: error.statusCode || 502,
-      latency_ms: Date.now() - started,
-      prompt_tokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
-      completion_tokens: 0,
-    }, ctx);
+      started,
+      promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+      completionTokens: 0,
+    }), ctx);
     throw error;
   }
 }
@@ -1850,17 +1860,16 @@ function chatContentToText(content) {
 }
 
 function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx) {
-  recordRequestLog(app, {
-          ts: hkNowIso(),
-    client: client.name || client.id || "client",
+  recordRequestLog(app, makeRequestLogEntry({
+    client,
     upstream: upstreamName,
     model,
     path: RESPONSES_PATH,
     status: status || 200,
-    latency_ms: Date.now() - started,
-    prompt_tokens: usage?.input_tokens || Math.max(1, Math.round(bodyText.length / 4)),
-    completion_tokens: usage?.output_tokens || 1,
-  }, ctx);
+    started,
+    promptTokens: usage?.input_tokens || Math.max(1, Math.round(bodyText.length / 4)),
+    completionTokens: usage?.output_tokens || 1,
+  }), ctx);
 }
 
 function streamResponsesFromChat(openaiResp, seed) {
