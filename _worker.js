@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-context-picker";
+const VERSION = "v26-07-06-upstream-groups";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3344,6 +3344,18 @@ function renderAdminStyle() {
       border: 1px solid #cfbea0; background: #fff9ef;
       border-radius: 16px; margin-bottom: 10px; overflow: hidden;
     }
+    .upstream-group {
+      border: 1px solid #cfbea0; border-radius: 14px; background: #fffdf8;
+      margin-bottom: 12px; overflow: hidden;
+    }
+    .upstream-group > summary {
+      cursor: pointer; list-style: none; user-select: none;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 10px 14px; background: #eadcc5; color: #3a2b1f; font-weight: 700;
+    }
+    .upstream-group > summary::-webkit-details-marker { display: none; }
+    .upstream-group-body { padding: 10px; }
+    .upstream-group-body .upstream-card:last-child { margin-bottom: 0; }
     .upstream-card.disabled { background: #f4efe7; border-color: #d8cbb8; opacity: .82; }
     .upstream-card summary {
       display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -3634,12 +3646,12 @@ function renderAdminMarkup(origin) {
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
+      <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
       <span class="toolbar-spacer"></span>
       <div class="menu-wrap" id="upstream-actions">
         <button type="button" class="secondary" id="upstream-actions-toggle">\u66f4\u591a\u64cd\u4f5c</button>
         <div class="menu">
           <button type="button" class="secondary small" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
-          <button type="button" class="secondary small" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
           <button type="button" class="secondary small" id="speed-test">\u6a21\u578b\u6d4b\u901f</button>
           <button type="button" class="secondary small" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
           <button type="button" class="secondary small" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
@@ -4128,7 +4140,21 @@ function renderAdminScript() {
       return;
     }
 
-    host.innerHTML = state.config.upstreams.map((item) => {
+    const groups = {};
+    state.config.upstreams.forEach((item) => {
+      const p = presetById(item.preset);
+      const key = (p ? p.name : (item.preset || "generic")) || "\u5176\u4ed6";
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(item);
+    });
+
+    host.innerHTML = Object.keys(groups).map((groupName) =>
+      '<details class="upstream-group" open><summary><span>' + esc(groupName) + '</span><span class="note">' + groups[groupName].length + ' \u4e2a\u4e0a\u6e38</span></summary><div class="upstream-group-body">' +
+        groups[groupName].map(upstreamCardHtml).join("") +
+      '</div></details>'
+    ).join("");
+
+    function upstreamCardHtml(item) {
       const p = presetById(item.preset);
       const badge = p ? p.name : (item.preset || "generic");
       const locked = baseUrlLocked(item.preset);
@@ -4176,7 +4202,7 @@ function renderAdminScript() {
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
         '</div>' +
       '</details>';
-    }).join("");
+    }
 
     host.querySelectorAll(".detect-upstream").forEach((btn) => {
       btn.addEventListener("click", async (event) => {

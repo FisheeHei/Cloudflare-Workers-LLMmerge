@@ -312,6 +312,7 @@ assert.equal(adminPage.includes("\u5de5\u5177\u8c03\u7528"), true);
 assert.equal(adminPage.includes("\u2705"), true);
 assert.equal(adminPage.includes(".model-tag-filter button.active { background: #1f8f61; color: white; }"), true);
 assert.equal(adminPage.includes("upstream-enable-toggle"), true);
+assert.equal(adminPage.includes("upstream-group"), true);
 assert.equal(adminPage.includes("model-entry-list"), true);
 assert.equal(adminPage.includes("model-context-input"), true);
 assert.equal(adminPage.includes("delete-model-row"), true);
