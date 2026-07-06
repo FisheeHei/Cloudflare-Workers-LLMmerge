@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-log-cleanup";
+const VERSION = "v26-07-06-html-upstream-guard";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -618,10 +618,17 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
 
   if (!upstreamResp.ok) {
     log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 });
+    if (looksLikeHtmlResponse(upstreamResp)) {
+      return upstreamBadGatewayResponse(`Upstream returned HTTP ${upstreamResp.status} HTML error page.`, headers);
+    }
     return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
   const contentType = upstreamResp.headers.get("content-type") || "";
+  if (looksLikeHtmlResponse(upstreamResp)) {
+    log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
+    return upstreamBadGatewayResponse("Upstream returned an HTML page instead of an API response.", headers);
+  }
   if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
     setSseHeaders(headers);
     const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started));
@@ -631,9 +638,13 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   if (contentType.includes("application/json")) {
     const textBody = await upstreamResp.text();
     const payload = safeJson(textBody);
+    if (!payload || looksLikeHtmlDocument(textBody)) {
+      log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
+      return upstreamBadGatewayResponse("Upstream returned a non-JSON API response.", headers);
+    }
     if (upstreamApplicationErrorMessage(payload || textBody)) {
       log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
-      return new Response(textBody, { status: 502, statusText: "Bad Gateway", headers });
+      return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
     }
     const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
     log(usage);
@@ -1669,7 +1680,12 @@ async function handleResponsesRequest(request, url, app, ctx) {
       return new Response(withSseKeepAlive(streamResponsesFromChat(upstreamResp, translated.seed)), { status: 200, headers });
     }
 
-    const openaiPayload = parseJsonBody(await upstreamResp.text());
+    const openaiText = await upstreamResp.text();
+    const openaiPayload = safeJson(openaiText);
+    if (!openaiPayload || looksLikeHtmlDocument(openaiText)) {
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx);
+      return upstreamBadGatewayResponse("Upstream returned a non-JSON API response.", headers);
+    }
     const choice = (openaiPayload.choices || [])[0] || {};
     const text = chatContentToText((choice.message || {}).content || "");
     const responsePayload = makeResponsesPayload(translated.seed, text, openaiPayload.usage);
@@ -2062,9 +2078,11 @@ function promptAppliesToClient(scope, client) {
 async function isRetryableUpstreamResponse(response) {
   if (RETRYABLE_STATUSES.has(response.status)) return true;
   const contentType = response.headers.get("content-type") || "";
+  if (looksLikeHtmlResponse(response)) return true;
   if (response.ok && !contentType.includes("application/json")) return false;
   try {
     const body = await response.clone().text();
+    if (looksLikeHtmlDocument(body)) return true;
     return upstreamApplicationErrorMessage(safeJson(body) || body) ||
       body.includes("DEGRADED function cannot be invoked") ||
       /Function id ['"][^'"]+['"].*Specified function .* is not found/i.test(body);
@@ -2083,6 +2101,25 @@ function upstreamApplicationErrorMessage(value) {
   if (typeof message === "string") return upstreamApplicationErrorMessage(message);
   if (Array.isArray(message)) return message.map(upstreamApplicationErrorMessage).find(Boolean) || "";
   return "";
+}
+
+function looksLikeHtmlResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  return /text\/html|application\/xhtml\+xml/i.test(contentType);
+}
+
+function looksLikeHtmlDocument(text) {
+  return /^\s*(?:<!doctype\s+html|<html[\s>]|<!--\[if\s+|<head[\s>]|<body[\s>])/i.test(String(text || ""));
+}
+
+function upstreamBadGatewayResponse(message, headers) {
+  const out = responseBodyHeaders(headers || new Headers());
+  out.set("content-type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify(openAiError(message || "Upstream returned an invalid response.", "server_error")), {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: out,
+  });
 }
 
 async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runtime, search }) {

@@ -40,6 +40,7 @@ const longStreamHits = [];
 const usageHits = [];
 const wrappedHits = [];
 const appErrorHits = [];
+const htmlHits = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
@@ -121,6 +122,13 @@ globalThis.fetch = async (url, init) => {
     return new Response(JSON.stringify({ error: { message: "Internal server error" } }), {
       status: 200,
       headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("html-error.example")) {
+    htmlHits.push("html");
+    return new Response("<!DOCTYPE html><html><body>bad gateway</body></html>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
     });
   }
   if (String(url).includes("responses-stream.example")) {
@@ -982,6 +990,66 @@ const appErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/
 }), appErrorEnv);
 assert.equal(appErrorHits.length, 1);
 assert.equal(appErrorResp.headers.get("x-llm-gateway-upstream"), "app-fallback");
+
+const htmlStore = new Map();
+htmlStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "html-error", base_url: "https://html-error.example/v1", api_key_encrypted: "h", models: ["html-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "html-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["html-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const htmlEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = htmlStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { htmlStore.set(key, value); },
+    async delete(key) { htmlStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "html-client", key: "sk-html", models: ["*"], upstreams: ["html-error", "html-fallback"] }]),
+};
+const htmlResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-html", "content-type": "application/json" },
+  body: JSON.stringify({ model: "html-model", messages: [] }),
+}), htmlEnv);
+assert.equal(htmlHits.length, 1);
+assert.equal(htmlResp.headers.get("x-llm-gateway-upstream"), "html-fallback");
+assert.equal((await htmlResp.text()).includes("<!DOCTYPE html>"), false);
+
+const htmlResponsesStore = new Map();
+htmlResponsesStore.set("gateway:config", JSON.stringify({
+  routing: { failover: false, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "html-response", base_url: "https://html-error.example/v1", api_key_encrypted: "h", models: ["html-response-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const htmlResponsesEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = htmlResponsesStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { htmlResponsesStore.set(key, value); },
+    async delete(key) { htmlResponsesStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "html-responses-client", key: "sk-html-resp", models: ["*"], upstreams: ["html-response"] }]),
+};
+const htmlResponsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-html-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "html-response-model", input: "hi" }),
+}), htmlResponsesEnv);
+const htmlResponsesBody = await htmlResponsesResp.text();
+assert.equal(htmlResponsesResp.status, 502);
+assert.equal(htmlResponsesBody.includes("<!DOCTYPE html>"), false);
+assert.equal(JSON.parse(htmlResponsesBody).error.type, "server_error");
 
 const degradedStore = new Map();
 degradedStore.set("gateway:config", JSON.stringify({
