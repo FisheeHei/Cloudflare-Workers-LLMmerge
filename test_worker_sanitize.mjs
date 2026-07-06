@@ -515,6 +515,8 @@ const glmAliasChatResp = await worker.default.fetch(new Request("https://gw.test
 }), aliasEnv);
 assert.equal(glmAliasChatResp.headers.get("x-llm-gateway-upstream"), "nim-alias");
 assert.equal(speedBodies[glmAliasBodyStart].model, "z-ai/glm-5.2");
+assert.equal(speedBodies[glmAliasBodyStart].chat_template_kwargs.enable_thinking, true);
+assert.equal(speedBodies[glmAliasBodyStart].chat_template_kwargs.clear_thinking, false);
 assert.equal("reasoning" in speedBodies[glmAliasBodyStart], false);
 assert.equal("reasoning_effort" in speedBodies[glmAliasBodyStart], false);
 assert.equal("reasoning_summary" in speedBodies[glmAliasBodyStart], false);

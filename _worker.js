@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-glm-call-fix";
+const VERSION = "v26-07-06-glm-thinking-fix";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2408,11 +2408,25 @@ function sanitizeProxyBody(bodyText, upstream) {
   let changed = false;
   const modelName = String(payload.model || "").toLowerCase();
   const isGlm = /(^|[\/_.-])glm([\/_.-]|$)/i.test(modelName);
+  const wantsGlmThinking = isNvidia && isGlm && glmThinkingRequested(payload);
   changed = applyProviderReasoningOptions(payload) || changed;
   changed = normalizeReasoningFields(payload, isGlm) || changed;
-  if (isNvidia) changed = sanitizeNvidiaPayload(payload, isGlm, modelName) || changed;
+  if (isNvidia) changed = sanitizeNvidiaPayload(payload, isGlm, modelName, wantsGlmThinking) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
+}
+
+function glmThinkingRequested(payload) {
+  return Boolean(
+    payload?.reasoning ||
+    payload?.reasoning_effort ||
+    payload?.reasoningEffort ||
+    payload?.reasoning_summary ||
+    payload?.reasoningSummary ||
+    payload?.thinking ||
+    payload?.enable_thinking === true ||
+    payload?.chat_template_kwargs?.enable_thinking === true
+  );
 }
 
 function bodyNeedsSanitizing(bodyText, isNvidia) {
@@ -2493,9 +2507,17 @@ function normalizeReasoningFields(payload, isGlm) {
   return changed;
 }
 
-function sanitizeNvidiaPayload(payload, isGlm, modelName) {
+function sanitizeNvidiaPayload(payload, isGlm, modelName, wantsGlmThinking = false) {
   let changed = false;
   if (isGlm) {
+    if (wantsGlmThinking) {
+      payload.chat_template_kwargs = {
+        ...(payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object" ? payload.chat_template_kwargs : {}),
+        enable_thinking: true,
+        clear_thinking: false,
+      };
+      changed = true;
+    }
     if ("reasoning" in payload) {
       delete payload.reasoning;
       changed = true;
