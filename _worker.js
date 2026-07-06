@@ -1064,6 +1064,7 @@ function normalizeGatewaySettings(settings = {}, app) {
     system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
     global_context: String(settings.global_context || settings.context_prompt || ""),
     global_context_clients: normalizeStringArray(settings.global_context_clients),
+    context_always_clients: normalizeStringArray(settings.context_always_clients),
     context_on_demand: settings.context_on_demand === true,
     context_item_limit: Math.max(1, Math.min(5, parsePositiveInt(settings.context_item_limit, 3))),
     context_max_chars: Math.max(500, Math.min(20000, parsePositiveInt(settings.context_max_chars, 4000))),
@@ -2062,10 +2063,13 @@ async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search
 }
 
 function applyGatewayPromptContext(bodyText, settings, client) {
-  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client) ? String(settings?.system_prompt || "").trim() : "";
-  const contextText = selectGatewayContext(bodyText, settings, client);
-  if ((!systemText && !contextText) || !bodyText) return bodyText;
-
+  if (!bodyText) return bodyText;
+  const clientIds = clientIdentitySet(client);
+  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
+  const items = Array.isArray(settings?.context_items) ? settings.context_items : [];
+  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
+    (settings?.context_on_demand === true && items.some((item) => item && item.enabled !== false && item.text));
+  if (!systemText && !hasContext) return bodyText;
   let payload;
   try {
     payload = JSON.parse(bodyText);
@@ -2074,6 +2078,8 @@ function applyGatewayPromptContext(bodyText, settings, client) {
   }
 
   if (!Array.isArray(payload.messages)) return bodyText;
+  const contextText = hasContext ? selectGatewayContext(payload, settings, client, clientIds) : "";
+  if (!systemText && !contextText) return bodyText;
   const injected = [];
   if (systemText) {
     injected.push({ role: "system", content: systemText });
@@ -2091,22 +2097,23 @@ function applyGatewayPromptContext(bodyText, settings, client) {
   return JSON.stringify(payload);
 }
 
-function selectGatewayContext(bodyText, settings, client) {
-  const base = promptAppliesToClient(settings?.global_context_clients, client) ? String(settings?.global_context || "").trim() : "";
+function selectGatewayContext(payload, settings, client, clientIds) {
+  const base = promptAppliesToClient(settings?.global_context_clients, client, clientIds) ? String(settings?.global_context || "").trim() : "";
   if (settings?.context_on_demand !== true) return base;
-  const items = normalizeContextItems(settings?.context_items);
+  const items = Array.isArray(settings?.context_items) ? settings.context_items : normalizeContextItems(settings?.context_items);
   if (!items.length) return base;
 
-  let payload = {};
-  try { payload = JSON.parse(bodyText); } catch {}
   const model = String(payload?.model || "").toLowerCase();
   const query = ((payload?.messages || []).slice(-4).map((msg) => chatContentToText(msg?.content || "")).join("\n") + "\n" + model + "\n" + (client?.name || "")).toLowerCase();
-  const picked = items
-    .filter((item) => item.enabled !== false && contextScopeMatches(item.clients, client) && contextModelMatches(item.models, model))
+  const candidates = items
+    .filter((item) => item.enabled !== false && contextScopeMatches(item.clients, client, clientIds) && contextModelMatches(item.models, model))
     .map((item) => ({ item, score: contextKeywordScore(item, query) }))
-    .filter((hit) => hit.score > 0)
     .sort((a, b) => b.score - a.score || b.item.priority - a.item.priority)
-    .slice(0, Math.max(1, Math.min(5, Number(settings.context_item_limit || 3))));
+  const alwaysClients = normalizeStringArray(settings?.context_always_clients);
+  const forceAll = alwaysClients.length && promptAppliesToClient(alwaysClients, client, clientIds);
+  const picked = forceAll
+    ? candidates
+    : candidates.filter((hit) => hit.score > 0).slice(0, Math.max(1, Math.min(5, Number(settings.context_item_limit || 3))));
   if (!picked.length) return base;
 
   let remaining = Math.max(500, Number(settings.context_max_chars || 4000));
@@ -2120,8 +2127,8 @@ function selectGatewayContext(bodyText, settings, client) {
   return parts.filter(Boolean).join("\n\n");
 }
 
-function contextScopeMatches(scope, client) {
-  return !normalizeStringArray(scope).length || promptAppliesToClient(scope, client);
+function contextScopeMatches(scope, client, clientIds) {
+  return !normalizeStringArray(scope).length || promptAppliesToClient(scope, client, clientIds);
 }
 
 function contextModelMatches(scope, model) {
@@ -2136,10 +2143,15 @@ function contextKeywordScore(item, query) {
   return keywords.reduce((score, keyword) => score + (query.includes(keyword.toLowerCase()) ? 1 : 0), 0) + (Number(item.priority || 0) / 100);
 }
 
-function promptAppliesToClient(scope, client) {
+function clientIdentitySet(client) {
+  return new Set([client?.id, client?.name, client?.key].map((item) => String(item || "").trim()).filter(Boolean));
+}
+
+function promptAppliesToClient(scope, client, clientIds) {
   const list = normalizeStringArray(scope);
-  if (!list.length) return true;
-  const ids = new Set([client?.id, client?.name, client?.key].map((item) => String(item || "").trim()).filter(Boolean));
+  if (!list.length || list.includes("*") || list.includes("__all__")) return true;
+  if (list.includes("__none__")) return false;
+  const ids = clientIds || clientIdentitySet(client);
   return list.some((item) => ids.has(item));
 }
 
@@ -3450,12 +3462,13 @@ function renderAdminStyle() {
     .system-prompt-textarea { min-height: min(24vh, 260px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
     .context-prompt-textarea { min-height: min(32vh, 360px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
     .prompt-splitter-textarea { min-height: 140px; font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
-    .prompt-modal-grid { display: grid; gap: 12px; }
-    .prompt-modal-card { width: min(1120px, calc(100vw - 32px)); }
-    .prompt-edit-grid { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 10px; align-items: stretch; }
-    .prompt-client-scope { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; max-height: 180px; overflow: auto; }
-    .prompt-client-scope label { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 6px; align-items: center; font-size: 12px; margin: 0 0 6px; color: var(--ink); line-height: 1.25; }
-    .prompt-client-scope input { margin: 0; justify-self: center; }
+    .prompt-modal-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) minmax(260px, .85fr); gap: 12px; align-items: start; }
+    .prompt-modal-card { width: min(1360px, calc(100vw - 20px)); }
+    .prompt-edit-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 10px; align-items: stretch; }
+    .prompt-client-scope { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; max-height: 180px; overflow: auto; display: flex; gap: 6px; flex-wrap: wrap; align-content: flex-start; }
+    .prompt-client-scope label { display: inline-flex; max-width: 100%; align-items: center; border: 1px solid #cfbea0; border-radius: 999px; padding: 5px 8px; font-size: 12px; margin: 0; color: var(--ink); line-height: 1.2; cursor: pointer; background: #fffdfa; }
+    .prompt-client-scope label.active { background: #1f8f61; border-color: #1f8f61; color: #fff; }
+    .prompt-client-scope input { position: absolute; opacity: 0; pointer-events: none; }
     .prompt-client-scope span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .prompt-splitter-row { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 10px; align-items: start; }
     .context-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
@@ -3497,6 +3510,9 @@ function renderAdminStyle() {
     .picker-actions { display: flex; gap: 10px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 14px; }
     .picker-actions button.small { padding: 7px 13px; font-size: 13px; }
     @media (max-width: 760px) {
+      .prompt-modal-grid { grid-template-columns: 1fr; }
+      .prompt-edit-grid { grid-template-columns: 1fr; }
+      .prompt-client-scope { max-height: 130px; }
       .model-picker-grid { grid-template-columns: 1fr; }
       .model-picker-groups, .model-picker-subgroups { max-height: 150px; }
       .model-row { align-items: flex-start; flex-wrap: wrap; }
@@ -3826,6 +3842,10 @@ function renderAdminMarkup(origin) {
           <button type="button" class="secondary small" id="add-context-item">\u65b0\u589e\u7247\u6bb5</button>
           <button type="button" class="secondary small" id="classify-context-items">\u4ece\u5927\u6587\u672c\u751f\u6210\u7247\u6bb5</button>
         </div>
+        <div class="field">
+          <label>\u5168\u91cf\u6ce8\u5165\u5ba2\u6237\u7aef Key <span class="note">\u4e0d\u9009=\u4e0d\u5f3a\u5236\u5168\u91cf\uff1b\u9009\u4e2d\u540e\u5ffd\u7565\u5173\u952e\u8bcd\uff0c\u4f46\u4ecd\u6309\u6700\u591a\u5b57\u7b26\u622a\u65ad</span></label>
+          <div class="prompt-client-scope" id="context-always-client-scope"></div>
+        </div>
         <div class="context-items" id="context-items"></div>
       </div>
       <div class="field">
@@ -4149,10 +4169,11 @@ function renderAdminScript() {
     });
 
     host.innerHTML = Object.keys(groups).map((groupName) =>
-      '<details class="upstream-group" open><summary><span>' + esc(groupName) + '</span><span class="note">' + groups[groupName].length + ' \u4e2a\u4e0a\u6e38</span></summary><div class="upstream-group-body">' +
+      '<details class="upstream-group"><summary><span>' + esc(groupName) + '</span><span class="note">' + groups[groupName].length + ' \u4e2a\u4e0a\u6e38</span><span class="note upstream-group-health">\u25cb \u672a\u68c0\u67e5</span></summary><div class="upstream-group-body">' +
         groups[groupName].map(upstreamCardHtml).join("") +
       '</div></details>'
     ).join("");
+    updateUpstreamGroupHealth();
 
     function upstreamCardHtml(item) {
       const p = presetById(item.preset);
@@ -4320,6 +4341,7 @@ function renderAdminScript() {
         system_prompt_clients: selectedPromptClients("system-prompt-client-scope"),
         global_context: byId("global-context-input").value,
         global_context_clients: selectedPromptClients("global-context-client-scope"),
+        context_always_clients: selectedPromptClients("context-always-client-scope"),
         context_on_demand: byId("context-on-demand").checked,
         context_item_limit: Number(byId("context-item-limit").value || 3),
         context_max_chars: Number(byId("context-max-chars").value || 4000),
@@ -4461,32 +4483,57 @@ function renderAdminScript() {
     renderPromptContextStatus("\u5f85\u4fdd\u5b58");
   }
 
-  function clientScopeHtml(selected) {
+  function clientScopeHtml(selected, forceAll) {
     const ids = new Set(selected || []);
     const clients = state.clients || [];
-    if (!clients.length) return '<div class="note">\u7a7a\u9009 = \u5168\u90e8\u5ba2\u6237\u7aef</div>';
-    return '<label><input type="checkbox" value="__all__"' + (ids.size ? '' : ' checked') + '><span>\u5168\u90e8\u5ba2\u6237\u7aef</span></label>' +
+    const allActive = forceAll ? ids.has("*") || ids.has("__all__") : !ids.size;
+    let html = forceAll
+      ? clientScopeChip("__none__", "\u4e0d\u542f\u7528\u5168\u91cf", !ids.size) + clientScopeChip("*", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive)
+      : clientScopeChip("__all__", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive);
+    if (!clients.length) return html + '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
+    return html +
       clients.map(function(c) {
         const id = text(c.id || c.name || c.key).trim();
         const label = text(c.name || c.id || "client");
-        return '<label><input type="checkbox" value="' + esc(id) + '"' + (ids.has(id) ? ' checked' : '') + '><span title="' + esc(label) + '">' + esc(label) + '</span></label>';
+        return clientScopeChip(id, label, !allActive && ids.has(id));
       }).join("");
   }
 
-  function bindPromptScope(host) {
-    const all = host.querySelector('input[value="__all__"]');
-    if (all) {
-      all.addEventListener("change", function() {
-        if (all.checked) host.querySelectorAll('input:not([value="__all__"])').forEach((input) => { input.checked = false; });
-        renderPromptContextStatus("\u5f85\u4fdd\u5b58");
-      });
-    }
-    host.querySelectorAll('input:not([value="__all__"])').forEach(function(input) {
+  function clientScopeChip(value, label, checked) {
+    const prefix = checked ? "\u2705 " : "";
+    return '<label class="' + (checked ? 'active' : '') + '"><input type="checkbox" value="' + esc(value) + '"' + (checked ? ' checked' : '') + '><span data-label="' + esc(label) + '" title="' + esc(label) + '">' + prefix + esc(label) + '</span></label>';
+  }
+
+  function bindPromptScope(host, forceAll) {
+    host.querySelectorAll('input').forEach(function(input) {
       input.addEventListener("change", function() {
-        if (input.checked && all) all.checked = false;
-        if (all && !host.querySelector('input:not([value="__all__"]):checked')) all.checked = true;
+        if (forceAll) {
+          if (["__none__", "*"].includes(input.value) && input.checked) {
+            host.querySelectorAll('input').forEach((other) => { if (other !== input) other.checked = false; });
+          } else if (input.checked) {
+            host.querySelectorAll('input[value="__none__"],input[value="*"]').forEach((other) => { other.checked = false; });
+          }
+          if (!host.querySelector('input:checked')) host.querySelector('input[value="__none__"]').checked = true;
+        } else {
+          const all = host.querySelector('input[value="__all__"]');
+          if (input.value === "__all__" && input.checked) host.querySelectorAll('input:not([value="__all__"])').forEach((other) => { other.checked = false; });
+          if (input.value !== "__all__" && input.checked && all) all.checked = false;
+          if (all && !host.querySelector('input:not([value="__all__"]):checked')) all.checked = true;
+        }
+        syncClientScopeChips(host);
         renderPromptContextStatus("\u5f85\u4fdd\u5b58");
       });
+    });
+    syncClientScopeChips(host);
+  }
+
+  function syncClientScopeChips(host) {
+    host.querySelectorAll("label").forEach(function(label) {
+      const input = label.querySelector("input");
+      const span = label.querySelector("span[data-label]");
+      if (!input || !span) return;
+      label.classList.toggle("active", input.checked);
+      span.textContent = (input.checked ? "\u2705 " : "") + span.dataset.label;
     });
   }
 
@@ -4494,31 +4541,45 @@ function renderAdminScript() {
     const s = state.config && state.config.settings || {};
     const systemHost = byId("system-prompt-client-scope");
     const contextHost = byId("global-context-client-scope");
-    if (!systemHost || !contextHost) return;
-    systemHost.innerHTML = clientScopeHtml(s.system_prompt_clients || []);
-    contextHost.innerHTML = clientScopeHtml(s.global_context_clients || []);
-    bindPromptScope(systemHost);
-    bindPromptScope(contextHost);
+    const alwaysHost = byId("context-always-client-scope");
+    if (!systemHost || !contextHost || !alwaysHost) return;
+    systemHost.innerHTML = clientScopeHtml(s.system_prompt_clients || [], false);
+    contextHost.innerHTML = clientScopeHtml(s.global_context_clients || [], false);
+    alwaysHost.innerHTML = clientScopeHtml(s.context_always_clients || [], true);
+    bindPromptScope(systemHost, false);
+    bindPromptScope(contextHost, false);
+    bindPromptScope(alwaysHost, true);
   }
 
   function selectedPromptClients(id) {
     const host = byId(id);
     if (!host) return [];
+    if (id === "context-always-client-scope") {
+      if (host.querySelector('input[value="*"]:checked')) return ["*"];
+      return [...host.querySelectorAll('input:checked')].map((input) => input.value).filter((value) => value && value !== "__none__");
+    }
     if (host.querySelector('input[value="__all__"]:checked')) return [];
     return [...host.querySelectorAll('input:not([value="__all__"]):checked')].map((input) => input.value).filter(Boolean);
+  }
+
+  function promptScopeLabel(id, emptyLabel) {
+    const values = selectedPromptClients(id);
+    if (values.includes("*")) return "\u5168\u90e8";
+    return values.length || emptyLabel;
   }
 
   function renderPromptContextStatus(prefix) {
     const systemLen = byId("system-prompt-input").value.length;
     const contextLen = byId("global-context-input").value.length;
     const itemCount = collectContextItems().length;
-    const systemScope = selectedPromptClients("system-prompt-client-scope").length || "\u5168\u90e8";
-    const contextScope = selectedPromptClients("global-context-client-scope").length || "\u5168\u90e8";
+    const systemScope = promptScopeLabel("system-prompt-client-scope", "\u5168\u90e8");
+    const contextScope = promptScopeLabel("global-context-client-scope", "\u5168\u90e8");
+    const alwaysScope = promptScopeLabel("context-always-client-scope", "\u65e0");
     if (!systemLen && !contextLen && !itemCount) {
       byId("system-prompt-status").textContent = "\u672a\u542f\u7528";
       return;
     }
-    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef\uff0c\u7247\u6bb5 " + itemCount + ")";
+    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef\uff0c\u7247\u6bb5 " + itemCount + "\uff0c\u5168\u91cf " + alwaysScope + ")";
   }
 
   function splitPromptContextDraft() {
@@ -4570,6 +4631,7 @@ function renderAdminScript() {
   async function checkHealth() {
     const dots = document.querySelectorAll(".health-dot");
     dots.forEach((d) => { d.className = "health-dot checking"; d.title = "\u68c0\u67e5\u4e2d..."; });
+    updateUpstreamGroupHealth();
     const resp = await fetch(API_BASE + "/health", { method: "POST" });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "\u5065\u5eb7\u5ea6\u68c0\u67e5\u5931\u8d25");
@@ -4581,7 +4643,23 @@ function renderAdminScript() {
     });
     const ok = (payload.results || []).filter((r) => r.ok).length;
     const total = (payload.results || []).length;
+    updateUpstreamGroupHealth();
     showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
+  }
+
+  function updateUpstreamGroupHealth() {
+    document.querySelectorAll(".upstream-group").forEach((group) => {
+      const status = group.querySelector(".upstream-group-health");
+      if (!status) return;
+      const dots = [...group.querySelectorAll(".health-dot")];
+      const ok = dots.filter((dot) => dot.classList.contains("ok")).length;
+      const fail = dots.filter((dot) => dot.classList.contains("fail")).length;
+      if (dots.some((dot) => dot.classList.contains("checking"))) status.textContent = "\u2026 \u68c0\u67e5\u4e2d";
+      else if (!ok && !fail) status.textContent = "\u25cb \u672a\u68c0\u67e5";
+      else if (!fail) status.textContent = "\u2705 " + ok + "/" + dots.length + " \u6b63\u5e38";
+      else if (!ok) status.textContent = "\u274c 0/" + dots.length + " \u6b63\u5e38";
+      else status.textContent = "\u26a0 " + ok + "/" + dots.length + " \u6b63\u5e38";
+    });
   }
 
   async function loadRuntimeStatus() {
