@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-trace-route-fallback";
+const VERSION = "v26-07-07-stream-cancel-guard";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -739,27 +739,41 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
     if (timer) clearInterval(timer);
     timer = null;
   };
+  const safeEnqueue = (controller, chunk) => {
+    if (closed) return false;
+    try {
+      controller.enqueue(chunk);
+      return true;
+    } catch {
+      cleanup();
+      return false;
+    }
+  };
+  const safeClose = (controller) => {
+    cleanup();
+    try { controller.close(); } catch {}
+  };
   return new ReadableStream({
     async start(controller) {
       reader = body.getReader();
       timer = setInterval(() => {
-        if (!closed && controller.desiredSize > 0) controller.enqueue(ping);
+        if (!closed && controller.desiredSize > 0) safeEnqueue(controller, ping);
       }, interval);
       try {
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          controller.enqueue(value);
+          if (!safeEnqueue(controller, value)) {
+            try { await reader.cancel("client closed"); } catch {}
+            return;
+          }
         }
         if (!closed) {
-          cleanup();
-          controller.close();
+          safeClose(controller);
         }
       } catch (error) {
         if (!closed) {
-          cleanup();
-          controller.enqueue(done);
-          controller.close();
+          if (safeEnqueue(controller, done)) safeClose(controller);
         }
       }
     },
