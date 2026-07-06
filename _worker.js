@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-prompt-context-layout";
+const VERSION = "v26-07-06-route-context-cache";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1075,17 +1075,23 @@ function normalizeGatewaySettings(settings = {}, app) {
 
 function normalizeContextItems(items) {
   if (!Array.isArray(items)) return [];
-  return items.map((item, index) => ({
-    id: String(item?.id || crypto.randomUUID()),
-    title: String(item?.title || `Context ${index + 1}`).trim(),
-    text: String(item?.text || "").trim(),
-    keywords: normalizeStringArray(item?.keywords),
-    clients: normalizeStringArray(item?.clients),
-    models: normalizeStringArray(item?.models),
-    enabled: item?.enabled !== false,
-    priority: Number(item?.priority || 0) || 0,
-    max_chars: Math.max(200, Math.min(8000, parsePositiveInt(item?.max_chars, 1200))),
-  })).filter((item) => item.text).slice(0, 50);
+  return items.map((item, index) => {
+    const keywords = normalizeStringArray(item?.keywords);
+    const models = normalizeStringArray(item?.models);
+    return {
+      id: String(item?.id || crypto.randomUUID()),
+      title: String(item?.title || `Context ${index + 1}`).trim(),
+      text: String(item?.text || "").trim(),
+      keywords,
+      keyword_lc: keywords.map((word) => word.toLowerCase()),
+      clients: normalizeStringArray(item?.clients),
+      models,
+      models_lc: models.map((model) => model.toLowerCase()),
+      enabled: item?.enabled !== false,
+      priority: Number(item?.priority || 0) || 0,
+      max_chars: Math.max(200, Math.min(8000, parsePositiveInt(item?.max_chars, 1200))),
+    };
+  }).filter((item) => item.text).slice(0, 50);
 }
 
 function buildUpstreamConfigRecord(item, index, options) {
@@ -1298,9 +1304,29 @@ async function loadRuntimeConfig(app) {
     upstreamCooldownTtl: editable.settings.upstream_cooldown_ttl,
     upstreams: decrypted,
   };
+  runtime.routeIndex = buildRouteIndex(decrypted);
   _runtimeCache = { app, runtime };
   _runtimeCacheTs = now;
   return runtime;
+}
+
+function buildRouteIndex(upstreams) {
+  const index = {};
+  for (const upstream of upstreams || []) {
+    for (const path of normalizeStringArray(upstream.paths)) {
+      if (!index[path]) index[path] = { wildcard: [], models: {} };
+      const models = configuredUpstreamModels(upstream);
+      if (!models.length || models.includes("*")) {
+        index[path].wildcard.push(upstream);
+        continue;
+      }
+      for (const model of models) {
+        if (!index[path].models[model]) index[path].models[model] = [];
+        index[path].models[model].push(upstream);
+      }
+    }
+  }
+  return index;
 }
 
 async function loadHealthUpstreams(app) {
@@ -1362,11 +1388,8 @@ async function requireClient(request, runtime) {
 }
 
 async function listModels(client, runtime) {
-  const allResults = runtime.upstreams
-    .filter((upstream) => clientAllowsUpstream(client, upstream.name))
-    .flatMap((upstream) => configuredUpstreamModels(upstream)
-      .filter((model) => model && model !== "*" && clientAllowsModel(client, model))
-      .map((model) => ({ model, upstream })));
+  const allResults = routeModelRows(runtime)
+    .filter((row) => clientAllowsUpstream(client, row.upstream.name) && clientAllowsModel(client, row.model));
 
   const rows = aliasRowsForModels(allResults).map((row) => ({
     id: row.alias,
@@ -1388,11 +1411,8 @@ async function resolveClientModelAlias(client, runtime, model) {
   const value = String(model || "").trim();
   if (!value || value.includes("@cf/")) return value;
   if (value.includes("/") || isLooseAliasModel(value)) {
-    const allResults = runtime.upstreams
-      .filter((upstream) => clientAllowsUpstream(client, upstream.name))
-      .flatMap((upstream) => configuredUpstreamModels(upstream)
-        .filter((item) => item && item !== "*" && clientAllowsModel(client, item))
-        .map((item) => ({ model: item, upstream })));
+    const allResults = routeModelRows(runtime)
+      .filter((row) => clientAllowsUpstream(client, row.upstream.name) && clientAllowsModel(client, row.model));
     const rows = aliasRowsForModels(allResults);
     const hit = rows.find((row) => row.alias === value || row.model === value);
     if (hit) return hit.model;
@@ -1402,6 +1422,16 @@ async function resolveClientModelAlias(client, runtime, model) {
     if (fuzzy.length === 1) return fuzzy[0].model;
   }
   return value;
+}
+
+function routeModelRows(runtime) {
+  if (runtime._routeModelRows) return runtime._routeModelRows;
+  runtime._routeModelRows = runtime.upstreams.flatMap((upstream) =>
+    configuredUpstreamModels(upstream)
+      .filter((model) => model && model !== "*")
+      .map((model) => ({ model, upstream }))
+  );
+  return runtime._routeModelRows;
 }
 
 function aliasRowsForModels(items) {
@@ -2036,11 +2066,14 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 }
 
 function proxyCandidates(runtime, client, model, pathname) {
-  return runtime.upstreams.filter((upstream) =>
+  const indexed = runtime.routeIndex?.[pathname];
+  const pool = indexed
+    ? [...(indexed.models[model] || []), ...indexed.wildcard]
+    : runtime.upstreams;
+  return pool.filter((upstream) =>
     clientAllowsUpstream(client, upstream.name) &&
     clientAllowsModel(client, model) &&
-    upstreamSupportsModel(upstream, model) &&
-    upstreamSupportsPath(upstream, pathname)
+    (indexed || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
   );
 }
 
@@ -2132,15 +2165,15 @@ function contextScopeMatches(scope, client, clientIds) {
 }
 
 function contextModelMatches(scope, model) {
-  const list = normalizeStringArray(scope);
+  const list = Array.isArray(scope) ? scope : normalizeStringArray(scope);
   if (!list.length || list.includes("*")) return true;
   return list.some((item) => modelsMatch(model, item) || model.includes(String(item).toLowerCase()));
 }
 
 function contextKeywordScore(item, query) {
-  const keywords = normalizeStringArray(item.keywords);
+  const keywords = item.keyword_lc || normalizeStringArray(item.keywords).map((word) => word.toLowerCase());
   if (!keywords.length) return 1 + (Number(item.priority || 0) / 100);
-  return keywords.reduce((score, keyword) => score + (query.includes(keyword.toLowerCase()) ? 1 : 0), 0) + (Number(item.priority || 0) / 100);
+  return keywords.reduce((score, keyword) => score + (query.includes(keyword) ? 1 : 0), 0) + (Number(item.priority || 0) / 100);
 }
 
 function clientIdentitySet(client) {
