@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-glm-thinking-fix";
+const VERSION = "v26-07-06-context-picker";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1064,8 +1064,27 @@ function normalizeGatewaySettings(settings = {}, app) {
     system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
     global_context: String(settings.global_context || settings.context_prompt || ""),
     global_context_clients: normalizeStringArray(settings.global_context_clients),
+    context_on_demand: settings.context_on_demand === true,
+    context_item_limit: Math.max(1, Math.min(5, parsePositiveInt(settings.context_item_limit, 3))),
+    context_max_chars: Math.max(500, Math.min(20000, parsePositiveInt(settings.context_max_chars, 4000))),
+    context_items: normalizeContextItems(settings.context_items),
     upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
   };
+}
+
+function normalizeContextItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item, index) => ({
+    id: String(item?.id || crypto.randomUUID()),
+    title: String(item?.title || `Context ${index + 1}`).trim(),
+    text: String(item?.text || "").trim(),
+    keywords: normalizeStringArray(item?.keywords),
+    clients: normalizeStringArray(item?.clients),
+    models: normalizeStringArray(item?.models),
+    enabled: item?.enabled !== false,
+    priority: Number(item?.priority || 0) || 0,
+    max_chars: Math.max(200, Math.min(8000, parsePositiveInt(item?.max_chars, 1200))),
+  })).filter((item) => item.text).slice(0, 50);
 }
 
 function buildUpstreamConfigRecord(item, index, options) {
@@ -2044,7 +2063,7 @@ async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search
 
 function applyGatewayPromptContext(bodyText, settings, client) {
   const systemText = promptAppliesToClient(settings?.system_prompt_clients, client) ? String(settings?.system_prompt || "").trim() : "";
-  const contextText = promptAppliesToClient(settings?.global_context_clients, client) ? String(settings?.global_context || "").trim() : "";
+  const contextText = selectGatewayContext(bodyText, settings, client);
   if ((!systemText && !contextText) || !bodyText) return bodyText;
 
   let payload;
@@ -2070,6 +2089,51 @@ function applyGatewayPromptContext(bodyText, settings, client) {
   }
   if (injected.length) payload.messages = injected.concat(payload.messages);
   return JSON.stringify(payload);
+}
+
+function selectGatewayContext(bodyText, settings, client) {
+  const base = promptAppliesToClient(settings?.global_context_clients, client) ? String(settings?.global_context || "").trim() : "";
+  if (settings?.context_on_demand !== true) return base;
+  const items = normalizeContextItems(settings?.context_items);
+  if (!items.length) return base;
+
+  let payload = {};
+  try { payload = JSON.parse(bodyText); } catch {}
+  const model = String(payload?.model || "").toLowerCase();
+  const query = ((payload?.messages || []).slice(-4).map((msg) => chatContentToText(msg?.content || "")).join("\n") + "\n" + model + "\n" + (client?.name || "")).toLowerCase();
+  const picked = items
+    .filter((item) => item.enabled !== false && contextScopeMatches(item.clients, client) && contextModelMatches(item.models, model))
+    .map((item) => ({ item, score: contextKeywordScore(item, query) }))
+    .filter((hit) => hit.score > 0)
+    .sort((a, b) => b.score - a.score || b.item.priority - a.item.priority)
+    .slice(0, Math.max(1, Math.min(5, Number(settings.context_item_limit || 3))));
+  if (!picked.length) return base;
+
+  let remaining = Math.max(500, Number(settings.context_max_chars || 4000));
+  const parts = [];
+  for (const { item } of picked) {
+    if (remaining <= 0) break;
+    const text = item.text.slice(0, Math.min(remaining, item.max_chars || remaining));
+    parts.push(`[${item.title}]\n${text}`);
+    remaining -= text.length;
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
+function contextScopeMatches(scope, client) {
+  return !normalizeStringArray(scope).length || promptAppliesToClient(scope, client);
+}
+
+function contextModelMatches(scope, model) {
+  const list = normalizeStringArray(scope);
+  if (!list.length || list.includes("*")) return true;
+  return list.some((item) => modelsMatch(model, item) || model.includes(String(item).toLowerCase()));
+}
+
+function contextKeywordScore(item, query) {
+  const keywords = normalizeStringArray(item.keywords);
+  if (!keywords.length) return 1 + (Number(item.priority || 0) / 100);
+  return keywords.reduce((score, keyword) => score + (query.includes(keyword.toLowerCase()) ? 1 : 0), 0) + (Number(item.priority || 0) / 100);
 }
 
 function promptAppliesToClient(scope, client) {
@@ -3382,6 +3446,13 @@ function renderAdminStyle() {
     .prompt-client-scope input { margin: 0; justify-self: center; }
     .prompt-client-scope span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .prompt-splitter-row { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 10px; align-items: start; }
+    .context-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+    .context-controls input[type="number"] { width: 84px; }
+    .context-items { display: grid; gap: 8px; max-height: 260px; overflow: auto; padding-right: 2px; }
+    .context-item { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; display: grid; gap: 6px; }
+    .context-item-head { display: grid; grid-template-columns: 18px minmax(0, 1fr) 88px auto; gap: 6px; align-items: center; }
+    .context-item-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+    .context-item textarea { min-height: 76px; font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
     .model-picker-backdrop { z-index: 80; }
     .model-picker-card { width: min(1216px, calc(100vw - 48px)); }
     .picker-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -3736,6 +3807,14 @@ function renderAdminMarkup(origin) {
             <div class="prompt-client-scope" id="global-context-client-scope"></div>
           </div>
         </div>
+        <div class="context-controls">
+          <label class="note"><input type="checkbox" id="context-on-demand"> \u6309\u9700\u6ce8\u5165\u7247\u6bb5</label>
+          <label class="note">\u6700\u591a\u7247\u6bb5 <input id="context-item-limit" type="number" min="1" max="5" value="3"></label>
+          <label class="note">\u6700\u591a\u5b57\u7b26 <input id="context-max-chars" type="number" min="500" max="20000" value="4000"></label>
+          <button type="button" class="secondary small" id="add-context-item">\u65b0\u589e\u7247\u6bb5</button>
+          <button type="button" class="secondary small" id="classify-context-items">\u4ece\u5927\u6587\u672c\u751f\u6210\u7247\u6bb5</button>
+        </div>
+        <div class="context-items" id="context-items"></div>
       </div>
       <div class="field">
         <label>\u5927\u6587\u672c\u62c6\u5206</label>
@@ -4215,6 +4294,10 @@ function renderAdminScript() {
         system_prompt_clients: selectedPromptClients("system-prompt-client-scope"),
         global_context: byId("global-context-input").value,
         global_context_clients: selectedPromptClients("global-context-client-scope"),
+        context_on_demand: byId("context-on-demand").checked,
+        context_item_limit: Number(byId("context-item-limit").value || 3),
+        context_max_chars: Number(byId("context-max-chars").value || 4000),
+        context_items: collectContextItems(),
       },
       routing: {
         load_balance: byId("routing-load-balance").checked,
@@ -4241,6 +4324,10 @@ function renderAdminScript() {
     byId("model-cache-ttl").value = s.model_cache_ttl || "";
     byId("system-prompt-input").value = s.system_prompt || "";
     byId("global-context-input").value = s.global_context || "";
+    byId("context-on-demand").checked = s.context_on_demand === true;
+    byId("context-item-limit").value = s.context_item_limit || 3;
+    byId("context-max-chars").value = s.context_max_chars || 4000;
+    renderContextItems(s.context_items || []);
     renderPromptClientScopes();
     renderPromptContextStatus();
     byId("routing-load-balance").checked = r.load_balance !== false;
@@ -4295,6 +4382,59 @@ function renderAdminScript() {
     byId("system-prompt-modal").classList.remove("open");
   }
 
+  function collectContextItems() {
+    return [...document.querySelectorAll(".context-item")].map(function(row) {
+      return {
+        id: row.dataset.id,
+        enabled: row.querySelector(".context-enabled").checked,
+        title: row.querySelector(".context-title").value.trim(),
+        keywords: splitList(row.querySelector(".context-keywords").value),
+        clients: splitList(row.querySelector(".context-clients").value),
+        models: splitList(row.querySelector(".context-models").value),
+        priority: Number(row.querySelector(".context-priority").value || 0),
+        max_chars: Number(row.querySelector(".context-max").value || 1200),
+        text: row.querySelector(".context-text").value.trim(),
+      };
+    }).filter((item) => item.text);
+  }
+
+  function renderContextItems(items) {
+    const host = byId("context-items");
+    if (!host) return;
+    host.innerHTML = (items || []).map(contextItemHtml).join("") || '<div class="note">\u6682\u65e0\u7247\u6bb5\uff0c\u53ef\u4ece\u5927\u6587\u672c\u751f\u6210\u3002</div>';
+    host.querySelectorAll(".delete-context-item").forEach((btn) => btn.addEventListener("click", () => {
+      btn.closest(".context-item").remove();
+      renderPromptContextStatus("\u5f85\u4fdd\u5b58");
+    }));
+    host.querySelectorAll("input,textarea").forEach((input) => input.addEventListener("input", () => renderPromptContextStatus("\u5f85\u4fdd\u5b58")));
+  }
+
+  function contextItemHtml(item) {
+    return '<div class="context-item" data-id="' + esc(item.id || crypto.randomUUID()) + '">' +
+      '<div class="context-item-head">' +
+        '<input class="context-enabled" type="checkbox"' + (item.enabled === false ? '' : ' checked') + '>' +
+        '<input class="context-title" placeholder="\u7247\u6bb5\u6807\u9898" value="' + esc(item.title || '') + '">' +
+        '<input class="context-priority" type="number" placeholder="\u4f18\u5148\u7ea7" value="' + esc(item.priority || 0) + '">' +
+        '<button type="button" class="danger small delete-context-item">\u5220\u9664</button>' +
+      '</div>' +
+      '<div class="context-item-grid">' +
+        '<input class="context-keywords" placeholder="\u5173\u952e\u8bcd\uff0c\u9017\u53f7\u5206\u9694" value="' + esc((item.keywords || []).join(", ")) + '">' +
+        '<input class="context-clients" placeholder="\u5ba2\u6237\u7aef\uff0c\u7a7a=\u5168\u90e8" value="' + esc((item.clients || []).join(", ")) + '">' +
+        '<input class="context-models" placeholder="\u6a21\u578b\uff0c\u7a7a=\u5168\u90e8" value="' + esc((item.models || []).join(", ")) + '">' +
+        '<input class="context-max" type="number" min="200" max="8000" value="' + esc(item.max_chars || 1200) + '">' +
+      '</div>' +
+      '<textarea class="context-text" placeholder="\u8fd9\u4e2a\u573a\u666f\u9700\u8981\u6ce8\u5165\u7684\u4e0a\u4e0b\u6587">' + esc(item.text || '') + '</textarea>' +
+    '</div>';
+  }
+
+  function addContextItem(item) {
+    const host = byId("context-items");
+    if (host.querySelector(".note")) host.innerHTML = "";
+    host.insertAdjacentHTML("beforeend", contextItemHtml(item || { enabled: true, max_chars: 1200 }));
+    renderContextItems(collectContextItems());
+    renderPromptContextStatus("\u5f85\u4fdd\u5b58");
+  }
+
   function clientScopeHtml(selected) {
     const ids = new Set(selected || []);
     const clients = state.clients || [];
@@ -4345,13 +4485,14 @@ function renderAdminScript() {
   function renderPromptContextStatus(prefix) {
     const systemLen = byId("system-prompt-input").value.length;
     const contextLen = byId("global-context-input").value.length;
+    const itemCount = collectContextItems().length;
     const systemScope = selectedPromptClients("system-prompt-client-scope").length || "\u5168\u90e8";
     const contextScope = selectedPromptClients("global-context-client-scope").length || "\u5168\u90e8";
-    if (!systemLen && !contextLen) {
+    if (!systemLen && !contextLen && !itemCount) {
       byId("system-prompt-status").textContent = "\u672a\u542f\u7528";
       return;
     }
-    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef)";
+    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef\uff0c\u7247\u6bb5 " + itemCount + ")";
   }
 
   function splitPromptContextDraft() {
@@ -4367,7 +4508,27 @@ function renderAdminScript() {
     });
     if (systemParts.length) byId("system-prompt-input").value = systemParts.join("\\n\\n");
     if (contextParts.length) byId("global-context-input").value = contextParts.join("\\n\\n");
+    if (contextParts.length) renderContextItems(makeContextItemsFromBlocks(contextParts));
     renderPromptContextStatus("\u5df2\u62c6\u5206\uff0c\u5f85\u4fdd\u5b58");
+  }
+
+  function classifyContextItemsDraft() {
+    const raw = (byId("prompt-splitter-input").value || byId("global-context-input").value).trim();
+    if (!raw) return;
+    const blocks = raw.split(/\\n\\s*\\n/).map((part) => part.trim()).filter(Boolean);
+    renderContextItems(makeContextItemsFromBlocks(blocks));
+    byId("context-on-demand").checked = true;
+    renderPromptContextStatus("\u5df2\u751f\u6210\u7247\u6bb5\uff0c\u5f85\u4fdd\u5b58");
+  }
+
+  function makeContextItemsFromBlocks(blocks) {
+    return blocks.map(function(part, index) {
+      const title = (part.split("\\n")[0] || ("Context " + (index + 1))).replace(/^#+\\s*/, "").slice(0, 80);
+      const words = (part.toLowerCase().match(/[a-z][a-z0-9_-]{3,}|[\u4e00-\u9fa5]{2,}/g) || [])
+        .filter((word, i, arr) => arr.indexOf(word) === i)
+        .slice(0, 8);
+      return { enabled: true, title, keywords: words, clients: [], models: [], priority: 0, max_chars: 1200, text: part };
+    });
   }
 
   async function refreshModels() {
@@ -5089,6 +5250,11 @@ function renderAdminScript() {
       byId("open-system-prompt-modal").addEventListener("click", openSystemPromptModal);
       byId("close-system-prompt-modal").addEventListener("click", closeSystemPromptModal);
       byId("split-prompt-context").addEventListener("click", splitPromptContextDraft);
+      byId("add-context-item").addEventListener("click", () => addContextItem());
+      byId("classify-context-items").addEventListener("click", classifyContextItemsDraft);
+      ["context-on-demand", "context-item-limit", "context-max-chars"].forEach((id) =>
+        byId(id).addEventListener("input", () => renderPromptContextStatus("\u5f85\u4fdd\u5b58"))
+      );
       byId("apply-system-prompt-modal").addEventListener("click", () => {
         renderPromptContextStatus("\u5f85\u4fdd\u5b58");
         closeSystemPromptModal();

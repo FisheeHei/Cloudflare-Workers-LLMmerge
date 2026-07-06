@@ -289,6 +289,9 @@ assert.equal(adminPage.includes("system-prompt-client-scope"), true);
 assert.equal(adminPage.includes("global-context-client-scope"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
+assert.equal(adminPage.includes("context-on-demand"), true);
+assert.equal(adminPage.includes("context-items"), true);
+assert.equal(adminPage.includes("classifyContextItemsDraft"), true);
 assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("stream-idle-timeout"), true);
 assert.equal(adminPage.includes("900000"), true);
@@ -668,7 +671,20 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/l
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
     routing: { failover: true, load_balance: false },
-    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, system_prompt: "Always obey the gateway rule.", global_context: "Project context should guide details.", upstream_cooldown_ttl: 60 },
+    settings: {
+      model_cache_ttl: 3600,
+      request_timeout_ms: 30000,
+      system_prompt: "Always obey the gateway rule.",
+      global_context: "Project context should guide details.",
+      context_on_demand: true,
+      context_item_limit: 2,
+      context_max_chars: 2000,
+      context_items: [
+        { title: "Coding", keywords: ["bugfix"], text: "Use tests and minimal patches.", enabled: true, max_chars: 1200 },
+        { title: "Travel", keywords: ["hotel"], text: "This travel note should not be injected.", enabled: true, max_chars: 1200 },
+      ],
+      upstream_cooldown_ttl: 60,
+    },
     upstreams: [
       { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["qwen3"], model_contexts: { qwen3: "1m" }, paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     ],
@@ -678,15 +694,19 @@ assert.equal(saveConfigResp.status, 200);
 const savedConfigPayload = await saveConfigResp.clone().json();
 assert.equal(savedConfigPayload.config.upstreams[0].model_contexts.qwen3, "1m");
 assert.equal(savedConfigPayload.config.settings.global_context, "Project context should guide details.");
+assert.equal(savedConfigPayload.config.settings.context_on_demand, true);
+assert.equal(savedConfigPayload.config.settings.context_items.length, 2);
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
-  body: JSON.stringify({ model: "qwen3", messages: [] }),
+  body: JSON.stringify({ model: "qwen3", messages: [{ role: "user", content: "Please bugfix this code." }] }),
 }), env);
 assert.equal(speedHits[cachedConfigHits], "fast");
 assert.deepEqual(speedBodies.at(-1).messages[0], { role: "system", content: "Always obey the gateway rule." });
 assert.equal(speedBodies.at(-1).messages[1].role, "user");
-assert.equal(speedBodies.at(-1).messages[1].content.includes("Project context should guide details."), true);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Use tests and minimal patches."), true);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Project context should guide details."), false);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("travel note"), false);
 
 const scopedStore = new Map();
 scopedStore.set("gateway:config", JSON.stringify({
