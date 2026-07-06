@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-route-context-cache";
+const VERSION = "v26-07-06-trace-route-fallback";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -170,6 +170,7 @@ export default {
         (pathname === CHAT_PATH || pathname === EMBEDDINGS_PATH) &&
         request.method === "POST"
       ) {
+        const traceId = requestTraceId(request);
         const runtime = await loadRuntimeConfig(app);
         const client = await requireClient(request, runtime);
         const bodyText = await request.text();
@@ -207,8 +208,9 @@ export default {
             started,
             promptTokens: pt,
             completionTokens: 0,
+            extra: { trace_id: traceId },
           }), ctx);
-          throw error;
+          return gatewayErrorResponse(error, traceId);
         }
 
         const upstreamResp = proxyResponse.response;
@@ -217,6 +219,7 @@ export default {
         headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
         headers.set("x-llm-gateway-client", client.name || client.id || "client");
         headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+        headers.set("x-llm-gateway-trace-id", traceId);
 
         return await buildLoggedProxyResponse({
           app,
@@ -229,16 +232,18 @@ export default {
           requestPayload: payload,
           proxyResponse,
           started,
+          traceId,
           upstreamResp,
         });
       }
 
       if (pathname === RESPONSES_PATH && request.method === "POST") {
-        return await handleResponsesRequest(request, url, app, ctx);
+        return await handleResponsesRequest(request, url, app, ctx, requestTraceId(request));
       }
 
       // ponytail: translate Anthropic messages <-> OpenAI chat.completions for Claude Code compatibility.
       if (pathname === MESSAGES_PATH && request.method === "POST") {
+        const traceId = requestTraceId(request);
         const started = Date.now();
         const runtime = await loadRuntimeConfig(app);
         const client = await requireClient(request, runtime);
@@ -291,8 +296,9 @@ export default {
             started,
             promptTokens: Math.max(1, Math.round(openaiBody.length / 4)),
             completionTokens: 0,
+            extra: { trace_id: traceId },
           }), ctx);
-          throw error;
+          return gatewayErrorResponse(error, traceId);
         }
 
         const openaiResp = proxyResponse.response;
@@ -321,6 +327,7 @@ export default {
         headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
         headers.set("x-llm-gateway-client", client.name || client.id || "client");
         headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+        headers.set("x-llm-gateway-trace-id", traceId);
         for (const [k, v] of Object.entries(CORS_HEADERS)) {
           headers.set(k, v);
         }
@@ -335,6 +342,7 @@ export default {
           started,
           promptTokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
           completionTokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
+          extra: { trace_id: traceId },
         });
         recordRequestLog(app, msgLogEntry, ctx);
 
@@ -602,7 +610,7 @@ async function getMergedLogs(app) {
   return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse();
 }
 
-async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, upstreamResp }) {
+async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
   const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
     client,
@@ -613,7 +621,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
     started,
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,
-    extra,
+    extra: { trace_id: traceId, ...extra },
   }), ctx);
 
   if (!upstreamResp.ok) {
@@ -1693,7 +1701,7 @@ function normalizeWorkersAiModelId(value) {
   return raw.includes("/") ? `@cf/${raw}` : "";
 }
 
-async function handleResponsesRequest(request, url, app, ctx) {
+async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const started = Date.now();
   const runtime = await loadRuntimeConfig(app);
   const client = await requireClient(request, runtime);
@@ -1721,30 +1729,31 @@ async function handleResponsesRequest(request, url, app, ctx) {
     headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
     headers.set("x-llm-gateway-client", client.name || client.id || "client");
     headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+    headers.set("x-llm-gateway-trace-id", traceId);
     for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
 
     if (!upstreamResp.ok) {
-      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx);
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId);
       return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
     }
 
     if (translated.stream) {
       setSseHeaders(headers);
-      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx);
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId);
       return new Response(withSseKeepAlive(streamResponsesFromChat(upstreamResp, translated.seed)), { status: 200, headers });
     }
 
     const openaiText = await upstreamResp.text();
     const openaiPayload = safeJson(openaiText);
     if (!openaiPayload || looksLikeHtmlDocument(openaiText)) {
-      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx);
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx, traceId);
       return upstreamBadGatewayResponse("Upstream returned a non-JSON API response.", headers);
     }
     const choice = (openaiPayload.choices || [])[0] || {};
     const text = chatContentToText((choice.message || {}).content || "");
     const responsePayload = makeResponsesPayload(translated.seed, text, openaiPayload.usage);
     headers.set("content-type", "application/json; charset=utf-8");
-    recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx);
+    recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId);
     return new Response(JSON.stringify(responsePayload), { status: 200, headers });
   } catch (error) {
     recordRequestLog(app, makeRequestLogEntry({
@@ -1756,8 +1765,9 @@ async function handleResponsesRequest(request, url, app, ctx) {
       started,
       promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
       completionTokens: 0,
+      extra: { trace_id: traceId },
     }), ctx);
-    throw error;
+    return gatewayErrorResponse(error, traceId);
   }
 }
 
@@ -1929,7 +1939,7 @@ function chatContentToText(content) {
   return content.map((part) => typeof part === "string" ? part : String(part?.text || part?.content || "")).join("");
 }
 
-function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx) {
+function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx, traceId) {
   recordRequestLog(app, makeRequestLogEntry({
     client,
     upstream: upstreamName,
@@ -1939,6 +1949,7 @@ function recordResponsesLog(app, client, upstreamName, model, started, status, b
     started,
     promptTokens: usage?.input_tokens || Math.max(1, Math.round(bodyText.length / 4)),
     completionTokens: usage?.output_tokens || 1,
+    extra: { trace_id: traceId },
   }), ctx);
 }
 
@@ -2067,14 +2078,27 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 
 function proxyCandidates(runtime, client, model, pathname) {
   const indexed = runtime.routeIndex?.[pathname];
-  const pool = indexed
+  const indexedPool = indexed
     ? [...(indexed.models[model] || []), ...indexed.wildcard]
-    : runtime.upstreams;
+    : null;
+  const pool = indexedPool && indexedPool.length ? indexedPool : runtime.upstreams;
   return pool.filter((upstream) =>
     clientAllowsUpstream(client, upstream.name) &&
     clientAllowsModel(client, model) &&
-    (indexed || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
+    (indexedPool?.length || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
   );
+}
+
+function gatewayErrorResponse(error, traceId) {
+  const response = withCorsResponse(json(openAiError(error.message || "Internal error.", mapErrorType(error.statusCode)), error.statusCode || 500));
+  return traceResponse(response, traceId);
+}
+
+function traceResponse(response, traceId) {
+  if (!traceId) return response;
+  const headers = new Headers(response.headers);
+  headers.set("x-llm-gateway-trace-id", traceId);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal, upstream }) {
@@ -3164,6 +3188,11 @@ function setSseHeaders(headers) {
 
 function generateClientKey() {
   return `sk-gw-${randomString(40)}`;
+}
+
+function requestTraceId(request) {
+  const incoming = String(request.headers.get("x-request-id") || request.headers.get("x-trace-id") || "").trim();
+  return incoming && incoming.length <= 128 ? incoming : `gw_${randomString(16)}`;
 }
 
 function randomString(length) {

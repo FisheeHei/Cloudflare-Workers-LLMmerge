@@ -496,10 +496,11 @@ assert.deepEqual(aliasModels.data.map((item) => item.id).sort(), [
 const aliasBodyStart = speedBodies.length;
 const aliasChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
-  headers: { authorization: "Bearer sk-alias", "content-type": "application/json" },
+  headers: { authorization: "Bearer sk-alias", "content-type": "application/json", "x-request-id": "trace-alias" },
   body: JSON.stringify({ model: "nvidia-nim/deepseek-v4-flash", messages: [] }),
 }), aliasEnv);
 assert.equal(aliasChatResp.headers.get("x-llm-gateway-upstream"), "nim-alias");
+assert.equal(aliasChatResp.headers.get("x-llm-gateway-trace-id"), "trace-alias");
 assert.equal(speedBodies[aliasBodyStart].model, "deepseek-ai/deepseek-v4-flash");
 
 const qwenBodyStart = speedBodies.length;
@@ -562,6 +563,15 @@ const fanoutChatResp = await worker.default.fetch(new Request("https://gw.test/v
 assert.equal(fanoutChatResp.headers.get("x-llm-gateway-upstream"), "qwen-local");
 assert.equal(speedBodies[fanoutBodyStart].model, "qwen/qwen3-coder-480b-a35b-instruct");
 assert.equal(fetchUrls.slice(fanoutUrlStart).some((url) => url.endsWith("/models")), false);
+
+const routeFallbackBodyStart = speedBodies.length;
+const routeFallbackResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-fanout", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen/qwen3-coder-480b-a35b-instruct", messages: [] }),
+}), fanoutEnv);
+assert.equal(routeFallbackResp.headers.get("x-llm-gateway-upstream"), "qwen-local");
+assert.equal(speedBodies[routeFallbackBodyStart].model, "qwen/qwen3-coder-480b-a35b-instruct");
 
 const modelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
   method: "POST",
@@ -1296,13 +1306,15 @@ const failEnv = {
 };
 const failResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
-  headers: { authorization: "Bearer sk-fail", "content-type": "application/json" },
+  headers: { authorization: "Bearer sk-fail", "content-type": "application/json", "x-trace-id": "trace-fail" },
   body: JSON.stringify({ model: "boom-model", messages: [] }),
 }), failEnv);
 assert.equal(failResp.status, 502);
 assert.equal(failResp.headers.get("retry-after"), "1");
+assert.equal(failResp.headers.get("x-llm-gateway-trace-id"), "trace-fail");
 const failLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), failEnv);
 const failLogs = await failLogsResp.json();
 assert.equal(failLogs.logs.some((entry) => entry.upstream === "boom" && entry.status === 502), true);
+assert.equal(failLogs.logs.some((entry) => entry.trace_id === "trace-fail"), true);
 
 console.log("ok");
