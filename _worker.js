@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-upstream-groups";
+const VERSION = "v26-07-06-prompt-context-layout";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3459,21 +3459,22 @@ function renderAdminStyle() {
     }
     .modal-card h3 { margin: 0 0 14px; font: 700 18px/1.2 Georgia, serif; }
     .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
-    .system-prompt-textarea { min-height: min(24vh, 260px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
-    .context-prompt-textarea { min-height: min(32vh, 360px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
-    .prompt-splitter-textarea { min-height: 140px; font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
-    .prompt-modal-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) minmax(260px, .85fr); gap: 12px; align-items: start; }
-    .prompt-modal-card { width: min(1360px, calc(100vw - 20px)); }
-    .prompt-edit-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 10px; align-items: stretch; }
-    .prompt-client-scope { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; max-height: 180px; overflow: auto; display: flex; gap: 6px; flex-wrap: wrap; align-content: flex-start; }
+    .system-prompt-textarea { min-height: min(30vh, 320px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
+    .context-prompt-textarea { min-height: min(38vh, 440px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
+    .prompt-splitter-textarea { min-height: min(66vh, 680px); font-family: "Cascadia Code","Fira Code",Consolas,monospace; }
+    .prompt-modal-grid { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(420px, 1.25fr) minmax(300px, .85fr); gap: 14px; align-items: start; }
+    .prompt-modal-card { width: min(1560px, calc(100vw - 12px)); }
+    .prompt-main-column { display: grid; gap: 12px; }
+    .prompt-scope-column { display: grid; gap: 12px; align-content: start; }
+    .prompt-client-scope { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; max-height: 220px; overflow: auto; display: flex; gap: 6px; flex-wrap: wrap; align-content: flex-start; }
     .prompt-client-scope label { display: inline-flex; max-width: 100%; align-items: center; border: 1px solid #cfbea0; border-radius: 999px; padding: 5px 8px; font-size: 12px; margin: 0; color: var(--ink); line-height: 1.2; cursor: pointer; background: #fffdfa; }
     .prompt-client-scope label.active { background: #1f8f61; border-color: #1f8f61; color: #fff; }
     .prompt-client-scope input { position: absolute; opacity: 0; pointer-events: none; }
     .prompt-client-scope span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .prompt-splitter-row { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 10px; align-items: start; }
+    .prompt-splitter-row { display: grid; gap: 10px; align-items: start; }
     .context-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
     .context-controls input[type="number"] { width: 84px; }
-    .context-items { display: grid; gap: 8px; max-height: 260px; overflow: auto; padding-right: 2px; }
+    .context-items { display: grid; gap: 8px; max-height: 340px; overflow: auto; padding-right: 2px; }
     .context-item { border: 1px solid #eadcc5; border-radius: 8px; background: #fffdfa; padding: 8px; display: grid; gap: 6px; }
     .context-item-head { display: grid; grid-template-columns: 18px minmax(0, 1fr) 88px auto; gap: 6px; align-items: center; }
     .context-item-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
@@ -3511,7 +3512,6 @@ function renderAdminStyle() {
     .picker-actions button.small { padding: 7px 13px; font-size: 13px; }
     @media (max-width: 760px) {
       .prompt-modal-grid { grid-template-columns: 1fr; }
-      .prompt-edit-grid { grid-template-columns: 1fr; }
       .prompt-client-scope { max-height: 130px; }
       .model-picker-grid { grid-template-columns: 1fr; }
       .model-picker-groups, .model-picker-subgroups { max-height: 150px; }
@@ -3817,23 +3817,20 @@ function renderAdminMarkup(origin) {
     <h3>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</h3>
     <div class="prompt-modal-grid">
       <div class="field">
-        <label>\u7cfb\u7edf\u63d0\u793a\u8bcd</label>
-        <div class="prompt-edit-grid">
-          <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7b80\u77ed\u3001\u5fc5\u987b\u7167\u505a\u7684\u6700\u9ad8\u6307\u4ee4\u3002\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002"></textarea>
-          <div>
-            <label>\u751f\u6548\u5ba2\u6237\u7aef Key</label>
-            <div class="prompt-client-scope" id="system-prompt-client-scope"></div>
-          </div>
+        <label>\u603b\u4f53\u6587\u672c / \u5927\u6587\u672c\u62c6\u5206</label>
+        <div class="prompt-splitter-row">
+          <textarea id="prompt-splitter-input" class="prompt-splitter-textarea" placeholder="\u53ef\u4ee5\u628a\u4e00\u6574\u6bb5\u63d0\u793a\u8bcd\u7c98\u8d34\u5230\u8fd9\u91cc\uff0c\u6309\u6bb5\u843d\u62c6\u5206\u5230\u4e2d\u95f4\u7684\u63d0\u793a\u8bcd / \u4e0a\u4e0b\u6587\u533a\u57df\u3002"></textarea>
+          <button type="button" class="secondary small" id="split-prompt-context">\u62c6\u5206\u5230\u63d0\u793a\u8bcd / \u4e0a\u4e0b\u6587</button>
         </div>
       </div>
-      <div class="field">
-        <label>\u5168\u5c40\u4e0a\u4e0b\u6587</label>
-        <div class="prompt-edit-grid">
+      <div class="prompt-main-column">
+        <div class="field">
+          <label>\u7cfb\u7edf\u63d0\u793a\u8bcd</label>
+          <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7b80\u77ed\u3001\u5fc5\u987b\u7167\u505a\u7684\u6700\u9ad8\u6307\u4ee4\u3002\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002"></textarea>
+        </div>
+        <div class="field">
+          <label>\u5168\u5c40\u4e0a\u4e0b\u6587</label>
           <textarea id="global-context-input" class="context-prompt-textarea" placeholder="\u66f4\u957f\u7684\u80cc\u666f\u3001\u504f\u597d\u548c\u7ec6\u5316\u8981\u6c42\u3002\u4f1a\u4f5c\u4e3a\u53c2\u8003\u4e0a\u4e0b\u6587\u9644\u52a0\u5230 Chat/Responses/Messages \u8bf7\u6c42\u3002"></textarea>
-          <div>
-            <label>\u751f\u6548\u5ba2\u6237\u7aef Key</label>
-            <div class="prompt-client-scope" id="global-context-client-scope"></div>
-          </div>
         </div>
         <div class="context-controls">
           <label class="note"><input type="checkbox" id="context-on-demand"> \u6309\u9700\u6ce8\u5165\u7247\u6bb5</label>
@@ -3842,17 +3839,20 @@ function renderAdminMarkup(origin) {
           <button type="button" class="secondary small" id="add-context-item">\u65b0\u589e\u7247\u6bb5</button>
           <button type="button" class="secondary small" id="classify-context-items">\u4ece\u5927\u6587\u672c\u751f\u6210\u7247\u6bb5</button>
         </div>
+        <div class="context-items" id="context-items"></div>
+      </div>
+      <div class="prompt-scope-column">
+        <div class="field">
+          <label>\u7cfb\u7edf\u63d0\u793a\u8bcd\u751f\u6548\u5ba2\u6237\u7aef Key</label>
+          <div class="prompt-client-scope" id="system-prompt-client-scope"></div>
+        </div>
+        <div class="field">
+          <label>\u5168\u5c40\u4e0a\u4e0b\u6587\u751f\u6548\u5ba2\u6237\u7aef Key</label>
+          <div class="prompt-client-scope" id="global-context-client-scope"></div>
+        </div>
         <div class="field">
           <label>\u5168\u91cf\u6ce8\u5165\u5ba2\u6237\u7aef Key <span class="note">\u4e0d\u9009=\u4e0d\u5f3a\u5236\u5168\u91cf\uff1b\u9009\u4e2d\u540e\u5ffd\u7565\u5173\u952e\u8bcd\uff0c\u4f46\u4ecd\u6309\u6700\u591a\u5b57\u7b26\u622a\u65ad</span></label>
           <div class="prompt-client-scope" id="context-always-client-scope"></div>
-        </div>
-        <div class="context-items" id="context-items"></div>
-      </div>
-      <div class="field">
-        <label>\u5927\u6587\u672c\u62c6\u5206</label>
-        <div class="prompt-splitter-row">
-          <textarea id="prompt-splitter-input" class="prompt-splitter-textarea" placeholder="\u53ef\u4ee5\u628a\u4e00\u6574\u6bb5\u63d0\u793a\u8bcd\u7c98\u8d34\u5230\u8fd9\u91cc\uff0c\u6309\u6bb5\u843d\u62c6\u5206\u5230\u4e0a\u9762\u4e24\u4e2a\u6846\u3002"></textarea>
-          <button type="button" class="secondary small" id="split-prompt-context">\u62c6\u5206\u5230\u63d0\u793a\u8bcd / \u4e0a\u4e0b\u6587</button>
         </div>
       </div>
     </div>
