@@ -462,7 +462,7 @@ aliasStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
   upstreams: [
-    { name: "nim-alias", preset: "nvidia-nim", base_url: "https://speed-fast.example/v1", api_key_encrypted: "n", models: ["deepseek-ai/deepseek-v4-flash", "google/codegemma-7b", "qwen/qwen3-coder-480b-a35b-instruct"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "nim-alias", preset: "nvidia-nim", base_url: "https://speed-fast.example/v1", api_key_encrypted: "n", models: ["deepseek-ai/deepseek-v4-flash", "google/codegemma-7b", "qwen/qwen3-coder-480b-a35b-instruct", "z-ai/glm-5.2"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "cf-alias", preset: "workers-ai", base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1", api_key_encrypted: "c", models: ["@cf/deepseek-ai/deepseek-v4-flash"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
   ],
 }));
@@ -485,6 +485,7 @@ const aliasModels = await aliasModelsResp.json();
 assert.deepEqual(aliasModels.data.map((item) => item.id).sort(), [
   "nvidia-nim/codegemma-7b",
   "nvidia-nim/deepseek-v4-flash",
+  "nvidia-nim/glm-5.2",
   "nvidia-nim/qwen3-coder-480b-a35b-instruct",
   "workers-ai/deepseek-v4-flash",
 ]);
@@ -505,6 +506,19 @@ const qwenChatResp = await worker.default.fetch(new Request("https://gw.test/v1/
 }), aliasEnv);
 assert.equal(qwenChatResp.headers.get("x-llm-gateway-upstream"), "nim-alias");
 assert.equal(speedBodies[qwenBodyStart].model, "qwen/qwen3-coder-480b-a35b-instruct");
+
+const glmAliasBodyStart = speedBodies.length;
+const glmAliasChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias", "content-type": "application/json" },
+  body: JSON.stringify({ model: "nvidia-nim/glm-5.2", messages: [], reasoning_effort: "high", reasoning_summary: "auto", reasoning: { effort: "high" }, thinking: {} }),
+}), aliasEnv);
+assert.equal(glmAliasChatResp.headers.get("x-llm-gateway-upstream"), "nim-alias");
+assert.equal(speedBodies[glmAliasBodyStart].model, "z-ai/glm-5.2");
+assert.equal("reasoning" in speedBodies[glmAliasBodyStart], false);
+assert.equal("reasoning_effort" in speedBodies[glmAliasBodyStart], false);
+assert.equal("reasoning_summary" in speedBodies[glmAliasBodyStart], false);
+assert.equal("thinking" in speedBodies[glmAliasBodyStart], false);
 
 const fanoutStore = new Map();
 fanoutStore.set("gateway:config", JSON.stringify({

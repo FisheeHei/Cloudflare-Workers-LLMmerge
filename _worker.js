@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-html-upstream-guard";
+const VERSION = "v26-07-06-glm-call-fix";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1367,7 +1367,7 @@ async function listModels(client, runtime) {
 async function resolveClientModelAlias(client, runtime, model) {
   const value = String(model || "").trim();
   if (!value || value.includes("@cf/")) return value;
-  if (value.includes("/") || isQwenModel(value)) {
+  if (value.includes("/") || isLooseAliasModel(value)) {
     const allResults = runtime.upstreams
       .filter((upstream) => clientAllowsUpstream(client, upstream.name))
       .flatMap((upstream) => configuredUpstreamModels(upstream)
@@ -1377,7 +1377,7 @@ async function resolveClientModelAlias(client, runtime, model) {
     const hit = rows.find((row) => row.alias === value || row.model === value);
     if (hit) return hit.model;
     const fuzzy = rows.filter((row) =>
-      isQwenModel(row.model) && (modelsMatch(value, row.alias) || modelsMatch(value, row.model))
+      isLooseAliasModel(row.model) && (modelsMatch(value, row.alias) || modelsMatch(value, row.model))
     );
     if (fuzzy.length === 1) return fuzzy[0].model;
   }
@@ -1434,12 +1434,16 @@ function isQwenModel(model) {
   return String(model || "").toLowerCase().includes("qwen");
 }
 
+function isLooseAliasModel(model) {
+  return isQwenModel(model) || /(^|[\/_.-])glm([\/_.-]|$)/i.test(String(model || ""));
+}
+
 function modelsMatch(left, right) {
   const a = String(left || "").trim();
   const b = String(right || "").trim();
   if (!a || !b) return false;
   if (a === b) return true;
-  if (!isQwenModel(a) && !isQwenModel(b)) return false;
+  if (!isLooseAliasModel(a) && !isLooseAliasModel(b)) return false;
   const lowerA = a.toLowerCase();
   const lowerB = b.toLowerCase();
   return lowerA === lowerB || modelSuffix(a).toLowerCase() === modelSuffix(b).toLowerCase();
@@ -2414,7 +2418,9 @@ function sanitizeProxyBody(bodyText, upstream) {
 function bodyNeedsSanitizing(bodyText, isNvidia) {
   return bodyText.includes('"thinking"') ||
     bodyText.includes('"reasoning"') ||
+    bodyText.includes('"reasoning_effort"') ||
     bodyText.includes('"reasoningEffort"') ||
+    bodyText.includes('"reasoning_summary"') ||
     bodyText.includes('"reasoningSummary"') ||
     bodyText.includes('"providerOptions"') ||
     bodyText.includes('"provider_options"') ||
@@ -2474,6 +2480,10 @@ function normalizeReasoningFields(payload, isGlm) {
   }
   if ("reasoningSummary" in payload) {
     delete payload.reasoningSummary;
+    changed = true;
+  }
+  if ("reasoning_summary" in payload) {
+    delete payload.reasoning_summary;
     changed = true;
   }
   if ("thinking" in payload) {
