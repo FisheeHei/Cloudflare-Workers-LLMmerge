@@ -34,9 +34,10 @@ const STDTIME_URL = "https://stdtime.gov.hk/";
 const STDTIME_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
+const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-active-spread";
+const VERSION = "v26-07-06-sse-keepalive";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -608,7 +609,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
 
   const contentType = upstreamResp.headers.get("content-type") || "";
   if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
-    const body = trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log);
+    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log));
     return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -667,6 +668,49 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone) {
         finish();
         controller.error(error);
       }
+    },
+  });
+}
+
+export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
+  if (!body) return body;
+  const encoder = new TextEncoder();
+  const ping = encoder.encode(": keepalive\n\n");
+  const interval = Math.max(1, Number(intervalMs) || SSE_KEEPALIVE_MS);
+  let reader = null;
+  let timer = null;
+  let closed = false;
+  const cleanup = () => {
+    closed = true;
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+  return new ReadableStream({
+    async start(controller) {
+      reader = body.getReader();
+      timer = setInterval(() => {
+        if (!closed && controller.desiredSize > 0) controller.enqueue(ping);
+      }, interval);
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        if (!closed) {
+          cleanup();
+          controller.close();
+        }
+      } catch (error) {
+        if (!closed) {
+          cleanup();
+          controller.error(error);
+        }
+      }
+    },
+    async cancel(reason) {
+      cleanup();
+      try { await reader?.cancel(reason); } catch {}
     },
   });
 }
@@ -1603,7 +1647,7 @@ async function handleResponsesRequest(request, url, app, ctx) {
       headers.set("content-type", "text/event-stream; charset=utf-8");
       headers.set("cache-control", "no-cache");
       recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx);
-      return new Response(streamResponsesFromChat(upstreamResp, translated.seed), { status: 200, headers });
+      return new Response(withSseKeepAlive(streamResponsesFromChat(upstreamResp, translated.seed)), { status: 200, headers });
     }
 
     const openaiPayload = parseJsonBody(await upstreamResp.text());

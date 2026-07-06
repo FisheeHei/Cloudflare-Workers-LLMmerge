@@ -3,6 +3,17 @@ import assert from "node:assert/strict";
 
 const code = fs.readFileSync("_worker.js", "utf8");
 const worker = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
+const keepaliveEncoder = new TextEncoder();
+const keepaliveText = await new Response(worker.withSseKeepAlive(new ReadableStream({
+  start(controller) {
+    setTimeout(() => {
+      controller.enqueue(keepaliveEncoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    }, 30);
+  },
+}), 5)).text();
+assert.equal(keepaliveText.includes(": keepalive\n\n"), true);
+assert.equal(keepaliveText.includes("data: [DONE]"), true);
 
 const bodies = [];
 const fetchUrls = [];
