@@ -282,6 +282,8 @@ assert.equal(adminPage.includes("global-context-client-scope"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("180000"), true);
+assert.equal(adminPage.includes("stream-idle-timeout"), true);
+assert.equal(adminPage.includes("900000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
 assert.equal(adminPage.includes("id=\"stat-tip\""), true);
 assert.equal(adminPage.includes("data-stat-kind"), true);
@@ -304,6 +306,7 @@ assert.equal(adminPage.includes("model-context-input"), true);
 assert.equal(adminPage.includes("delete-model-row"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
 const configPayload = await configResp.json();
+assert.equal(configPayload.config.settings.stream_idle_timeout_ms, 900000);
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
 assert.equal(openRouterPreset.name, "OpenRouter");
 assert.equal(openRouterPreset.base_url, "https://openrouter.ai/api/v1");
@@ -914,6 +917,8 @@ const responsesStreamResp = await worker.default.fetch(new Request("https://gw.t
   body: JSON.stringify({ model: "stream-model", input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }], stream: true }),
 }), responsesEnv);
 assert.equal(responsesStreamResp.headers.get("content-type").includes("text/event-stream"), true);
+assert.equal(responsesStreamResp.headers.get("cache-control"), "no-cache, no-transform");
+assert.equal(responsesStreamResp.headers.get("x-accel-buffering"), "no");
 const responsesStreamText = await responsesStreamResp.text();
 assert.equal(responseStreamHits[0].stream, true);
 assert.equal(responsesStreamText.includes('"type":"response.output_text.delta"'), true);
@@ -1151,11 +1156,18 @@ const usageStreamResp = await worker.default.fetch(new Request("https://gw.test/
 }), usageEnv);
 assert.equal(usageStreamResp.headers.get("content-length"), null);
 assert.equal(usageStreamResp.headers.get("content-encoding"), null);
+assert.equal(usageStreamResp.headers.get("cache-control"), "no-cache, no-transform");
+assert.equal(usageStreamResp.headers.get("x-accel-buffering"), "no");
 await usageStreamResp.text();
 const usageLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), usageEnv);
 const usageLogs = await usageLogsResp.json();
 assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-json" && entry.prompt_tokens === 11 && entry.completion_tokens === 22), true);
 assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-stream" && entry.prompt_tokens === 7 && entry.completion_tokens === 9), true);
+const usageStreamLog = usageLogs.logs.find((entry) => entry.model === "usage-stream");
+assert.equal(usageStreamLog.close_reason, "done");
+assert.equal(Number.isFinite(usageStreamLog.time_to_first_byte_ms), true);
+assert.equal(Number.isFinite(usageStreamLog.time_to_first_token_ms), true);
+assert.equal(Number.isFinite(usageStreamLog.max_stream_gap_ms), true);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({

@@ -25,6 +25,7 @@ const LOG_KEY = "gateway:logs";
 const STATS_PREFIX = "gateway:stats:";
 const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 180000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const HK_TIME_ZONE = "Asia/Hong_Kong";
@@ -37,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-sse-soft-close";
+const VERSION = "v26-07-06-stream-diagnostics";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -401,6 +402,7 @@ function createApp(env) {
     adminToken,
     defaultCooldownTtl: parsePositiveInt(env.UPSTREAM_COOLDOWN_TTL, DEFAULT_COOLDOWN_TTL),
     defaultModelCacheTtl: parsePositiveInt(env.MODEL_CACHE_TTL, DEFAULT_MODEL_CACHE_TTL),
+    defaultStreamIdleTimeoutMs: parsePositiveInt(env.STREAM_IDLE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS),
     defaultTimeoutMs: parsePositiveInt(env.REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     encryptionSecret: String(env.API_KEY_CRYPT_SECRET || adminToken || ""),
     env,
@@ -590,7 +592,7 @@ async function getMergedLogs(app) {
 
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
-  const log = (usage, statusOverride) => recordRequestLog(app, {
+  const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, {
     ts: hkNowIso(),
     client: client.name || client.id || "client",
     upstream: proxyResponse.upstream.name,
@@ -600,6 +602,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
     latency_ms: Date.now() - started,
     prompt_tokens: usage.prompt_tokens,
     completion_tokens: usage.completion_tokens,
+    ...extra,
   }, ctx);
 
   if (!upstreamResp.ok) {
@@ -609,7 +612,8 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
 
   const contentType = upstreamResp.headers.get("content-type") || "";
   if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
-    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log));
+    setSseHeaders(headers);
+    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started));
     return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -629,17 +633,27 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
 }
 
-function trackOpenAiStreamUsage(body, fallbackPrompt, onDone) {
+function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now()) {
   const decoder = new TextDecoder();
   let buffer = "";
   let usage = null;
   let outputText = "";
   let logged = false;
   let failureStatus = 0;
+  let firstByteMs = 0;
+  let firstTokenMs = 0;
+  let lastChunkAt = started;
+  let maxStreamGapMs = 0;
+  let closeReason = "done";
   const finish = () => {
     if (logged) return;
     logged = true;
-    onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)), failureStatus || 0);
+    onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)), failureStatus || 0, {
+      close_reason: closeReason,
+      max_stream_gap_ms: maxStreamGapMs,
+      time_to_first_byte_ms: firstByteMs,
+      time_to_first_token_ms: firstTokenMs,
+    });
   };
 
   return new ReadableStream({
@@ -649,22 +663,31 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone) {
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
+          const now = Date.now();
+          if (!firstByteMs) firstByteMs = now - started;
+          maxStreamGapMs = Math.max(maxStreamGapMs, now - lastChunkAt);
+          lastChunkAt = now;
           buffer += decoder.decode(value, { stream: true });
           readOpenAiStreamBlocks(buffer, (rest) => { buffer = rest; }, (chunk) => {
             if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
             usage = chunk.usage || usage;
-            outputText += chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+            const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+            if (delta && !firstTokenMs) firstTokenMs = now - started;
+            outputText += delta;
           });
           controller.enqueue(value);
         }
         if (buffer) readOpenAiStreamBlocks(buffer + "\n\n", (rest) => { buffer = rest; }, (chunk) => {
           if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
           usage = chunk.usage || usage;
-          outputText += chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+          const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+          if (delta && !firstTokenMs) firstTokenMs = Date.now() - started;
+          outputText += delta;
         });
         finish();
         controller.close();
       } catch (error) {
+        closeReason = "error";
         finish();
         controller.error(error);
       }
@@ -1035,6 +1058,7 @@ async function repairStoredGatewayConfig(config, app) {
     settings: {
       model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
       request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
+      stream_idle_timeout_ms: parsePositiveInt(settings.stream_idle_timeout_ms, app.defaultStreamIdleTimeoutMs),
       system_prompt: String(settings.system_prompt || ""),
       system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
       global_context: String(settings.global_context || settings.context_prompt || ""),
@@ -1095,6 +1119,7 @@ async function buildGatewayConfigFromEnv(app) {
     settings: {
       model_cache_ttl: app.defaultModelCacheTtl,
       request_timeout_ms: app.defaultTimeoutMs,
+      stream_idle_timeout_ms: app.defaultStreamIdleTimeoutMs,
       system_prompt: String(app.env.SYSTEM_PROMPT || app.env.GLOBAL_SYSTEM_PROMPT || ""),
       system_prompt_clients: [],
       global_context: String(app.env.GLOBAL_CONTEXT || app.env.GLOBAL_SYSTEM_CONTEXT || ""),
@@ -1167,6 +1192,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
     settings: {
       model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
       request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
+      stream_idle_timeout_ms: parsePositiveInt(settings.stream_idle_timeout_ms, app.defaultStreamIdleTimeoutMs),
       system_prompt: String(settings.system_prompt || ""),
       system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
       global_context: String(settings.global_context || settings.context_prompt || ""),
@@ -1244,6 +1270,7 @@ async function loadRuntimeConfig(app) {
     kv: app.kv,
     modelCacheTtl: editable.settings.model_cache_ttl,
     requestTimeoutMs: editable.settings.request_timeout_ms,
+    streamIdleTimeoutMs: editable.settings.stream_idle_timeout_ms,
     routing: editable.routing,
     settings: editable.settings,
     upstreamCooldownTtl: editable.settings.upstream_cooldown_ttl,
@@ -1646,8 +1673,7 @@ async function handleResponsesRequest(request, url, app, ctx) {
     }
 
     if (translated.stream) {
-      headers.set("content-type", "text/event-stream; charset=utf-8");
-      headers.set("cache-control", "no-cache");
+      setSseHeaders(headers);
       recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx);
       return new Response(withSseKeepAlive(streamResponsesFromChat(upstreamResp, translated.seed)), { status: 200, headers });
     }
@@ -1964,6 +1990,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
           body: sanitizeProxyBody(bodyText, upstream),
         },
         runtime.requestTimeoutMs,
+        runtime.streamIdleTimeoutMs,
       );
       const upstreamLatency = Date.now() - upstreamStarted;
 
@@ -2092,6 +2119,7 @@ async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runti
             signal: controllers[index].signal,
           },
           runtime.requestTimeoutMs,
+          runtime.streamIdleTimeoutMs,
         );
         return { response, upstream, index, latency: Date.now() - started };
       } catch (error) {
@@ -2879,8 +2907,9 @@ function getBearerToken(request) {
   return auth.slice("Bearer ".length).trim();
 }
 
-async function fetchWithTimeout(url, init, timeoutMs) {
+async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs) {
   const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
+  const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
   const controller = new AbortController();
   const upstreamSignal = init?.signal;
   const abort = () => controller.abort(upstreamSignal?.reason || "timeout");
@@ -2892,7 +2921,7 @@ async function fetchWithTimeout(url, init, timeoutMs) {
     const response = await fetch(url, { ...init, signal: controller.signal });
     clearTimeout(timer);
     upstreamSignal?.removeEventListener("abort", abort);
-    return wrapIdleTimeout(response, timeout);
+    return wrapIdleTimeout(response, idleTimeout);
   } catch (error) {
     clearTimeout(timer);
     upstreamSignal?.removeEventListener("abort", abort);
@@ -2951,6 +2980,13 @@ function responseBodyHeaders(headers) {
   const safe = new Headers(headers);
   ["content-length", "content-encoding", "transfer-encoding"].forEach((name) => safe.delete(name));
   return safe;
+}
+
+function setSseHeaders(headers) {
+  headers.set("content-type", "text/event-stream; charset=utf-8");
+  headers.set("cache-control", "no-cache, no-transform");
+  headers.set("x-accel-buffering", "no");
+  headers.delete("content-length");
 }
 
 function generateClientKey() {
@@ -3484,9 +3520,10 @@ function renderAdminPage(origin) {
     <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
     <div class="settings-body">
       <div class="row">
-        <div class="field span-4"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba4180000)</label><input id="request-timeout" type="number" min="1000" placeholder="180000"></div>
-        <div class="field span-4"><label>\u51b7\u5374 TTL (s, \u9ed8\u8ba460)</label><input id="cooldown-ttl" type="number" min="1" placeholder="60"></div>
-        <div class="field span-4"><label>\u6a21\u578b\u7f13\u5b58 TTL (s, \u9ed8\u8ba43600)</label><input id="model-cache-ttl" type="number" min="1" placeholder="3600"></div>
+        <div class="field span-3"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba4180000)</label><input id="request-timeout" type="number" min="1000" placeholder="180000"></div>
+        <div class="field span-3"><label>\u6d41\u5f0f\u7a7a\u95f2\u8d85\u65f6 (ms, \u9ed8\u8ba4900000)</label><input id="stream-idle-timeout" type="number" min="1000" placeholder="900000"></div>
+        <div class="field span-3"><label>\u51b7\u5374 TTL (s, \u9ed8\u8ba460)</label><input id="cooldown-ttl" type="number" min="1" placeholder="60"></div>
+        <div class="field span-3"><label>\u6a21\u578b\u7f13\u5b58 TTL (s, \u9ed8\u8ba43600)</label><input id="model-cache-ttl" type="number" min="1" placeholder="3600"></div>
       </div>
       <div class="row">
         <div class="field span-3">
@@ -4093,6 +4130,7 @@ function renderAdminPage(origin) {
     return {
       settings: {
         request_timeout_ms: Number(byId("request-timeout").value || 180000),
+        stream_idle_timeout_ms: Number(byId("stream-idle-timeout").value || 900000),
         upstream_cooldown_ttl: Number(byId("cooldown-ttl").value || 60),
         model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
         system_prompt: byId("system-prompt-input").value,
@@ -4120,6 +4158,7 @@ function renderAdminPage(origin) {
     var s = state.config && state.config.settings || {};
     var r = state.config && state.config.routing || {};
     byId("request-timeout").value = s.request_timeout_ms || "";
+    byId("stream-idle-timeout").value = s.stream_idle_timeout_ms || "";
     byId("cooldown-ttl").value = s.upstream_cooldown_ttl || "";
     byId("model-cache-ttl").value = s.model_cache_ttl || "";
     byId("system-prompt-input").value = s.system_prompt || "";
@@ -4849,6 +4888,10 @@ function renderAdminPage(origin) {
 
   /* ---- Logs ---- */
   
+  function streamDiag(l) {
+    if (!l || l.time_to_first_byte_ms == null) return "";
+    return "B" + (l.time_to_first_byte_ms || 0) + "/T" + (l.time_to_first_token_ms || 0) + "/G" + (l.max_stream_gap_ms || 0) + " " + (l.close_reason || "");
+  }
 
   function renderLogs(logs) {
     if (!logs.length) {
@@ -4865,7 +4908,7 @@ function renderAdminPage(origin) {
     byId("token-total").textContent = "\u603b\u8ba1: " + totalPrompt + " input + " + totalCompletion + " output = " + (totalPrompt + totalCompletion) + " tokens (" + logs.length + " \u8bf7\u6c42)";
 
     byId("log-list").innerHTML = toggle + '<table class="log-table"><thead><tr>' +
-      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Tokens</th>' +
+      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tokens</th>' +
     '</tr></thead><tbody>' +
     visibleLogs.map((l) => '<tr>' +
       '<td>' + esc((l.ts || "").slice(11, 19)) + '</td>' +
@@ -4875,6 +4918,7 @@ function renderAdminPage(origin) {
       '<td class="mono">' + esc((l.path || "").replace("/v1/", "")) + '</td>' +
       '<td class="' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</td>' +
       '<td>' + esc(l.latency_ms) + 'ms</td>' +
+      '<td class="mono">' + esc(streamDiag(l)) + '</td>' +
       '<td>' + esc(l.prompt_tokens || 0) + '/' + esc(l.completion_tokens || 0) + '</td>' +
     '</tr>').join("") +
     '</tbody></table>';
