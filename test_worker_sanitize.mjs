@@ -1051,6 +1051,40 @@ const longIdleRuntime = await longIdleRuntimeResp.json();
 assert.equal(longIdleRuntime.active_upstreams["long-stream"], undefined);
 assert.equal(longStreamHits.length, 1);
 
+const spreadStore = new Map();
+spreadStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "busy", base_url: "https://long-stream.example/v1", api_key_encrypted: "b", models: ["spread-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "idle", base_url: "https://speed-fast.example/v1", api_key_encrypted: "i", models: ["spread-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const spreadEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = spreadStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { spreadStore.set(key, value); },
+    async delete(key) { spreadStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "spread-client", key: "sk-spread", models: ["*"], upstreams: ["busy", "idle"] }]),
+};
+const spreadBusyResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-spread", "content-type": "application/json" },
+  body: JSON.stringify({ model: "spread-model", messages: [] }),
+}), spreadEnv);
+const spreadResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-spread", "content-type": "application/json" },
+  body: JSON.stringify({ model: "spread-model", messages: [] }),
+}), spreadEnv);
+assert.equal(spreadResp.headers.get("x-llm-gateway-upstream"), "idle");
+await spreadBusyResp.text();
+
 const usageStore = new Map();
 usageStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },

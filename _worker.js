@@ -36,7 +36,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-05-glm-zhipu";
+const VERSION = "v26-07-06-active-spread";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2149,12 +2149,12 @@ async function orderUpstreams(runtime, candidates) {
   });
 
   const orderedHealthy = runtime.routing.load_balance === false
-    ? latencySort(prioritySort(healthy))
-    : latencySort(weightedShuffle(healthy));
+    ? activeSort(latencySort(prioritySort(healthy)))
+    : activeSort(latencySort(weightedShuffle(healthy)));
 
   const orderedCooling = runtime.routing.load_balance === false
-    ? latencySort(prioritySort(cooling))
-    : latencySort(weightedShuffle(cooling));
+    ? activeSort(latencySort(prioritySort(cooling)))
+    : activeSort(latencySort(weightedShuffle(cooling)));
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
   if (runtime.routing.failover === false) {
@@ -2171,6 +2171,14 @@ function prioritySort(items) {
 
 function latencySort(items) {
   return [...items].sort((a, b) => upstreamLatencyScore(a) - upstreamLatencyScore(b));
+}
+
+function activeSort(items) {
+  return [...items].sort((a, b) => activeUpstreamCount(a) - activeUpstreamCount(b));
+}
+
+function activeUpstreamCount(upstream) {
+  return Number(_activeUpstreams[String(upstream?.name || "").trim()] || 0) || 0;
 }
 
 function upstreamLatencyScore(upstream) {
