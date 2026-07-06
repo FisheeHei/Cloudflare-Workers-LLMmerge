@@ -779,48 +779,11 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   const apiPath = pathname.slice(adminBasePath.length);
 
   if (apiPath === "/api/config" && request.method === "GET") {
-    const stored = await getEditableConfig(app);
-    return withCorsResponse(
-      json(
-        {
-          ok: true,
-          gateway: {
-            base_url: `${url.origin}/v1`,
-          },
-          presets: PRESET_TEMPLATES,
-          config: toPublicGatewayConfig(stored),
-        },
-        200,
-      ),
-    );
+    return adminConfigResponse(url, app);
   }
 
   if (apiPath === "/api/config" && request.method === "PUT") {
-    const payload = parseJsonBody(await request.text());
-    // ponytail: merge into existing so a partial payload never wipes upstreams
-    const existing = await getEditableConfig(app);
-    const hasUpstreams = Object.prototype.hasOwnProperty.call(payload, "upstreams");
-    const merged = {
-      settings: { ...existing.settings, ...(payload.settings || {}) },
-      routing: { ...existing.routing, ...(payload.routing || {}) },
-      upstreams: hasUpstreams && Array.isArray(payload.upstreams)
-        ? payload.upstreams
-        : (existing.upstreams || []),
-    };
-    const normalized = await normalizeGatewayConfigPayload(merged, app);
-    await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
-    invalidateRuntimeCache();
-
-    return withCorsResponse(
-      json(
-        {
-          ok: true,
-          message: "Configuration saved.",
-          config: toPublicGatewayConfig(normalized),
-        },
-        200,
-      ),
-    );
+    return saveAdminConfig(request, app);
   }
 
   if (apiPath === "/api/refresh" && request.method === "POST") {
@@ -887,41 +850,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
       // ponytail: fetch model list from a saved or draft upstream for picker
   if (apiPath === "/api/fetch-models" && request.method === "POST") {
-    const payload = parseJsonBody(await request.text());
-    let ups = null;
-    const uName = payload.name || "";
-    if (uName) {
-      const runtime = await loadRuntimeConfig(app);
-      ups = runtime.upstreams.find((u) => u.name === uName);
-      if (!ups) return withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404));
-      ups = {
-        ...ups,
-        account_id: String(payload.account_id || ups.account_id || "").trim(),
-        api_key: String(payload.api_key || payload.api_key_value || ups.api_key || "").trim(),
-        base_url: String(payload.base_url || ups.base_url || "").trim(),
-        headers: { ...normalizeHeaders(ups.headers), ...normalizeHeaders(payload.headers) },
-        preset: String(payload.preset || ups.preset || inferPresetId(payload.base_url || ups.base_url)).trim(),
-      };
-    } else {
-      const baseUrl = String(payload.base_url || "").trim();
-      const apiKey = String(payload.api_key || payload.api_key_value || "").trim();
-      if (!baseUrl || !apiKey) return withCorsResponse(json({ ok: false, error: "Base URL and API Key are required" }, 400));
-      ups = {
-        name: "draft",
-        account_id: String(payload.account_id || "").trim(),
-        base_url: baseUrl,
-        api_key: apiKey,
-        headers: normalizeHeaders(payload.headers),
-        preset: String(payload.preset || inferPresetId(baseUrl)).trim(),
-      };
-    }
-    try {
-      const models = await fetchUpstreamModelIds(ups, 15000);
-      return withCorsResponse(json({ ok: true, models }, 200));
-    } catch (err) {
-      const status = err.status && err.status < 500 ? err.status : 502;
-      return withCorsResponse(json({ ok: false, status: err.status || status, error: err.message }, status));
-    }
+    return fetchAdminModels(request, app);
   }
 
   if (apiPath === "/api/upstreams/export" && request.method === "GET") {
@@ -939,63 +868,141 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/speed-test" && request.method === "POST") {
-    const runtime = await loadRuntimeConfig(app);
-    const payload = parseJsonBody(await request.text());
-    const model = String(payload.model || "").trim();
-    if (!model) {
-      return withCorsResponse(json(openAiError("Model is required for speed test.", "invalid_request_error"), 400));
-    }
-    const upstreamNames = new Set(normalizeStringArray(payload.upstreams));
-    const targets = runtime.upstreams
-      .filter((upstream) =>
-        upstream.enabled !== false &&
-        (!upstreamNames.size || upstreamNames.has(upstream.name)) &&
-        upstreamSupportsModel(upstream, model) &&
-        upstreamSupportsPath(upstream, CHAT_PATH)
-      );
-    const results = await Promise.all(targets.map((upstream) => speedTestUpstream(runtime, upstream, model)));
-    return withCorsResponse(json({ ok: true, results }, 200));
+    return speedTestAdminUpstreams(request, app);
   }
 
 // ponytail: detect uses single getEditableConfig call, not loadRuntimeConfig + getEditableConfig
   const detectMatch = apiPath.match(/^\/api\/upstreams\/([^/]+)\/detect$/);
   if (detectMatch && request.method === "POST") {
-    const upstreamName = decodeURIComponent(detectMatch[1]);
-    const config = await getEditableConfig(app);
-    const upstream = config.upstreams.find((u) => u.name === upstreamName);
-    if (!upstream) {
-      return withCorsResponse(json(openAiError("Upstream not found.", "not_found_error"), 404));
-    }
-    const apiKey = await decryptValue(upstream.api_key_encrypted, app.encryptionSecret);
-    const started = Date.now();
-    try {
-      const resp = await fetchWithTimeout(
-        buildUpstreamUrl(upstream.base_url, EMBEDDINGS_PATH, ""),
-        {
-          method: "POST",
-          headers: { "authorization": "Bearer " + apiKey, "content-type": "application/json", "accept": "application/json", "user-agent": "cf-llm-gateway/0.3" },
-          body: JSON.stringify({ model: "detect", input: "test" }),
-        },
-        10000,
-      );
-      const latency = Date.now() - started;
-      const ok = resp.ok || resp.status === 400;
-      const capability = ok ? "openai" : "claude";
-      const paths = ok ? [CHAT_PATH, EMBEDDINGS_PATH] : [CHAT_PATH];
-      const target = config.upstreams.find((u) => u.name === upstreamName);
-      if (target) {
-        target.capability = capability;
-        target.paths = paths;
-        await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(config));
-        invalidateRuntimeCache();
-      }
-      return withCorsResponse(json({ ok: true, capability, paths, latency_ms: latency }, 200));
-    } catch (err) {
-      return withCorsResponse(json({ ok: true, capability: "claude", paths: [CHAT_PATH], latency_ms: Date.now() - started }, 200));
-    }
+    return detectAdminUpstream(app, decodeURIComponent(detectMatch[1]));
   }
 
   return withCorsResponse(json(openAiError("Admin route not found.", "not_found_error"), 404));
+}
+
+async function adminConfigResponse(url, app) {
+  const stored = await getEditableConfig(app);
+  return withCorsResponse(json({
+    ok: true,
+    gateway: { base_url: `${url.origin}/v1` },
+    presets: PRESET_TEMPLATES,
+    config: toPublicGatewayConfig(stored),
+  }, 200));
+}
+
+async function saveAdminConfig(request, app) {
+  const payload = parseJsonBody(await request.text());
+  // ponytail: merge into existing so a partial payload never wipes upstreams
+  const existing = await getEditableConfig(app);
+  const hasUpstreams = Object.prototype.hasOwnProperty.call(payload, "upstreams");
+  const merged = {
+    settings: { ...existing.settings, ...(payload.settings || {}) },
+    routing: { ...existing.routing, ...(payload.routing || {}) },
+    upstreams: hasUpstreams && Array.isArray(payload.upstreams) ? payload.upstreams : (existing.upstreams || []),
+  };
+  const normalized = await normalizeGatewayConfigPayload(merged, app);
+  await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
+  invalidateRuntimeCache();
+  return withCorsResponse(json({
+    ok: true,
+    message: "Configuration saved.",
+    config: toPublicGatewayConfig(normalized),
+  }, 200));
+}
+
+async function fetchAdminModels(request, app) {
+  const payload = parseJsonBody(await request.text());
+  const upstream = await resolveModelFetchUpstream(payload, app);
+  if (upstream.response) return upstream.response;
+  try {
+    const models = await fetchUpstreamModelIds(upstream, 15000);
+    return withCorsResponse(json({ ok: true, models }, 200));
+  } catch (err) {
+    const status = err.status && err.status < 500 ? err.status : 502;
+    return withCorsResponse(json({ ok: false, status: err.status || status, error: err.message }, status));
+  }
+}
+
+async function resolveModelFetchUpstream(payload, app) {
+  const uName = payload.name || "";
+  if (uName) {
+    const runtime = await loadRuntimeConfig(app);
+    const saved = runtime.upstreams.find((u) => u.name === uName);
+    if (!saved) return { response: withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404)) };
+    return {
+      ...saved,
+      account_id: String(payload.account_id || saved.account_id || "").trim(),
+      api_key: String(payload.api_key || payload.api_key_value || saved.api_key || "").trim(),
+      base_url: String(payload.base_url || saved.base_url || "").trim(),
+      headers: { ...normalizeHeaders(saved.headers), ...normalizeHeaders(payload.headers) },
+      preset: String(payload.preset || saved.preset || inferPresetId(payload.base_url || saved.base_url)).trim(),
+    };
+  }
+
+  const baseUrl = String(payload.base_url || "").trim();
+  const apiKey = String(payload.api_key || payload.api_key_value || "").trim();
+  if (!baseUrl || !apiKey) return { response: withCorsResponse(json({ ok: false, error: "Base URL and API Key are required" }, 400)) };
+  return {
+    name: "draft",
+    account_id: String(payload.account_id || "").trim(),
+    base_url: baseUrl,
+    api_key: apiKey,
+    headers: normalizeHeaders(payload.headers),
+    preset: String(payload.preset || inferPresetId(baseUrl)).trim(),
+  };
+}
+
+async function speedTestAdminUpstreams(request, app) {
+  const runtime = await loadRuntimeConfig(app);
+  const payload = parseJsonBody(await request.text());
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    return withCorsResponse(json(openAiError("Model is required for speed test.", "invalid_request_error"), 400));
+  }
+  const upstreamNames = new Set(normalizeStringArray(payload.upstreams));
+  const targets = runtime.upstreams.filter((upstream) =>
+    upstream.enabled !== false &&
+    (!upstreamNames.size || upstreamNames.has(upstream.name)) &&
+    upstreamSupportsModel(upstream, model) &&
+    upstreamSupportsPath(upstream, CHAT_PATH)
+  );
+  const results = await Promise.all(targets.map((upstream) => speedTestUpstream(runtime, upstream, model)));
+  return withCorsResponse(json({ ok: true, results }, 200));
+}
+
+async function detectAdminUpstream(app, upstreamName) {
+  const config = await getEditableConfig(app);
+  const upstream = config.upstreams.find((u) => u.name === upstreamName);
+  if (!upstream) {
+    return withCorsResponse(json(openAiError("Upstream not found.", "not_found_error"), 404));
+  }
+  const apiKey = await decryptValue(upstream.api_key_encrypted, app.encryptionSecret);
+  const started = Date.now();
+  try {
+    const resp = await fetchWithTimeout(
+      buildUpstreamUrl(upstream.base_url, EMBEDDINGS_PATH, ""),
+      {
+        method: "POST",
+        headers: { "authorization": "Bearer " + apiKey, "content-type": "application/json", "accept": "application/json", "user-agent": "cf-llm-gateway/0.3" },
+        body: JSON.stringify({ model: "detect", input: "test" }),
+      },
+      10000,
+    );
+    const latency = Date.now() - started;
+    const ok = resp.ok || resp.status === 400;
+    const capability = ok ? "openai" : "claude";
+    const paths = ok ? [CHAT_PATH, EMBEDDINGS_PATH] : [CHAT_PATH];
+    const target = config.upstreams.find((u) => u.name === upstreamName);
+    if (target) {
+      target.capability = capability;
+      target.paths = paths;
+      await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(config));
+      invalidateRuntimeCache();
+    }
+    return withCorsResponse(json({ ok: true, capability, paths, latency_ms: latency }, 200));
+  } catch (err) {
+    return withCorsResponse(json({ ok: true, capability: "claude", paths: [CHAT_PATH], latency_ms: Date.now() - started }, 200));
+  }
 }
 
 async function getEditableConfig(app) {
@@ -1016,6 +1023,53 @@ function unwrapGatewayConfig(value) {
   return unwrapGatewayConfig(value.config || value.gateway_config || value.gatewayConfig);
 }
 
+function normalizeGatewayRouting(routing = {}) {
+  return {
+    failover: routing.failover !== false,
+    fast_routing: routing.fast_routing === true,
+    hedge_enabled: routing.hedge_enabled === true,
+    hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
+    load_balance: routing.load_balance !== false,
+  };
+}
+
+function normalizeGatewaySettings(settings = {}, app) {
+  return {
+    model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
+    request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
+    stream_idle_timeout_ms: parsePositiveInt(settings.stream_idle_timeout_ms, app.defaultStreamIdleTimeoutMs),
+    system_prompt: String(settings.system_prompt || ""),
+    system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
+    global_context: String(settings.global_context || settings.context_prompt || ""),
+    global_context_clients: normalizeStringArray(settings.global_context_clients),
+    upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
+  };
+}
+
+function buildUpstreamConfigRecord(item, index, options) {
+  const preset = options.preset;
+  const defaults = presetById(preset) || presetById("custom");
+  const models = options.models || normalizeStringArray(item?.models);
+  const paths = normalizeStringArray(item?.paths);
+  return {
+    api_key_encrypted: options.apiKeyEncrypted,
+    base_url: String(options.baseUrl || "").trim(),
+    account_id: String(options.accountId || "").trim(),
+    enabled: item?.enabled !== false,
+    headers: { ...presetDefaultHeaders(preset), ...normalizeHeaders(item?.headers) },
+    id: String(item?.id || crypto.randomUUID()),
+    models,
+    model_contexts: normalizeModelContexts(item?.model_contexts, models),
+    name: String(options.name || item?.name || `upstream-${index + 1}`).trim(),
+    note: String(options.note ?? item?.note ?? "").trim(),
+    paths: paths.length ? paths : [...defaults.paths],
+    preset,
+    priority: parsePriority(item?.priority, index + 1),
+    weight: parsePositiveInt(item?.weight, 1),
+    capability: item?.capability || null,
+  };
+}
+
 async function repairStoredGatewayConfig(config, app) {
   const settings = config.settings && typeof config.settings === "object" ? config.settings : {};
   const routing = config.routing && typeof config.routing === "object" ? config.routing : {};
@@ -1025,46 +1079,22 @@ async function repairStoredGatewayConfig(config, app) {
     const defaults = presetById(preset) || presetById("custom");
     const accountId = String(item?.account_id || "").trim();
     const models = normalizeStringArray(item?.models);
-    const paths = normalizeStringArray(item?.paths);
     const apiKeyValue = String(item?.api_key_encrypted || item?.api_key_value || item?.api_key || "").trim();
-    return {
-      api_key_encrypted: apiKeyValue ? await ensureEncryptedValue(apiKeyValue, app.encryptionSecret) : "",
-      base_url: String(item?.base_url || resolveBaseUrl(preset, "", defaults.base_url, accountId)).trim(),
-      account_id: accountId,
-      enabled: item?.enabled !== false,
-      headers: { ...presetDefaultHeaders(preset), ...normalizeHeaders(item?.headers) },
-      id: String(item?.id || crypto.randomUUID()),
+    return buildUpstreamConfigRecord(item, index, {
+      accountId,
+      apiKeyEncrypted: apiKeyValue ? await ensureEncryptedValue(apiKeyValue, app.encryptionSecret) : "",
+      baseUrl: item?.base_url || resolveBaseUrl(preset, "", defaults.base_url, accountId),
       models,
-      model_contexts: normalizeModelContexts(item?.model_contexts, models),
       name: String(item?.name || `upstream-${index + 1}`).trim(),
       note: String(item?.note || "").trim(),
-      paths: paths.length ? paths : [...defaults.paths],
       preset,
-      priority: parsePriority(item?.priority, index + 1),
-      weight: parsePositiveInt(item?.weight, 1),
-      capability: item?.capability || null,
-    };
+    });
   }));
   const validUpstreams = upstreams.filter((item) => item.name && item.base_url && item.api_key_encrypted);
 
   return {
-    routing: {
-      failover: routing.failover !== false,
-      fast_routing: routing.fast_routing === true,
-      hedge_enabled: routing.hedge_enabled === true,
-      hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
-      load_balance: routing.load_balance !== false,
-    },
-    settings: {
-      model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
-      request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
-      stream_idle_timeout_ms: parsePositiveInt(settings.stream_idle_timeout_ms, app.defaultStreamIdleTimeoutMs),
-      system_prompt: String(settings.system_prompt || ""),
-      system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
-      global_context: String(settings.global_context || settings.context_prompt || ""),
-      global_context_clients: normalizeStringArray(settings.global_context_clients),
-      upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
-    },
+    routing: normalizeGatewayRouting(routing),
+    settings: normalizeGatewaySettings(settings, app),
     upstreams: validUpstreams,
     version: config.version || 1,
   };
@@ -1080,52 +1110,28 @@ async function buildGatewayConfigFromEnv(app) {
     const accountId = String(upstream.account_id || "").trim();
 
     const models = normalizeStringArray(upstream.models);
-    upstreams.push({
-      api_key_encrypted: plaintextKey
-        ? await ensureEncryptedValue(plaintextKey, app.encryptionSecret)
-        : "",
-      base_url: resolveBaseUrl(
+    upstreams.push(buildUpstreamConfigRecord(upstream, index, {
+      accountId,
+      apiKeyEncrypted: plaintextKey ? await ensureEncryptedValue(plaintextKey, app.encryptionSecret) : "",
+      baseUrl: resolveBaseUrl(
         presetId,
         upstream.base_url,
         presetById(presetId)?.base_url,
         accountId,
       ),
-      enabled: upstream.enabled !== false,
-      headers: { ...presetDefaultHeaders(presetId), ...normalizeHeaders(upstream.headers) },
-      account_id: accountId,
-      id: String(upstream.id || crypto.randomUUID()),
       models,
-      model_contexts: normalizeModelContexts(upstream.model_contexts, models),
       name: String(upstream.name || `upstream-${index + 1}`),
       note: String(upstream.note || upstream.name || ""),
-      paths: normalizeStringArray(upstream.paths).length
-        ? normalizeStringArray(upstream.paths)
-        : [...(presetById(presetId)?.paths || [CHAT_PATH, EMBEDDINGS_PATH])],
       preset: presetId,
-      priority: parsePriority(upstream.priority, index + 1),
-      weight: parsePositiveInt(upstream.weight, 1),
-      capability: upstream.capability || null,
-    });
+    }));
   }
 
   return {
-    routing: {
-      failover: true,
-      fast_routing: false,
-      hedge_enabled: false,
-      hedge_max: 2,
-      load_balance: true,
-    },
-    settings: {
-      model_cache_ttl: app.defaultModelCacheTtl,
-      request_timeout_ms: app.defaultTimeoutMs,
-      stream_idle_timeout_ms: app.defaultStreamIdleTimeoutMs,
+    routing: normalizeGatewayRouting(),
+    settings: normalizeGatewaySettings({
       system_prompt: String(app.env.SYSTEM_PROMPT || app.env.GLOBAL_SYSTEM_PROMPT || ""),
-      system_prompt_clients: [],
       global_context: String(app.env.GLOBAL_CONTEXT || app.env.GLOBAL_SYSTEM_CONTEXT || ""),
-      global_context_clients: [],
-      upstream_cooldown_ttl: app.defaultCooldownTtl,
-    },
+    }, app),
     upstreams,
     version: 1,
   };
@@ -1160,45 +1166,19 @@ async function normalizeGatewayConfigPayload(payload, app) {
     }
 
     const models = normalizeStringArray(item.models);
-    upstreams.push({
-      api_key_encrypted: await ensureEncryptedValue(apiKeyValue, app.encryptionSecret),
-      base_url: baseUrl,
-      account_id: accountId,
-      enabled: item.enabled !== false,
-      headers: { ...presetDefaultHeaders(preset), ...normalizeHeaders(item.headers) },
-      id: String(item.id || crypto.randomUUID()),
+    upstreams.push(buildUpstreamConfigRecord(item, index, {
+      accountId,
+      apiKeyEncrypted: await ensureEncryptedValue(apiKeyValue, app.encryptionSecret),
+      baseUrl,
       models,
-      model_contexts: normalizeModelContexts(item.model_contexts, models),
       name,
-      note: String(item.note || "").trim(),
-      paths: normalizeStringArray(item.paths).length
-        ? normalizeStringArray(item.paths)
-        : [...defaults.paths],
       preset,
-      priority: parsePriority(item.priority, index + 1),
-      weight: parsePositiveInt(item.weight, 1),
-      capability: item.capability || null,
-    });
+    }));
   }
 
   return {
-    routing: {
-      failover: routing.failover !== false,
-      fast_routing: routing.fast_routing === true,
-      hedge_enabled: routing.hedge_enabled === true,
-      hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
-      load_balance: routing.load_balance !== false,
-    },
-    settings: {
-      model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
-      request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
-      stream_idle_timeout_ms: parsePositiveInt(settings.stream_idle_timeout_ms, app.defaultStreamIdleTimeoutMs),
-      system_prompt: String(settings.system_prompt || ""),
-      system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
-      global_context: String(settings.global_context || settings.context_prompt || ""),
-      global_context_clients: normalizeStringArray(settings.global_context_clients),
-      upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
-    },
+    routing: normalizeGatewayRouting(routing),
+    settings: normalizeGatewaySettings(settings, app),
     upstreams,
     version: 1,
   };
@@ -1941,21 +1921,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
 
-  const candidates = runtime.upstreams.filter((upstream) => {
-    if (!clientAllowsUpstream(client, upstream.name)) {
-      return false;
-    }
-    if (!clientAllowsModel(client, model)) {
-      return false;
-    }
-    if (!upstreamSupportsModel(upstream, model)) {
-      return false;
-    }
-    if (!upstreamSupportsPath(upstream, pathname)) {
-      return false;
-    }
-    return true;
-  });
+  const candidates = proxyCandidates(runtime, client, model, pathname);
 
   if (candidates.length === 0) {
     throw httpError(404, `No upstream available for model: ${model}`);
@@ -1980,19 +1946,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         lastError.upstreamName = upstream.name;
         continue;
       }
-      const upstreamStarted = Date.now();
-      noteActiveUpstream(upstream, 1);
-      let response = await fetchWithTimeout(
-        buildUpstreamUrl(upstream.base_url, pathname, search),
-        {
-          method: request.method,
-          headers: buildUpstreamHeaders(request, upstream),
-          body: sanitizeProxyBody(bodyText, upstream),
-        },
-        runtime.requestTimeoutMs,
-        runtime.streamIdleTimeoutMs,
-      );
-      const upstreamLatency = Date.now() - upstreamStarted;
+      const upstreamResult = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, upstream });
+      let response = upstreamResult.response;
+      const upstreamLatency = upstreamResult.latency;
 
       const shouldRetry = runtime.routing.failover !== false && await isRetryableUpstreamResponse(response);
       if (shouldRetry) {
@@ -2028,6 +1984,33 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   const err = httpError(502, lastError?.message || "All upstreams failed.");
   err.upstreamName = lastError?.upstreamName || "none";
   throw err;
+}
+
+function proxyCandidates(runtime, client, model, pathname) {
+  return runtime.upstreams.filter((upstream) =>
+    clientAllowsUpstream(client, upstream.name) &&
+    clientAllowsModel(client, model) &&
+    upstreamSupportsModel(upstream, model) &&
+    upstreamSupportsPath(upstream, pathname)
+  );
+}
+
+async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal, upstream }) {
+  const started = Date.now();
+  noteActiveUpstream(upstream, 1);
+  const init = {
+    method: request.method,
+    headers: buildUpstreamHeaders(request, upstream),
+    body: sanitizeProxyBody(bodyText, upstream),
+  };
+  if (signal) init.signal = signal;
+  const response = await fetchWithTimeout(
+    buildUpstreamUrl(upstream.base_url, pathname, search),
+    init,
+    runtime.requestTimeoutMs,
+    runtime.streamIdleTimeoutMs,
+  );
+  return { response, latency: Date.now() - started };
 }
 
 function applyGatewayPromptContext(bodyText, settings, client) {
@@ -2107,24 +2090,12 @@ async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runti
       if (!takeNimMinuteSlot(upstream)) {
         return { limited: true, error: new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`), upstream, index };
       }
-      const started = Date.now();
-      noteActiveUpstream(upstream, 1);
       try {
-        const response = await fetchWithTimeout(
-          buildUpstreamUrl(upstream.base_url, pathname, search),
-          {
-            method: request.method,
-            headers: buildUpstreamHeaders(request, upstream),
-            body: sanitizeProxyBody(bodyText, upstream),
-            signal: controllers[index].signal,
-          },
-          runtime.requestTimeoutMs,
-          runtime.streamIdleTimeoutMs,
-        );
-        return { response, upstream, index, latency: Date.now() - started };
+        const result = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal: controllers[index].signal, upstream });
+        return { ...result, upstream, index };
       } catch (error) {
         noteActiveUpstream(upstream, -1);
-        return { error, upstream, index, latency: Date.now() - started };
+        return { error, upstream, index, latency: 0 };
       }
     });
   }
@@ -2374,19 +2345,8 @@ function buildUpstreamUrl(baseUrl, pathname, search) {
 function sanitizeProxyBody(bodyText, upstream) {
   if (!bodyText) return bodyText;
 
-  const baseUrl = String(upstream.base_url || "").toLowerCase();
-  const isNvidia = baseUrl.includes("integrate.api.nvidia.com");
-  if (
-    !bodyText.includes('"thinking"') &&
-    !bodyText.includes('"reasoning"') &&
-    !bodyText.includes('"reasoningEffort"') &&
-    !bodyText.includes('"reasoningSummary"') &&
-    !bodyText.includes('"providerOptions"') &&
-    !bodyText.includes('"provider_options"') &&
-    (!isNvidia || (!bodyText.includes('"reasoning_split"') && !bodyText.includes('"enable_thinking"')))
-  ) {
-    return bodyText;
-  }
+  const isNvidia = isNvidiaNimUpstream(upstream);
+  if (!bodyNeedsSanitizing(bodyText, isNvidia)) return bodyText;
 
   let payload;
   try {
@@ -2398,6 +2358,25 @@ function sanitizeProxyBody(bodyText, upstream) {
   let changed = false;
   const modelName = String(payload.model || "").toLowerCase();
   const isGlm = /(^|[\/_.-])glm([\/_.-]|$)/i.test(modelName);
+  changed = applyProviderReasoningOptions(payload) || changed;
+  changed = normalizeReasoningFields(payload, isGlm) || changed;
+  if (isNvidia) changed = sanitizeNvidiaPayload(payload, isGlm, modelName) || changed;
+
+  return changed ? JSON.stringify(payload) : bodyText;
+}
+
+function bodyNeedsSanitizing(bodyText, isNvidia) {
+  return bodyText.includes('"thinking"') ||
+    bodyText.includes('"reasoning"') ||
+    bodyText.includes('"reasoningEffort"') ||
+    bodyText.includes('"reasoningSummary"') ||
+    bodyText.includes('"providerOptions"') ||
+    bodyText.includes('"provider_options"') ||
+    (isNvidia && (bodyText.includes('"reasoning_split"') || bodyText.includes('"enable_thinking"')));
+}
+
+function applyProviderReasoningOptions(payload) {
+  let changed = false;
   const providerOptions = payload.providerOptions || payload.provider_options;
   const openaiOptions = providerOptions && typeof providerOptions === "object"
     ? providerOptions.openai || providerOptions.openAI || providerOptions.gateway
@@ -2416,11 +2395,7 @@ function sanitizeProxyBody(bodyText, upstream) {
       changed = true;
     }
     if (openaiOptions.reasoningSummary != null && !payload.reasoning?.summary) {
-      payload.reasoning = {
-        ...(payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {}),
-        summary: openaiOptions.reasoningSummary,
-      };
-      changed = true;
+      changed = setReasoningSummary(payload, openaiOptions.reasoningSummary) || changed;
     }
   }
   if ("providerOptions" in payload) {
@@ -2431,16 +2406,17 @@ function sanitizeProxyBody(bodyText, upstream) {
     delete payload.provider_options;
     changed = true;
   }
+  return changed;
+}
+
+function normalizeReasoningFields(payload, isGlm) {
+  let changed = false;
   if (!isGlm && payload.reasoning && typeof payload.reasoning === "object" && payload.reasoning.effort != null && !("reasoning_effort" in payload)) {
     payload.reasoning_effort = payload.reasoning.effort;
     changed = true;
   }
   if ("reasoningSummary" in payload && !payload.reasoning?.summary) {
-    payload.reasoning = {
-      ...(payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {}),
-      summary: payload.reasoningSummary,
-    };
-    changed = true;
+    changed = setReasoningSummary(payload, payload.reasoningSummary) || changed;
   }
   if (!isGlm && "reasoningEffort" in payload && !("reasoning_effort" in payload)) {
     payload.reasoning_effort = payload.reasoningEffort;
@@ -2458,8 +2434,12 @@ function sanitizeProxyBody(bodyText, upstream) {
     delete payload.thinking;
     changed = true;
   }
+  return changed;
+}
 
-  if (isNvidia && isGlm) {
+function sanitizeNvidiaPayload(payload, isGlm, modelName) {
+  let changed = false;
+  if (isGlm) {
     if ("reasoning" in payload) {
       delete payload.reasoning;
       changed = true;
@@ -2469,8 +2449,6 @@ function sanitizeProxyBody(bodyText, upstream) {
       changed = true;
     }
   }
-
-  if (!isNvidia) return changed ? JSON.stringify(payload) : bodyText;
 
   if ("reasoning_split" in payload) {
     delete payload.reasoning_split;
@@ -2491,7 +2469,15 @@ function sanitizeProxyBody(bodyText, upstream) {
     changed = true;
   }
 
-  return changed ? JSON.stringify(payload) : bodyText;
+  return changed;
+}
+
+function setReasoningSummary(payload, summary) {
+  payload.reasoning = {
+    ...(payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {}),
+    summary,
+  };
+  return true;
 }
 
 function buildUpstreamHeaders(request, upstream) {
