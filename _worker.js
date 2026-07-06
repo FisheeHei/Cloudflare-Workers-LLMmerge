@@ -37,7 +37,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-sse-keepalive";
+const VERSION = "v26-07-06-sse-soft-close";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -676,6 +676,7 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
   if (!body) return body;
   const encoder = new TextEncoder();
   const ping = encoder.encode(": keepalive\n\n");
+  const done = encoder.encode(": stream closed\n\ndata: [DONE]\n\n");
   const interval = Math.max(1, Number(intervalMs) || SSE_KEEPALIVE_MS);
   let reader = null;
   let timer = null;
@@ -704,7 +705,8 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
       } catch (error) {
         if (!closed) {
           cleanup();
-          controller.error(error);
+          controller.enqueue(done);
+          controller.close();
         }
       }
     },

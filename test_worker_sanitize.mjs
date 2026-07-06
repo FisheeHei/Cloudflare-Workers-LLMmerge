@@ -14,6 +14,14 @@ const keepaliveText = await new Response(worker.withSseKeepAlive(new ReadableStr
 }), 5)).text();
 assert.equal(keepaliveText.includes(": keepalive\n\n"), true);
 assert.equal(keepaliveText.includes("data: [DONE]"), true);
+const cancelledText = await new Response(worker.withSseKeepAlive(new ReadableStream({
+  start(controller) {
+    controller.enqueue(keepaliveEncoder.encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'));
+    setTimeout(() => controller.error(new Error("CANCEL")), 5);
+  },
+}), 50)).text();
+assert.equal(cancelledText.includes('"content":"hi"'), true);
+assert.equal(cancelledText.endsWith("data: [DONE]\n\n"), true);
 
 const bodies = [];
 const fetchUrls = [];
