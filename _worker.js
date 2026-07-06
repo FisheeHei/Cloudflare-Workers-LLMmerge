@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-06-worker-modular";
+const VERSION = "v26-07-06-admin-modular";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3099,7 +3099,13 @@ function renderAdminPage(origin) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LLM Gateway</title>
-  <style>
+${renderAdminStyle()}${renderAdminMarkup(origin)}${renderAdminScript()}
+</body>
+</html>`;
+}
+
+function renderAdminStyle() {
+  return `  <style>
     :root {
       --bg: #f5f1e8;
       --panel: #fffdf8;
@@ -3411,7 +3417,11 @@ function renderAdminPage(origin) {
       .picker-actions { justify-content: stretch; }
       .picker-actions button, .picker-actions label { flex: 1 1 140px; }
     }
-  </style>
+  </style>`;
+}
+
+function renderAdminMarkup(origin) {
+  return `
 </head>
 <body>
 <div class="wrap">
@@ -3664,7 +3674,11 @@ function renderAdminPage(origin) {
   </div>
 </div>
 
-<script>
+`;
+}
+
+function renderAdminScript() {
+  return `<script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
   const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false };
   const byId = (id) => document.getElementById(id);
@@ -5140,8 +5154,6 @@ function renderAdminPage(origin) {
   }
 
   boot();
-</script>
-</body>
-</html>`;
+</script>`;
 }
 
