@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-stream-parser-refactor";
+const VERSION = "v26-07-07-header-refactor";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -214,12 +214,7 @@ export default {
         }
 
         const upstreamResp = proxyResponse.response;
-        const headers = responseBodyHeaders(upstreamResp.headers);
-        for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
-        headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
-        headers.set("x-llm-gateway-client", client.name || client.id || "client");
-        headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
-        headers.set("x-llm-gateway-trace-id", traceId);
+        const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
 
         return await buildLoggedProxyResponse({
           app,
@@ -322,15 +317,8 @@ export default {
           } : { input_tokens: 0, output_tokens: 0 },
         };
 
-        const headers = responseBodyHeaders(openaiResp.headers);
+        const headers = proxyResponseHeaders(openaiResp, proxyResponse, client, traceId);
         headers.set("content-type", "application/json; charset=utf-8");
-        headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
-        headers.set("x-llm-gateway-client", client.name || client.id || "client");
-        headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
-        headers.set("x-llm-gateway-trace-id", traceId);
-        for (const [k, v] of Object.entries(CORS_HEADERS)) {
-          headers.set(k, v);
-        }
 
         const loggedStatusMsg = openaiResp.ok ? openaiResp.status : (openaiResp.status || 502);
         var msgLogEntry = makeRequestLogEntry({
@@ -1755,12 +1743,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     });
 
     const upstreamResp = proxyResponse.response;
-    const headers = responseBodyHeaders(upstreamResp.headers);
-    headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
-    headers.set("x-llm-gateway-client", client.name || client.id || "client");
-    headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
-    headers.set("x-llm-gateway-trace-id", traceId);
-    for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
 
     if (!upstreamResp.ok) {
       recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId);
@@ -3224,6 +3207,16 @@ function responseBodyHeaders(headers) {
   const safe = new Headers(headers);
   ["content-length", "content-encoding", "transfer-encoding"].forEach((name) => safe.delete(name));
   return safe;
+}
+
+function proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId) {
+  const headers = responseBodyHeaders(upstreamResp.headers);
+  for (const [key, value] of Object.entries(CORS_HEADERS)) headers.set(key, value);
+  headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
+  headers.set("x-llm-gateway-client", client.name || client.id || "client");
+  headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+  headers.set("x-llm-gateway-trace-id", traceId);
+  return headers;
 }
 
 function setSseHeaders(headers) {
