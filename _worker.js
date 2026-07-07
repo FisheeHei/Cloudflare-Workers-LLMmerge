@@ -40,7 +40,8 @@ const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
-const VERSION = "v26-07-08-prompt-context-io";
+const ANALYTICS_LIVE_PENDING_MS = 60000;
+const VERSION = "v26-07-08-active-upstream-groups";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -398,7 +399,7 @@ function createApp(env) {
     analytics: env.ANALYTICS || env.LLM_ANALYTICS || env.LLM_GATEWAY_ANALYTICS || null,
     analyticsAccountId: String(env.ANALYTICS_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID || "").trim(),
     analyticsApiToken: String(env.ANALYTICS_API_TOKEN || env.CLOUDFLARE_API_TOKEN || "").trim(),
-    analyticsDataset: String(env.ANALYTICS_DATASET || "").trim(),
+    analyticsDataset: String(env.ANALYTICS_DATASET || "llmmerge_requests").trim(),
     defaultCooldownTtl: parsePositiveInt(env.UPSTREAM_COOLDOWN_TTL, DEFAULT_COOLDOWN_TTL),
     defaultModelCacheTtl: parsePositiveInt(env.MODEL_CACHE_TTL, DEFAULT_MODEL_CACHE_TTL),
     defaultStreamIdleTimeoutMs: parsePositiveInt(env.STREAM_IDLE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS),
@@ -641,7 +642,38 @@ async function getMergedLogs(app) {
 }
 
 async function getBestLogs(app) {
-  return await getAnalyticsLogs(app).catch(() => null) || await getMergedLogs(app);
+  const analyticsLogs = await getAnalyticsLogs(app).catch(() => null);
+  if (analyticsLogs) return mergeRecentLogs(analyticsLogs, recentPendingLogs());
+  return await getMergedLogs(app);
+}
+
+function recentPendingLogs(maxAgeMs = ANALYTICS_LIVE_PENDING_MS) {
+  const cutoff = Date.now() - maxAgeMs;
+  return _pendingLogs.filter((entry) => Date.parse(entry.ts || "") >= cutoff).slice(-50).reverse();
+}
+
+function mergeRecentLogs(persisted, recent) {
+  const seen = new Set();
+  return [...(recent || []), ...(persisted || [])]
+    .sort((a, b) => Date.parse(b.ts || 0) - Date.parse(a.ts || 0))
+    .filter((entry) => {
+      const key = entry.trace_id || [entry.ts, entry.client, entry.upstream, entry.model, entry.status].join("|");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 50);
+}
+
+function recentPendingStats(maxAgeMs = ANALYTICS_LIVE_PENDING_MS) {
+  const buckets = {};
+  for (const entry of _pendingLogs) {
+    if (Date.parse(entry.ts || "") < Date.now() - maxAgeMs) continue;
+    const hour = hkHourKey(entry.ts);
+    if (!buckets[hour]) buckets[hour] = emptyStatsBucket();
+    addStatsEntry(buckets[hour], entry);
+  }
+  return buckets;
 }
 
 function canQueryAnalytics(app) {
@@ -1024,7 +1056,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/logs" && request.method === "GET") {
-    const logs = await getAnalyticsLogs(app).catch(() => null) || await getMergedLogs(app);
+    const logs = await getBestLogs(app);
     return withCorsResponse(json({ ok: true, logs }, 200));
   }
 
@@ -1037,10 +1069,11 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     }
     const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
     const raws = analyticsBuckets ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
+    const liveStats = analyticsBuckets ? recentPendingStats() : _pendingStats;
     const logs = await getBestLogs(app);
     const buckets = hourKeys.map((hour, i) => {
       const raw = analyticsBuckets ? analyticsBuckets[hour] : raws[i];
-      return { hour, ...mergeStatsBucket(raw, _pendingStats[hour]) };
+      return { hour, ...mergeStatsBucket(raw, liveStats[hour]) };
     });
     return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: hkNowIso(), time_zone: HK_TIME_ZONE_LABEL }, 200));
   }
@@ -2208,7 +2241,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   const attempts = await orderUpstreams(runtime, candidates);
   const maxAttempts = runtime.routing.failover === false ? 1 : attempts.length;
   if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-    const limit = runtime.routing.fast_routing === true ? Math.min(2, runtime.routing.hedge_max || 2) : (runtime.routing.hedge_max || 2);
+    const limit = runtime.routing.fast_routing === true ? 2 : (runtime.routing.hedge_max || 2);
     const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, limit)));
     return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, pathname, request, runtime, search });
   }
@@ -3813,6 +3846,7 @@ function renderAdminStyle() {
       display: flex; align-items: center; justify-content: space-between; gap: 12px;
       padding: 10px 14px; background: #eadcc5; color: #3a2b1f; font-weight: 700;
     }
+    .upstream-group-active { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
     .upstream-group > summary::-webkit-details-marker { display: none; }
     .upstream-group-body { padding: 10px; }
     .upstream-group-body .upstream-card:last-child { margin-bottom: 0; }
@@ -4160,7 +4194,7 @@ function renderAdminMarkup(origin) {
           <label><input type="checkbox" id="routing-hedge"> Hedged Request</label>
         </div>
         <div class="field span-3">
-          <label><input type="checkbox" id="routing-fast"> Gateway Soft Fast</label>
+          <label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305\uff0c\u53ef\u80fd\u589e\u52a0\u4e0a\u6e38\u8bf7\u6c42</span></label>
         </div>
       </div>
       <div class="row">
@@ -4632,7 +4666,7 @@ function renderAdminScript() {
     });
 
     host.innerHTML = Object.keys(groups).map((groupName) =>
-      '<details class="upstream-group"><summary><span>' + esc(groupName) + '</span><span class="note">' + groups[groupName].length + ' \u4e2a\u4e0a\u6e38</span><span class="note upstream-group-health">\u25cb \u672a\u68c0\u67e5</span></summary><div class="upstream-group-body">' +
+      '<details class="upstream-group"><summary><span>' + esc(groupName) + '</span><span class="note">' + groups[groupName].length + ' \u4e2a\u4e0a\u6e38</span><span class="note upstream-group-active"></span><span class="note upstream-group-health">\u25cb \u672a\u68c0\u67e5</span></summary><div class="upstream-group-body">' +
         groups[groupName].map(upstreamCardHtml).join("") +
       '</div></details>'
     ).join("");
@@ -5254,6 +5288,7 @@ function renderAdminScript() {
         el.title = "";
       }
     });
+    updateUpstreamGroupActive(active);
     const nim = payload.nim_rpm || {};
     document.querySelectorAll(".nim-rpm").forEach(function(el) {
       const item = nim[el.dataset.upstream];
@@ -5272,6 +5307,31 @@ function renderAdminScript() {
         timerEl.textContent = " · " + seconds + "s";
       }
       el.title = seconds + "s \u540e\u6e05\u96f6";
+    });
+  }
+
+  function updateUpstreamGroupActive(active) {
+    const now = Date.now();
+    document.querySelectorAll(".upstream-group").forEach(function(group) {
+      const el = group.querySelector(".upstream-group-active");
+      if (!el) return;
+      const names = [...group.querySelectorAll(".upstream-status-emoji")]
+        .map((item) => item.dataset.upstream)
+        .filter((name) => name && Number(active[name] || 0) > 0);
+      if (names.length) {
+        const textValue = "\u26a1 \u6d3b\u8dc3: " + names.join(", ");
+        el.textContent = textValue;
+        group.dataset.activeText = textValue;
+        group.dataset.activeUntil = String(now + 30000);
+        return;
+      }
+      if (Number(group.dataset.activeUntil || 0) > now && group.dataset.activeText) {
+        el.textContent = group.dataset.activeText;
+      } else {
+        el.textContent = "";
+        delete group.dataset.activeText;
+        delete group.dataset.activeUntil;
+      }
     });
   }
 

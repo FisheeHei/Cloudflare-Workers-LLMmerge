@@ -317,6 +317,7 @@ const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
 assert.equal(adminPage.includes("routing-fast"), true);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
+assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("picker-apply-same-preset"), true);
 assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
@@ -863,14 +864,13 @@ const analyticsQueryEnv = {
   ...analyticsEnv,
   ANALYTICS_ACCOUNT_ID: "acct",
   ANALYTICS_API_TOKEN: "tok",
-  ANALYTICS_DATASET: "llmmerge_requests",
 };
 const analyticsStatsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), analyticsQueryEnv);
 const analyticsStats = await analyticsStatsResp.json();
 assert.equal(analyticsStats.buckets.some((bucket) => bucket.models?.qwen3 >= 2), true);
 const analyticsLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), analyticsQueryEnv);
 const analyticsLogs = await analyticsLogsResp.json();
-assert.equal(analyticsLogs.logs[0].model, "qwen3");
+assert.equal(analyticsLogs.logs.some((entry) => entry.model === "qwen3"), true);
 assert.equal(analyticsSqlQueries.length >= 2, true);
 
 const cachedConfigHits = speedHits.length;
@@ -1059,7 +1059,7 @@ assert.equal(hedgeHits[hedgeSecondStart], "slow");
 
 const softFastStore = new Map();
 softFastStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, fast_routing: true, hedge_enabled: false, hedge_max: 2, load_balance: false },
+  routing: { failover: true, fast_routing: true, hedge_enabled: false, hedge_max: 1, load_balance: false },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "soft-fast-slow", base_url: "https://soft-fast-slow.example/v1", api_key_encrypted: "s", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
