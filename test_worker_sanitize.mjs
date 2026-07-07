@@ -41,6 +41,8 @@ const usageHits = [];
 const wrappedHits = [];
 const appErrorHits = [];
 const htmlHits = [];
+const analyticsPoints = [];
+const analyticsSqlQueries = [];
 const kvPuts = [];
 const kvStore = new Map();
 globalThis.fetch = async (url, init) => {
@@ -50,6 +52,33 @@ globalThis.fetch = async (url, init) => {
       status: 200,
       headers: { date: "Sat, 04 Jul 2026 04:00:00 GMT" },
     });
+  }
+  if (String(url).includes("/analytics_engine/sql")) {
+    const sql = String(init.body || "");
+    analyticsSqlQueries.push(sql);
+    const data = sql.includes("GROUP BY hour")
+      ? [{
+        hour: "2026-07-04:12",
+        upstream: "nim",
+        model: "qwen3",
+        total: 2,
+        success: 1,
+        fail: 1,
+        prompt_tokens: 30,
+        completion_tokens: 40,
+      }]
+      : [{
+        timestamp: "2026-07-04 12:00:00",
+        client: "c",
+        upstream: "nim",
+        model: "qwen3",
+        path: "/v1/chat/completions",
+        status: 200,
+        latency_ms: 123,
+        prompt_tokens: 10,
+        completion_tokens: 20,
+      }];
+    return new Response(JSON.stringify({ data }), { status: 200, headers: { "content-type": "application/json" } });
   }
   if (String(url).includes("disabled.example")) {
     disabledHits.push(String(url));
@@ -806,6 +835,41 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 assert.equal(waitUntilTasks.length > 0, true);
 await Promise.all(waitUntilTasks);
 assert.equal(kvPuts.length, kvPutsBeforeWaitUntil);
+
+const analyticsTasks = [];
+const kvPutsBeforeAnalytics = kvPuts.length;
+const analyticsEnv = {
+  ...env,
+  ANALYTICS: {
+    writeDataPoint(point) {
+      analyticsPoints.push(point);
+    },
+  },
+};
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [] }),
+}), analyticsEnv, { waitUntil(task) { analyticsTasks.push(task); } });
+await Promise.all(analyticsTasks);
+assert.equal(analyticsPoints.length > 0, true);
+assert.equal(analyticsPoints.at(-1).blobs[3], "qwen3");
+assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
+assert.equal(kvPuts.length, kvPutsBeforeAnalytics);
+
+const analyticsQueryEnv = {
+  ...analyticsEnv,
+  ANALYTICS_ACCOUNT_ID: "acct",
+  ANALYTICS_API_TOKEN: "tok",
+  ANALYTICS_DATASET: "llmmerge_requests",
+};
+const analyticsStatsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), analyticsQueryEnv);
+const analyticsStats = await analyticsStatsResp.json();
+assert.equal(analyticsStats.buckets.some((bucket) => bucket.models?.qwen3 >= 2), true);
+const analyticsLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), analyticsQueryEnv);
+const analyticsLogs = await analyticsLogsResp.json();
+assert.equal(analyticsLogs.logs[0].model, "qwen3");
+assert.equal(analyticsSqlQueries.length >= 2, true);
 
 const cachedConfigHits = speedHits.length;
 const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {

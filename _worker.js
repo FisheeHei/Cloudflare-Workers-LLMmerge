@@ -40,7 +40,7 @@ const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
-const VERSION = "v26-07-08-subagent-prompt";
+const VERSION = "v26-07-08-analytics-engine";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -395,6 +395,10 @@ function createApp(env) {
     adminPath: "/" + adminToken,
     adminPaths: buildAdminPathAliases(adminToken),
     adminToken,
+    analytics: env.ANALYTICS || env.LLM_ANALYTICS || env.LLM_GATEWAY_ANALYTICS || null,
+    analyticsAccountId: String(env.ANALYTICS_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID || "").trim(),
+    analyticsApiToken: String(env.ANALYTICS_API_TOKEN || env.CLOUDFLARE_API_TOKEN || "").trim(),
+    analyticsDataset: String(env.ANALYTICS_DATASET || "").trim(),
     defaultCooldownTtl: parsePositiveInt(env.UPSTREAM_COOLDOWN_TTL, DEFAULT_COOLDOWN_TTL),
     defaultModelCacheTtl: parsePositiveInt(env.MODEL_CACHE_TTL, DEFAULT_MODEL_CACHE_TTL),
     defaultStreamIdleTimeoutMs: parsePositiveInt(env.STREAM_IDLE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS),
@@ -482,7 +486,40 @@ function recordStats(app, entry) {
 function recordRequestLog(app, entry, ctx) {
   appendLog(app, entry);
   recordStats(app, entry);
-  scheduleLogFlush(app, ctx);
+  recordAnalyticsPoint(app, entry, ctx);
+  if (!hasAnalyticsEngine(app)) scheduleLogFlush(app, ctx);
+}
+
+function hasAnalyticsEngine(app) {
+  return app?.analytics && typeof app.analytics.writeDataPoint === "function";
+}
+
+function recordAnalyticsPoint(app, entry, ctx) {
+  if (!hasAnalyticsEngine(app)) return;
+  const task = Promise.resolve().then(() => app.analytics.writeDataPoint({
+    blobs: [
+      entry.ts || "",
+      entry.client || "",
+      entry.upstream || "",
+      entry.model || "",
+      entry.path || "",
+      String(entry.status || ""),
+      entry.trace_id || "",
+      entry.close_reason || "",
+    ],
+    doubles: [
+      Number(entry.status || 0),
+      Number(entry.latency_ms || 0),
+      Number(entry.prompt_tokens || 0),
+      Number(entry.completion_tokens || 0),
+      Number(entry.time_to_first_byte_ms || 0),
+      Number(entry.time_to_first_token_ms || 0),
+      Number(entry.max_stream_gap_ms || 0),
+      entry.status >= 200 && entry.status < 400 ? 1 : 0,
+    ],
+    indexes: [entry.client || "client"],
+  })).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
 }
 
 function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path, promptTokens, started, status, upstream }) {
@@ -601,6 +638,116 @@ function mergeStatsBucket(base, delta) {
 async function getMergedLogs(app) {
   const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
   return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse();
+}
+
+async function getBestLogs(app) {
+  return await getAnalyticsLogs(app).catch(() => null) || await getMergedLogs(app);
+}
+
+function canQueryAnalytics(app) {
+  return Boolean(app?.analyticsAccountId && app?.analyticsApiToken && /^[A-Za-z0-9_]+$/.test(app?.analyticsDataset || ""));
+}
+
+async function queryAnalyticsEngine(app, sql) {
+  if (!canQueryAnalytics(app)) return null;
+  const resp = await fetch(`https://api.cloudflare.com/client/v4/accounts/${app.analyticsAccountId}/analytics_engine/sql`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${app.analyticsApiToken}`,
+      "content-type": "text/plain; charset=utf-8",
+    },
+    body: sql,
+  });
+  if (!resp.ok) return null;
+  const payload = await resp.json();
+  return Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
+}
+
+async function getAnalyticsLogs(app) {
+  const rows = await queryAnalyticsEngine(app, `
+SELECT
+  timestamp,
+  blob2 AS client,
+  blob3 AS upstream,
+  blob4 AS model,
+  blob5 AS path,
+  double1 AS status,
+  double2 AS latency_ms,
+  double3 AS prompt_tokens,
+  double4 AS completion_tokens,
+  double5 AS time_to_first_byte_ms,
+  double6 AS time_to_first_token_ms,
+  double7 AS max_stream_gap_ms,
+  blob7 AS trace_id,
+  blob8 AS close_reason
+FROM ${app.analyticsDataset}
+WHERE timestamp >= NOW() - INTERVAL '24' HOUR
+ORDER BY timestamp DESC
+LIMIT 50
+`);
+  if (!rows) return null;
+  return rows.map((row) => ({
+    ts: row.timestamp || row.ts || "",
+    client: row.client || "",
+    upstream: row.upstream || "",
+    model: row.model || "",
+    path: row.path || "",
+    status: Number(row.status || 0),
+    latency_ms: Number(row.latency_ms || 0),
+    prompt_tokens: Number(row.prompt_tokens || 0),
+    completion_tokens: Number(row.completion_tokens || 0),
+    time_to_first_byte_ms: Number(row.time_to_first_byte_ms || 0),
+    time_to_first_token_ms: Number(row.time_to_first_token_ms || 0),
+    max_stream_gap_ms: Number(row.max_stream_gap_ms || 0),
+    trace_id: row.trace_id || "",
+    close_reason: row.close_reason || "",
+  }));
+}
+
+async function getAnalyticsStats(app, hourKeys) {
+  const rows = await queryAnalyticsEngine(app, `
+SELECT
+  formatDateTime(toStartOfHour(timestamp), '%Y-%m-%d:%H', 'Asia/Hong_Kong') AS hour,
+  blob3 AS upstream,
+  blob4 AS model,
+  sum(_sample_interval) AS total,
+  sum(if(double8 = 1, _sample_interval, 0)) AS success,
+  sum(if(double8 = 1, 0, _sample_interval)) AS fail,
+  sum(double3 * _sample_interval) AS prompt_tokens,
+  sum(double4 * _sample_interval) AS completion_tokens
+FROM ${app.analyticsDataset}
+WHERE timestamp >= NOW() - INTERVAL '24' HOUR
+GROUP BY hour, upstream, model
+ORDER BY hour ASC
+`);
+  if (!rows) return null;
+  const buckets = {};
+  const wanted = new Set(hourKeys);
+  for (const row of rows) {
+    const hour = String(row.hour || "");
+    if (!wanted.has(hour)) continue;
+    const bucket = buckets[hour] || emptyStatsBucket();
+    const entry = {
+      upstream: row.upstream || "unknown",
+      model: row.model || "unknown",
+      status: Number(row.success || 0) > 0 ? 200 : 500,
+      prompt_tokens: Number(row.prompt_tokens || 0),
+      completion_tokens: Number(row.completion_tokens || 0),
+    };
+    bucket.total += Number(row.total || 0);
+    bucket.success += Number(row.success || 0);
+    bucket.fail += Number(row.fail || 0);
+    bucket.prompt_tokens += entry.prompt_tokens;
+    bucket.completion_tokens += entry.completion_tokens;
+    bucket.upstreams[entry.upstream] = (bucket.upstreams[entry.upstream] || 0) + Number(row.total || 0);
+    bucket.models[entry.model] = (bucket.models[entry.model] || 0) + Number(row.total || 0);
+    const ms = bucket.model_statuses[entry.model] || { success: 0, fail: 0 };
+    ms.success += Number(row.success || 0);
+    ms.fail += Number(row.fail || 0);
+    bucket.model_statuses[entry.model] = ms;
+    buckets[hour] = bucket;
+  }
+  return buckets;
 }
 
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
@@ -877,7 +1024,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/logs" && request.method === "GET") {
-    const logs = await getMergedLogs(app);
+    const logs = await getAnalyticsLogs(app).catch(() => null) || await getMergedLogs(app);
     return withCorsResponse(json({ ok: true, logs }, 200));
   }
 
@@ -888,10 +1035,11 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
       hourKeys.push(hkHourKey(now - h * 3600000));
     }
-    const raws = app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null);
-    const logs = await getMergedLogs(app);
+    const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
+    const raws = analyticsBuckets ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
+    const logs = await getBestLogs(app);
     const buckets = hourKeys.map((hour, i) => {
-      const raw = raws[i];
+      const raw = analyticsBuckets ? analyticsBuckets[hour] : raws[i];
       return { hour, ...mergeStatsBucket(raw, _pendingStats[hour]) };
     });
     return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: hkNowIso(), time_zone: HK_TIME_ZONE_LABEL }, 200));
@@ -3964,6 +4112,8 @@ function renderAdminMarkup(origin) {
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
+      <button type="button" class="secondary" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
+      <button type="button" class="secondary" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
       <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
       <span class="toolbar-spacer"></span>
       <div class="menu-wrap" id="upstream-actions">
@@ -3971,8 +4121,6 @@ function renderAdminMarkup(origin) {
         <div class="menu">
           <button type="button" class="secondary small" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
           <button type="button" class="secondary small" id="speed-test">\u6a21\u578b\u6d4b\u901f</button>
-          <button type="button" class="secondary small" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
-          <button type="button" class="secondary small" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
         </div>
       </div>
       <span class="note" id="config-status"></span>
