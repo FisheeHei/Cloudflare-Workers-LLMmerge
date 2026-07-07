@@ -26,6 +26,7 @@ const STATS_PREFIX = "gateway:stats:";
 const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
+const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const HK_TIME_ZONE = "Asia/Hong_Kong";
@@ -38,7 +39,8 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-nim-bridge-3";
+const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
+const VERSION = "v26-07-08-subagent-prompt";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -461,6 +463,7 @@ var _pendingStats = {}; // hourKey -> bucket
 var _lastFlush = Date.now();
 var FLUSH_INTERVAL_MS = 15 * 60 * 1000;
 var FLUSH_PENDING_LIMIT = 200;
+var _flushPromise = null;
 
 // ponytail: appendLog just pushes; caller calls flushBatch after log+stats
 function appendLog(app, entry) {
@@ -499,7 +502,7 @@ function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path
 
 function scheduleLogFlush(app, ctx) {
   if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(flushBatch(app, true));
+    ctx.waitUntil(flushBatch(app));
   } else {
     flushBatch(app);
   }
@@ -510,8 +513,10 @@ async function flushBatch(app, force = false) {
   var now = Date.now();
   // ponytail: Free KV has tight write limits; dashboard reads merge pending memory instead.
   if (!force && now - _lastFlush < FLUSH_INTERVAL_MS && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
+  if (_flushPromise) return _flushPromise;
   _lastFlush = now;
-  try { await _doFlush(app); } catch { /* flush failures must not break */ }
+  _flushPromise = _doFlush(app).catch(() => {}).finally(() => { _flushPromise = null; });
+  return _flushPromise;
 }
 
 // ponytail: parallel log+stats flush instead of sequential blocks
@@ -1088,6 +1093,7 @@ function normalizeGatewaySettings(settings = {}, app) {
     stream_idle_timeout_ms: parsePositiveInt(settings.stream_idle_timeout_ms, app.defaultStreamIdleTimeoutMs),
     system_prompt: String(settings.system_prompt || ""),
     system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
+    subagent_prompt_clients: normalizeStringArray(settings.subagent_prompt_clients),
     global_context: String(settings.global_context || settings.context_prompt || ""),
     global_context_clients: normalizeStringArray(settings.global_context_clients),
     context_always_clients: normalizeStringArray(settings.context_always_clients),
@@ -2138,29 +2144,47 @@ function traceResponse(response, traceId) {
 async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal, upstream }) {
   const started = Date.now();
   noteActiveUpstream(upstream, 1);
+  const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
   const init = {
     method: request.method,
     headers: buildUpstreamHeaders(request, upstream),
-    body: sanitizeProxyBody(bodyText, upstream),
+    body: sanitizedBody,
   };
   if (signal) init.signal = signal;
   const response = await fetchWithTimeout(
     buildUpstreamUrl(upstream.base_url, pathname, search),
     init,
-    runtime.requestTimeoutMs,
+    proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
     runtime.streamIdleTimeoutMs,
   );
   return { response, latency: Date.now() - started };
+}
+
+function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
+  const base = runtime.requestTimeoutMs;
+  if (!isNvidiaNimUpstream(upstream)) return base;
+  try {
+    const modelName = String(JSON.parse(bodyText || "{}").model || "").toLowerCase();
+    // ponytail: GLM/MiniMax on NIM can spend minutes before first byte; streaming idle timeout still guards after headers.
+    return (isGlmModel(modelName) || isMiniMaxM3Model(modelName))
+      ? Math.max(base, NIM_SLOW_FIRST_BYTE_TIMEOUT_MS)
+      : base;
+  } catch {
+    return base;
+  }
 }
 
 function applyGatewayPromptContext(bodyText, settings, client) {
   if (!bodyText) return bodyText;
   const clientIds = clientIdentitySet(client);
   const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
+  const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
+  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
+  const combinedSystemText = [systemText, subagentText].filter(Boolean).join("\n\n");
   const items = Array.isArray(settings?.context_items) ? settings.context_items : [];
   const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
     (settings?.context_on_demand === true && items.some((item) => item && item.enabled !== false && item.text));
-  if (!systemText && !hasContext) return bodyText;
+  if (!combinedSystemText && !hasContext) return bodyText;
   let payload;
   try {
     payload = JSON.parse(bodyText);
@@ -2170,10 +2194,10 @@ function applyGatewayPromptContext(bodyText, settings, client) {
 
   if (!Array.isArray(payload.messages)) return bodyText;
   const contextText = hasContext ? selectGatewayContext(payload, settings, client, clientIds) : "";
-  if (!systemText && !contextText) return bodyText;
+  if (!combinedSystemText && !contextText) return bodyText;
   const injected = [];
-  if (systemText) {
-    injected.push({ role: "system", content: systemText });
+  if (combinedSystemText) {
+    injected.push({ role: "system", content: combinedSystemText });
   }
   if (contextText) {
     const contextMessage = {
@@ -4116,13 +4140,20 @@ function renderAdminMarkup(origin) {
           <label class="note">\u6700\u591a\u5b57\u7b26 <input id="context-max-chars" type="number" min="500" max="20000" value="4000"></label>
           <button type="button" class="secondary small" id="add-context-item">\u65b0\u589e\u7247\u6bb5</button>
           <button type="button" class="secondary small" id="classify-context-items">\u4ece\u5927\u6587\u672c\u751f\u6210\u7247\u6bb5</button>
+          <button type="button" class="secondary small" id="export-context-items">\u5bfc\u51fa\u4e0a\u4e0b\u6587</button>
+          <button type="button" class="secondary small" id="import-context-items">\u5bfc\u5165\u4e0a\u4e0b\u6587</button>
         </div>
+        <input type="file" id="import-context-file" accept=".json,application/json" hidden>
         <div class="context-items" id="context-items"></div>
       </div>
       <div class="prompt-scope-column">
         <div class="field">
           <label>\u7cfb\u7edf\u63d0\u793a\u8bcd\u751f\u6548\u5ba2\u6237\u7aef Key</label>
           <div class="prompt-client-scope" id="system-prompt-client-scope"></div>
+        </div>
+        <div class="field">
+          <label>Subagent Prompt \u751f\u6548\u5ba2\u6237\u7aef Key <span class="note">\u9009\u4e2d\u540e\u5728\u7cfb\u7edf\u63d0\u793a\u8bcd\u540e\u8ffd\u52a0\u56fa\u5b9a\u82f1\u6587\u53e5\u5b50</span></label>
+          <div class="prompt-client-scope" id="subagent-prompt-client-scope"></div>
         </div>
         <div class="field">
           <label>\u5168\u5c40\u4e0a\u4e0b\u6587\u751f\u6548\u5ba2\u6237\u7aef Key</label>
@@ -4617,6 +4648,7 @@ function renderAdminScript() {
         model_cache_ttl: Number(byId("model-cache-ttl").value || 3600),
         system_prompt: byId("system-prompt-input").value,
         system_prompt_clients: selectedPromptClients("system-prompt-client-scope"),
+        subagent_prompt_clients: selectedPromptClients("subagent-prompt-client-scope"),
         global_context: byId("global-context-input").value,
         global_context_clients: selectedPromptClients("global-context-client-scope"),
         context_always_clients: selectedPromptClients("context-always-client-scope"),
@@ -4724,6 +4756,69 @@ function renderAdminScript() {
     }).filter((item) => item.text);
   }
 
+  function currentContextBundle() {
+    return {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      global_context: byId("global-context-input").value,
+      global_context_clients: selectedPromptClients("global-context-client-scope"),
+      context_always_clients: selectedPromptClients("context-always-client-scope"),
+      subagent_prompt_clients: selectedPromptClients("subagent-prompt-client-scope"),
+      context_on_demand: byId("context-on-demand").checked,
+      context_item_limit: Number(byId("context-item-limit").value || 3),
+      context_max_chars: Number(byId("context-max-chars").value || 4000),
+      context_items: collectContextItems(),
+    };
+  }
+
+  function normalizeImportedContextBundle(payload) {
+    const source = payload && (payload.context || payload);
+    const items = Array.isArray(source.context_items) ? source.context_items : (Array.isArray(source.items) ? source.items : []);
+    return {
+      global_context: text(source.global_context || source.context_text || ""),
+      global_context_clients: normalizeImportList(source.global_context_clients),
+      context_always_clients: normalizeImportList(source.context_always_clients),
+      subagent_prompt_clients: normalizeImportList(source.subagent_prompt_clients),
+      context_on_demand: source.context_on_demand === true || items.length > 0,
+      context_item_limit: Number(source.context_item_limit || 3),
+      context_max_chars: Number(source.context_max_chars || 4000),
+      context_items: items.map(function(item) {
+        return {
+          id: text(item && item.id).trim() || crypto.randomUUID(),
+          enabled: item && item.enabled !== false,
+          title: text(item && item.title).trim(),
+          keywords: normalizeImportList(item && item.keywords),
+          clients: normalizeImportList(item && item.clients),
+          models: normalizeImportList(item && item.models),
+          priority: Number(item && item.priority || 0),
+          max_chars: Number(item && item.max_chars || 1200),
+          text: text(item && item.text).trim(),
+        };
+      }).filter((item) => item.text),
+    };
+  }
+
+  async function importContextFromFile(file) {
+    const payload = JSON.parse(await file.text());
+    const bundle = normalizeImportedContextBundle(payload);
+    if (!bundle.global_context && !bundle.context_items.length) throw new Error("\u5bfc\u5165\u6587\u4ef6\u91cc\u6ca1\u6709\u4e0a\u4e0b\u6587\u6216\u7247\u6bb5");
+    if (collectContextItems().length && !confirm("\u5bfc\u5165\u4f1a\u8986\u76d6\u5f53\u524d\u4e0a\u4e0b\u6587\u7247\u6bb5\uff0c\u7ee7\u7eed\u5417\uff1f")) return;
+
+    const settings = state.config.settings || (state.config.settings = {});
+    settings.global_context_clients = bundle.global_context_clients;
+    settings.context_always_clients = bundle.context_always_clients;
+    settings.subagent_prompt_clients = bundle.subagent_prompt_clients;
+    byId("global-context-input").value = bundle.global_context;
+    byId("context-on-demand").checked = bundle.context_on_demand;
+    byId("context-item-limit").value = bundle.context_item_limit;
+    byId("context-max-chars").value = bundle.context_max_chars;
+    renderPromptClientScopes();
+    renderContextItems(bundle.context_items);
+    renderPromptContextStatus("\u5df2\u5bfc\u5165\uff0c\u4fdd\u5b58\u4e2d");
+    await saveConfig();
+    showToast("\u5df2\u5bfc\u5165 " + bundle.context_items.length + " \u4e2a\u4e0a\u4e0b\u6587\u7247\u6bb5");
+  }
+
   function renderContextItems(items) {
     const host = byId("context-items");
     if (!host) return;
@@ -4818,13 +4913,16 @@ function renderAdminScript() {
   function renderPromptClientScopes() {
     const s = state.config && state.config.settings || {};
     const systemHost = byId("system-prompt-client-scope");
+    const subagentHost = byId("subagent-prompt-client-scope");
     const contextHost = byId("global-context-client-scope");
     const alwaysHost = byId("context-always-client-scope");
-    if (!systemHost || !contextHost || !alwaysHost) return;
+    if (!systemHost || !subagentHost || !contextHost || !alwaysHost) return;
     systemHost.innerHTML = clientScopeHtml(s.system_prompt_clients || [], false);
+    subagentHost.innerHTML = clientScopeHtml(s.subagent_prompt_clients || ["__none__"], true);
     contextHost.innerHTML = clientScopeHtml(s.global_context_clients || [], false);
     alwaysHost.innerHTML = clientScopeHtml(s.context_always_clients || [], true);
     bindPromptScope(systemHost, false);
+    bindPromptScope(subagentHost, true);
     bindPromptScope(contextHost, false);
     bindPromptScope(alwaysHost, true);
   }
@@ -4832,7 +4930,7 @@ function renderAdminScript() {
   function selectedPromptClients(id) {
     const host = byId(id);
     if (!host) return [];
-    if (id === "context-always-client-scope") {
+    if (id === "context-always-client-scope" || id === "subagent-prompt-client-scope") {
       if (host.querySelector('input[value="*"]:checked')) return ["*"];
       return [...host.querySelectorAll('input:checked')].map((input) => input.value).filter((value) => value && value !== "__none__");
     }
@@ -4851,13 +4949,15 @@ function renderAdminScript() {
     const contextLen = byId("global-context-input").value.length;
     const itemCount = collectContextItems().length;
     const systemScope = promptScopeLabel("system-prompt-client-scope", "\u5168\u90e8");
+    const subagentScope = promptScopeLabel("subagent-prompt-client-scope", "\u65e0");
     const contextScope = promptScopeLabel("global-context-client-scope", "\u5168\u90e8");
     const alwaysScope = promptScopeLabel("context-always-client-scope", "\u65e0");
-    if (!systemLen && !contextLen && !itemCount) {
+    const subagentEnabled = selectedPromptClients("subagent-prompt-client-scope").length > 0;
+    if (!systemLen && !contextLen && !itemCount && !subagentEnabled) {
       byId("system-prompt-status").textContent = "\u672a\u542f\u7528";
       return;
     }
-    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef\uff0c\u7247\u6bb5 " + itemCount + "\uff0c\u5168\u91cf " + alwaysScope + ")";
+    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0cSubagent " + subagentScope + "\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef\uff0c\u7247\u6bb5 " + itemCount + "\uff0c\u5168\u91cf " + alwaysScope + ")";
   }
 
   function splitPromptContextDraft() {
@@ -5654,6 +5754,23 @@ function renderAdminScript() {
       byId("split-prompt-context").addEventListener("click", splitPromptContextDraft);
       byId("add-context-item").addEventListener("click", () => addContextItem());
       byId("classify-context-items").addEventListener("click", classifyContextItemsDraft);
+      byId("export-context-items").addEventListener("click", () => {
+        const payload = currentContextBundle();
+        downloadJsonFile("llmmerge-context-" + payload.exported_at.slice(0, 10) + ".json", payload);
+        showToast("\u5df2\u5bfc\u51fa " + payload.context_items.length + " \u4e2a\u7247\u6bb5");
+      });
+      byId("import-context-items").addEventListener("click", () => {
+        const input = byId("import-context-file");
+        input.value = "";
+        input.click();
+      });
+      byId("import-context-file").addEventListener("change", (e) =>
+        withButtonBusy(byId("import-context-items"), "\u5bfc\u5165\u4e2d...", async () => {
+          const file = e.target.files && e.target.files[0];
+          if (!file) return;
+          await importContextFromFile(file);
+        }).catch(showError)
+      );
       ["context-on-demand", "context-item-limit", "context-max-chars"].forEach((id) =>
         byId(id).addEventListener("input", () => renderPromptContextStatus("\u5f85\u4fdd\u5b58"))
       );

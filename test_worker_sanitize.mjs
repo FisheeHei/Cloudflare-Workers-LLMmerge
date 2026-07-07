@@ -213,6 +213,14 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("slow-first-byte.example")) {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    if (init.signal?.aborted) throw new Error("aborted before first byte");
+    return new Response(JSON.stringify({ id: "slow-first-byte", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("boom.example")) {
     throw new Error("network down");
   }
@@ -288,12 +296,15 @@ assert.equal(adminPage.includes("input / "), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
 assert.equal(adminPage.includes("global-context-input"), true);
 assert.equal(adminPage.includes("system-prompt-client-scope"), true);
+assert.equal(adminPage.includes("subagent-prompt-client-scope"), true);
 assert.equal(adminPage.includes("global-context-client-scope"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("context-on-demand"), true);
 assert.equal(adminPage.includes("context-items"), true);
 assert.equal(adminPage.includes("classifyContextItemsDraft"), true);
+assert.equal(adminPage.includes("export-context-items"), true);
+assert.equal(adminPage.includes("import-context-file"), true);
 assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("stream-idle-timeout"), true);
 assert.equal(adminPage.includes("900000"), true);
@@ -632,6 +643,21 @@ assert.equal("reasoning_effort" in speedBodies[glmAliasBodyStart], false);
 assert.equal("reasoning_summary" in speedBodies[glmAliasBodyStart], false);
 assert.equal("thinking" in speedBodies[glmAliasBodyStart], false);
 
+const slowFirstByteEnv = {
+  KV: null,
+  REQUEST_TIMEOUT_MS: "10",
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "slow-nim", preset: "nvidia-nim", base_url: "https://slow-first-byte.example/v1", api_key: "n", models: ["z-ai/glm-5.2"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ]),
+  CLIENTS_JSON: JSON.stringify([{ name: "slow-client", key: "sk-slow", models: ["*"], upstreams: ["slow-nim"] }]),
+};
+const slowFirstByteResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-slow", "content-type": "application/json" },
+  body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [] }),
+}), slowFirstByteEnv);
+assert.equal(slowFirstByteResp.status, 200);
+
 const fanoutStore = new Map();
 fanoutStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
@@ -771,6 +797,7 @@ assert.equal(exported.upstreams[1].account_id, "acc123");
 assert.equal(exported.upstreams[1].base_url, "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1");
 
 const waitUntilTasks = [];
+const kvPutsBeforeWaitUntil = kvPuts.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
@@ -778,8 +805,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), env, { waitUntil(task) { waitUntilTasks.push(task); } });
 assert.equal(waitUntilTasks.length > 0, true);
 await Promise.all(waitUntilTasks);
-assert.equal(kvPuts.includes("gateway:logs"), true);
-assert.equal(kvPuts.some((key) => key.startsWith("gateway:stats:")), true);
+assert.equal(kvPuts.length, kvPutsBeforeWaitUntil);
 
 const cachedConfigHits = speedHits.length;
 const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {
@@ -832,6 +858,7 @@ scopedStore.set("gateway:config", JSON.stringify({
     request_timeout_ms: 30000,
     system_prompt: "Scoped system.",
     system_prompt_clients: ["scoped-client"],
+    subagent_prompt_clients: ["scoped-client"],
     global_context: "Scoped context.",
     global_context_clients: ["scoped-client"],
     upstream_cooldown_ttl: 60,
@@ -860,7 +887,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   headers: { authorization: "Bearer sk-scoped", "content-type": "application/json" },
   body: JSON.stringify({ model: "scoped-model", messages: [] }),
 }), scopedEnv);
-assert.equal(speedBodies.at(-1).messages[0].content, "Scoped system.");
+assert.equal(speedBodies.at(-1).messages[0].content, "Scoped system.\n\nWhen the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.");
 assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped context."), true);
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
