@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-nim-bridge-2";
+const VERSION = "v26-07-07-nim-bridge-3";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2710,8 +2710,20 @@ function isNemotronModel(modelName) {
   return /(^|[\/_.-])nemotron([\/_.-]|$)/i.test(String(modelName || ""));
 }
 
+function isNemotron3Model(modelName) {
+  return /(^|[\/_.-])nemotron[\/_.-]*3([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
 function isMistralModel(modelName) {
-  return /(^|[\/_.-])(mistral|mixtral|codestral)([\/_.-]|$)/i.test(String(modelName || ""));
+  return /(^|[\/_.-])(mistral|mixtral|codestral|magistral)([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function isGptOssModel(modelName) {
+  return /(^|[\/_.-])gpt[\/_.-]*oss([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function isSarvamModel(modelName) {
+  return /(^|[\/_.-])sarvam([\/_.-]|$)/i.test(String(modelName || ""));
 }
 
 function applyNimBridge(payload, modelName) {
@@ -2719,6 +2731,7 @@ function applyNimBridge(payload, modelName) {
   const isGlm = isGlmModel(modelName);
   const isQwen = modelName.includes("qwen");
   const isKimi = isKimiModel(modelName);
+  const isNemotron3 = isNemotron3Model(modelName);
   const reasoningEffort = nimFamilyReasoningEffort(modelName, payload);
   if (isGlm) {
     if (glmThinkingRequested(payload)) {
@@ -2748,6 +2761,21 @@ function applyNimBridge(payload, modelName) {
       changed = true;
     }
     changed = removeNimReasoningPayloadFields(payload) || changed;
+  }
+
+  if (isNemotron3 && nimReasoningRequested(payload)) {
+    const raw = nimReasoningEffortInput(payload);
+    const disabled = nimReasoningDisabled(payload);
+    setChatTemplateKwargs(payload, {
+      enable_thinking: !disabled,
+      low_effort: !disabled && (raw === "low" || raw === "minimal"),
+    });
+    const budget = nimReasoningBudget(payload);
+    if (budget != null) {
+      payload.reasoning_budget = budget;
+    }
+    changed = true;
+    changed = removeNimReasoningPayloadFields(payload, { keepReasoningBudget: true }) || changed;
   }
 
   if (reasoningEffort) {
@@ -2785,6 +2813,14 @@ function removeNimReasoningPayloadFields(payload, options = {}) {
     delete payload.reasoning_effort;
     changed = true;
   }
+  if (!options.keepReasoningBudget && "reasoning_budget" in payload) {
+    delete payload.reasoning_budget;
+    changed = true;
+  }
+  if ("reasoningBudget" in payload) {
+    delete payload.reasoningBudget;
+    changed = true;
+  }
   if (!options.keepThinking && "thinking" in payload) {
     delete payload.thinking;
     changed = true;
@@ -2803,14 +2839,23 @@ function nimFamilyReasoningEffort(modelName, payload) {
   if (!nimReasoningRequested(payload)) return "";
   const raw = nimReasoningEffortInput(payload);
   if (isDeepSeekModel(modelName)) return mapNimReasoningEffort(raw, ["none", "high", "max"], "high");
-  if (isStepModel(modelName) || isNemotronModel(modelName)) return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
-  if (isMistralModel(modelName)) return mapNimReasoningEffort(raw, ["none", "high"], "high");
+  if (isStepModel(modelName) || (isNemotronModel(modelName) && !isNemotron3Model(modelName)) || isGptOssModel(modelName) || isSarvamModel(modelName)) {
+    return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
+  }
+  if (isMistralModel(modelName)) return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
   return "";
 }
 
 function nimReasoningEffortInput(payload) {
   if (nimReasoningDisabled(payload)) return "none";
   return String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || payload?.reasoning?.enabled || payload?.enable_thinking || "").toLowerCase();
+}
+
+function nimReasoningBudget(payload) {
+  const value = payload?.reasoning_budget ?? payload?.reasoningBudget ?? payload?.reasoning?.budget ?? payload?.reasoning?.budget_tokens ?? payload?.thinking?.budget ?? payload?.thinking?.budget_tokens;
+  if (value == null || value === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.floor(numeric) : null;
 }
 
 function mapNimReasoningEffort(raw, allowed, fallback) {

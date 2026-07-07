@@ -494,9 +494,13 @@ assert.equal("reasoning_effort" in bodies[nimFamilyBodyStart + 2], false);
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
-  body: JSON.stringify({ model: "nvidia/nemotron-3-ultra", messages: [], reasoningEffort: "low" }),
+  body: JSON.stringify({ model: "nvidia/nemotron-3-ultra", messages: [], reasoningEffort: "low", reasoningBudget: 4096 }),
 }), env);
-assert.equal(bodies[nimFamilyBodyStart + 3].reasoning_effort, "low");
+assert.equal(bodies[nimFamilyBodyStart + 3].chat_template_kwargs.enable_thinking, true);
+assert.equal(bodies[nimFamilyBodyStart + 3].chat_template_kwargs.low_effort, true);
+assert.equal(bodies[nimFamilyBodyStart + 3].reasoning_budget, 4096);
+assert.equal("reasoning_effort" in bodies[nimFamilyBodyStart + 3], false);
+assert.equal("reasoningBudget" in bodies[nimFamilyBodyStart + 3], false);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -505,6 +509,29 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), env);
 assert.equal(bodies[nimFamilyBodyStart + 4].reasoning_effort, "high");
 assert.equal("thinking" in bodies[nimFamilyBodyStart + 4], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "openai/gpt-oss-120b", messages: [], reasoningEffort: "medium" }),
+}), env);
+assert.equal(bodies[nimFamilyBodyStart + 5].reasoning_effort, "medium");
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "sarvamai/sarvam-m", messages: [], enable_thinking: true }),
+}), env);
+assert.equal(bodies[nimFamilyBodyStart + 6].reasoning_effort, "high");
+assert.equal("enable_thinking" in bodies[nimFamilyBodyStart + 6], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "nvidia/llama-nemotron-ultra", messages: [], reasoning: { effort: "medium" } }),
+}), env);
+assert.equal(bodies[nimFamilyBodyStart + 7].reasoning_effort, "medium");
+assert.equal("reasoning" in bodies[nimFamilyBodyStart + 7], false);
 
 const wrappedKvConfig = {
   routing: { failover: true, load_balance: false },
