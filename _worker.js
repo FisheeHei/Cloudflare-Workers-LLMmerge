@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-stream-cancel-guard";
+const VERSION = "v26-07-07-response-stream-log";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1753,8 +1753,8 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
 
     if (translated.stream) {
       setSseHeaders(headers);
-      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId);
-      return new Response(withSseKeepAlive(streamResponsesFromChat(upstreamResp, translated.seed)), { status: 200, headers });
+      const onDone = (usage, extra) => recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
+      return new Response(withSseKeepAlive(streamResponsesFromChat(upstreamResp, translated.seed, onDone, started)), { status: 200, headers });
     }
 
     const openaiText = await upstreamResp.text();
@@ -1953,7 +1953,7 @@ function chatContentToText(content) {
   return content.map((part) => typeof part === "string" ? part : String(part?.text || part?.content || "")).join("");
 }
 
-function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx, traceId) {
+function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx, traceId, extra = {}) {
   recordRequestLog(app, makeRequestLogEntry({
     client,
     upstream: upstreamName,
@@ -1963,11 +1963,11 @@ function recordResponsesLog(app, client, upstreamName, model, started, status, b
     started,
     promptTokens: usage?.input_tokens || Math.max(1, Math.round(bodyText.length / 4)),
     completionTokens: usage?.output_tokens || 1,
-    extra: { trace_id: traceId },
+    extra: { trace_id: traceId, ...extra },
   }), ctx);
 }
 
-function streamResponsesFromChat(openaiResp, seed) {
+function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now()) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -1979,6 +1979,11 @@ function streamResponsesFromChat(openaiResp, seed) {
     let buffer = "";
     let text = "";
     let usage = null;
+    let firstByteMs = 0;
+    let firstTokenMs = 0;
+    let lastChunkAt = started;
+    let maxStreamGapMs = 0;
+    let closeReason = "done";
     try {
       await write({ type: "response.created", response: makeResponsesPayload(seed, "", null, "in_progress") });
       await write({ type: "response.output_item.added", output_index: 0, item: baseMessage });
@@ -1988,6 +1993,10 @@ function streamResponsesFromChat(openaiResp, seed) {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        const now = Date.now();
+        if (!firstByteMs) firstByteMs = now - started;
+        maxStreamGapMs = Math.max(maxStreamGapMs, now - lastChunkAt);
+        lastChunkAt = now;
         buffer += decoder.decode(value, { stream: true });
         const blocks = buffer.split(/\r?\n\r?\n/);
         buffer = blocks.pop() || "";
@@ -1999,6 +2008,7 @@ function streamResponsesFromChat(openaiResp, seed) {
           usage = chunk.usage || usage;
           const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
           if (!delta) continue;
+          if (!firstTokenMs) firstTokenMs = now - started;
           text += delta;
           await write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: 0, content_index: 0, delta });
         }
@@ -2011,8 +2021,15 @@ function streamResponsesFromChat(openaiResp, seed) {
       await write({ type: "response.completed", response: makeResponsesPayload(seed, text, usage) });
       await writer.write(encoder.encode("data: [DONE]\n\n"));
     } catch (error) {
+      closeReason = "error";
       await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
     } finally {
+      if (onDone) onDone(normalizeResponsesUsage(usage), {
+        close_reason: closeReason,
+        max_stream_gap_ms: maxStreamGapMs,
+        time_to_first_byte_ms: firstByteMs,
+        time_to_first_token_ms: firstTokenMs,
+      });
       await writer.close();
     }
   })();
@@ -3611,6 +3628,9 @@ function renderAdminStyle() {
     .log-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
     .log-table .ok { color: var(--accent-2); }
     .log-table .err { color: #8d2f23; }
+    .log-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+    .log-filter { padding: 5px 9px; font-size: 12px; }
+    .log-filter.active { background: #1f8f61; color: #fff; }
     .chart-bar { display: flex; align-items: stretch; gap: 2px; height: 110px; padding: 4px 0; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
     .chart-bar .bar-hit { flex: 1; min-width: 8px; display: flex; align-items: flex-end; position: relative; cursor: default; }
     .chart-bar .bar { width: 100%; background: var(--accent); border-radius: 2px 2px 0 0; position: relative; pointer-events: none; }
@@ -3945,7 +3965,7 @@ function renderAdminMarkup(origin) {
 function renderAdminScript() {
   return `<script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all" };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
 
@@ -5312,21 +5332,36 @@ function renderAdminScript() {
     return "B" + (l.time_to_first_byte_ms || 0) + "/T" + (l.time_to_first_token_ms || 0) + "/G" + (l.max_stream_gap_ms || 0) + " " + (l.close_reason || "");
   }
 
+  function filterLogs(logs) {
+    if (state.logFilter === "stream") return logs.filter((l) => l.time_to_first_byte_ms != null);
+    if (state.logFilter === "error") return logs.filter((l) => Number(l.status || 0) >= 400 || l.close_reason === "error");
+    if (state.logFilter === "slow") return logs.filter((l) => Number(l.max_stream_gap_ms || 0) >= 30000);
+    return logs;
+  }
+
   function renderLogs(logs) {
     if (!logs.length) {
       byId("log-list").innerHTML = '<div class="note">\u6682\u65e0\u8c03\u7528\u8bb0\u5f55\u3002</div>';
       byId("token-total").textContent = "";
       return;
     }
-    const visibleLogs = state.logExpanded ? logs : logs.slice(0, 5);
-    const toggle = logs.length > 5
-      ? '<button type="button" class="small secondary" id="toggle-log-expanded">' + (state.logExpanded ? '\u6536\u8d77' : '\u5c55\u5f00\u5168\u90e8 ' + logs.length + ' \u6761') + '</button>'
+    const filtered = filterLogs(logs);
+    const visibleLogs = state.logExpanded ? filtered : filtered.slice(0, 5);
+    const toggle = filtered.length > 5
+      ? '<button type="button" class="small secondary" id="toggle-log-expanded">' + (state.logExpanded ? '\u6536\u8d77' : '\u5c55\u5f00\u5168\u90e8 ' + filtered.length + ' \u6761') + '</button>'
       : "";
     const totalPrompt = logs.reduce((s, l) => s + (l.prompt_tokens || 0), 0);
     const totalCompletion = logs.reduce((s, l) => s + (l.completion_tokens || 0), 0);
-    byId("token-total").textContent = "\u603b\u8ba1: " + totalPrompt + " input + " + totalCompletion + " output = " + (totalPrompt + totalCompletion) + " tokens (" + logs.length + " \u8bf7\u6c42)";
+    byId("token-total").textContent = "\u603b\u8ba1: " + totalPrompt + " input / " + totalCompletion + " output (" + logs.length + " \u8bf7\u6c42)";
 
-    byId("log-list").innerHTML = toggle + '<table class="log-table"><thead><tr>' +
+    const filters = [
+      ["all", "\u5168\u90e8"],
+      ["stream", "\u6d41\u5f0f"],
+      ["error", "\u5f02\u5e38"],
+      ["slow", "\u6162\u95f4\u9694"],
+    ].map((item) => '<button type="button" class="small secondary log-filter' + (state.logFilter === item[0] ? ' active' : '') + '" data-log-filter="' + item[0] + '">' + item[1] + '</button>').join("");
+    byId("log-list").innerHTML = '<div class="log-tools">' + filters + '<span class="note">' + filtered.length + '/' + logs.length + '</span>' + toggle + '</div>' +
+    (filtered.length ? '<table class="log-table"><thead><tr>' +
       '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tokens</th>' +
     '</tr></thead><tbody>' +
     visibleLogs.map((l) => '<tr>' +
@@ -5340,7 +5375,12 @@ function renderAdminScript() {
       '<td class="mono">' + esc(streamDiag(l)) + '</td>' +
       '<td>' + esc(l.prompt_tokens || 0) + '/' + esc(l.completion_tokens || 0) + '</td>' +
     '</tr>').join("") +
-    '</tbody></table>';
+    '</tbody></table>' : '<div class="note">\u5f53\u524d\u7b5b\u9009\u65e0\u8bb0\u5f55</div>');
+    byId("log-list").querySelectorAll("[data-log-filter]").forEach((btn) => btn.addEventListener("click", () => {
+      state.logFilter = btn.dataset.logFilter || "all";
+      state.logExpanded = false;
+      renderLogs(state.logs);
+    }));
     byId("toggle-log-expanded")?.addEventListener("click", () => {
       state.logExpanded = !state.logExpanded;
       renderLogs(state.logs);

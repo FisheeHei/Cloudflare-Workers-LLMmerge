@@ -283,6 +283,8 @@ assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("picker-apply-same-preset"), true);
 assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
+assert.equal(adminPage.includes("data-log-filter"), true);
+assert.equal(adminPage.includes("input / "), true);
 assert.equal(adminPage.includes("system-prompt-modal"), true);
 assert.equal(adminPage.includes("global-context-input"), true);
 assert.equal(adminPage.includes("system-prompt-client-scope"), true);
@@ -979,6 +981,12 @@ assert.equal(responseStreamHits[0].stream, true);
 assert.equal(responsesStreamText.includes('"type":"response.output_text.delta"'), true);
 assert.equal(responsesStreamText.includes('"delta":"hel"'), true);
 assert.equal(responsesStreamText.includes('"type":"response.completed"'), true);
+const responsesStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), responsesEnv);
+const responsesStreamLogs = await responsesStreamLogsResp.json();
+const responsesStreamLog = responsesStreamLogs.logs.find((entry) => entry.model === "stream-model" && entry.path === "/v1/responses");
+assert.equal(responsesStreamLog.completion_tokens >= 1, true);
+assert.equal(responsesStreamLog.close_reason, "done");
+assert.equal(Number.isFinite(responsesStreamLog.time_to_first_byte_ms), true);
 
 const paymentStore = new Map();
 paymentStore.set("gateway:config", JSON.stringify({
