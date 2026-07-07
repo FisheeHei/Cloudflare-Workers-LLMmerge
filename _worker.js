@@ -40,7 +40,7 @@ const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
-const VERSION = "v26-07-08-analytics-engine";
+const VERSION = "v26-07-08-prompt-context-io";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -3762,9 +3762,10 @@ function renderAdminStyle() {
     .menu-wrap { position: relative; }
     .menu {
       position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
-      display: none; min-width: 150px; padding: 6px;
+      display: none; min-width: 150px; max-height: min(52vh, 320px); overflow-y: auto; padding: 6px;
       background: #fffdfa; border: 1px solid #cfbea0; border-radius: 12px;
       box-shadow: 0 12px 24px rgba(38,28,18,.12);
+      overscroll-behavior: contain;
     }
     .menu-wrap.open .menu { display: grid; gap: 4px; }
     .menu button { width: 100%; text-align: left; border-radius: 8px; }
@@ -4277,6 +4278,11 @@ function renderAdminMarkup(origin) {
         <div class="field">
           <label>\u7cfb\u7edf\u63d0\u793a\u8bcd</label>
           <textarea id="system-prompt-input" class="system-prompt-textarea" placeholder="\u7b80\u77ed\u3001\u5fc5\u987b\u7167\u505a\u7684\u6700\u9ad8\u6307\u4ee4\u3002\u7559\u7a7a\u5219\u4e0d\u6ce8\u5165\u3002"></textarea>
+          <div class="context-controls">
+            <button type="button" class="secondary small" id="export-prompt-config">\u5bfc\u51fa\u63d0\u793a\u8bcd</button>
+            <button type="button" class="secondary small" id="import-prompt-config">\u5bfc\u5165\u63d0\u793a\u8bcd</button>
+          </div>
+          <input type="file" id="import-prompt-file" accept=".json,application/json,.txt,text/plain" hidden>
         </div>
         <div class="field">
           <label>\u5168\u5c40\u4e0a\u4e0b\u6587</label>
@@ -4911,11 +4917,32 @@ function renderAdminScript() {
       global_context: byId("global-context-input").value,
       global_context_clients: selectedPromptClients("global-context-client-scope"),
       context_always_clients: selectedPromptClients("context-always-client-scope"),
-      subagent_prompt_clients: selectedPromptClients("subagent-prompt-client-scope"),
       context_on_demand: byId("context-on-demand").checked,
       context_item_limit: Number(byId("context-item-limit").value || 3),
       context_max_chars: Number(byId("context-max-chars").value || 4000),
       context_items: collectContextItems(),
+    };
+  }
+
+  function currentPromptBundle() {
+    return {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      system_prompt: byId("system-prompt-input").value,
+      system_prompt_clients: selectedPromptClients("system-prompt-client-scope"),
+      subagent_prompt_clients: selectedPromptClients("subagent-prompt-client-scope"),
+    };
+  }
+
+  function normalizeImportedPromptBundle(payload, rawText) {
+    const source = payload && (payload.prompt || payload);
+    if (!source || typeof source !== "object") {
+      return { system_prompt: String(rawText || "").trim(), system_prompt_clients: [], subagent_prompt_clients: [] };
+    }
+    return {
+      system_prompt: text(source.system_prompt || source.prompt || ""),
+      system_prompt_clients: normalizeImportList(source.system_prompt_clients),
+      subagent_prompt_clients: normalizeImportList(source.subagent_prompt_clients),
     };
   }
 
@@ -4926,7 +4953,6 @@ function renderAdminScript() {
       global_context: text(source.global_context || source.context_text || ""),
       global_context_clients: normalizeImportList(source.global_context_clients),
       context_always_clients: normalizeImportList(source.context_always_clients),
-      subagent_prompt_clients: normalizeImportList(source.subagent_prompt_clients),
       context_on_demand: source.context_on_demand === true || items.length > 0,
       context_item_limit: Number(source.context_item_limit || 3),
       context_max_chars: Number(source.context_max_chars || 4000),
@@ -4946,6 +4972,24 @@ function renderAdminScript() {
     };
   }
 
+  async function importPromptFromFile(file) {
+    const raw = await file.text();
+    let payload = null;
+    try { payload = JSON.parse(raw); } catch {}
+    const bundle = normalizeImportedPromptBundle(payload, raw);
+    if (!bundle.system_prompt && !bundle.subagent_prompt_clients.length) throw new Error("\u5bfc\u5165\u6587\u4ef6\u91cc\u6ca1\u6709\u63d0\u793a\u8bcd\u914d\u7f6e");
+    if (byId("system-prompt-input").value.trim() && !confirm("\u5bfc\u5165\u4f1a\u8986\u76d6\u5f53\u524d\u7cfb\u7edf\u63d0\u793a\u8bcd\uff0c\u7ee7\u7eed\u5417\uff1f")) return;
+
+    const settings = state.config.settings || (state.config.settings = {});
+    settings.system_prompt_clients = bundle.system_prompt_clients;
+    settings.subagent_prompt_clients = bundle.subagent_prompt_clients;
+    byId("system-prompt-input").value = bundle.system_prompt;
+    renderPromptClientScopes();
+    renderPromptContextStatus("\u5df2\u5bfc\u5165\uff0c\u4fdd\u5b58\u4e2d");
+    await saveConfig();
+    showToast("\u5df2\u5bfc\u5165\u63d0\u793a\u8bcd");
+  }
+
   async function importContextFromFile(file) {
     const payload = JSON.parse(await file.text());
     const bundle = normalizeImportedContextBundle(payload);
@@ -4955,7 +4999,6 @@ function renderAdminScript() {
     const settings = state.config.settings || (state.config.settings = {});
     settings.global_context_clients = bundle.global_context_clients;
     settings.context_always_clients = bundle.context_always_clients;
-    settings.subagent_prompt_clients = bundle.subagent_prompt_clients;
     byId("global-context-input").value = bundle.global_context;
     byId("context-on-demand").checked = bundle.context_on_demand;
     byId("context-item-limit").value = bundle.context_item_limit;
@@ -5902,6 +5945,23 @@ function renderAdminScript() {
       byId("split-prompt-context").addEventListener("click", splitPromptContextDraft);
       byId("add-context-item").addEventListener("click", () => addContextItem());
       byId("classify-context-items").addEventListener("click", classifyContextItemsDraft);
+      byId("export-prompt-config").addEventListener("click", () => {
+        const payload = currentPromptBundle();
+        downloadJsonFile("llmmerge-prompt-" + payload.exported_at.slice(0, 10) + ".json", payload);
+        showToast("\u5df2\u5bfc\u51fa\u63d0\u793a\u8bcd");
+      });
+      byId("import-prompt-config").addEventListener("click", () => {
+        const input = byId("import-prompt-file");
+        input.value = "";
+        input.click();
+      });
+      byId("import-prompt-file").addEventListener("change", (e) =>
+        withButtonBusy(byId("import-prompt-config"), "\u5bfc\u5165\u4e2d...", async () => {
+          const file = e.target.files && e.target.files[0];
+          if (!file) return;
+          await importPromptFromFile(file);
+        }).catch(showError)
+      );
       byId("export-context-items").addEventListener("click", () => {
         const payload = currentContextBundle();
         downloadJsonFile("llmmerge-context-" + payload.exported_at.slice(0, 10) + ".json", payload);

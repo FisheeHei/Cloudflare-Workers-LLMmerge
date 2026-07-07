@@ -332,6 +332,8 @@ assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("context-on-demand"), true);
 assert.equal(adminPage.includes("context-items"), true);
 assert.equal(adminPage.includes("classifyContextItemsDraft"), true);
+assert.equal(adminPage.includes("export-prompt-config"), true);
+assert.equal(adminPage.includes("import-prompt-file"), true);
 assert.equal(adminPage.includes("export-context-items"), true);
 assert.equal(adminPage.includes("import-context-file"), true);
 assert.equal(adminPage.includes("180000"), true);
