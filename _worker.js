@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-kimi-preserved-thinking";
+const VERSION = "v26-07-07-nim-bridge";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2575,13 +2575,12 @@ function sanitizeProxyBody(bodyText, upstream) {
 
   let changed = false;
   const modelName = String(payload.model || "").toLowerCase();
-  const isGlm = /(^|[\/_.-])glm([\/_.-]|$)/i.test(modelName);
-  const wantsGlmThinking = isNvidia && isGlm && glmThinkingRequested(payload);
+  const isGlm = isGlmModel(modelName);
   const wantsKimiPreservedThinking = kimiPreservedThinkingRequested(payload, modelName);
   changed = applyProviderReasoningOptions(payload) || changed;
   changed = normalizeReasoningFields(payload, isGlm, wantsKimiPreservedThinking) || changed;
   changed = applyKimiPreservedThinking(payload, wantsKimiPreservedThinking) || changed;
-  if (isNvidia) changed = sanitizeNvidiaPayload(payload, isGlm, modelName, wantsGlmThinking) || changed;
+  if (isNvidia) changed = applyNimBridge(payload, modelName) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
 }
@@ -2609,7 +2608,7 @@ function bodyNeedsSanitizing(bodyText, bodyLower, isNvidia) {
     bodyText.includes('"providerOptions"') ||
     bodyText.includes('"provider_options"') ||
     bodyLower.includes("kimi-k2") ||
-    (isNvidia && (bodyText.includes('"reasoning_split"') || bodyText.includes('"enable_thinking"')));
+    (isNvidia && (bodyText.includes('"reasoning_split"') || bodyText.includes('"enable_thinking"') || bodyLower.includes("minimax-m3")));
 }
 
 function applyProviderReasoningOptions(payload) {
@@ -2691,15 +2690,36 @@ function applyKimiPreservedThinking(payload, enabled) {
   return true;
 }
 
-function sanitizeNvidiaPayload(payload, isGlm, modelName, wantsGlmThinking = false) {
+function isGlmModel(modelName) {
+  return /(^|[\/_.-])glm([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function isMiniMaxM3Model(modelName) {
+  return /(^|[\/_.-])minimax[\/_.-]*m3([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function applyNimBridge(payload, modelName) {
   let changed = false;
+  const isGlm = isGlmModel(modelName);
   if (isGlm) {
-    if (wantsGlmThinking) {
-      payload.chat_template_kwargs = {
-        ...(payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object" ? payload.chat_template_kwargs : {}),
-        enable_thinking: true,
-        clear_thinking: false,
-      };
+    if (glmThinkingRequested(payload)) {
+      setChatTemplateKwargs(payload, { enable_thinking: true, clear_thinking: false });
+      changed = true;
+    }
+    if ("reasoning" in payload) {
+      delete payload.reasoning;
+      changed = true;
+    }
+    if ("reasoning_effort" in payload) {
+      delete payload.reasoning_effort;
+      changed = true;
+    }
+  }
+
+  if (isMiniMaxM3Model(modelName)) {
+    const thinkingMode = nimThinkingMode(payload);
+    if (thinkingMode) {
+      setChatTemplateKwargs(payload, { thinking_mode: thinkingMode });
       changed = true;
     }
     if ("reasoning" in payload) {
@@ -2721,17 +2741,27 @@ function sanitizeNvidiaPayload(payload, isGlm, modelName, wantsGlmThinking = fal
     const enableThinking = payload.enable_thinking;
     delete payload.enable_thinking;
     if (modelName.includes("qwen")) {
-      payload.chat_template_kwargs = {
-        ...(payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object"
-          ? payload.chat_template_kwargs
-          : {}),
-        enable_thinking: enableThinking,
-      };
+      setChatTemplateKwargs(payload, { enable_thinking: enableThinking });
     }
     changed = true;
   }
 
   return changed;
+}
+
+function setChatTemplateKwargs(payload, values) {
+  payload.chat_template_kwargs = {
+    ...(payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object" ? payload.chat_template_kwargs : {}),
+    ...values,
+  };
+}
+
+function nimThinkingMode(payload) {
+  if (payload?.chat_template_kwargs?.thinking_mode) return "";
+  const effort = String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || "").toLowerCase();
+  if (effort === "none" || effort === "disabled" || effort === "off" || effort === "low") return "disabled";
+  if (effort === "high" || effort === "medium" || effort === "enabled" || effort === "on") return "enabled";
+  return glmThinkingRequested(payload) ? "adaptive" : "";
 }
 
 function setReasoningSummary(payload, summary) {
