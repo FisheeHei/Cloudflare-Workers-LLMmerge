@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-nim-bridge";
+const VERSION = "v26-07-07-nim-bridge-2";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2578,7 +2578,7 @@ function sanitizeProxyBody(bodyText, upstream) {
   const isGlm = isGlmModel(modelName);
   const wantsKimiPreservedThinking = kimiPreservedThinkingRequested(payload, modelName);
   changed = applyProviderReasoningOptions(payload) || changed;
-  changed = normalizeReasoningFields(payload, isGlm, wantsKimiPreservedThinking) || changed;
+  changed = normalizeReasoningFields(payload, isGlm, wantsKimiPreservedThinking || isNvidia) || changed;
   changed = applyKimiPreservedThinking(payload, wantsKimiPreservedThinking) || changed;
   if (isNvidia) changed = applyNimBridge(payload, modelName) || changed;
 
@@ -2698,35 +2698,46 @@ function isMiniMaxM3Model(modelName) {
   return /(^|[\/_.-])minimax[\/_.-]*m3([\/_.-]|$)/i.test(String(modelName || ""));
 }
 
+function isDeepSeekModel(modelName) {
+  return /(^|[\/_.-])deepseek([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function isStepModel(modelName) {
+  return /(^|[\/_.-])(step|stepfun|step-ai)([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function isNemotronModel(modelName) {
+  return /(^|[\/_.-])nemotron([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function isMistralModel(modelName) {
+  return /(^|[\/_.-])(mistral|mixtral|codestral)([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
 function applyNimBridge(payload, modelName) {
   let changed = false;
   const isGlm = isGlmModel(modelName);
   const isQwen = modelName.includes("qwen");
+  const isKimi = isKimiModel(modelName);
+  const reasoningEffort = nimFamilyReasoningEffort(modelName, payload);
   if (isGlm) {
     if (glmThinkingRequested(payload)) {
       setChatTemplateKwargs(payload, { enable_thinking: true, clear_thinking: false });
       changed = true;
     }
-    if ("reasoning" in payload) {
-      delete payload.reasoning;
-      changed = true;
-    }
-    if ("reasoning_effort" in payload) {
-      delete payload.reasoning_effort;
-      changed = true;
-    }
+    changed = removeNimReasoningPayloadFields(payload) || changed;
+  }
+
+  if (isKimi && glmThinkingRequested(payload)) {
+    const mode = nimReasoningDisabled(payload) ? "disabled" : "enabled";
+    payload.thinking = mode === "enabled" ? { type: "enabled", keep: "all" } : { type: "disabled" };
+    changed = true;
+    changed = removeNimReasoningPayloadFields(payload, { keepThinking: true }) || changed;
   }
 
   if (isQwen && nimReasoningRequested(payload)) {
     setChatTemplateKwargs(payload, { enable_thinking: !nimReasoningDisabled(payload) });
-    if ("reasoning" in payload) {
-      delete payload.reasoning;
-      changed = true;
-    }
-    if ("reasoning_effort" in payload) {
-      delete payload.reasoning_effort;
-      changed = true;
-    }
+    changed = removeNimReasoningPayloadFields(payload) || changed;
     changed = true;
   }
 
@@ -2736,14 +2747,15 @@ function applyNimBridge(payload, modelName) {
       setChatTemplateKwargs(payload, { thinking_mode: thinkingMode });
       changed = true;
     }
-    if ("reasoning" in payload) {
-      delete payload.reasoning;
+    changed = removeNimReasoningPayloadFields(payload) || changed;
+  }
+
+  if (reasoningEffort) {
+    if (payload.reasoning_effort !== reasoningEffort) {
+      payload.reasoning_effort = reasoningEffort;
       changed = true;
     }
-    if ("reasoning_effort" in payload) {
-      delete payload.reasoning_effort;
-      changed = true;
-    }
+    changed = removeNimReasoningPayloadFields(payload, { keepReasoningEffort: true }) || changed;
   }
 
   if ("reasoning_split" in payload) {
@@ -2763,11 +2775,52 @@ function applyNimBridge(payload, modelName) {
   return changed;
 }
 
+function removeNimReasoningPayloadFields(payload, options = {}) {
+  let changed = false;
+  if ("reasoning" in payload) {
+    delete payload.reasoning;
+    changed = true;
+  }
+  if (!options.keepReasoningEffort && "reasoning_effort" in payload) {
+    delete payload.reasoning_effort;
+    changed = true;
+  }
+  if (!options.keepThinking && "thinking" in payload) {
+    delete payload.thinking;
+    changed = true;
+  }
+  return changed;
+}
+
 function setChatTemplateKwargs(payload, values) {
   payload.chat_template_kwargs = {
     ...(payload.chat_template_kwargs && typeof payload.chat_template_kwargs === "object" ? payload.chat_template_kwargs : {}),
     ...values,
   };
+}
+
+function nimFamilyReasoningEffort(modelName, payload) {
+  if (!nimReasoningRequested(payload)) return "";
+  const raw = nimReasoningEffortInput(payload);
+  if (isDeepSeekModel(modelName)) return mapNimReasoningEffort(raw, ["none", "high", "max"], "high");
+  if (isStepModel(modelName) || isNemotronModel(modelName)) return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
+  if (isMistralModel(modelName)) return mapNimReasoningEffort(raw, ["none", "high"], "high");
+  return "";
+}
+
+function nimReasoningEffortInput(payload) {
+  if (nimReasoningDisabled(payload)) return "none";
+  return String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || payload?.reasoning?.enabled || payload?.enable_thinking || "").toLowerCase();
+}
+
+function mapNimReasoningEffort(raw, allowed, fallback) {
+  const value = String(raw || "").toLowerCase();
+  if (allowed.includes(value)) return value;
+  if (value === "xhigh" || value === "maximum") return allowed.includes("max") ? "max" : "high";
+  if (value === "minimal") return allowed.includes("low") ? "low" : fallback;
+  if (value === "false" || value === "off" || value === "disabled") return "none";
+  if (value === "true" || value === "on" || value === "enabled" || !value) return fallback;
+  return fallback;
 }
 
 function nimThinkingMode(payload) {
@@ -2779,12 +2832,13 @@ function nimThinkingMode(payload) {
 }
 
 function nimReasoningRequested(payload) {
-  return Boolean(payload?.reasoning || payload?.reasoning_effort || payload?.reasoningEffort || payload?.enable_thinking != null || payload?.chat_template_kwargs?.enable_thinking != null);
+  return Boolean(payload?.reasoning || payload?.reasoning_effort || payload?.reasoningEffort || payload?.thinking != null || payload?.enable_thinking != null || payload?.chat_template_kwargs?.enable_thinking != null);
 }
 
 function nimReasoningDisabled(payload) {
   const effort = String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || "").toLowerCase();
-  return payload?.enable_thinking === false || effort === "none" || effort === "disabled" || effort === "off";
+  const thinkingType = String(payload?.thinking?.type || "").toLowerCase();
+  return payload?.enable_thinking === false || thinkingType === "disabled" || effort === "none" || effort === "disabled" || effort === "off";
 }
 
 function setReasoningSummary(payload, summary) {

@@ -402,7 +402,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), env);
 
 assert.equal(bodies[3].reasoning_effort, "high");
-assert.equal(bodies[3].reasoning.summary, "auto");
+assert.equal("reasoning" in bodies[3], false);
 assert.equal("reasoningEffort" in bodies[3], false);
 assert.equal("reasoningSummary" in bodies[3], false);
 
@@ -412,8 +412,8 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "deepseek-reasoner", messages: [], providerOptions: { openai: { reasoningEffort: "medium", reasoningSummary: "auto", reasoning: { effort: "medium" } } } }),
 }), env);
 
-assert.equal(bodies[4].reasoning_effort, "medium");
-assert.equal(bodies[4].reasoning.summary, "auto");
+assert.equal(bodies[4].reasoning_effort, "high");
+assert.equal("reasoning" in bodies[4], false);
 assert.equal("providerOptions" in bodies[4], false);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -464,6 +464,47 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "moonshotai/kimi-k2.7-code", messages: [] }),
 }), env);
 assert.equal("thinking" in bodies[kimiBodyStart + 1], false);
+
+const nimFamilyBodyStart = bodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-r1", messages: [], reasoningEffort: "max", reasoningSummary: "auto" }),
+}), env);
+assert.equal(bodies[nimFamilyBodyStart].reasoning_effort, "max");
+assert.equal("reasoning" in bodies[nimFamilyBodyStart], false);
+assert.equal("reasoningEffort" in bodies[nimFamilyBodyStart], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "stepfun/step-3", messages: [], reasoning: { effort: "medium" } }),
+}), env);
+assert.equal(bodies[nimFamilyBodyStart + 1].reasoning_effort, "medium");
+assert.equal("reasoning" in bodies[nimFamilyBodyStart + 1], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "moonshotai/kimi-k2.5", messages: [], reasoningEffort: "none" }),
+}), env);
+assert.deepEqual(bodies[nimFamilyBodyStart + 2].thinking, { type: "disabled" });
+assert.equal("reasoning_effort" in bodies[nimFamilyBodyStart + 2], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "nvidia/nemotron-3-ultra", messages: [], reasoningEffort: "low" }),
+}), env);
+assert.equal(bodies[nimFamilyBodyStart + 3].reasoning_effort, "low");
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "mistralai/mistral-medium-3", messages: [], thinking: { type: "enabled" } }),
+}), env);
+assert.equal(bodies[nimFamilyBodyStart + 4].reasoning_effort, "high");
+assert.equal("thinking" in bodies[nimFamilyBodyStart + 4], false);
 
 const wrappedKvConfig = {
   routing: { failover: true, load_balance: false },
