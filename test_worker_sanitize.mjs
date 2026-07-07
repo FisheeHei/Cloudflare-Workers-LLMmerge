@@ -430,6 +430,21 @@ const logs = await logsResp.json();
 assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
 assert.equal(kvPuts.length, 0);
 
+const kimiBodyStart = bodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "moonshotai/kimi-k2-thinking", messages: [] }),
+}), env);
+assert.deepEqual(bodies[kimiBodyStart].thinking, { type: "enabled", keep: "all" });
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "moonshotai/kimi-k2.7-code", messages: [] }),
+}), env);
+assert.equal("thinking" in bodies[kimiBodyStart + 1], false);
+
 const wrappedKvConfig = {
   routing: { failover: true, load_balance: false },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },

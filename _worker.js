@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-header-refactor";
+const VERSION = "v26-07-07-kimi-preserved-thinking";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -1510,6 +1510,10 @@ function isQwenModel(model) {
   return String(model || "").toLowerCase().includes("qwen");
 }
 
+function isKimiModel(model) {
+  return /(^|[\/_.-])kimi([\/_.-]|$)/i.test(String(model || ""));
+}
+
 function isLooseAliasModel(model) {
   return isQwenModel(model) || /(^|[\/_.-])glm([\/_.-]|$)/i.test(String(model || ""));
 }
@@ -2559,7 +2563,8 @@ function sanitizeProxyBody(bodyText, upstream) {
   if (!bodyText) return bodyText;
 
   const isNvidia = isNvidiaNimUpstream(upstream);
-  if (!bodyNeedsSanitizing(bodyText, isNvidia)) return bodyText;
+  const bodyLower = bodyText.toLowerCase();
+  if (!bodyNeedsSanitizing(bodyText, bodyLower, isNvidia)) return bodyText;
 
   let payload;
   try {
@@ -2572,8 +2577,10 @@ function sanitizeProxyBody(bodyText, upstream) {
   const modelName = String(payload.model || "").toLowerCase();
   const isGlm = /(^|[\/_.-])glm([\/_.-]|$)/i.test(modelName);
   const wantsGlmThinking = isNvidia && isGlm && glmThinkingRequested(payload);
+  const wantsKimiPreservedThinking = kimiPreservedThinkingRequested(payload, modelName);
   changed = applyProviderReasoningOptions(payload) || changed;
-  changed = normalizeReasoningFields(payload, isGlm) || changed;
+  changed = normalizeReasoningFields(payload, isGlm, wantsKimiPreservedThinking) || changed;
+  changed = applyKimiPreservedThinking(payload, wantsKimiPreservedThinking) || changed;
   if (isNvidia) changed = sanitizeNvidiaPayload(payload, isGlm, modelName, wantsGlmThinking) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
@@ -2592,7 +2599,7 @@ function glmThinkingRequested(payload) {
   );
 }
 
-function bodyNeedsSanitizing(bodyText, isNvidia) {
+function bodyNeedsSanitizing(bodyText, bodyLower, isNvidia) {
   return bodyText.includes('"thinking"') ||
     bodyText.includes('"reasoning"') ||
     bodyText.includes('"reasoning_effort"') ||
@@ -2601,6 +2608,7 @@ function bodyNeedsSanitizing(bodyText, isNvidia) {
     bodyText.includes('"reasoningSummary"') ||
     bodyText.includes('"providerOptions"') ||
     bodyText.includes('"provider_options"') ||
+    bodyLower.includes("kimi-k2") ||
     (isNvidia && (bodyText.includes('"reasoning_split"') || bodyText.includes('"enable_thinking"')));
 }
 
@@ -2638,7 +2646,7 @@ function applyProviderReasoningOptions(payload) {
   return changed;
 }
 
-function normalizeReasoningFields(payload, isGlm) {
+function normalizeReasoningFields(payload, isGlm, keepThinking = false) {
   let changed = false;
   if (!isGlm && payload.reasoning && typeof payload.reasoning === "object" && payload.reasoning.effort != null && !("reasoning_effort" in payload)) {
     payload.reasoning_effort = payload.reasoning.effort;
@@ -2663,11 +2671,24 @@ function normalizeReasoningFields(payload, isGlm) {
     delete payload.reasoning_summary;
     changed = true;
   }
-  if ("thinking" in payload) {
+  if ("thinking" in payload && !keepThinking) {
     delete payload.thinking;
     changed = true;
   }
   return changed;
+}
+
+function kimiPreservedThinkingRequested(payload, modelName) {
+  if (!isKimiModel(modelName) || /kimi[\/_.-]*k2[\/_.-]*7[\/_.-]*code/i.test(modelName)) return false;
+  return /kimi[\/_.-]*k2/i.test(modelName) || glmThinkingRequested(payload);
+}
+
+function applyKimiPreservedThinking(payload, enabled) {
+  if (!enabled) return false;
+  const current = payload.thinking && typeof payload.thinking === "object" ? payload.thinking : {};
+  if (current.type === "enabled" && current.keep === "all") return false;
+  payload.thinking = { ...current, type: "enabled", keep: "all" };
+  return true;
 }
 
 function sanitizeNvidiaPayload(payload, isGlm, modelName, wantsGlmThinking = false) {
@@ -5000,7 +5021,7 @@ function renderAdminScript() {
     const vision = /(^|[\/_.-])(vl|vision|visual|image|multimodal|omni|pixtral|gemini|gpt-4o|qwen2(?:\.5)?-vl)([\/_.-]|$)/i.test(value);
     tags.push(vision ? "vision" : "text");
     if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|glm|llama-3|mistral|mixtral|deepseek|codestral|coder|codegemma)/i.test(value)) tags.push("tools");
-    if (/(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3|glm)([\/_.-]|$)/i.test(value)) tags.push("thinking");
+    if (/(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3|glm|kimi-k2)([\/_.-]|$)/i.test(value)) tags.push("thinking");
     if (/(agent|agentic|computer-use|operator|claude|gpt-|gemini|qwen.*coder|glm|coder|codegemma|codestral|deepseek-coder|devstral|swe|opus|sonnet)/i.test(value)) tags.push("agentic");
     return tags;
   }
