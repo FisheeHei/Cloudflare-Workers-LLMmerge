@@ -38,7 +38,7 @@ const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
-const VERSION = "v26-07-07-response-stream-log";
+const VERSION = "v26-07-07-stream-parser-refactor";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -670,19 +670,14 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   let outputText = "";
   let logged = false;
   let failureStatus = 0;
-  let firstByteMs = 0;
-  let firstTokenMs = 0;
-  let lastChunkAt = started;
-  let maxStreamGapMs = 0;
+  const diag = createStreamDiag(started);
   let closeReason = "done";
   const finish = () => {
     if (logged) return;
     logged = true;
     onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)), failureStatus || 0, {
       close_reason: closeReason,
-      max_stream_gap_ms: maxStreamGapMs,
-      time_to_first_byte_ms: firstByteMs,
-      time_to_first_token_ms: firstTokenMs,
+      ...streamDiagExtra(diag),
     });
   };
 
@@ -694,24 +689,22 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
           const { done, value } = await reader.read();
           if (done) break;
           const now = Date.now();
-          if (!firstByteMs) firstByteMs = now - started;
-          maxStreamGapMs = Math.max(maxStreamGapMs, now - lastChunkAt);
-          lastChunkAt = now;
+          noteStreamByte(diag, now);
           buffer += decoder.decode(value, { stream: true });
-          readOpenAiStreamBlocks(buffer, (rest) => { buffer = rest; }, (chunk) => {
+          buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
             if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
             usage = chunk.usage || usage;
             const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
-            if (delta && !firstTokenMs) firstTokenMs = now - started;
+            if (delta) noteStreamToken(diag, now);
             outputText += delta;
           });
           controller.enqueue(value);
         }
-        if (buffer) readOpenAiStreamBlocks(buffer + "\n\n", (rest) => { buffer = rest; }, (chunk) => {
+        if (buffer) consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => {
           if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
           usage = chunk.usage || usage;
           const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
-          if (delta && !firstTokenMs) firstTokenMs = Date.now() - started;
+          if (delta) noteStreamToken(diag);
           outputText += delta;
         });
         finish();
@@ -784,15 +777,38 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
   });
 }
 
-function readOpenAiStreamBlocks(text, setRest, onChunk) {
+function consumeOpenAiStreamBuffer(text, onChunk) {
   const blocks = text.split(/\r?\n\r?\n/);
-  setRest(blocks.pop() || "");
+  const rest = blocks.pop() || "";
   for (const block of blocks) {
     const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
     if (!data || data === "[DONE]") continue;
     const chunk = safeJson(data);
     if (chunk) onChunk(chunk);
   }
+  return rest;
+}
+
+function createStreamDiag(started = Date.now()) {
+  return { firstByteMs: 0, firstTokenMs: 0, lastChunkAt: started, maxStreamGapMs: 0, started };
+}
+
+function noteStreamByte(diag, now = Date.now()) {
+  if (!diag.firstByteMs) diag.firstByteMs = now - diag.started;
+  diag.maxStreamGapMs = Math.max(diag.maxStreamGapMs, now - diag.lastChunkAt);
+  diag.lastChunkAt = now;
+}
+
+function noteStreamToken(diag, now = Date.now()) {
+  if (!diag.firstTokenMs) diag.firstTokenMs = now - diag.started;
+}
+
+function streamDiagExtra(diag) {
+  return {
+    max_stream_gap_ms: diag.maxStreamGapMs,
+    time_to_first_byte_ms: diag.firstByteMs,
+    time_to_first_token_ms: diag.firstTokenMs,
+  };
 }
 
 function safeJson(text) {
@@ -1979,11 +1995,9 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     let buffer = "";
     let text = "";
     let usage = null;
-    let firstByteMs = 0;
-    let firstTokenMs = 0;
-    let lastChunkAt = started;
-    let maxStreamGapMs = 0;
+    const diag = createStreamDiag(started);
     let closeReason = "done";
+    const writes = [];
     try {
       await write({ type: "response.created", response: makeResponsesPayload(seed, "", null, "in_progress") });
       await write({ type: "response.output_item.added", output_index: 0, item: baseMessage });
@@ -1994,24 +2008,28 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         const { done, value } = await reader.read();
         if (done) break;
         const now = Date.now();
-        if (!firstByteMs) firstByteMs = now - started;
-        maxStreamGapMs = Math.max(maxStreamGapMs, now - lastChunkAt);
-        lastChunkAt = now;
+        noteStreamByte(diag, now);
         buffer += decoder.decode(value, { stream: true });
-        const blocks = buffer.split(/\r?\n\r?\n/);
-        buffer = blocks.pop() || "";
-        for (const block of blocks) {
-          const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
-          if (!data || data === "[DONE]") continue;
-          let chunk;
-          try { chunk = JSON.parse(data); } catch { continue; }
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
           usage = chunk.usage || usage;
           const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
-          if (!delta) continue;
-          if (!firstTokenMs) firstTokenMs = now - started;
+          if (!delta) return;
+          noteStreamToken(diag, now);
           text += delta;
-          await write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: 0, content_index: 0, delta });
-        }
+          writes.push(write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: 0, content_index: 0, delta }));
+        });
+        await Promise.all(writes.splice(0));
+      }
+      if (buffer) {
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => {
+          usage = chunk.usage || usage;
+          const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+          if (!delta) return;
+          noteStreamToken(diag);
+          text += delta;
+          writes.push(write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: 0, content_index: 0, delta }));
+        });
+        await Promise.all(writes.splice(0));
       }
 
       const donePart = { type: "output_text", text, annotations: [] };
@@ -2026,9 +2044,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     } finally {
       if (onDone) onDone(normalizeResponsesUsage(usage), {
         close_reason: closeReason,
-        max_stream_gap_ms: maxStreamGapMs,
-        time_to_first_byte_ms: firstByteMs,
-        time_to_first_token_ms: firstTokenMs,
+        ...streamDiagExtra(diag),
       });
       await writer.close();
     }
