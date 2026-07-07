@@ -378,12 +378,22 @@ assert.equal(bodies[0].chat_template_kwargs.enable_thinking, true);
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [], reasoningEffort: "high" }),
+}), env);
+
+assert.equal(bodies[1].chat_template_kwargs.enable_thinking, true);
+assert.equal("reasoningEffort" in bodies[1], false);
+assert.equal("reasoning_effort" in bodies[1], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
   body: JSON.stringify({ model: "minimax-m3", messages: [], reasoning_split: true, enable_thinking: true }),
 }), env);
 
-assert.equal("reasoning_split" in bodies[1], false);
-assert.equal("enable_thinking" in bodies[1], false);
-assert.equal(bodies[1].chat_template_kwargs.thinking_mode, "adaptive");
+assert.equal("reasoning_split" in bodies[2], false);
+assert.equal("enable_thinking" in bodies[2], false);
+assert.equal(bodies[2].chat_template_kwargs.thinking_mode, "adaptive");
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -391,10 +401,10 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "deepseek-reasoner", messages: [], reasoningEffort: "high", reasoningSummary: "auto" }),
 }), env);
 
-assert.equal(bodies[2].reasoning_effort, "high");
-assert.equal(bodies[2].reasoning.summary, "auto");
-assert.equal("reasoningEffort" in bodies[2], false);
-assert.equal("reasoningSummary" in bodies[2], false);
+assert.equal(bodies[3].reasoning_effort, "high");
+assert.equal(bodies[3].reasoning.summary, "auto");
+assert.equal("reasoningEffort" in bodies[3], false);
+assert.equal("reasoningSummary" in bodies[3], false);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -402,9 +412,9 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "deepseek-reasoner", messages: [], providerOptions: { openai: { reasoningEffort: "medium", reasoningSummary: "auto", reasoning: { effort: "medium" } } } }),
 }), env);
 
-assert.equal(bodies[3].reasoning_effort, "medium");
-assert.equal(bodies[3].reasoning.summary, "auto");
-assert.equal("providerOptions" in bodies[3], false);
+assert.equal(bodies[4].reasoning_effort, "medium");
+assert.equal(bodies[4].reasoning.summary, "auto");
+assert.equal("providerOptions" in bodies[4], false);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -412,9 +422,9 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "minimax-m3", messages: [], reasoningEffort: "high" }),
 }), env);
 
-assert.equal(bodies[4].chat_template_kwargs.thinking_mode, "enabled");
-assert.equal("reasoningEffort" in bodies[4], false);
-assert.equal("reasoning_effort" in bodies[4], false);
+assert.equal(bodies[5].chat_template_kwargs.thinking_mode, "enabled");
+assert.equal("reasoningEffort" in bodies[5], false);
+assert.equal("reasoning_effort" in bodies[5], false);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -422,10 +432,10 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "glm-4.6", messages: [], reasoning: { effort: "high" }, reasoningEffort: "high", thinking: {} }),
 }), env);
 
-assert.equal("reasoning" in bodies[5], false);
-assert.equal("reasoning_effort" in bodies[5], false);
-assert.equal("reasoningEffort" in bodies[5], false);
-assert.equal("thinking" in bodies[5], false);
+assert.equal("reasoning" in bodies[6], false);
+assert.equal("reasoning_effort" in bodies[6], false);
+assert.equal("reasoningEffort" in bodies[6], false);
+assert.equal("thinking" in bodies[6], false);
 
 const statsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), env);
 const stats = await statsResp.json();

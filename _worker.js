@@ -2701,6 +2701,7 @@ function isMiniMaxM3Model(modelName) {
 function applyNimBridge(payload, modelName) {
   let changed = false;
   const isGlm = isGlmModel(modelName);
+  const isQwen = modelName.includes("qwen");
   if (isGlm) {
     if (glmThinkingRequested(payload)) {
       setChatTemplateKwargs(payload, { enable_thinking: true, clear_thinking: false });
@@ -2714,6 +2715,19 @@ function applyNimBridge(payload, modelName) {
       delete payload.reasoning_effort;
       changed = true;
     }
+  }
+
+  if (isQwen && nimReasoningRequested(payload)) {
+    setChatTemplateKwargs(payload, { enable_thinking: !nimReasoningDisabled(payload) });
+    if ("reasoning" in payload) {
+      delete payload.reasoning;
+      changed = true;
+    }
+    if ("reasoning_effort" in payload) {
+      delete payload.reasoning_effort;
+      changed = true;
+    }
+    changed = true;
   }
 
   if (isMiniMaxM3Model(modelName)) {
@@ -2740,7 +2754,7 @@ function applyNimBridge(payload, modelName) {
   if ("enable_thinking" in payload) {
     const enableThinking = payload.enable_thinking;
     delete payload.enable_thinking;
-    if (modelName.includes("qwen")) {
+    if (isQwen) {
       setChatTemplateKwargs(payload, { enable_thinking: enableThinking });
     }
     changed = true;
@@ -2762,6 +2776,15 @@ function nimThinkingMode(payload) {
   if (effort === "none" || effort === "disabled" || effort === "off" || effort === "low") return "disabled";
   if (effort === "high" || effort === "medium" || effort === "enabled" || effort === "on") return "enabled";
   return glmThinkingRequested(payload) ? "adaptive" : "";
+}
+
+function nimReasoningRequested(payload) {
+  return Boolean(payload?.reasoning || payload?.reasoning_effort || payload?.reasoningEffort || payload?.enable_thinking != null || payload?.chat_template_kwargs?.enable_thinking != null);
+}
+
+function nimReasoningDisabled(payload) {
+  const effort = String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || "").toLowerCase();
+  return payload?.enable_thinking === false || effort === "none" || effort === "disabled" || effort === "off";
 }
 
 function setReasoningSummary(payload, summary) {
