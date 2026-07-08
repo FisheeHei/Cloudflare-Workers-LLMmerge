@@ -203,31 +203,55 @@ function isSarvamModel(modelName) {
 
 function applyDeepSeekBridge(payload) {
   let changed = false;
-  if (nimReasoningRequested(payload) || glmThinkingRequested(payload)) {
-    const disabled = nimReasoningDisabled(payload);
+  if (deepSeekReasoningRequested(payload)) {
+    const disabled = deepSeekReasoningDisabled(payload);
     payload.thinking = { type: disabled ? "disabled" : "enabled" };
     changed = true;
-    const effort = deepSeekReasoningEffort(payload);
-    if (effort) {
-      payload.reasoning_effort = effort;
-      changed = true;
-    } else if ("reasoning_effort" in payload) {
-      delete payload.reasoning_effort;
-      changed = true;
+    if (disabled) {
+      if ("reasoning_effort" in payload) { delete payload.reasoning_effort; changed = true; }
+    } else {
+      const effort = mapDeepSeekEffort(deepSeekEffortInput(payload));
+      if (effort) { payload.reasoning_effort = effort; changed = true; }
+      else if ("reasoning_effort" in payload) { delete payload.reasoning_effort; changed = true; }
     }
   }
-  changed = removeDeepSeekIncompatibleReasoningFields(payload) || changed;
+  for (const key of ["reasoning", "reasoning_budget", "reasoningBudget", "reasoning_split", "enable_thinking", "chat_template_kwargs"]) {
+    if (key in payload) { delete payload[key]; changed = true; }
+  }
   return changed;
 }
 
-function deepSeekReasoningEffort(payload) {
-  if (nimReasoningDisabled(payload)) return "";
-  return mapNimReasoningEffort(nimReasoningEffortInput(payload), ["high", "max"], "high");
+function deepSeekReasoningRequested(payload) {
+  return Boolean(
+    payload?.reasoning ||
+    payload?.reasoning_effort ||
+    payload?.reasoningEffort ||
+    payload?.reasoning_summary ||
+    payload?.reasoningSummary ||
+    payload?.thinking != null ||
+    payload?.enable_thinking != null ||
+    payload?.chat_template_kwargs?.enable_thinking != null
+  );
 }
 
-function removeDeepSeekIncompatibleReasoningFields(payload) {
-  let changed = removeNimReasoningPayloadFields(payload, { keepReasoningEffort: true, keepThinking: true });
-  return deleteKeys(payload, ["reasoning_split", "enable_thinking", "chat_template_kwargs"]) || changed;
+function deepSeekReasoningDisabled(payload) {
+  const effort = String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || "").toLowerCase();
+  const thinkingType = String(payload?.thinking?.type || "").toLowerCase();
+  return payload?.enable_thinking === false || thinkingType === "disabled" || effort === "none" || effort === "disabled" || effort === "off";
+}
+
+function deepSeekEffortInput(payload) {
+  if (deepSeekReasoningDisabled(payload)) return "none";
+  return String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || payload?.reasoning?.enabled || payload?.enable_thinking || "").toLowerCase();
+}
+
+function mapDeepSeekEffort(raw) {
+  const value = String(raw || "").toLowerCase();
+  if (value === "high" || value === "max") return value;
+  if (value === "xhigh" || value === "maximum") return "max";
+  if (value === "minimal") return "high";
+  if (value === "false" || value === "off" || value === "disabled") return "none";
+  return "high";
 }
 
 function applyMoonshotBridge(payload, modelName) {
