@@ -324,6 +324,8 @@ const adminPage = await adminPageResp.text();
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
 assert.equal(adminPage.includes("routing-fast"), true);
+assert.equal(adminPage.includes("document.visibilityState"), true);
+assert.equal(adminPage.includes("Fast \\u52a0\\u901f\\u524d 2 \\u4e2a") || adminPage.includes("Fast 加速前 2 个"), true);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("picker-apply-same-preset"), true);

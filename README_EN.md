@@ -1,311 +1,212 @@
-# ⚡ LLM-merge
+# LLM-merge
 
 [中文 README](./README.md)
 
-LLM-merge is a single-file LLM gateway for Cloudflare Workers / Pages Advanced Mode. It merges multiple OpenAI-compatible upstreams behind your own `/v1` endpoint and ships with a hidden admin dashboard for upstreams, client keys, model import, logs, and stats.
+LLM-merge is a single-file LLM aggregation gateway for Cloudflare Workers or Pages Advanced Mode. It combines multiple upstream model providers into one `/v1` Base URL and includes a lightweight admin panel for upstreams, client keys, models, prompts, context, routing, logs, and statistics.
 
-> [!IMPORTANT]
-> `ADMIN_TOKEN` is only a path segment, not a real login system. Use a random long value in production.
+## Features
 
-> [!WARNING]
-> `API_KEY_CRYPT_SECRET` encrypts upstream API keys. Do not rotate it casually after production data already exists.
+- OpenAI-compatible endpoints: `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`
+- Basic Responses API compatibility: `/v1/responses`
+- Claude / Anthropic-style endpoint: `/v1/messages`
+- Multiple upstreams with enable/disable, weight, priority, paths, and model allowlists
+- Routing: failover, load balancing, Hedged Request, Gateway Fast mode
+- Model picker with source grouping, tags, and context-length notes
+- NVIDIA NIM bridge for GLM, Qwen, MiniMax, Kimi, DeepSeek, Nemotron, Mistral, and related models
+- Prompt / Context injection scoped by client key, with keyword-based context fragments and import/export
+- Live in-memory stats + Analytics Engine history, with KV fallback
+- Upstream import/export, health checks, model speed tests, and active-upstream display
 
-## ✨ Features
+## Deployment
 
-- Unified OpenAI-compatible endpoints: `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`
-- Claude Code-compatible `/v1/messages`, internally converted to OpenAI Chat Completions
-- Multiple upstreams, multiple API keys, enable/disable, weight, priority, path allowlist, model allowlist
-- `load_balance` and `failover` routing switches
-- Hidden admin dashboard at `/{ADMIN_TOKEN}`
-- Model picker that can import from a saved upstream or a draft upstream, grouped by source and family
-- Virtual `sk-gw-...` client keys with model and upstream restrictions
-- KV-backed persistence for config, client keys, model cache, cooldown state, logs, and stats
-- Encrypted storage for upstream API keys
+### 1. Create a project
 
-## 🧭 Admin dashboard
-
-Dashboard areas:
-
-| Area | Purpose |
-| --- | --- |
-| Overview | Request counts, success rate, token totals, current model |
-| Client Keys | Create, refresh, copy, and delete `sk-gw-...` keys |
-| Upstreams | Add, edit, delete upstreams, and configure models, paths, weight, and priority |
-| Model Picker | Pull models from an upstream and filter by source / family before writing back |
-| Logs & Diagnostics | Recent requests, health checks, upstream capability detection |
-| Global Settings | Timeout, cooldown, model cache TTL, routing switches |
-
-The dashboard supports:
-
-- add, edit, and delete upstreams
-- auto-save on upstream add / delete
-- manual save for normal field edits
-- import models from the current draft upstream or from an existing saved upstream
-- filter models by source and family; Workers AI hides `@cf/` in the picker display while keeping full model IDs in config
-- export and import upstream config files
-- inspect upstream health and latency
-- toggle `load_balance` / `failover`
-- create, refresh, and delete virtual client keys
-- view recent logs, 24h stats, current model, and token totals
-
-## 🚀 Deployment
-
-### 1. Create a Worker or Pages project
-
-Workers:
+Deploy as a Worker:
 
 ```bash
 wrangler deploy
 ```
 
-Pages: use Advanced Mode and point it at `_worker.js`. No frontend build step is needed.
+For Pages, use Advanced Mode and keep `_worker.js` as the entry file. No build step is required.
 
 ### 2. Bind KV
 
-Create a KV namespace:
+The KV binding name must be:
 
-```bash
-wrangler kv namespace create KV
-```
-
-Then bind it as:
-
-```text
+```txt
 KV
 ```
 
-The namespace display name can be anything. The code only reads `env.KV`.
+The KV namespace name can be anything. KV stores gateway config, client keys, upstreams, Prompt, Context, model cache, and cooldown state.
 
-### 3. Set variables and secrets
+### 3. Bind Analytics Engine
 
-Recommended production secrets:
+Recommended binding:
 
-```bash
-wrangler secret put ADMIN_TOKEN
-wrangler secret put API_KEY_CRYPT_SECRET
+```txt
+binding: ANALYTICS
+dataset: llmmerge_requests
 ```
 
-Local development:
+To query historical stats in the admin panel, also set:
 
-```bash
-copy .dev.vars.example .dev.vars
+```txt
+ANALYTICS_ACCOUNT_ID = your Cloudflare Account ID
+ANALYTICS_API_TOKEN  = API token with Account Analytics Read
 ```
 
-macOS / Linux:
+`ANALYTICS_DATASET` is optional and defaults to `llmmerge_requests`. Set it only if you use another dataset name.
 
-```bash
-cp .dev.vars.example .dev.vars
+### 4. Set environment variables
+
+Recommended minimum:
+
+```txt
+ADMIN_TOKEN=your-admin-path
+API_KEY_CRYPT_SECRET=long-random-secret
 ```
 
-### 4. Open the dashboard
+Admin panel:
 
-After deploy:
-
-```text
+```txt
 https://your-domain.example/{ADMIN_TOKEN}
 ```
 
-If `ADMIN_TOKEN` is omitted, the default path is:
+If `ADMIN_TOKEN` is not set, the default admin path is `/llmmerge-admin`. Do not use the default in production.
 
-```text
-/llmmerge-admin
-```
+## Variables
 
-Using a random value is still strongly recommended.
+| Variable | Required | Description |
+| --- | --- | --- |
+| `KV` | Yes | Cloudflare KV binding |
+| `ADMIN_TOKEN` | Recommended | Admin path token |
+| `API_KEY_CRYPT_SECRET` | Recommended | Secret used to encrypt upstream API keys; keep stable in production |
+| `ANALYTICS` | Optional | Analytics Engine binding for request stats |
+| `ANALYTICS_ACCOUNT_ID` | Optional | Account ID for Analytics Engine SQL queries |
+| `ANALYTICS_API_TOKEN` | Optional | Requires `Account Analytics Read` |
+| `ANALYTICS_DATASET` | Optional | Defaults to `llmmerge_requests` |
+| `REQUEST_TIMEOUT_MS` | Optional | Defaults to `180000` |
+| `STREAM_IDLE_TIMEOUT_MS` | Optional | Defaults to `900000` |
+| `UPSTREAM_COOLDOWN_TTL` | Optional | Defaults to `60` seconds |
+| `MODEL_CACHE_TTL` | Optional | Defaults to `3600` seconds |
+| `STDTIME_URL` | Optional | Defaults to `https://stdtime.gov.hk/` |
+| `UPSTREAMS_JSON` | Optional | Initial upstream seed config |
+| `CLIENTS_JSON` | Optional | Initial client-key seed config |
 
-## 🔧 Variables
+## Upstreams
 
-| Variable | Example | Required | Notes |
-| --- | --- | --- | --- |
-| `KV` | KV binding | Recommended | Cloudflare KV binding used by the dashboard and persistence layer |
-| `ADMIN_TOKEN` | `change-me-admin-token` | Recommended | Admin path segment; also accepts `ADMIN`, `admin`, `TOKEN`, `token` |
-| `API_KEY_CRYPT_SECRET` | `change-me-32-bytes-or-longer` | Recommended | Encryption secret for upstream API keys |
-| `REQUEST_TIMEOUT_MS` | `180000` | No | Upstream first-byte/idle timeout, default `180000` |
-| `STDTIME_URL` | `https://stdtime.gov.hk/` | No | Hong Kong Standard Time calibration source; project time zone is `Asia/Hong_Kong` / UTC+8 |
-| `UPSTREAM_COOLDOWN_TTL` | `60` | No | Cooldown seconds after a failed upstream, default `60` |
-| `MODEL_CACHE_TTL` | `3600` | No | Model list cache seconds, default `3600` |
-| `UPSTREAMS_JSON` | see below | No | Initial upstream seed config; KV wins once a saved config exists |
-| `CLIENTS_JSON` | see below | No | Initial client key seed config |
-
-## 🔌 Upstream config
-
-`UPSTREAMS_JSON` can be used as a seed, or you can add upstreams directly in the dashboard:
+You can add upstreams in the admin panel or seed them with `UPSTREAMS_JSON`:
 
 ```json
 [
   {
     "name": "nim-primary",
+    "preset": "nvidia-nim",
     "base_url": "https://integrate.api.nvidia.com/v1",
-    "api_key": "nvapi-xxxxxxxx",
-    "models": ["meta/llama-3.1-8b-instruct", "nvidia/nv-embed-v1"],
+    "api_key": "nvapi-...",
+    "models": ["z-ai/glm-5.2", "moonshotai/kimi-k2.5"],
     "paths": ["/v1/chat/completions", "/v1/embeddings"],
-    "weight": 3,
     "priority": 1,
+    "weight": 1,
     "enabled": true
   }
 ]
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `name` | Internal upstream name |
-| `base_url` | OpenAI-compatible API base URL; the Cloudflare Workers AI REST preset builds it from the Account ID |
-| `api_key` | Upstream API key; use a Cloudflare API token for the Cloudflare preset; encrypted when saved through the dashboard |
-| `models` | Model allowlist; empty means no model restriction |
-| `paths` | Path allowlist such as `/v1/chat/completions` or `/v1/embeddings` |
-| `weight` | Load-balancing weight |
-| `priority` | Attempt order when load balancing is off; smaller is earlier |
-| `enabled` | Enabled or disabled |
-| `headers` | Optional extra request headers |
-| `note` | Optional note |
-| `account_id` | Account ID used by the Cloudflare Workers AI REST preset |
-
-Built-in presets:
+Built-in templates:
 
 - NVIDIA NIM
 - DeepInfra
 - Together AI
 - DeepSeek
 - OpenRouter
-- Cloudflare Workers AI (REST)
+- GLM / Zhipu
+- Cloudflare Workers AI REST
 - Custom OpenAI-compatible upstream
 
-The Cloudflare Workers AI REST preset follows the official AI Gateway REST API:
+Cloudflare Workers AI REST uses:
 
-- Base URL: `https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1`
-- API Key: Cloudflare API token; model calls need `AI Gateway` permission, and model import needs `Workers AI Read` or `Workers AI Write`
-- Header: includes `cf-aig-gateway-id: default` by default; edit upstream `headers` if you use another Gateway ID
-- Model IDs: Workers AI uses `@cf/author/model`, for example `@cf/moonshotai/kimi-k2.6`
-- Model list: the dashboard fetches Cloudflare `/ai/models/search`; use the Cloudflare Model Catalog as the source of truth
+```txt
+https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
+```
 
-Verify the API token first with Cloudflare's official endpoint:
+You can verify a Cloudflare API token first:
 
 ```bash
 curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \
   -H "Authorization: Bearer {API_TOKEN}"
 ```
 
-## 🔑 Client keys
+## Client Keys
 
-`CLIENTS_JSON` example:
+The admin panel can generate `sk-gw-...` keys. You can also seed clients with `CLIENTS_JSON`:
 
 ```json
 [
   {
-    "name": "default-client",
-    "key": "sk-gw-demo-please-change",
+    "name": "default",
+    "key": "sk-gw-change-me",
     "models": ["*"],
-    "upstreams": ["nim-primary"]
+    "upstreams": []
   }
 ]
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `name` | Client display name |
-| `key` | Client key used to call the gateway; must start with `sk-` |
-| `models` | Allowed models; empty or `*` means no restriction |
-| `upstreams` | Allowed upstreams; empty means no restriction |
+- Empty `models` or `["*"]` means all models are allowed.
+- Empty `upstreams` means all upstreams are allowed.
 
-The dashboard can also generate `sk-gw-...` client keys.
+## Usage
 
-## 🧪 Usage
-
-### OpenAI SDK
+OpenAI SDK:
 
 ```js
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: "sk-gw-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  apiKey: "sk-gw-...",
   baseURL: "https://your-domain.example/v1",
 });
 
-const completion = await client.chat.completions.create({
-  model: "meta/llama-3.1-8b-instruct",
+const res = await client.chat.completions.create({
+  model: "z-ai/glm-5.2",
   messages: [{ role: "user", content: "hello" }],
 });
 ```
 
-### Claude Code / Anthropic-style entry
+Main endpoints:
 
-If the client lets you set a custom Anthropic Base URL, point it to:
-
-```text
-https://your-domain.example/v1
-```
-
-Then use a generated `sk-gw-...` key. `/v1/messages` is converted inside the Worker into an OpenAI Chat Completions request.
-
-## 📡 Endpoints
-
-Public endpoints:
-
-| Method | Path | Purpose |
+| Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness check |
+| `GET` | `/health` | Health check |
 | `GET` | `/v1/models` | Aggregated model list |
-| `POST` | `/v1/chat/completions` | OpenAI Chat Completions-compatible proxy |
-| `POST` | `/v1/embeddings` | OpenAI Embeddings-compatible proxy |
-| `POST` | `/v1/messages` | Claude / Anthropic-style messages entry |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | Responses API compatibility |
+| `POST` | `/v1/messages` | Claude / Anthropic-style messages |
+| `POST` | `/v1/embeddings` | Embeddings |
 
-Admin endpoints live under:
+## Statistics
 
-```text
-/{ADMIN_TOKEN}/api/*
-```
+- Memory: live recent requests, tokens, logs, and active upstreams
+- Analytics Engine: historical logs and statistics
+- KV fallback: batch stats when Analytics Engine is not bound
 
-Common admin actions include reading and saving config, refreshing model cache, health checks, fetching upstream models, detecting upstream capability, creating and deleting client keys, and reading logs / stats.
+In short: memory is for live display, Analytics Engine is for history, and KV is for configuration.
 
-## 💾 KV keys
+## Routing
 
-| Key | Meaning |
-| --- | --- |
-| `gateway:config` | Saved gateway config |
-| `client:index` | Client key index |
-| `client:id:*` | Client records by ID |
-| `client:token:*` | Reverse lookup by client key |
-| `cache:models:*` | Upstream model cache |
-| `cooldown:upstream:*` | Upstream cooldown state |
-| `gateway:logs` | Recent request logs |
-| `gateway:stats:*` | Hourly aggregated stats |
+- `failover`: try another upstream after failure
+- `load_balance`: distribute by weight
+- `Hedged Request`: race multiple upstreams for the same model
+- `Gateway Fast mode`: speed up the first two candidates for faster first byte
+- Fast + Hedged together: Hedged decides candidate count, Fast speeds up the first two
 
-## 🔀 Routing
+## Notes
 
-- `load_balance` on: split traffic across healthy upstreams by `weight`
-- `load_balance` off: try upstreams by `priority`
-- `failover` on: retry the next candidate when an upstream fails
-- `failover` off: only try the current candidate
+- Do not expose real upstream API keys.
+- `ADMIN_TOKEN` only hides the admin path. It is not a full login system.
+- Do not rotate `API_KEY_CRYPT_SECRET` casually after production use; saved upstream keys depend on it.
+- Upstream export files contain plaintext API keys. Store them carefully.
+- Analytics Engine SQL queries require `Account > Account Analytics > Read`.
+- In-memory live stats may be lost if the Worker isolate is recycled. Use Analytics Engine as the historical source of truth.
+- Long-reasoning models may have slow first bytes. Use suitable timeouts, Hedged Request, or Gateway Fast mode.
 
-Default retryable status codes:
-
-```text
-408, 409, 425, 429, 500, 502, 503, 504
-```
-
-## ⚠️ Notes
-
-- Never expose real upstream API keys in a public repo or frontend page.
-- `ADMIN_TOKEN` is only a hidden path, not authentication.
-- Do not rotate `API_KEY_CRYPT_SECRET` lightly once production config exists.
-- KV free quotas are limited; logs and stats are batched, but high-traffic setups still need attention.
-- Empty upstream `models` means no restriction, not disabled models.
-- Empty client `models` or `*` means no restriction.
-- Cloudflare Workers AI REST model IDs must use the `@cf/...` format.
-- Exported files contain plain API keys. Treat them as secrets and do not share them publicly.
-- Cloudflare Workers still have runtime limits; huge responses, very slow upstreams, or long streaming sessions can hit platform constraints.
-
-## 💤 Not included
-
-- Full login system
-- Fine-grained RBAC
-- Billing / quota accounting
-- Long-term audit logs
-- Responses API
-- Image, audio, and file endpoints
-
-Keep it single-file, low-dependency, and easy to deploy. Add more only when real usage proves it is needed.
-
-## 🙏 Credit
-
-The README structure borrows from [FisheeHei/CF-Workers-SUB](https://github.com/FisheeHei/CF-Workers-SUB).

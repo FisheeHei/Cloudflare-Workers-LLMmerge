@@ -41,7 +41,8 @@ const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
-const VERSION = "v26-07-08-fast-hedge-compat";
+const ANALYTICS_QUERY_CACHE_MS = 2000;
+const VERSION = "v26-07-08-ae-refresh-tune";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -383,6 +384,7 @@ var RUNTIME_CACHE_TTL_MS = 30000;
 var _stdTimeOffsetMs = 0;
 var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
+var _analyticsQueryCache = {};
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -682,6 +684,10 @@ function canQueryAnalytics(app) {
 
 async function queryAnalyticsEngine(app, sql) {
   if (!canQueryAnalytics(app)) return null;
+  const cacheKey = app.analyticsAccountId + ":" + app.analyticsDataset + ":" + sql;
+  const cached = _analyticsQueryCache[cacheKey];
+  const now = Date.now();
+  if (cached && now - cached.ts < ANALYTICS_QUERY_CACHE_MS) return cached.data;
   const resp = await fetch(`https://api.cloudflare.com/client/v4/accounts/${app.analyticsAccountId}/analytics_engine/sql`, {
     method: "POST",
     headers: {
@@ -692,7 +698,9 @@ async function queryAnalyticsEngine(app, sql) {
   });
   if (!resp.ok) return null;
   const payload = await resp.json();
-  return Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
+  const data = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
+  _analyticsQueryCache[cacheKey] = { ts: now, data };
+  return data;
 }
 
 async function getAnalyticsLogs(app) {
@@ -4196,7 +4204,7 @@ function renderAdminMarkup(origin) {
           <label><input type="checkbox" id="routing-hedge"> Hedged Request</label>
         </div>
         <div class="field span-3">
-          <label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305\uff0c\u53ef\u80fd\u589e\u52a0\u4e0a\u6e38\u8bf7\u6c42</span></label>
+          <label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305\uff1b\u4e0e Hedged \u540c\u5f00\u65f6\uff0cHedged \u51b3\u5b9a\u5019\u9009\u6570\uff0cFast \u52a0\u901f\u524d 2 \u4e2a</span></label>
         </div>
       </div>
       <div class="row">
@@ -6165,12 +6173,13 @@ function renderAdminScript() {
       var statsPanel = byId("stats-panel");
       var logPanel = byId("log-panel");
       setInterval(function() {
+        if (document.visibilityState !== "visible") return;
         var statsVisible = !statsPanel || statsPanel.offsetParent !== null;
         var logVisible = !logPanel || logPanel.offsetParent !== null;
         if (statsVisible) loadStats(true).catch(function(){});
         if (logVisible) loadLogs().catch(function(){});
       }, 2000);
-      setInterval(function() { loadRuntimeStatus().catch(function(){}); }, 2000);
+      setInterval(function() { if (document.visibilityState === "visible") loadRuntimeStatus().catch(function(){}); }, 2000);
 
 
     } catch (error) {
