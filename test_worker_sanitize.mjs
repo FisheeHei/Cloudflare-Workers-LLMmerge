@@ -1,8 +1,7 @@
-import fs from "node:fs";
 import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
 
-const code = fs.readFileSync("_worker.js", "utf8");
-const worker = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
+const worker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?t=${Date.now()}`);
 const keepaliveEncoder = new TextEncoder();
 const keepaliveText = await new Response(worker.withSseKeepAlive(new ReadableStream({
   start(controller) {
