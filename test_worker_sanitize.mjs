@@ -378,6 +378,12 @@ assert.equal(configPayload.config.settings.stream_idle_timeout_ms, 900000);
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
 assert.equal(openRouterPreset.name, "OpenRouter");
 assert.equal(openRouterPreset.base_url, "https://openrouter.ai/api/v1");
+const moonshotPreset = configPayload.presets.find((item) => item.id === "moonshot");
+assert.equal(moonshotPreset.name, "Kimi / \u6708\u4e4b\u6697\u9762");
+assert.equal(moonshotPreset.base_url, "https://api.moonshot.ai/v1");
+const minimaxPreset = configPayload.presets.find((item) => item.id === "minimax");
+assert.equal(minimaxPreset.name, "MiniMax");
+assert.equal(minimaxPreset.base_url, "https://api.minimax.io/v1");
 const zhipuPreset = configPayload.presets.find((item) => item.id === "zhipu");
 assert.equal(zhipuPreset.name, "GLM / \u667a\u8c31 AI");
 assert.equal(zhipuPreset.base_url, "https://open.bigmodel.cn/api/paas/v4");
@@ -586,6 +592,111 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), env);
 assert.equal(bodies[nimFamilyBodyStart + 7].reasoning_effort, "medium");
 assert.equal("reasoning" in bodies[nimFamilyBodyStart + 7], false);
+
+const deepSeekOfficialEnv = {
+  ...env,
+  KV: {
+    async get() { return null; },
+    async put() {},
+    async delete() {},
+  },
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "deepseek-official", preset: "deepseek", base_url: "https://api.deepseek.com/v1", api_key: "ds", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ]),
+  CLIENTS_JSON: JSON.stringify([{ name: "deepseek-client", key: "sk-deepseek", models: ["*"], upstreams: ["deepseek-official"] }]),
+};
+const deepSeekOfficialStart = bodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", messages: [], reasoningEffort: "medium", reasoningSummary: "auto", thinking: { budget_tokens: 1024 }, enable_thinking: true }),
+}), deepSeekOfficialEnv);
+assert.equal(bodies[deepSeekOfficialStart].reasoning_effort, "high");
+assert.deepEqual(bodies[deepSeekOfficialStart].thinking, { type: "enabled" });
+assert.equal("reasoning" in bodies[deepSeekOfficialStart], false);
+assert.equal("reasoningEffort" in bodies[deepSeekOfficialStart], false);
+assert.equal("reasoningSummary" in bodies[deepSeekOfficialStart], false);
+assert.equal("enable_thinking" in bodies[deepSeekOfficialStart], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", messages: [], reasoning: { effort: "none" }, chat_template_kwargs: { enable_thinking: true } }),
+}), { ...deepSeekOfficialEnv });
+assert.deepEqual(bodies[deepSeekOfficialStart + 1].thinking, { type: "disabled" });
+assert.equal("reasoning_effort" in bodies[deepSeekOfficialStart + 1], false);
+assert.equal("chat_template_kwargs" in bodies[deepSeekOfficialStart + 1], false);
+
+const moonshotEnv = {
+  ...env,
+  KV: {
+    async get() { return null; },
+    async put() {},
+    async delete() {},
+  },
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "moonshot", preset: "moonshot", base_url: "https://api.moonshot.ai/v1", api_key: "mk", models: ["kimi-k2.6", "kimi-k2.7-code"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ]),
+  CLIENTS_JSON: JSON.stringify([{ name: "moonshot-client", key: "sk-moonshot", models: ["*"], upstreams: ["moonshot"] }]),
+};
+const moonshotStart = bodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-moonshot", "content-type": "application/json" },
+  body: JSON.stringify({ model: "kimi-k2.6", messages: [], reasoningEffort: "high", temperature: 0.2, functions: [{ name: "search", parameters: {} }], function_call: "auto", tool_choice: "required" }),
+}), moonshotEnv);
+assert.deepEqual(bodies[moonshotStart].thinking, { type: "enabled", keep: "all" });
+assert.equal(Array.isArray(bodies[moonshotStart].tools), true);
+assert.equal(bodies[moonshotStart].tool_choice, "auto");
+assert.equal("functions" in bodies[moonshotStart], false);
+assert.equal("function_call" in bodies[moonshotStart], false);
+assert.equal("reasoning_effort" in bodies[moonshotStart], false);
+assert.equal("temperature" in bodies[moonshotStart], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-moonshot", "content-type": "application/json" },
+  body: JSON.stringify({ model: "kimi-k2.7-code", messages: [], reasoningEffort: "high", thinking: { type: "enabled", keep: "all" }, temperature: 0.7 }),
+}), { ...moonshotEnv });
+assert.equal("thinking" in bodies[moonshotStart + 1], false);
+assert.equal("reasoning_effort" in bodies[moonshotStart + 1], false);
+assert.equal("temperature" in bodies[moonshotStart + 1], false);
+
+const minimaxEnv = {
+  ...env,
+  KV: {
+    async get() { return null; },
+    async put() {},
+    async delete() {},
+  },
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "minimax", preset: "minimax", base_url: "https://api.minimax.io/v1", api_key: "mm", models: ["MiniMax-M2"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ]),
+  CLIENTS_JSON: JSON.stringify([{ name: "minimax-client", key: "sk-minimax", models: ["*"], upstreams: ["minimax"] }]),
+};
+const minimaxStart = bodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-minimax", "content-type": "application/json" },
+  body: JSON.stringify({ model: "MiniMax-M2", messages: [], reasoningEffort: "high", functions: [{ name: "search", parameters: {} }], function_call: "auto" }),
+}), minimaxEnv);
+assert.deepEqual(bodies[minimaxStart].thinking, { type: "adaptive" });
+assert.equal(bodies[minimaxStart].reasoning_split, true);
+assert.equal(Array.isArray(bodies[minimaxStart].tools), true);
+assert.equal(bodies[minimaxStart].tool_choice, "auto");
+assert.equal("functions" in bodies[minimaxStart], false);
+assert.equal("function_call" in bodies[minimaxStart], false);
+assert.equal("reasoning_effort" in bodies[minimaxStart], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-minimax", "content-type": "application/json" },
+  body: JSON.stringify({ model: "MiniMax-M2", messages: [], reasoning: { effort: "none" }, enable_thinking: true, chat_template_kwargs: { thinking_mode: "enabled" } }),
+}), { ...minimaxEnv });
+assert.deepEqual(bodies[minimaxStart + 1].thinking, { type: "disabled" });
+assert.equal("reasoning" in bodies[minimaxStart + 1], false);
+assert.equal("enable_thinking" in bodies[minimaxStart + 1], false);
+assert.equal("chat_template_kwargs" in bodies[minimaxStart + 1], false);
 
 const wrappedKvConfig = {
   routing: { failover: true, load_balance: false },

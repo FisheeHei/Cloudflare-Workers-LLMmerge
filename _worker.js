@@ -42,7 +42,7 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-08-ae-refresh-tune";
+const VERSION = "v26-07-08-minimax-bridge";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -72,6 +72,20 @@ const PRESET_TEMPLATES = [
     name: "DeepSeek",
     base_url: "https://api.deepseek.com/v1",
     paths: [CHAT_PATH, EMBEDDINGS_PATH],
+    requires_base_url: false,
+  },
+  {
+    id: "moonshot",
+    name: "Kimi / \u6708\u4e4b\u6697\u9762",
+    base_url: "https://api.moonshot.ai/v1",
+    paths: [CHAT_PATH],
+    requires_base_url: false,
+  },
+  {
+    id: "minimax",
+    name: "MiniMax",
+    base_url: "https://api.minimax.io/v1",
+    paths: [CHAT_PATH],
     requires_base_url: false,
   },
   {
@@ -2778,8 +2792,11 @@ function sanitizeProxyBody(bodyText, upstream) {
   if (!bodyText) return bodyText;
 
   const isNvidia = isNvidiaNimUpstream(upstream);
+  const isDeepSeekOfficial = isDeepSeekUpstream(upstream);
+  const isMoonshotOfficial = isMoonshotUpstream(upstream);
+  const isMiniMaxOfficial = isMiniMaxUpstream(upstream);
   const bodyLower = bodyText.toLowerCase();
-  if (!bodyNeedsSanitizing(bodyText, bodyLower, isNvidia)) return bodyText;
+  if (!bodyNeedsSanitizing(bodyText, bodyLower, isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial)) return bodyText;
 
   let payload;
   try {
@@ -2793,8 +2810,11 @@ function sanitizeProxyBody(bodyText, upstream) {
   const isGlm = isGlmModel(modelName);
   const wantsKimiPreservedThinking = kimiPreservedThinkingRequested(payload, modelName);
   changed = applyProviderReasoningOptions(payload) || changed;
-  changed = normalizeReasoningFields(payload, isGlm, wantsKimiPreservedThinking || isNvidia) || changed;
+  changed = normalizeReasoningFields(payload, isGlm, wantsKimiPreservedThinking || isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial) || changed;
   changed = applyKimiPreservedThinking(payload, wantsKimiPreservedThinking) || changed;
+  if (isDeepSeekOfficial) changed = applyDeepSeekBridge(payload) || changed;
+  if (isMoonshotOfficial) changed = applyMoonshotBridge(payload, modelName) || changed;
+  if (isMiniMaxOfficial) changed = applyMiniMaxBridge(payload) || changed;
   if (isNvidia) changed = applyNimBridge(payload, modelName) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
@@ -2813,7 +2833,7 @@ function glmThinkingRequested(payload) {
   );
 }
 
-function bodyNeedsSanitizing(bodyText, bodyLower, isNvidia) {
+function bodyNeedsSanitizing(bodyText, bodyLower, providerBridge) {
   return bodyText.includes('"thinking"') ||
     bodyText.includes('"reasoning"') ||
     bodyText.includes('"reasoning_effort"') ||
@@ -2823,7 +2843,15 @@ function bodyNeedsSanitizing(bodyText, bodyLower, isNvidia) {
     bodyText.includes('"providerOptions"') ||
     bodyText.includes('"provider_options"') ||
     bodyLower.includes("kimi-k2") ||
-    (isNvidia && (bodyText.includes('"reasoning_split"') || bodyText.includes('"enable_thinking"') || bodyLower.includes("minimax-m3")));
+    (providerBridge && (
+      bodyText.includes('"reasoning_split"') ||
+      bodyText.includes('"enable_thinking"') ||
+      bodyText.includes('"functions"') ||
+      bodyText.includes('"function_call"') ||
+      bodyText.includes('"tool_choice"') ||
+      bodyText.includes('"temperature"') ||
+      bodyLower.includes("minimax-m3")
+    ));
 }
 
 function applyProviderReasoningOptions(payload) {
@@ -2917,6 +2945,20 @@ function isDeepSeekModel(modelName) {
   return /(^|[\/_.-])deepseek([\/_.-]|$)/i.test(String(modelName || ""));
 }
 
+function isDeepSeekUpstream(upstream) {
+  return String(upstream?.preset || "") === "deepseek" || String(upstream?.base_url || "").toLowerCase().includes("api.deepseek.com");
+}
+
+function isMoonshotUpstream(upstream) {
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return String(upstream?.preset || "") === "moonshot" || baseUrl.includes("api.moonshot.ai") || baseUrl.includes("api.kimi.com");
+}
+
+function isMiniMaxUpstream(upstream) {
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return String(upstream?.preset || "") === "minimax" || baseUrl.includes("api.minimax.io") || baseUrl.includes("api.minimaxi.com");
+}
+
 function isStepModel(modelName) {
   return /(^|[\/_.-])(step|stepfun|step-ai)([\/_.-]|$)/i.test(String(modelName || ""));
 }
@@ -2939,6 +2981,126 @@ function isGptOssModel(modelName) {
 
 function isSarvamModel(modelName) {
   return /(^|[\/_.-])sarvam([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
+function applyDeepSeekBridge(payload) {
+  let changed = false;
+  if (nimReasoningRequested(payload) || glmThinkingRequested(payload)) {
+    const disabled = nimReasoningDisabled(payload);
+    payload.thinking = { type: disabled ? "disabled" : "enabled" };
+    changed = true;
+    const effort = deepSeekReasoningEffort(payload);
+    if (effort) {
+      payload.reasoning_effort = effort;
+      changed = true;
+    } else if ("reasoning_effort" in payload) {
+      delete payload.reasoning_effort;
+      changed = true;
+    }
+  }
+  changed = removeDeepSeekIncompatibleReasoningFields(payload) || changed;
+  return changed;
+}
+
+function deepSeekReasoningEffort(payload) {
+  if (nimReasoningDisabled(payload)) return "";
+  return mapNimReasoningEffort(nimReasoningEffortInput(payload), ["high", "max"], "high");
+}
+
+function removeDeepSeekIncompatibleReasoningFields(payload) {
+  let changed = removeNimReasoningPayloadFields(payload, { keepReasoningEffort: true, keepThinking: true });
+  for (const key of ["reasoning_split", "enable_thinking", "chat_template_kwargs"]) {
+    if (key in payload) {
+      delete payload[key];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function applyMoonshotBridge(payload, modelName) {
+  let changed = false;
+  const isK27Code = /kimi[\/_.-]*k2[\/_.-]*7[\/_.-]*code/i.test(modelName);
+  const isK26 = /kimi[\/_.-]*k2[\/_.-]*6/i.test(modelName);
+  const isK25 = /kimi[\/_.-]*k2[\/_.-]*5/i.test(modelName);
+  const wantsThinking = nimReasoningRequested(payload) || glmThinkingRequested(payload);
+  if (wantsThinking) {
+    if (isK27Code) {
+      if ("thinking" in payload) delete payload.thinking;
+    } else {
+      const enabled = !nimReasoningDisabled(payload);
+      payload.thinking = { type: enabled ? "enabled" : "disabled" };
+      if (enabled && isK26) payload.thinking.keep = "all";
+    }
+    changed = true;
+  }
+  if (isK27Code || isK26 || isK25) {
+    changed = deleteKeys(payload, ["temperature", "top_p", "presence_penalty", "frequency_penalty"]) || changed;
+  }
+  changed = normalizeLegacyToolPayload(payload) || changed;
+  changed = removeMoonshotIncompatibleReasoningFields(payload) || changed;
+  return changed;
+}
+
+function applyMiniMaxBridge(payload) {
+  let changed = false;
+  if (nimReasoningRequested(payload) || glmThinkingRequested(payload)) {
+    if (nimReasoningDisabled(payload)) {
+      payload.thinking = { type: "disabled" };
+    } else {
+      payload.thinking = { type: "adaptive" };
+      if (!("reasoning_split" in payload)) payload.reasoning_split = true;
+    }
+    changed = true;
+  }
+  changed = normalizeLegacyToolPayload(payload) || changed;
+  changed = removeMiniMaxIncompatibleReasoningFields(payload) || changed;
+  return changed;
+}
+
+function normalizeLegacyToolPayload(payload) {
+  let changed = false;
+  if (Array.isArray(payload.functions) && !Array.isArray(payload.tools)) {
+    payload.tools = payload.functions.map((fn) => ({ type: "function", function: fn }));
+    changed = true;
+  }
+  if ("functions" in payload) {
+    delete payload.functions;
+    changed = true;
+  }
+  if ("function_call" in payload) {
+    if (!("tool_choice" in payload) && (payload.function_call === "none" || payload.function_call === "auto")) {
+      payload.tool_choice = payload.function_call;
+    }
+    delete payload.function_call;
+    changed = true;
+  }
+  if (payload.tool_choice === "required" || (payload.tool_choice && typeof payload.tool_choice === "object")) {
+    payload.tool_choice = "auto";
+    changed = true;
+  }
+  return changed;
+}
+
+function removeMoonshotIncompatibleReasoningFields(payload) {
+  let changed = removeNimReasoningPayloadFields(payload, { keepThinking: true });
+  return deleteKeys(payload, ["reasoning_split", "enable_thinking", "chat_template_kwargs"]) || changed;
+}
+
+function removeMiniMaxIncompatibleReasoningFields(payload) {
+  let changed = removeNimReasoningPayloadFields(payload, { keepThinking: true });
+  return deleteKeys(payload, ["enable_thinking", "chat_template_kwargs"]) || changed;
+}
+
+function deleteKeys(target, keys) {
+  let changed = false;
+  for (const key of keys) {
+    if (key in target) {
+      delete target[key];
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function applyNimBridge(payload, modelName) {
@@ -3332,6 +3494,15 @@ function inferPresetId(baseUrl) {
   }
   if (value.includes("together.xyz")) {
     return "together";
+  }
+  if (value.includes("api.deepseek.com")) {
+    return "deepseek";
+  }
+  if (value.includes("api.moonshot.ai") || value.includes("api.kimi.com")) {
+    return "moonshot";
+  }
+  if (value.includes("api.minimax.io") || value.includes("api.minimaxi.com")) {
+    return "minimax";
   }
   if (value.includes("api.cloudflare.com/client/v4/accounts/") && value.includes("/ai/v1")) {
     return "workers-ai";

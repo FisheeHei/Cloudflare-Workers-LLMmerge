@@ -119,6 +119,8 @@ Built-in templates:
 - DeepInfra
 - Together AI
 - DeepSeek
+- Kimi / Moonshot AI
+- MiniMax
 - OpenRouter
 - GLM / Zhipu
 - Cloudflare Workers AI REST
@@ -209,4 +211,3 @@ In short: memory is for live display, Analytics Engine is for history, and KV is
 - Analytics Engine SQL queries require `Account > Account Analytics > Read`.
 - In-memory live stats may be lost if the Worker isolate is recycled. Use Analytics Engine as the historical source of truth.
 - Long-reasoning models may have slow first bytes. Use suitable timeouts, Hedged Request, or Gateway Fast mode.
-

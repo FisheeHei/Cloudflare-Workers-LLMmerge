@@ -119,6 +119,8 @@ https://your-domain.example/{ADMIN_TOKEN}
 - DeepInfra
 - Together AI
 - DeepSeek
+- Kimi / Moonshot AI
+- MiniMax
 - OpenRouter
 - GLM / 智谱
 - Cloudflare Workers AI REST
@@ -209,4 +211,3 @@ const res = await client.chat.completions.create({
 - Analytics Engine 查询需要 `Account > Account Analytics > Read`
 - Worker 内存实时统计可能因 isolate 回收而丢失，历史统计以 Analytics Engine 为准
 - 长推理模型首包可能很慢，建议开启合适的超时、Hedged Request 或 Gateway Fast 模式
-
