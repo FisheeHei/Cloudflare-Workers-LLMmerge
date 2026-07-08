@@ -46,7 +46,7 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-08-deepseek-bridge-standalone";
+const VERSION = "v26-07-09-ae-stats-offload";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -82,7 +82,7 @@ export default {
       }
 
       if (request.method === "GET" && adminRoute?.kind === "page") {
-        // ponytail: ETag-based conditional request â€” CDN caches, revalidates with 304
+        // ponytail: ETag-based conditional request ï¿?CDN caches, revalidates with 304
         var inm = request.headers.get("if-none-match") || ""; if (inm.includes(VERSION)) {
           return new Response(null, { status: 304, headers: { etag: '"'+VERSION+'"', "cache-control": "public, max-age=0, must-revalidate" } });
         }
@@ -486,8 +486,9 @@ function scheduleLogFlush(app, ctx) {
 
 async function flushBatch(app, force = false) {
   if (!app.kv) return;
+  // ponytail: AE handles stats+log persistence, skip KV writes entirely
+  if (hasAnalyticsEngine(app)) return;
   var now = Date.now();
-  // ponytail: Free KV has tight write limits; dashboard reads merge pending memory instead.
   if (!force && now - _lastFlush < FLUSH_INTERVAL_MS && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
   if (_flushPromise) return _flushPromise;
   _lastFlush = now;
@@ -1012,8 +1013,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       hourKeys.push(hkHourKey(now - h * 3600000));
     }
     const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
-    const raws = analyticsBuckets ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
-    const liveStats = analyticsBuckets ? recentPendingStats() : _pendingStats;
+    // ponytail: AE available -> skip KV stats reads entirely, use AE SQL + memory merge
+    const useAnalyticsForStats = analyticsBuckets || hasAnalyticsEngine(app);
+    const raws = useAnalyticsForStats ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
+    const liveStats = recentPendingStats();
     const logs = await getBestLogs(app);
     const buckets = hourKeys.map((hour, i) => {
       const raw = analyticsBuckets ? analyticsBuckets[hour] : raws[i];
@@ -1500,7 +1503,7 @@ function invalidateRuntimeCache() {
   _runtimeCacheTs = 0;
 }
 
-// ponytail: LRU cache per-isolate for client tokens â€” saves KV read every proxy request
+// ponytail: LRU cache per-isolate for client tokens ï¿?saves KV read every proxy request
 var _clientCache = {};
 var _clientCacheTs = {};
 var CLIENT_CACHE_TTL_MS = 60000;
@@ -3297,7 +3300,7 @@ function badConfig(message) {
   return httpError(500, message);
 }
 
-// ponytail: minimal nginx decoy â€” just enough to look real, ~60% smaller
+// ponytail: minimal nginx decoy ï¿?just enough to look real, ~60% smaller
 function renderNginxWelcomePage() {
   return "<!doctype html><html lang=en><head><meta charset=utf-8><title>Welcome to nginx!</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7fa;color:#111827;font:16px/1.6 Georgia,serif}main{width:min(600px,calc(100vw - 32px));background:#fff;border:1px solid #d1d5db;padding:32px}h1{margin:0 0 16px}p{margin:0 0 12px}</style></head><body><main><h1>Welcome to nginx!</h1><p>If you see this page, the web server is successfully installed and working.</p><p>Further configuration is required.</p></main></body></html>";
 }
