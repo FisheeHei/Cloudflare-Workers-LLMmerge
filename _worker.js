@@ -46,7 +46,7 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-08-admin-page-split";
+const VERSION = "v26-07-08-deepseek-bridge-standalone";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
