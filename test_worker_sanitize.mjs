@@ -184,7 +184,7 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("hedge-slow.example")) {
     hedgeHits.push("slow");
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await new Promise((resolve) => setTimeout(resolve, 260));
     return new Response(JSON.stringify({ id: "hedge-slow", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -199,7 +199,7 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("soft-fast-slow.example")) {
     softFastHits.push("slow");
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await new Promise((resolve) => setTimeout(resolve, 260));
     return new Response(JSON.stringify({ id: "soft-fast-slow", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -208,6 +208,14 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("soft-fast-fast.example")) {
     softFastHits.push("fast");
     return new Response(JSON.stringify({ id: "soft-fast-fast", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("soft-fast-third.example")) {
+    softFastHits.push("third");
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    return new Response(JSON.stringify({ id: "soft-fast-third", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -1023,7 +1031,7 @@ assert.equal(speedHits[beforeSpeedChoice], "fast");
 const hedgeStore = new Map();
 hedgeStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 600, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "hedge-slow", base_url: "https://hedge-slow.example/v1", api_key_encrypted: "s", models: ["hedge-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "hedge-fast", base_url: "https://hedge-fast.example/v1", api_key_encrypted: "f", models: ["hedge-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
@@ -1077,7 +1085,7 @@ const softFastEnv = {
     async put(key, value) { softFastStore.set(key, value); },
     async delete(key) { softFastStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "soft-fast-client", key: "sk-soft-fast", models: ["*"], upstreams: ["soft-fast-slow", "soft-fast-fast"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "soft-fast-client", key: "sk-soft-fast", models: ["*"], upstreams: ["soft-fast-slow", "soft-fast-third", "soft-fast-fast"] }]),
 };
 const softFastStart = softFastHits.length;
 const softFastResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -1087,6 +1095,24 @@ const softFastResp = await worker.default.fetch(new Request("https://gw.test/v1/
 }), softFastEnv);
 assert.equal(softFastResp.headers.get("x-llm-gateway-upstream"), "soft-fast-fast");
 assert.deepEqual(softFastHits.slice(softFastStart), ["slow", "fast"]);
+
+softFastStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, fast_routing: true, hedge_enabled: true, hedge_max: 3, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "soft-fast-slow", base_url: "https://soft-fast-slow.example/v1", api_key_encrypted: "s", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "soft-fast-third", base_url: "https://soft-fast-third.example/v1", api_key_encrypted: "t", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "soft-fast-fast", base_url: "https://soft-fast-fast.example/v1", api_key_encrypted: "f", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+  ],
+}));
+const softFastHedgeEnv = { ...softFastEnv };
+const softFastHedgeStart = softFastHits.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-soft-fast", "content-type": "application/json" },
+  body: JSON.stringify({ model: "soft-fast-model", messages: [] }),
+}), softFastHedgeEnv);
+assert.equal(softFastHits.slice(softFastHedgeStart).includes("third"), true);
 
 const nimStore = new Map();
 nimStore.set("gateway:config", JSON.stringify({

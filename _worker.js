@@ -41,7 +41,7 @@ const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
-const VERSION = "v26-07-08-quiet-auto-stats";
+const VERSION = "v26-07-08-fast-hedge-compat";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -2241,7 +2241,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   const attempts = await orderUpstreams(runtime, candidates);
   const maxAttempts = runtime.routing.failover === false ? 1 : attempts.length;
   if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-    const limit = runtime.routing.fast_routing === true ? 2 : (runtime.routing.hedge_max || 2);
+    const limit = runtime.routing.hedge_enabled === true ? (runtime.routing.hedge_max || 2) : 2;
     const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, limit)));
     return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, pathname, request, runtime, search });
   }
@@ -2500,14 +2500,16 @@ function upstreamBadGatewayResponse(message, headers) {
 
 async function hedgedProxyRequest({ attempts, bodyText, pathname, request, runtime, search }) {
   const controllers = attempts.map(() => new AbortController());
-  const hedgeDelayMs = runtime.routing.fast_routing === true
-    ? Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)))
-    : Math.max(100, Math.floor(runtime.requestTimeoutMs / Math.max(2, attempts.length + 1)));
+  const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
+  const hedgeDelayMs = Math.max(100, Math.floor(runtime.requestTimeoutMs / Math.max(2, attempts.length + 1)));
+  const launchDelay = (index) => runtime.routing.fast_routing === true && index < 2
+    ? index * fastDelayMs
+    : index * hedgeDelayMs;
   let done = false;
 
   function launchLater(index) {
     const upstream = attempts[index];
-    return sleep(index * hedgeDelayMs).then(async () => {
+    return sleep(launchDelay(index)).then(async () => {
       if (done) return { cancelled: true, upstream, index };
       if (!takeNimMinuteSlot(upstream)) {
         return { limited: true, error: new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`), upstream, index };
