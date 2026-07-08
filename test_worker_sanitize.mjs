@@ -346,6 +346,7 @@ assert.equal(adminPage.includes("data-stat-kind"), true);
 assert.equal(adminPage.includes("bar-hit"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
+assert.equal(adminPage.includes("}, 2000);"), true);
 assert.equal(adminPage.includes("width: min(1216px"), true);
 assert.equal(adminPage.includes(".picker-actions button.small"), true);
 assert.equal(adminPage.includes("EXCLUSIVE_MODEL_TAGS"), true);

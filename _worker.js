@@ -40,8 +40,8 @@ const SSE_KEEPALIVE_MS = 15000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
-const ANALYTICS_LIVE_PENDING_MS = 60000;
-const VERSION = "v26-07-08-active-upstream-groups";
+const ANALYTICS_LIVE_PENDING_MS = 120000;
+const VERSION = "v26-07-08-quiet-auto-stats";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 const PRESET_TEMPLATES = [
@@ -5772,7 +5772,7 @@ function renderAdminScript() {
     });
   }
 
-  async function loadStats() {
+  async function loadStats(silent) {
     const resp = await fetch(API_BASE + "/stats");
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "读取统计失败");
@@ -5836,7 +5836,7 @@ function renderAdminScript() {
     bindStatBars(skeleton);
 
     byId("stat-updated").textContent = (payload.now || "").slice(11, 19) + " HKT";
-    showToast("统计已加载");
+    if (!silent) showToast("统计已加载");
   }
 
   async function loadLogs() {
@@ -6157,18 +6157,18 @@ function renderAdminScript() {
       await Promise.all([loadConfig(), loadClients()]);
       if (bootSpan.parentNode) bootSpan.remove();
       loadRuntimeStatus().catch(function(){});
-      loadStats().catch(function(){}); // ponytail: don't block boot on stats
+      loadStats(true).catch(function(){}); // ponytail: don't block boot on stats
       loadLogs().catch(function(){});  // don't block on logs either
-      // ponytail: only auto-refresh when stats panel is visible (save KV reads)
+      // ponytail: AE path is cheap enough; only refresh visible panels.
       var statsPanel = byId("stats-panel");
       var logPanel = byId("log-panel");
       setInterval(function() {
         var statsVisible = !statsPanel || statsPanel.offsetParent !== null;
         var logVisible = !logPanel || logPanel.offsetParent !== null;
-        if (statsVisible) loadStats().catch(function(){});
+        if (statsVisible) loadStats(true).catch(function(){});
         if (logVisible) loadLogs().catch(function(){});
-      }, 120000); // ponytail: 2min auto-refresh to save KV quota
-      setInterval(function() { loadRuntimeStatus().catch(function(){}); }, 5000);
+      }, 2000);
+      setInterval(function() { loadRuntimeStatus().catch(function(){}); }, 2000);
 
 
     } catch (error) {
