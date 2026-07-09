@@ -284,7 +284,7 @@ function renderAdminStyle() {
     }
     #toast.show { opacity: 1; transform: translateX(-50%) translateY(-6px); }
     #log-list { max-width: 100%; overflow-x: auto; }
-    .log-table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 13px; }
+    .log-table { width: 100%; min-width: 780px; border-collapse: collapse; font-size: 13px; }
     .log-table th, .log-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line); }
     .log-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
     .log-table .ok { color: var(--accent-2); }
@@ -2137,6 +2137,10 @@ function renderAdminScript(version) {
     return "B" + (l.time_to_first_byte_ms || 0) + "/T" + (l.time_to_first_token_ms || 0) + "/G" + (l.max_stream_gap_ms || 0) + " " + (l.close_reason || "");
   }
 
+  function toolDiag(l) {
+    return (Number(l?.tools_count || 0)) + "/" + (Number(l?.tool_calls_count || 0));
+  }
+
   function filterLogs(logs) {
     if (state.logFilter === "stream") return logs.filter((l) => l.time_to_first_byte_ms != null);
     if (state.logFilter === "error") return logs.filter((l) => Number(l.status || 0) >= 400 || l.close_reason === "error");
@@ -2167,7 +2171,7 @@ function renderAdminScript(version) {
     ].map((item) => '<button type="button" class="small secondary log-filter' + (state.logFilter === item[0] ? ' active' : '') + '" data-log-filter="' + item[0] + '">' + item[1] + '</button>').join("");
     byId("log-list").innerHTML = '<div class="log-tools">' + filters + '<span class="note">' + filtered.length + '/' + logs.length + '</span>' + toggle + '</div>' +
     (filtered.length ? '<table class="log-table"><thead><tr>' +
-      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tokens</th>' +
+      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tools</th><th>Tokens</th>' +
     '</tr></thead><tbody>' +
     visibleLogs.map((l) => '<tr>' +
       '<td>' + esc((l.ts || "").slice(11, 19)) + '</td>' +
@@ -2178,6 +2182,7 @@ function renderAdminScript(version) {
       '<td class="' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</td>' +
       '<td>' + esc(l.latency_ms) + 'ms</td>' +
       '<td class="mono">' + esc(streamDiag(l)) + '</td>' +
+      '<td class="mono">' + esc(toolDiag(l)) + '</td>' +
       '<td>' + esc(l.prompt_tokens || 0) + '/' + esc(l.completion_tokens || 0) + '</td>' +
     '</tr>').join("") +
     '</tbody></table>' : '<div class="note">\u5f53\u524d\u7b5b\u9009\u65e0\u8bb0\u5f55</div>');

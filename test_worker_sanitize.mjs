@@ -103,6 +103,13 @@ globalThis.fetch = async (url, init) => {
       usage: { prompt_tokens: 11, completion_tokens: 22, total_tokens: 33 },
     }), { status: 200, headers: { "content-type": "application/json", "content-length": "999", "content-encoding": "gzip" } });
   }
+  if (String(url).includes("tool-call.example")) {
+    return new Response(JSON.stringify({
+      id: "tool-call",
+      choices: [{ message: { tool_calls: [{ id: "call_1", type: "function", function: { name: "web_search", arguments: "{}" } }] } }],
+      usage: { prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).includes("long-stream.example")) {
     longStreamHits.push("stream");
     const encoder = new TextEncoder();
@@ -373,6 +380,7 @@ assert.equal(adminPage.includes("upstream-group"), true);
 assert.equal(adminPage.includes("model-entry-list"), true);
 assert.equal(adminPage.includes("model-context-input"), true);
 assert.equal(adminPage.includes("delete-model-row"), true);
+assert.equal(adminPage.includes("toolDiag"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
 const configPayload = await configResp.json();
 assert.equal(configPayload.config.settings.stream_idle_timeout_ms, 900000);
@@ -1719,6 +1727,37 @@ assert.equal(usageStreamLog.close_reason, "done");
 assert.equal(Number.isFinite(usageStreamLog.time_to_first_byte_ms), true);
 assert.equal(Number.isFinite(usageStreamLog.time_to_first_token_ms), true);
 assert.equal(Number.isFinite(usageStreamLog.max_stream_gap_ms), true);
+
+const toolLogStore = new Map();
+toolLogStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "tool-call", base_url: "https://tool-call.example/v1", api_key_encrypted: "t", models: ["tool-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const toolLogEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = toolLogStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { toolLogStore.set(key, value); },
+    async delete(key) { toolLogStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "tool-client", key: "sk-tool", models: ["*"], upstreams: ["tool-call"] }]),
+};
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-tool", "content-type": "application/json" },
+  body: JSON.stringify({ model: "tool-model", messages: [], tools: [{ type: "function", function: { name: "web_search", parameters: {} } }] }),
+}), toolLogEnv);
+const toolLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), toolLogEnv);
+const toolLogs = await toolLogsResp.json();
+const toolLog = toolLogs.logs.find((entry) => entry.model === "tool-model");
+assert.equal(toolLog.tools_count, 1);
+assert.equal(toolLog.tool_calls_count, 1);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({

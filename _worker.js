@@ -48,7 +48,7 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-09-config-snapshots";
+const VERSION = "v26-07-09-tool-diagnostics";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -150,7 +150,7 @@ export default {
             started,
             promptTokens: pt,
             completionTokens: 0,
-            extra: { trace_id: traceId },
+            extra: { trace_id: traceId, tools_count: requestToolsCount(payload) },
           }), ctx);
           return gatewayErrorResponse(error, traceId);
         }
@@ -233,7 +233,7 @@ export default {
             started,
             promptTokens: Math.max(1, Math.round(openaiBody.length / 4)),
             completionTokens: 0,
-            extra: { trace_id: traceId },
+            extra: { trace_id: traceId, tools_count: requestToolsCount(anthropicPayload) },
           }), ctx);
           return gatewayErrorResponse(error, traceId);
         }
@@ -272,7 +272,7 @@ export default {
           started,
           promptTokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
           completionTokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
-          extra: { trace_id: traceId },
+          extra: { trace_id: traceId, tools_count: requestToolsCount(anthropicPayload), tool_calls_count: responseToolCallsCount(openaiPayload) },
         });
         recordRequestLog(app, msgLogEntry, ctx);
 
@@ -445,6 +445,7 @@ function recordAnalyticsPoint(app, entry, ctx) {
       entry.model || "",
       entry.path || "",
       String(entry.status || ""),
+      String(entry.tools_count || 0),
       entry.trace_id || "",
       entry.close_reason || "",
     ],
@@ -457,6 +458,7 @@ function recordAnalyticsPoint(app, entry, ctx) {
       Number(entry.time_to_first_token_ms || 0),
       Number(entry.max_stream_gap_ms || 0),
       entry.status >= 200 && entry.status < 400 ? 1 : 0,
+      Number(entry.tool_calls_count || 0),
     ],
     indexes: [entry.client || "client"],
   })).catch(() => {});
@@ -657,30 +659,37 @@ SELECT
   double5 AS time_to_first_byte_ms,
   double6 AS time_to_first_token_ms,
   double7 AS max_stream_gap_ms,
-  blob7 AS trace_id,
-  blob8 AS close_reason
+  blob7 AS raw_blob7,
+  blob8 AS raw_blob8,
+  blob9 AS raw_blob9,
+  double9 AS tool_calls_count
 FROM ${app.analyticsDataset}
 WHERE timestamp >= NOW() - INTERVAL '24' HOUR
 ORDER BY timestamp DESC
 LIMIT 50
 `);
   if (!rows) return null;
-  return rows.map((row) => ({
-    ts: row.timestamp || row.ts || "",
-    client: row.client || "",
-    upstream: row.upstream || "",
-    model: row.model || "",
-    path: row.path || "",
-    status: Number(row.status || 0),
-    latency_ms: Number(row.latency_ms || 0),
-    prompt_tokens: Number(row.prompt_tokens || 0),
-    completion_tokens: Number(row.completion_tokens || 0),
-    time_to_first_byte_ms: Number(row.time_to_first_byte_ms || 0),
-    time_to_first_token_ms: Number(row.time_to_first_token_ms || 0),
-    max_stream_gap_ms: Number(row.max_stream_gap_ms || 0),
-    trace_id: row.trace_id || "",
-    close_reason: row.close_reason || "",
-  }));
+  return rows.map((row) => {
+    const hasToolBlob = isIntegerString(row.raw_blob7);
+    return {
+      ts: row.timestamp || row.ts || "",
+      client: row.client || "",
+      upstream: row.upstream || "",
+      model: row.model || "",
+      path: row.path || "",
+      status: Number(row.status || 0),
+      latency_ms: Number(row.latency_ms || 0),
+      prompt_tokens: Number(row.prompt_tokens || 0),
+      completion_tokens: Number(row.completion_tokens || 0),
+      time_to_first_byte_ms: Number(row.time_to_first_byte_ms || 0),
+      time_to_first_token_ms: Number(row.time_to_first_token_ms || 0),
+      max_stream_gap_ms: Number(row.max_stream_gap_ms || 0),
+      tools_count: hasToolBlob ? Number(row.raw_blob7 || 0) : 0,
+      tool_calls_count: Number(row.tool_calls_count || 0),
+      trace_id: hasToolBlob ? (row.raw_blob8 || "") : (row.raw_blob7 || ""),
+      close_reason: hasToolBlob ? (row.raw_blob9 || "") : (row.raw_blob8 || ""),
+    };
+  });
 }
 
 async function getAnalyticsStats(app, hourKeys) {
@@ -731,6 +740,7 @@ ORDER BY hour ASC
 
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
+  const toolsCount = requestToolsCount(requestPayload);
   const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
     client,
     upstream: proxyResponse.upstream.name,
@@ -740,7 +750,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
     started,
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,
-    extra: { trace_id: traceId, ...extra },
+    extra: { trace_id: traceId, tools_count: toolsCount, ...extra },
   }), ctx);
 
   if (!upstreamResp.ok) {
@@ -774,7 +784,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
       return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
     }
     const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
-    log(usage);
+    log(usage, 0, { tool_calls_count: responseToolCallsCount(payload) });
     return new Response(textBody, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -789,6 +799,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   let outputText = "";
   let logged = false;
   let failureStatus = 0;
+  const toolCallKeys = new Set();
   const diag = createStreamDiag(started);
   let closeReason = "done";
   const finish = () => {
@@ -796,6 +807,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
     logged = true;
     onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)), failureStatus || 0, {
       close_reason: closeReason,
+      tool_calls_count: toolCallKeys.size,
       ...streamDiagExtra(diag),
     });
   };
@@ -813,6 +825,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
           buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
             if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
             usage = chunk.usage || usage;
+            noteStreamToolCalls(chunk, toolCallKeys);
             const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
             if (delta) noteStreamToken(diag, now);
             outputText += delta;
@@ -822,6 +835,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
         if (buffer) consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => {
           if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
           usage = chunk.usage || usage;
+          noteStreamToolCalls(chunk, toolCallKeys);
           const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
           if (delta) noteStreamToken(diag);
           outputText += delta;
@@ -948,6 +962,27 @@ function estimateOpenAiCompletionTokens(payload) {
 
 function estimateTokens(text) {
   return Math.max(0, Math.round(String(text || "").length / 4));
+}
+
+function isIntegerString(value) {
+  return /^\d+$/.test(String(value || ""));
+}
+
+function requestToolsCount(payload) {
+  if (!payload || typeof payload !== "object") return 0;
+  return (Array.isArray(payload.tools) ? payload.tools.length : 0) + (Array.isArray(payload.functions) ? payload.functions.length : 0);
+}
+
+function responseToolCallsCount(payload) {
+  return (payload?.choices || []).reduce((count, choice) => count + (Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls.length : 0), 0);
+}
+
+function noteStreamToolCalls(chunk, seen) {
+  const calls = (chunk?.choices || []).flatMap((choice) => Array.isArray(choice?.delta?.tool_calls) ? choice.delta.tool_calls : []);
+  for (let index = 0; index < calls.length; index += 1) {
+    const call = calls[index] || {};
+    seen.add(String(call.id ?? call.index ?? index));
+  }
 }
 
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
