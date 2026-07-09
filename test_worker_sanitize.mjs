@@ -23,6 +23,7 @@ assert.equal(cancelledText.includes('"content":"hi"'), true);
 assert.equal(cancelledText.endsWith("data: [DONE]\n\n"), true);
 
 const bodies = [];
+const zhipuBodies = [];
 const fetchUrls = [];
 const speedHits = [];
 const speedBodies = [];
@@ -275,6 +276,7 @@ globalThis.fetch = async (url, init) => {
     });
   }
   if (String(url).includes("open.bigmodel.cn")) {
+    zhipuBodies.push(JSON.parse(init.body));
     return new Response(JSON.stringify({ id: "glm", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -417,6 +419,18 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), zhipuEnv);
 assert.equal(fetchUrls.slice(zhipuUrlStart).some((url) => url.includes("/api/paas/v4/chat/completions")), true);
 assert.equal(fetchUrls.slice(zhipuUrlStart).some((url) => url.includes("/api/paas/v4/v1/chat/completions")), false);
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-glm", "content-type": "application/json" },
+  body: JSON.stringify({ model: "glm-4.6", messages: [], reasoningEffort: "medium", enable_thinking: true, chat_template_kwargs: { enable_thinking: true }, functions: [{ name: "search", parameters: {} }], function_call: "auto" }),
+}), zhipuEnv);
+assert.deepEqual(zhipuBodies.at(-1).thinking, { type: "enabled" });
+assert.equal(zhipuBodies.at(-1).reasoning_effort, "medium");
+assert.equal(Array.isArray(zhipuBodies.at(-1).tools), true);
+assert.equal("reasoning" in zhipuBodies.at(-1), false);
+assert.equal("enable_thinking" in zhipuBodies.at(-1), false);
+assert.equal("chat_template_kwargs" in zhipuBodies.at(-1), false);
+assert.equal("functions" in zhipuBodies.at(-1), false);
 
 const healthTimeResp = await worker.default.fetch(new Request("https://gw.test/health"), env);
 const healthTime = await healthTimeResp.json();
@@ -696,6 +710,51 @@ assert.deepEqual(bodies[minimaxStart + 1].thinking, { type: "disabled" });
 assert.equal("reasoning" in bodies[minimaxStart + 1], false);
 assert.equal("enable_thinking" in bodies[minimaxStart + 1], false);
 assert.equal("chat_template_kwargs" in bodies[minimaxStart + 1], false);
+
+const nonNimBridgeEnv = {
+  ...env,
+  KV: {
+    async get() { return null; },
+    async put() {},
+    async delete() {},
+  },
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "openrouter", preset: "openrouter", base_url: "https://openrouter.ai/api/v1", api_key: "or", models: ["or-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "deepinfra", preset: "deepinfra", base_url: "https://api.deepinfra.com/v1/openai", api_key: "di", models: ["di-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "workers", preset: "workers-ai", base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1", api_key: "cf", models: ["cf-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ]),
+  CLIENTS_JSON: JSON.stringify([{ name: "non-nim-client", key: "sk-non-nim", models: ["*"], upstreams: ["openrouter", "deepinfra", "workers"] }]),
+};
+const nonNimBridgeStart = bodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-non-nim", "content-type": "application/json" },
+  body: JSON.stringify({ model: "or-model", messages: [], reasoningEffort: "high", enable_thinking: true, chat_template_kwargs: { enable_thinking: true }, functions: [{ name: "search", parameters: {} }], function_call: "auto" }),
+}), nonNimBridgeEnv);
+assert.equal(bodies[nonNimBridgeStart].reasoning.effort, "high");
+assert.equal(Array.isArray(bodies[nonNimBridgeStart].tools), true);
+assert.equal("reasoning_effort" in bodies[nonNimBridgeStart], false);
+assert.equal("enable_thinking" in bodies[nonNimBridgeStart], false);
+assert.equal("chat_template_kwargs" in bodies[nonNimBridgeStart], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-non-nim", "content-type": "application/json" },
+  body: JSON.stringify({ model: "di-model", messages: [], reasoning: { effort: "low" }, enable_thinking: true, chat_template_kwargs: { enable_thinking: true } }),
+}), nonNimBridgeEnv);
+assert.equal(bodies[nonNimBridgeStart + 1].reasoning_effort, "low");
+assert.equal("reasoning" in bodies[nonNimBridgeStart + 1], false);
+assert.equal("enable_thinking" in bodies[nonNimBridgeStart + 1], false);
+assert.equal("chat_template_kwargs" in bodies[nonNimBridgeStart + 1], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-non-nim", "content-type": "application/json" },
+  body: JSON.stringify({ model: "cf-model", messages: [], reasoningEffort: "high", thinking: { type: "enabled" }, enable_thinking: true }),
+}), nonNimBridgeEnv);
+assert.equal("reasoning_effort" in bodies[nonNimBridgeStart + 2], false);
+assert.equal("thinking" in bodies[nonNimBridgeStart + 2], false);
+assert.equal("enable_thinking" in bodies[nonNimBridgeStart + 2], false);
 
 const wrappedKvConfig = {
   routing: { failover: true, load_balance: false },

@@ -9,8 +9,12 @@ export function sanitizeProxyBody(bodyText, upstream) {
   const isDeepSeekOfficial = isDeepSeekUpstream(upstream);
   const isMoonshotOfficial = isMoonshotUpstream(upstream);
   const isMiniMaxOfficial = isMiniMaxUpstream(upstream);
+  const isOpenRouterOfficial = isOpenRouterUpstream(upstream);
+  const isZhipuOfficial = isZhipuUpstream(upstream);
+  const isWorkersAiOfficial = isWorkersAiUpstream(upstream);
+  const isGenericOpenAi = isGenericOpenAiUpstream(upstream);
   const bodyLower = bodyText.toLowerCase();
-  if (!bodyNeedsSanitizing(bodyText, bodyLower, isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial)) return bodyText;
+  if (!bodyNeedsSanitizing(bodyText, bodyLower, isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial || isOpenRouterOfficial || isZhipuOfficial || isGenericOpenAi)) return bodyText;
 
   let payload;
   try {
@@ -24,11 +28,14 @@ export function sanitizeProxyBody(bodyText, upstream) {
   const isGlm = isGlmModel(modelName);
   const wantsKimiPreservedThinking = kimiPreservedThinkingRequested(payload, modelName);
   changed = applyProviderReasoningOptions(payload) || changed;
-  changed = normalizeReasoningFields(payload, isGlm, wantsKimiPreservedThinking || isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial) || changed;
+  changed = normalizeReasoningFields(payload, isGlm && !isZhipuOfficial, wantsKimiPreservedThinking || isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial || isOpenRouterOfficial || isZhipuOfficial || isGenericOpenAi) || changed;
   changed = applyKimiPreservedThinking(payload, wantsKimiPreservedThinking) || changed;
   if (isDeepSeekOfficial) changed = applyDeepSeekBridge(payload) || changed;
   if (isMoonshotOfficial) changed = applyMoonshotBridge(payload, modelName) || changed;
   if (isMiniMaxOfficial) changed = applyMiniMaxBridge(payload) || changed;
+  if (isOpenRouterOfficial) changed = applyOpenRouterBridge(payload) || changed;
+  if (isZhipuOfficial) changed = applyZhipuBridge(payload) || changed;
+  if (isGenericOpenAi && !isDeepSeekOfficial && !isMoonshotOfficial && !isMiniMaxOfficial && !isOpenRouterOfficial && !isZhipuOfficial) changed = applyGenericOpenAiBridge(payload, { keepReasoningEffort: !isWorkersAiOfficial }) || changed;
   if (isNvidia) changed = applyNimBridge(payload, modelName) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
@@ -56,10 +63,11 @@ function bodyNeedsSanitizing(bodyText, bodyLower, providerBridge) {
     bodyText.includes('"reasoningSummary"') ||
     bodyText.includes('"providerOptions"') ||
     bodyText.includes('"provider_options"') ||
+    bodyText.includes('"reasoning_split"') ||
+    bodyText.includes('"enable_thinking"') ||
+    bodyText.includes('"chat_template_kwargs"') ||
     bodyLower.includes("kimi-k2") ||
     (providerBridge && (
-      bodyText.includes('"reasoning_split"') ||
-      bodyText.includes('"enable_thinking"') ||
       bodyText.includes('"functions"') ||
       bodyText.includes('"function_call"') ||
       bodyText.includes('"tool_choice"') ||
@@ -177,6 +185,31 @@ function isMiniMaxUpstream(upstream) {
   return String(upstream?.preset || "") === "minimax" || baseUrl.includes("api.minimax.io") || baseUrl.includes("api.minimaxi.com");
 }
 
+function isOpenRouterUpstream(upstream) {
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return String(upstream?.preset || "") === "openrouter" || baseUrl.includes("openrouter.ai");
+}
+
+function isZhipuUpstream(upstream) {
+  const preset = String(upstream?.preset || "");
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return preset === "zhipu" || preset === "zhipu-coding" || baseUrl.includes("open.bigmodel.cn");
+}
+
+function isWorkersAiUpstream(upstream) {
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return String(upstream?.preset || "") === "workers-ai" || (baseUrl.includes("api.cloudflare.com/client/v4/accounts/") && baseUrl.includes("/ai/v1"));
+}
+
+function isGenericOpenAiUpstream(upstream) {
+  const preset = String(upstream?.preset || "");
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return ["deepinfra", "together", "workers-ai", "custom"].includes(preset) ||
+    baseUrl.includes("deepinfra.com") ||
+    baseUrl.includes("together.xyz") ||
+    isWorkersAiUpstream(upstream);
+}
+
 function isStepModel(modelName) {
   return /(^|[\/_.-])(step|stepfun|step-ai)([\/_.-]|$)/i.test(String(modelName || ""));
 }
@@ -292,6 +325,69 @@ function applyMiniMaxBridge(payload) {
   changed = normalizeLegacyToolPayload(payload) || changed;
   changed = removeMiniMaxIncompatibleReasoningFields(payload) || changed;
   return changed;
+}
+
+function applyOpenRouterBridge(payload) {
+  let changed = false;
+  if (nimReasoningRequested(payload)) {
+    if (nimReasoningDisabled(payload)) {
+      if ("reasoning" in payload) { delete payload.reasoning; changed = true; }
+    } else {
+      const current = payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {};
+      const raw = bridgeReasoningEffortInput(payload);
+      const effort = raw ? mapOpenAiReasoningEffort(raw) : "";
+      payload.reasoning = effort ? { ...current, effort } : current;
+      changed = true;
+    }
+  }
+  changed = normalizeLegacyToolPayload(payload) || changed;
+  return deleteKeys(payload, ["reasoning_effort", "reasoning_summary", "reasoning_split", "enable_thinking", "chat_template_kwargs", "reasoning_budget", "reasoningBudget", "thinking"]) || changed;
+}
+
+function applyZhipuBridge(payload) {
+  let changed = false;
+  if (nimReasoningRequested(payload) || glmThinkingRequested(payload)) {
+    const disabled = nimReasoningDisabled(payload);
+    const current = payload.thinking && typeof payload.thinking === "object" ? payload.thinking : {};
+    payload.thinking = { ...current, type: disabled ? "disabled" : "enabled" };
+    changed = true;
+    const raw = bridgeReasoningEffortInput(payload);
+    const effort = raw ? mapOpenAiReasoningEffort(raw) : "";
+    if (!disabled && effort && effort !== "none") {
+      payload.reasoning_effort = effort;
+    } else if ("reasoning_effort" in payload) {
+      delete payload.reasoning_effort;
+    }
+  }
+  changed = normalizeLegacyToolPayload(payload) || changed;
+  return deleteKeys(payload, ["reasoning", "reasoning_summary", "reasoning_split", "enable_thinking", "chat_template_kwargs", "reasoning_budget", "reasoningBudget"]) || changed;
+}
+
+function applyGenericOpenAiBridge(payload, options = {}) {
+  let changed = false;
+  if (nimReasoningRequested(payload)) {
+    const disabled = nimReasoningDisabled(payload);
+    const raw = bridgeReasoningEffortInput(payload);
+    const effort = raw ? mapOpenAiReasoningEffort(raw) : "";
+    if (disabled || options.keepReasoningEffort === false) {
+      if ("reasoning_effort" in payload) { delete payload.reasoning_effort; changed = true; }
+    } else if (effort && effort !== "none" && payload.reasoning_effort !== effort) {
+      payload.reasoning_effort = effort;
+      changed = true;
+    }
+  }
+  changed = normalizeLegacyToolPayload(payload) || changed;
+  return deleteKeys(payload, ["reasoning", "reasoning_summary", "reasoning_split", "enable_thinking", "chat_template_kwargs", "reasoning_budget", "reasoningBudget", "thinking"]) || changed;
+}
+
+function mapOpenAiReasoningEffort(raw) {
+  return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
+}
+
+function bridgeReasoningEffortInput(payload) {
+  const effort = nimReasoningEffortInput(payload);
+  if (effort) return effort;
+  return String(payload?.thinking?.type || "").toLowerCase() === "enabled" ? "high" : "";
 }
 
 function normalizeLegacyToolPayload(payload) {
