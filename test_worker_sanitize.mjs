@@ -1084,6 +1084,40 @@ assert.equal(savedConfigPayload.config.upstreams[0].model_contexts.qwen3, "1m");
 assert.equal(savedConfigPayload.config.settings.global_context, "Project context should guide details.");
 assert.equal(savedConfigPayload.config.settings.context_on_demand, true);
 assert.equal(savedConfigPayload.config.settings.context_items.length, 2);
+
+const snapshotStore = new Map();
+const snapshotEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = snapshotStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { snapshotStore.set(key, value); },
+    async delete(key) { snapshotStore.delete(key); },
+  },
+};
+await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    routing: { failover: false, load_balance: false },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+    upstreams: [
+      { name: "snapshot-new", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["snapshot-new"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    ],
+  }),
+}), snapshotEnv);
+const snapshotListResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config/snapshots"), snapshotEnv);
+const snapshotList = await snapshotListResp.json();
+assert.equal(snapshotList.snapshots.length, 1);
+assert.equal(snapshotList.snapshots[0].upstream_count, 3);
+assert.equal("config" in snapshotList.snapshots[0], false);
+const snapshotRestoreResp = await worker.default.fetch(new Request(`https://gw.test/llmmerge-admin/api/config/snapshots/${snapshotList.snapshots[0].id}/restore`, { method: "POST" }), snapshotEnv);
+const snapshotRestored = await snapshotRestoreResp.json();
+assert.equal(snapshotRestored.config.upstreams.length, 3);
+assert.equal(snapshotRestored.config.upstreams.some((upstream) => upstream.name === "ai-old"), true);
+
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },

@@ -25,6 +25,8 @@ const RESPONSES_PATH = "/v1/responses";
 const EMBEDDINGS_PATH = "/v1/embeddings";
 const MESSAGES_PATH = "/v1/messages";
 const GATEWAY_CONFIG_KEY = "gateway:config";
+const CONFIG_SNAPSHOTS_KEY = "gateway:config:snapshots";
+const CONFIG_SNAPSHOT_LIMIT = 5;
 const LOG_KEY = "gateway:logs";
 const STATS_PREFIX = "gateway:stats:";
 const STATS_WINDOW_HOURS = 24;
@@ -46,7 +48,7 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-09-ae-stats-offload";
+const VERSION = "v26-07-09-config-snapshots";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -963,6 +965,16 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return saveAdminConfig(request, app);
   }
 
+  if (apiPath === "/api/config/snapshots" && request.method === "GET") {
+    const snapshots = await listConfigSnapshots(app.kv);
+    return withCorsResponse(json({ ok: true, snapshots: snapshots.map(publicConfigSnapshot) }, 200));
+  }
+
+  const snapshotRestoreMatch = apiPath.match(/^\/api\/config\/snapshots\/([^/]+)\/restore$/);
+  if (snapshotRestoreMatch && request.method === "POST") {
+    return restoreConfigSnapshot(app, decodeURIComponent(snapshotRestoreMatch[1]));
+  }
+
   if (apiPath === "/api/refresh" && request.method === "POST") {
     const runtime = await loadRuntimeConfig(app);
     const result = await refreshModelCache(runtime);
@@ -1082,6 +1094,7 @@ async function saveAdminConfig(request, app) {
     upstreams: hasUpstreams && Array.isArray(payload.upstreams) ? payload.upstreams : (existing.upstreams || []),
   };
   const normalized = await normalizeGatewayConfigPayload(merged, app);
+  await saveConfigSnapshot(app.kv, existing);
   await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
   invalidateRuntimeCache();
   return withCorsResponse(json({
@@ -1403,6 +1416,47 @@ function toPublicGatewayConfig(config) {
     })),
     version: config.version || 1,
   };
+}
+
+async function listConfigSnapshots(kv) {
+  const snapshots = await kv.get(CONFIG_SNAPSHOTS_KEY, "json");
+  return Array.isArray(snapshots) ? snapshots : [];
+}
+
+function publicConfigSnapshot(snapshot) {
+  return {
+    id: snapshot.id,
+    created_at: snapshot.created_at,
+    upstream_count: snapshot.upstream_count || 0,
+    client_note: snapshot.client_note || "",
+  };
+}
+
+async function saveConfigSnapshot(kv, config, clientNote = "before-save") {
+  if (!config || !Array.isArray(config.upstreams)) return;
+  const snapshots = await listConfigSnapshots(kv);
+  snapshots.unshift({
+    id: `cfg_${Date.now()}_${randomString(6).toLowerCase()}`,
+    created_at: hkNowIso(),
+    upstream_count: config.upstreams.length,
+    client_note: clientNote,
+    config,
+  });
+  await kv.put(CONFIG_SNAPSHOTS_KEY, JSON.stringify(snapshots.slice(0, CONFIG_SNAPSHOT_LIMIT)));
+}
+
+async function restoreConfigSnapshot(app, snapshotId) {
+  const snapshots = await listConfigSnapshots(app.kv);
+  const snapshot = snapshots.find((item) => String(item.id || "").toLowerCase() === String(snapshotId || "").toLowerCase());
+  if (!snapshot?.config) {
+    return withCorsResponse(json(openAiError("Config snapshot not found.", "not_found_error"), 404));
+  }
+  const current = await getEditableConfig(app);
+  await saveConfigSnapshot(app.kv, current, "before-restore");
+  const restored = await repairStoredGatewayConfig(snapshot.config, app);
+  await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(restored));
+  invalidateRuntimeCache();
+  return withCorsResponse(json({ ok: true, config: toPublicGatewayConfig(restored) }, 200));
 }
 
 async function exportUpstreamGroup(app) {
