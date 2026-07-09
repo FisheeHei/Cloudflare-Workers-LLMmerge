@@ -32,6 +32,8 @@ const softFastHits = [];
 const nimHits = [];
 const responseHits = [];
 const responseStreamHits = [];
+const anthropicHits = [];
+const anthropicStreamHits = [];
 const paymentHits = [];
 const degradedHits = [];
 const missingFunctionHits = [];
@@ -39,6 +41,7 @@ const disabledHits = [];
 const longStreamHits = [];
 const usageHits = [];
 const wrappedHits = [];
+const toolStreamHits = [];
 const appErrorHits = [];
 const htmlHits = [];
 const analyticsPoints = [];
@@ -109,6 +112,18 @@ globalThis.fetch = async (url, init) => {
       choices: [{ message: { tool_calls: [{ id: "call_1", type: "function", function: { name: "web_search", arguments: "{}" } }] } }],
       usage: { prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 },
     }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("tool-stream.example")) {
+    toolStreamHits.push("stream");
+    const encoder = new TextEncoder();
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"web_search","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n'));
+      },
+      cancel() {
+        toolStreamHits.push("cancel");
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("long-stream.example")) {
     longStreamHits.push("stream");
@@ -184,6 +199,36 @@ globalThis.fetch = async (url, init) => {
       id: "chatcmpl-resp",
       choices: [{ message: { content: "hello" }, finish_reason: "stop" }],
       usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("anthropic-stream.example")) {
+    anthropicStreamHits.push(JSON.parse(init.body));
+    const chunks = [
+      { choices: [{ delta: { content: "Checking " } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_stream", type: "function", function: { name: "web_search", arguments: "{\"query\":" } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "\"glm\"}" } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 13, completion_tokens: 5 } },
+    ];
+    return new Response(chunks.map((chunk) => "data: " + JSON.stringify(chunk) + "\n\n").join(""), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }
+  if (String(url).includes("anthropic.example")) {
+    anthropicHits.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      id: "chatcmpl-anthropic",
+      model: "anthropic-model",
+      choices: [{
+        message: {
+          content: "I will search.",
+          tool_calls: [{ id: "call_search", type: "function", function: { name: "web_search", arguments: "{\"query\":\"llm\"}" } }],
+        },
+        finish_reason: "tool_calls",
+      }],
+      usage: { prompt_tokens: 17, completion_tokens: 8, total_tokens: 25 },
     }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -1424,6 +1469,81 @@ assert.equal(responsesStreamLog.completion_tokens >= 1, true);
 assert.equal(responsesStreamLog.close_reason, "done");
 assert.equal(Number.isFinite(responsesStreamLog.time_to_first_byte_ms), true);
 
+const anthropicStore = new Map();
+anthropicStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "anthropic", base_url: "https://anthropic.example/v1", api_key_encrypted: "a", models: ["anthropic-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "anthropic-stream", base_url: "https://anthropic-stream.example/v1", api_key_encrypted: "s", models: ["anthropic-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const anthropicEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = anthropicStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { anthropicStore.set(key, value); },
+    async delete(key) { anthropicStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "anthropic-client", key: "sk-anthropic", models: ["*"], upstreams: ["anthropic", "anthropic-stream"] }]),
+};
+const anthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({
+    model: "anthropic-model",
+    max_tokens: 64,
+    system: [{ type: "text", text: "System rules." }],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "Find info." }] },
+      { role: "assistant", content: [{ type: "text", text: "Sure." }, { type: "tool_use", id: "call_prev", name: "web_search", input: { query: "old" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_prev", content: [{ type: "text", text: "old result" }] }] },
+    ],
+    tools: [{ name: "web_search", description: "Search web", input_schema: { type: "object", properties: { query: { type: "string" } } } }],
+    tool_choice: { type: "tool", name: "web_search" },
+  }),
+}), anthropicEnv);
+const anthropicPayload = await anthropicResp.json();
+assert.equal(anthropicResp.status, 200);
+assert.equal(anthropicHits[0].messages[0].role, "system");
+assert.equal(anthropicHits[0].messages.some((msg) => msg.role === "tool" && msg.tool_call_id === "call_prev"), true);
+assert.equal(anthropicHits[0].messages.some((msg) => msg.role === "assistant" && msg.tool_calls?.[0]?.function?.name === "web_search"), true);
+assert.equal(anthropicHits[0].tools[0].function.parameters.properties.query.type, "string");
+assert.equal(anthropicHits[0].tool_choice === "auto" || anthropicHits[0].tool_choice?.function?.name === "web_search", true);
+assert.equal(anthropicPayload.type, "message");
+assert.equal(anthropicPayload.stop_reason, "tool_use");
+assert.equal(anthropicPayload.content.some((block) => block.type === "tool_use" && block.input.query === "llm"), true);
+assert.equal(anthropicPayload.usage.input_tokens, 17);
+assert.equal(anthropicPayload.usage.output_tokens, 8);
+
+const anthropicStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json" },
+  body: JSON.stringify({
+    model: "anthropic-stream-model",
+    max_tokens: 64,
+    stream: true,
+    messages: [{ role: "user", content: "Use a tool." }],
+    tools: [{ name: "web_search", input_schema: { type: "object", properties: { query: { type: "string" } } } }],
+  }),
+}), anthropicEnv);
+assert.equal(anthropicStreamResp.headers.get("content-type").includes("text/event-stream"), true);
+const anthropicStreamText = await anthropicStreamResp.text();
+assert.equal(anthropicStreamHits[0].stream, true);
+assert.equal(anthropicStreamText.includes("event: message_start"), true);
+assert.equal(anthropicStreamText.includes('"type":"text_delta","text":"Checking "'), true);
+assert.equal(anthropicStreamText.includes('"type":"input_json_delta","partial_json":"{\\"query\\":"'), true);
+assert.equal(anthropicStreamText.includes('"stop_reason":"tool_use"'), true);
+assert.equal(anthropicStreamText.includes("event: message_stop"), true);
+const anthropicLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), anthropicEnv);
+const anthropicLogs = await anthropicLogsResp.json();
+const anthropicStreamLog = anthropicLogs.logs.find((entry) => entry.model === "anthropic-stream-model" && entry.path === "/v1/messages");
+assert.equal(anthropicStreamLog.finish_reason, "tool_calls");
+assert.equal(anthropicStreamLog.tool_calls_count, 1);
+
 const paymentStore = new Map();
 paymentStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
@@ -1758,6 +1878,47 @@ const toolLogs = await toolLogsResp.json();
 const toolLog = toolLogs.logs.find((entry) => entry.model === "tool-model");
 assert.equal(toolLog.tools_count, 1);
 assert.equal(toolLog.tool_calls_count, 1);
+
+const toolStreamStore = new Map();
+toolStreamStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "tool-stream", base_url: "https://tool-stream.example/v1", api_key_encrypted: "t", models: ["tool-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const toolStreamEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = toolStreamStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { toolStreamStore.set(key, value); },
+    async delete(key) { toolStreamStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "tool-stream-client", key: "sk-tool-stream", models: ["*"], upstreams: ["tool-stream"] }]),
+};
+const toolStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-tool-stream", "content-type": "application/json" },
+  body: JSON.stringify({
+    model: "tool-stream-model",
+    messages: [],
+    stream: true,
+    tools: [{ type: "function", function: { name: "web_search", parameters: {} } }],
+  }),
+}), toolStreamEnv);
+const toolStreamText = await toolStreamResp.text();
+assert.equal(toolStreamText.includes('"finish_reason":"tool_calls"'), true);
+assert.equal(toolStreamText.endsWith("data: [DONE]\n\n"), true);
+const toolStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), toolStreamEnv);
+const toolStreamLogs = await toolStreamLogsResp.json();
+const toolStreamLog = toolStreamLogs.logs.find((entry) => entry.model === "tool-stream-model");
+assert.equal(toolStreamLog.close_reason, "finish_grace");
+assert.equal(toolStreamLog.finish_reason, "tool_calls");
+assert.equal(toolStreamLog.tools_count, 1);
+assert.equal(toolStreamLog.tool_calls_count, 1);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({

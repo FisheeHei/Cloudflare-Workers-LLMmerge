@@ -2134,7 +2134,7 @@ function renderAdminScript(version) {
   
   function streamDiag(l) {
     if (!l || l.time_to_first_byte_ms == null) return "";
-    return "B" + (l.time_to_first_byte_ms || 0) + "/T" + (l.time_to_first_token_ms || 0) + "/G" + (l.max_stream_gap_ms || 0) + " " + (l.close_reason || "");
+    return "B" + (l.time_to_first_byte_ms || 0) + "/T" + (l.time_to_first_token_ms || 0) + "/G" + (l.max_stream_gap_ms || 0) + " " + (l.close_reason || "") + (l.finish_reason ? "/" + l.finish_reason : "");
   }
 
   function toolDiag(l) {

@@ -43,12 +43,13 @@ const STDTIME_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 const SSE_KEEPALIVE_MS = 15000;
+const SSE_FINISH_GRACE_MS = 1000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-09-tool-diagnostics";
+const VERSION = "v26-07-09-anthropic-messages";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -178,108 +179,8 @@ export default {
         return await handleResponsesRequest(request, url, app, ctx, requestTraceId(request));
       }
 
-      // ponytail: translate Anthropic messages <-> OpenAI chat.completions for Claude Code compatibility.
       if (pathname === MESSAGES_PATH && request.method === "POST") {
-        const traceId = requestTraceId(request);
-        const started = Date.now();
-        const runtime = await loadRuntimeConfig(app);
-        const client = await requireClient(request, runtime);
-        const bodyText = await request.text();
-        const anthropicPayload = parseJsonBody(bodyText);
-        const requestedModel = anthropicPayload.model;
-
-        if (!requestedModel || typeof requestedModel !== "string") {
-          return withCorsResponse(
-            json({ type: "error", error: { type: "invalid_request_error", message: "`model` is required." } }, 400),
-          );
-        }
-        const model = await resolveClientModelAlias(client, runtime, requestedModel);
-
-        // Anthropic -> OpenAI request translation
-        const openaiMessages = [];
-        if (anthropicPayload.system && typeof anthropicPayload.system === "string") {
-          openaiMessages.push({ role: "system", content: anthropicPayload.system });
-        }
-        for (const msg of (anthropicPayload.messages || [])) {
-          openaiMessages.push({ role: msg.role, content: typeof msg.content === "string" ? msg.content : (Array.isArray(msg.content) ? msg.content.map((b) => b.text || "").join("") : "") });
-        }
-
-        const openaiBody = JSON.stringify({
-          model,
-          messages: openaiMessages,
-          max_tokens: anthropicPayload.max_tokens,
-          temperature: anthropicPayload.temperature,
-          top_p: anthropicPayload.top_p,
-          stop: anthropicPayload.stop_sequences,
-        });
-
-        let proxyResponse;
-        try {
-          proxyResponse = await proxyRequest({
-            client, model,
-            pathname: CHAT_PATH,
-            request,
-            bodyText: openaiBody,
-            runtime,
-            search: url.search,
-          });
-        } catch (error) {
-          recordRequestLog(app, makeRequestLogEntry({
-            client,
-            upstream: error.upstreamName || "none",
-            model,
-            path: MESSAGES_PATH,
-            status: error.statusCode || 502,
-            started,
-            promptTokens: Math.max(1, Math.round(openaiBody.length / 4)),
-            completionTokens: 0,
-            extra: { trace_id: traceId, tools_count: requestToolsCount(anthropicPayload) },
-          }), ctx);
-          return gatewayErrorResponse(error, traceId);
-        }
-
-        const openaiResp = proxyResponse.response;
-        const respBody = await openaiResp.text();
-        const openaiPayload = parseJsonBody(respBody);
-        const choice = (openaiPayload.choices || [])[0] || {};
-        const finish = choice.finish_reason || "stop";
-
-        // OpenAI -> Anthropic response translation
-        const anthropicResp = {
-          id: "msg_" + (openaiPayload.id || crypto.randomUUID()),
-          type: "message",
-          role: "assistant",
-          model: openaiPayload.model || model,
-          content: [{ type: "text", text: (choice.message || {}).content || "" }],
-          stop_reason: finish === "stop" ? "end_turn" : finish === "length" ? "max_tokens" : "end_turn",
-          stop_sequence: null,
-          usage: openaiPayload.usage ? {
-            input_tokens: openaiPayload.usage.prompt_tokens || 0,
-            output_tokens: openaiPayload.usage.completion_tokens || 0,
-          } : { input_tokens: 0, output_tokens: 0 },
-        };
-
-        const headers = proxyResponseHeaders(openaiResp, proxyResponse, client, traceId);
-        headers.set("content-type", "application/json; charset=utf-8");
-
-        const loggedStatusMsg = openaiResp.ok ? openaiResp.status : (openaiResp.status || 502);
-        var msgLogEntry = makeRequestLogEntry({
-          client,
-          upstream: proxyResponse.upstream.name,
-          model,
-          path: MESSAGES_PATH,
-          status: loggedStatusMsg,
-          started,
-          promptTokens: anthropicResp.usage ? anthropicResp.usage.input_tokens || 0 : 0,
-          completionTokens: anthropicResp.usage ? anthropicResp.usage.output_tokens || 0 : 0,
-          extra: { trace_id: traceId, tools_count: requestToolsCount(anthropicPayload), tool_calls_count: responseToolCallsCount(openaiPayload) },
-        });
-        recordRequestLog(app, msgLogEntry, ctx);
-
-        return new Response(JSON.stringify(anthropicResp), {
-          status: openaiResp.ok ? 200 : openaiResp.status,
-          headers,
-        });
+        return await handleAnthropicMessagesRequest(request, url, app, ctx, requestTraceId(request));
       }
 
       if (env.ASSETS && request.method === "GET" && pathname !== "/") {
@@ -448,6 +349,7 @@ function recordAnalyticsPoint(app, entry, ctx) {
       String(entry.tools_count || 0),
       entry.trace_id || "",
       entry.close_reason || "",
+      entry.finish_reason || "",
     ],
     doubles: [
       Number(entry.status || 0),
@@ -662,6 +564,7 @@ SELECT
   blob7 AS raw_blob7,
   blob8 AS raw_blob8,
   blob9 AS raw_blob9,
+  blob10 AS finish_reason,
   double9 AS tool_calls_count
 FROM ${app.analyticsDataset}
 WHERE timestamp >= NOW() - INTERVAL '24' HOUR
@@ -688,6 +591,7 @@ LIMIT 50
       tool_calls_count: Number(row.tool_calls_count || 0),
       trace_id: hasToolBlob ? (row.raw_blob8 || "") : (row.raw_blob7 || ""),
       close_reason: hasToolBlob ? (row.raw_blob9 || "") : (row.raw_blob8 || ""),
+      finish_reason: row.finish_reason || "",
     };
   });
 }
@@ -784,7 +688,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
       return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
     }
     const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
-    log(usage, 0, { tool_calls_count: responseToolCallsCount(payload) });
+    log(usage, 0, { finish_reason: responseFinishReason(payload), tool_calls_count: responseToolCallsCount(payload) });
     return new Response(textBody, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -793,7 +697,9 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
 }
 
 function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now()) {
+  const encoder = new TextEncoder();
   const decoder = new TextDecoder();
+  const doneChunk = encoder.encode("data: [DONE]\n\n");
   let buffer = "";
   let usage = null;
   let outputText = "";
@@ -802,11 +708,23 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   const toolCallKeys = new Set();
   const diag = createStreamDiag(started);
   let closeReason = "done";
+  let finishReason = "";
+  let sawDone = false;
+  const noteChunk = (chunk, now = Date.now()) => {
+    if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
+    usage = chunk.usage || usage;
+    finishReason = responseFinishReason(chunk) || finishReason;
+    noteStreamToolCalls(chunk, toolCallKeys);
+    const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+    if (delta) noteStreamToken(diag, now);
+    outputText += delta;
+  };
   const finish = () => {
     if (logged) return;
     logged = true;
     onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)), failureStatus || 0, {
       close_reason: closeReason,
+      finish_reason: finishReason,
       tool_calls_count: toolCallKeys.size,
       ...streamDiagExtra(diag),
     });
@@ -817,29 +735,29 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
       const reader = body.getReader();
       try {
         for (;;) {
-          const { done, value } = await reader.read();
+          const result = shouldApplyToolFinishGrace(finishReason) && !sawDone
+            ? await Promise.race([
+              reader.read(),
+              sleep(SSE_FINISH_GRACE_MS).then(() => ({ finishGrace: true })),
+            ])
+            : await reader.read();
+          if (result.finishGrace) {
+            closeReason = "finish_grace";
+            Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+            controller.enqueue(doneChunk);
+            sawDone = true;
+            break;
+          }
+          const { done, value } = result;
           if (done) break;
           const now = Date.now();
           noteStreamByte(diag, now);
           buffer += decoder.decode(value, { stream: true });
-          buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
-            if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
-            usage = chunk.usage || usage;
-            noteStreamToolCalls(chunk, toolCallKeys);
-            const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
-            if (delta) noteStreamToken(diag, now);
-            outputText += delta;
-          });
+          buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk, now), () => { sawDone = true; });
           controller.enqueue(value);
+          if (sawDone) break;
         }
-        if (buffer) consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => {
-          if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
-          usage = chunk.usage || usage;
-          noteStreamToolCalls(chunk, toolCallKeys);
-          const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
-          if (delta) noteStreamToken(diag);
-          outputText += delta;
-        });
+        if (buffer) consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => noteChunk(chunk), () => { sawDone = true; });
         finish();
         controller.close();
       } catch (error) {
@@ -910,12 +828,16 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
   });
 }
 
-function consumeOpenAiStreamBuffer(text, onChunk) {
+function consumeOpenAiStreamBuffer(text, onChunk, onDone = null) {
   const blocks = text.split(/\r?\n\r?\n/);
   const rest = blocks.pop() || "";
   for (const block of blocks) {
     const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
-    if (!data || data === "[DONE]") continue;
+    if (!data) continue;
+    if (data === "[DONE]") {
+      if (onDone) onDone();
+      continue;
+    }
     const chunk = safeJson(data);
     if (chunk) onChunk(chunk);
   }
@@ -975,6 +897,18 @@ function requestToolsCount(payload) {
 
 function responseToolCallsCount(payload) {
   return (payload?.choices || []).reduce((count, choice) => count + (Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls.length : 0), 0);
+}
+
+function responseFinishReason(payload) {
+  const reasons = new Set();
+  for (const choice of (payload?.choices || [])) {
+    if (choice?.finish_reason) reasons.add(String(choice.finish_reason));
+  }
+  return [...reasons].join(",");
+}
+
+function shouldApplyToolFinishGrace(finishReason) {
+  return String(finishReason || "").split(",").includes("tool_calls");
 }
 
 function noteStreamToolCalls(chunk, seen) {
@@ -1946,6 +1880,332 @@ function normalizeWorkersAiModelId(value) {
   return raw.includes("/") ? `@cf/${raw}` : "";
 }
 
+async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await request.text());
+  const translated = translateAnthropicMessagesRequest(payload);
+  const resolvedModel = await resolveClientModelAlias(client, runtime, translated.model);
+  if (resolvedModel !== translated.model) {
+    translated.model = resolvedModel;
+    translated.seed.model = resolvedModel;
+    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
+  }
+
+  try {
+    const proxyResponse = await proxyRequest({
+      client,
+      model: translated.model,
+      pathname: CHAT_PATH,
+      request,
+      bodyText: translated.bodyText,
+      runtime,
+      search: url.search,
+    });
+
+    const upstreamResp = proxyResponse.response;
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+
+    if (!upstreamResp.ok) {
+      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId);
+      return await anthropicUpstreamErrorResponse(upstreamResp, headers);
+    }
+
+    if (translated.stream) {
+      setSseHeaders(headers);
+      const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, extra);
+      return new Response(withSseKeepAlive(streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started)), { status: 200, headers });
+    }
+
+    const openaiText = await upstreamResp.text();
+    const openaiPayload = safeJson(openaiText);
+    if (!openaiPayload || looksLikeHtmlDocument(openaiText) || upstreamApplicationErrorMessage(openaiPayload)) {
+      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated, null, ctx, traceId);
+      return anthropicErrorResponse(upstreamApplicationErrorMessage(openaiPayload) || "Upstream returned an invalid response.", 502, headers);
+    }
+
+    const responsePayload = openAiChatToAnthropicMessage(openaiPayload, translated.seed);
+    headers.set("content-type", "application/json; charset=utf-8");
+    recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated, responsePayload.usage, ctx, traceId, {
+      finish_reason: responseFinishReason(openaiPayload),
+      tool_calls_count: responseToolCallsCount(openaiPayload),
+    });
+    return new Response(JSON.stringify(responsePayload), { status: 200, headers });
+  } catch (error) {
+    recordRequestLog(app, makeRequestLogEntry({
+      client,
+      upstream: error.upstreamName || "none",
+      model: translated.model,
+      path: MESSAGES_PATH,
+      status: error.statusCode || 502,
+      started,
+      promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+      completionTokens: 0,
+      extra: { trace_id: traceId, tools_count: translated.toolsCount },
+    }), ctx);
+    const headers = new Headers(JSON_HEADERS);
+    if (traceId) headers.set("x-llm-gateway-trace-id", traceId);
+    return anthropicErrorResponse(error.message || "Internal error.", error.statusCode || 500, headers);
+  }
+}
+
+function translateAnthropicMessagesRequest(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Request body must be a JSON object.");
+  }
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    throw httpError(400, "`model` is required.");
+  }
+  const messages = anthropicMessagesToOpenAiMessages(payload.system, payload.messages);
+  if (!messages.length) {
+    throw httpError(400, "`messages` is required.");
+  }
+
+  const chat = { model, messages, stream: payload.stream === true };
+  copyIfPresent(payload, chat, ["temperature", "top_p", "thinking", "reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
+  if (payload.max_tokens != null) chat.max_tokens = payload.max_tokens;
+  if (payload.stop_sequences != null) chat.stop = payload.stop_sequences;
+  if (payload.metadata?.user_id) chat.user = String(payload.metadata.user_id);
+  const tools = anthropicToolsToOpenAiTools(payload.tools);
+  if (tools.length) chat.tools = tools;
+  const toolChoice = anthropicToolChoiceToOpenAi(payload.tool_choice);
+  if (toolChoice != null) chat.tool_choice = toolChoice;
+
+  return {
+    bodyText: JSON.stringify(chat),
+    model,
+    stream: chat.stream,
+    toolsCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
+    seed: {
+      id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+      createdAt: Math.floor(hkNowMs() / 1000),
+      model,
+    },
+  };
+}
+
+function anthropicMessagesToOpenAiMessages(system, messages) {
+  const out = [];
+  const systemText = anthropicBlocksToText(system);
+  if (systemText) out.push({ role: "system", content: systemText });
+  const rows = Array.isArray(messages) ? messages : [];
+  for (const msg of rows) out.push(...anthropicMessageToOpenAiMessages(msg));
+  return out.filter((msg) => msg && (msg.tool_call_id || msg.tool_calls?.length || msg.content !== ""));
+}
+
+function anthropicMessageToOpenAiMessages(msg) {
+  if (!msg || typeof msg !== "object") return [];
+  const role = String(msg.role || "user") === "assistant" ? "assistant" : "user";
+  if (typeof msg.content === "string") return [{ role, content: msg.content }];
+  if (!Array.isArray(msg.content)) return [];
+  return role === "assistant"
+    ? anthropicAssistantBlocksToOpenAiMessages(msg.content)
+    : anthropicUserBlocksToOpenAiMessages(msg.content);
+}
+
+function anthropicAssistantBlocksToOpenAiMessages(blocks) {
+  const text = [];
+  const toolCalls = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "tool_use") {
+      toolCalls.push({
+        id: String(block.id || `call_${crypto.randomUUID().replace(/-/g, "")}`),
+        type: "function",
+        function: {
+          name: String(block.name || "tool"),
+          arguments: JSON.stringify(block.input && typeof block.input === "object" ? block.input : {}),
+        },
+      });
+      continue;
+    }
+    const blockText = anthropicBlockToText(block);
+    if (blockText) text.push(blockText);
+  }
+  const message = { role: "assistant", content: text.join("") };
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  return [message];
+}
+
+function anthropicUserBlocksToOpenAiMessages(blocks) {
+  const out = [];
+  let pending = [];
+  const flush = () => {
+    if (!pending.length) return;
+    const hasMedia = pending.some((part) => typeof part === "object" && part.type !== "text");
+    out.push({ role: "user", content: hasMedia ? pending : pending.map((part) => typeof part === "string" ? part : part.text || "").join("") });
+    pending = [];
+  };
+
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "tool_result") {
+      flush();
+      out.push({
+        role: "tool",
+        tool_call_id: String(block.tool_use_id || ""),
+        content: anthropicBlocksToText(block.content) || (block.is_error ? "Tool returned an error." : ""),
+      });
+      continue;
+    }
+    const part = anthropicBlockToOpenAiContentPart(block);
+    if (part != null) pending.push(part);
+  }
+  flush();
+  return out;
+}
+
+function anthropicBlockToOpenAiContentPart(block) {
+  if (!block || typeof block !== "object") return null;
+  if (block.type === "text") return { type: "text", text: String(block.text || "") };
+  if (block.type === "image") {
+    const url = anthropicImageSourceToUrl(block.source);
+    return url ? { type: "image_url", image_url: { url } } : { type: "text", text: "[image omitted]" };
+  }
+  const text = anthropicBlockToText(block);
+  return text ? { type: "text", text } : null;
+}
+
+function anthropicImageSourceToUrl(source) {
+  if (!source || typeof source !== "object") return "";
+  if (source.type === "url" && source.url) return String(source.url);
+  if (source.type === "base64" && source.media_type && source.data) {
+    return `data:${source.media_type};base64,${source.data}`;
+  }
+  return "";
+}
+
+function anthropicToolsToOpenAiTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: String(tool?.name || "tool"),
+      description: String(tool?.description || ""),
+      parameters: tool?.input_schema && typeof tool.input_schema === "object" ? tool.input_schema : { type: "object", properties: {} },
+    },
+  }));
+}
+
+function anthropicToolChoiceToOpenAi(choice) {
+  if (!choice) return null;
+  if (typeof choice === "string") return choice === "any" ? "required" : choice;
+  if (choice.type === "auto") return "auto";
+  if (choice.type === "any") return "required";
+  if (choice.type === "none") return "none";
+  if (choice.type === "tool" && choice.name) return { type: "function", function: { name: String(choice.name) } };
+  return null;
+}
+
+function openAiChatToAnthropicMessage(openaiPayload, seed) {
+  const choice = (openaiPayload?.choices || [])[0] || {};
+  const message = choice.message || {};
+  const content = openAiMessageToAnthropicContent(message);
+  return {
+    id: seed.id,
+    type: "message",
+    role: "assistant",
+    model: openaiPayload?.model || seed.model,
+    content,
+    stop_reason: openAiFinishToAnthropicStop(choice.finish_reason),
+    stop_sequence: null,
+    usage: normalizeAnthropicUsage(openaiPayload?.usage, content),
+  };
+}
+
+function openAiMessageToAnthropicContent(message) {
+  const content = [];
+  const text = chatContentToText(message?.content || "");
+  if (text) content.push({ type: "text", text });
+  for (const call of (message?.tool_calls || [])) {
+    content.push({
+      type: "tool_use",
+      id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`),
+      name: String(call.function?.name || call.name || "tool"),
+      input: parseToolArguments(call.function?.arguments),
+    });
+  }
+  return content.length ? content : [{ type: "text", text: "" }];
+}
+
+function parseToolArguments(value) {
+  if (value && typeof value === "object") return value;
+  const parsed = safeJson(String(value || "{}"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  return {};
+}
+
+function openAiFinishToAnthropicStop(reason) {
+  if (reason === "tool_calls" || reason === "function_call") return "tool_use";
+  if (reason === "length") return "max_tokens";
+  if (reason === "stop" || !reason) return "end_turn";
+  return String(reason);
+}
+
+function normalizeAnthropicUsage(usage, content = []) {
+  const input = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
+  const outputFallback = estimateTokens((content || []).map((block) => block.text || JSON.stringify(block.input || "")).join(""));
+  const output = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? outputFallback) || 0);
+  return { input_tokens: input, output_tokens: output };
+}
+
+function anthropicBlocksToText(value) {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value.map(anthropicBlockToText).filter(Boolean).join("");
+}
+
+function anthropicBlockToText(block) {
+  if (typeof block === "string") return block;
+  if (!block || typeof block !== "object") return "";
+  if (block.type === "text") return String(block.text || "");
+  if (block.type === "thinking") return String(block.thinking || "");
+  if (block.text != null) return String(block.text);
+  if (block.content != null) return anthropicBlocksToText(block.content);
+  return "";
+}
+
+function anthropicErrorResponse(message, status = 500, headers = new Headers()) {
+  const out = responseBodyHeaders(headers);
+  out.set("content-type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify({ type: "error", error: { type: anthropicErrorType(status), message: message || "Internal error." } }), {
+    status,
+    headers: out,
+  });
+}
+
+async function anthropicUpstreamErrorResponse(upstreamResp, headers) {
+  const text = await upstreamResp.text().catch(() => "");
+  const payload = safeJson(text);
+  const message = upstreamApplicationErrorMessage(payload || text) || payload?.error?.message || payload?.message || text || `Upstream returned HTTP ${upstreamResp.status}.`;
+  return anthropicErrorResponse(looksLikeHtmlDocument(text) ? `Upstream returned HTTP ${upstreamResp.status} HTML error page.` : message, upstreamResp.status || 502, headers);
+}
+
+function anthropicErrorType(status) {
+  if (status === 400) return "invalid_request_error";
+  if (status === 401) return "authentication_error";
+  if (status === 403) return "permission_error";
+  if (status === 404) return "not_found_error";
+  if (status === 429) return "rate_limit_error";
+  return "api_error";
+}
+
+function recordAnthropicLog(app, client, upstreamName, model, started, status, translated, usage, ctx, traceId, extra = {}) {
+  recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model,
+    path: MESSAGES_PATH,
+    status: status || 200,
+    started,
+    promptTokens: usage?.input_tokens || Math.max(1, Math.round(translated.bodyText.length / 4)),
+    completionTokens: usage?.output_tokens || 0,
+    extra: { trace_id: traceId, tools_count: translated.toolsCount || 0, ...extra },
+  }), ctx);
+}
+
 async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const started = Date.now();
   const runtime = await loadRuntimeConfig(app);
@@ -2191,6 +2451,149 @@ function recordResponsesLog(app, client, upstreamName, model, started, status, b
     completionTokens: usage?.output_tokens || 1,
     extra: { trace_id: traceId, ...extra },
   }), ctx);
+}
+
+function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now()) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const write = (eventName, payload) => writer.write(encoder.encode(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`));
+
+  (async () => {
+    let buffer = "";
+    let usage = null;
+    let finishReason = "";
+    let sawDone = false;
+    let closeReason = "done";
+    let textIndex = null;
+    let nextIndex = 0;
+    const toolBlocks = new Map();
+    const diag = createStreamDiag(started);
+    const closeText = async () => {
+      if (textIndex == null) return;
+      await write("content_block_stop", { type: "content_block_stop", index: textIndex });
+      textIndex = null;
+    };
+    const ensureText = async () => {
+      if (textIndex != null) return textIndex;
+      textIndex = nextIndex++;
+      await write("content_block_start", { type: "content_block_start", index: textIndex, content_block: { type: "text", text: "" } });
+      return textIndex;
+    };
+    const ensureTool = async (call) => {
+      await closeText();
+      const key = String(call.index ?? toolBlocks.size);
+      let block = toolBlocks.get(key);
+      if (block) {
+        if (call.id) block.id = String(call.id);
+        if (call.function?.name) block.name = String(call.function.name);
+        return block;
+      }
+      block = {
+        index: nextIndex++,
+        id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`),
+        name: String(call.function?.name || call.name || "tool"),
+        args: "",
+        stopped: false,
+      };
+      toolBlocks.set(key, block);
+      await write("content_block_start", {
+        type: "content_block_start",
+        index: block.index,
+        content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+      });
+      return block;
+    };
+    const stopOpenBlocks = async () => {
+      await closeText();
+      for (const block of toolBlocks.values()) {
+        if (block.stopped) continue;
+        block.stopped = true;
+        await write("content_block_stop", { type: "content_block_stop", index: block.index });
+      }
+    };
+    const processChunk = async (chunk, now = Date.now()) => {
+      usage = chunk.usage || usage;
+      const choice = (chunk.choices || [])[0] || {};
+      finishReason = choice.finish_reason || finishReason;
+      const delta = choice.delta || {};
+      const text = chatContentToText(delta.content || "");
+      if (text) {
+        const index = await ensureText();
+        noteStreamToken(diag, now);
+        await write("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text } });
+      }
+      for (const call of (delta.tool_calls || [])) {
+        const block = await ensureTool(call);
+        const args = String(call.function?.arguments || "");
+        if (args) {
+          block.args += args;
+          await write("content_block_delta", { type: "content_block_delta", index: block.index, delta: { type: "input_json_delta", partial_json: args } });
+        }
+      }
+    };
+
+    try {
+      await write("message_start", {
+        type: "message_start",
+        message: { id: seed.id, type: "message", role: "assistant", model: seed.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
+      });
+
+      const reader = openaiResp.body.getReader();
+      for (;;) {
+        const result = shouldApplyToolFinishGrace(finishReason) && !sawDone
+          ? await Promise.race([
+            reader.read(),
+            sleep(SSE_FINISH_GRACE_MS).then(() => ({ finishGrace: true })),
+          ])
+          : await reader.read();
+        if (result.finishGrace) {
+          closeReason = "finish_grace";
+          Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+          break;
+        }
+        const { done, value } = result;
+        if (done) break;
+        const now = Date.now();
+        noteStreamByte(diag, now);
+        buffer += decoder.decode(value, { stream: true });
+        const writes = [];
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; });
+        await Promise.all(writes);
+        if (sawDone) break;
+      }
+      if (buffer) {
+        const writes = [];
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; });
+        await Promise.all(writes);
+      }
+      await stopOpenBlocks();
+      const stopReason = openAiFinishToAnthropicStop(finishReason);
+      const finalUsage = normalizeAnthropicUsage(usage, []);
+      await write("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: finalUsage.output_tokens } });
+      await write("message_stop", { type: "message_stop" });
+      if (onDone) onDone(finalUsage, {
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        tool_calls_count: toolBlocks.size,
+        ...streamDiagExtra(diag),
+      });
+    } catch (error) {
+      closeReason = "error";
+      await write("error", { type: "error", error: { type: "api_error", message: error.message || "Stream error." } });
+      if (onDone) onDone(normalizeAnthropicUsage(usage, []), {
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        tool_calls_count: toolBlocks.size,
+        ...streamDiagExtra(diag),
+      });
+    } finally {
+      await writer.close();
+    }
+  })();
+
+  return readable;
 }
 
 function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now()) {
@@ -3206,12 +3609,13 @@ async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs)
 function wrapIdleTimeout(response, timeoutMs) {
   if (!response.body) return response;
   const stream = response.body;
+  let reader = null;
+  let closed = false;
+  let timer = null;
+  const stop = () => { if (timer) clearTimeout(timer); timer = null; };
   return new Response(new ReadableStream({
     async start(controller) {
-      const reader = stream.getReader();
-      let closed = false;
-      let timer = null;
-      const stop = () => { if (timer) clearTimeout(timer); timer = null; };
+      reader = stream.getReader();
       const reset = () => {
         stop();
         timer = setTimeout(async () => {
@@ -3228,6 +3632,7 @@ function wrapIdleTimeout(response, timeoutMs) {
           const { done, value } = await reader.read();
           if (done) break;
           reset();
+          if (closed) break;
           controller.enqueue(value);
         }
         if (!closed) {
@@ -3242,6 +3647,11 @@ function wrapIdleTimeout(response, timeoutMs) {
           controller.error(error);
         }
       }
+    },
+    async cancel(reason) {
+      closed = true;
+      stop();
+      try { await reader?.cancel(reason); } catch {}
     },
   }), {
     status: response.status,
