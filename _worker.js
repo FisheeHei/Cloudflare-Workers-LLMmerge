@@ -14,7 +14,7 @@ const HTML_HEADERS = {
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "access-control-allow-headers": "authorization,content-type,x-admin-token",
+  "access-control-allow-headers": "authorization,content-type,x-admin-token,x-api-key,anthropic-version,anthropic-beta",
   "access-control-max-age": "3600",
 };
 
@@ -49,7 +49,7 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-09-anthropic-messages";
+const VERSION = "v26-07-09-anthropic-cherry-auth";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -1534,7 +1534,7 @@ var CLIENT_CACHE_TTL_MS = 60000;
 async function requireClient(request, runtime) {
   const token = getBearerToken(request);
   if (!token) {
-    throw httpError(401, "Missing bearer token.");
+    throw httpError(401, "Missing API key.");
   }
 
   // ponytail: hit in-memory cache if fresh (<60s)
@@ -1965,9 +1965,9 @@ function translateAnthropicMessagesRequest(payload) {
 
   const chat = { model, messages, stream: payload.stream === true };
   copyIfPresent(payload, chat, ["temperature", "top_p", "thinking", "reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
-  if (payload.max_tokens != null) chat.max_tokens = payload.max_tokens;
-  if (payload.stop_sequences != null) chat.stop = payload.stop_sequences;
-  if (payload.metadata?.user_id) chat.user = String(payload.metadata.user_id);
+  if (isProvidedValue(payload.max_tokens)) chat.max_tokens = payload.max_tokens;
+  if (isProvidedValue(payload.stop_sequences)) chat.stop = payload.stop_sequences;
+  if (isProvidedValue(payload.metadata?.user_id)) chat.user = String(payload.metadata.user_id);
   const tools = anthropicToolsToOpenAiTools(payload.tools);
   if (tools.length) chat.tools = tools;
   const toolChoice = anthropicToolChoiceToOpenAi(payload.tool_choice);
@@ -2090,7 +2090,7 @@ function anthropicToolsToOpenAiTools(tools) {
 }
 
 function anthropicToolChoiceToOpenAi(choice) {
-  if (!choice) return null;
+  if (!isProvidedValue(choice)) return null;
   if (typeof choice === "string") return choice === "any" ? "required" : choice;
   if (choice.type === "auto") return "auto";
   if (choice.type === "any") return "required";
@@ -2382,8 +2382,12 @@ function normalizeChatRole(role) {
 
 function copyIfPresent(from, to, keys) {
   for (const key of keys) {
-    if (from[key] != null) to[key] = from[key];
+    if (isProvidedValue(from[key])) to[key] = from[key];
   }
+}
+
+function isProvidedValue(value) {
+  return value != null && String(value) !== "[undefined]";
 }
 
 function makeResponsesPayload(seed, text, usage, status = "completed") {
@@ -3578,10 +3582,10 @@ function resolveBaseUrl(presetId, inputBaseUrl, defaultBaseUrl, accountId) {
 
 function getBearerToken(request) {
   const auth = request.headers.get("authorization") || "";
-  if (!auth.startsWith("Bearer ")) {
-    return null;
+  if (auth.startsWith("Bearer ")) {
+    return auth.slice("Bearer ".length).trim();
   }
-  return auth.slice("Bearer ".length).trim();
+  return (request.headers.get("x-api-key") || "").trim() || null;
 }
 
 async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs) {

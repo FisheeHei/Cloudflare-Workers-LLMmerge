@@ -1521,18 +1521,28 @@ assert.equal(anthropicPayload.usage.output_tokens, 8);
 
 const anthropicStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
-  headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json" },
+  headers: { "x-api-key": "sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },
   body: JSON.stringify({
     model: "anthropic-stream-model",
     max_tokens: 64,
+    temperature: "[undefined]",
+    top_p: "[undefined]",
+    stop_sequences: "[undefined]",
     stream: true,
-    messages: [{ role: "user", content: "Use a tool." }],
-    tools: [{ name: "web_search", input_schema: { type: "object", properties: { query: { type: "string" } } } }],
+    system: [{ type: "text", text: "test", cache_control: "[undefined]" }],
+    messages: [{ role: "user", content: [{ type: "text", text: "Use a tool.", cache_control: "[undefined]" }] }],
+    tools: "[undefined]",
+    tool_choice: "[undefined]",
   }),
 }), anthropicEnv);
 assert.equal(anthropicStreamResp.headers.get("content-type").includes("text/event-stream"), true);
 const anthropicStreamText = await anthropicStreamResp.text();
 assert.equal(anthropicStreamHits[0].stream, true);
+assert.equal("temperature" in anthropicStreamHits[0], false);
+assert.equal("top_p" in anthropicStreamHits[0], false);
+assert.equal("stop" in anthropicStreamHits[0], false);
+assert.equal("tools" in anthropicStreamHits[0], false);
+assert.equal("tool_choice" in anthropicStreamHits[0], false);
 assert.equal(anthropicStreamText.includes("event: message_start"), true);
 assert.equal(anthropicStreamText.includes('"type":"text_delta","text":"Checking "'), true);
 assert.equal(anthropicStreamText.includes('"type":"input_json_delta","partial_json":"{\\"query\\":"'), true);
