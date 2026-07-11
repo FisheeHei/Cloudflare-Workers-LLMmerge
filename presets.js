@@ -88,6 +88,7 @@ export function inferPresetId(baseUrl) {
   if (value.includes("api.deepseek.com")) return "deepseek";
   if (value.includes("api.moonshot.ai") || value.includes("api.kimi.com")) return "moonshot";
   if (value.includes("api.minimax.io") || value.includes("api.minimaxi.com")) return "minimax";
+  if (value.includes("openrouter.ai")) return "openrouter";
   if (value.includes("api.cloudflare.com/client/v4/accounts/") && value.includes("/ai/v1")) return "workers-ai";
   if (value.includes("open.bigmodel.cn/api/coding/paas/v4")) return "zhipu-coding";
   if (value.includes("open.bigmodel.cn/api/paas/v4")) return "zhipu";

@@ -49,7 +49,7 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-12-model-protocol-bridge";
+const VERSION = "v26-07-12-full-function-speed-fix";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -105,7 +105,7 @@ export default {
         const client = await requireClient(request, runtime);
         const res = await listModels(client, runtime);
         const hdrs = new Headers(res.headers);
-        hdrs.set("cache-control", "public, max-age=30");
+        hdrs.set("cache-control", "private, max-age=30");
         return new Response(res.body, { status: res.status, statusText: res.statusText, headers: hdrs });
       }
 
@@ -995,10 +995,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       hourKeys.push(hkHourKey(now - h * 3600000));
     }
     const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
-    // ponytail: AE available -> skip KV stats reads entirely, use AE SQL + memory merge
-    const useAnalyticsForStats = analyticsBuckets || hasAnalyticsEngine(app);
+    const useAnalyticsForStats = analyticsBuckets !== null;
     const raws = useAnalyticsForStats ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
-    const liveStats = recentPendingStats();
+    // Keep all isolate-local stats when AE is write-only; the two-minute merge window is only for readable AE data.
+    const liveStats = useAnalyticsForStats ? recentPendingStats() : _pendingStats;
     const logs = await getBestLogs(app);
     const buckets = hourKeys.map((hour, i) => {
       const raw = analyticsBuckets ? analyticsBuckets[hour] : raws[i];
@@ -1130,6 +1130,9 @@ async function speedTestAdminUpstreams(request, app) {
     upstreamSupportsModel(upstream, model) &&
     upstreamSupportsPath(upstream, CHAT_PATH)
   );
+  if (!targets.length) {
+    return withCorsResponse(json(openAiError("No enabled upstream provides this model.", "not_found_error"), 404));
+  }
   const results = await Promise.all(targets.map((upstream) => speedTestUpstream(runtime, upstream, model)));
   return withCorsResponse(json({ ok: true, results }, 200));
 }
@@ -1780,18 +1783,26 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
       { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
       timeoutMs,
     );
-    if (resp.status === 401 || resp.status === 403) {
+    const model = configuredUpstreamModels(upstream).find((item) => item && item !== "*");
+    if (!resp.ok && model && ![401, 403, 429].includes(resp.status)) {
+      try { await resp.body?.cancel("falling back to model probe"); } catch {}
+      if (!takeNimMinuteSlot(upstream)) {
+        return { name: upstream.name, ok: false, status: 429, error: "NVIDIA NIM RPM limit reached", latency_ms: Date.now() - started };
+      }
+      const body = sanitizeProxyBody(JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false }), upstream);
       resp = await fetchWithTimeout(
         buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
         {
           method: "POST",
           headers: buildUpstreamHeaders(null, upstream),
-          body: JSON.stringify({ model: "health-check", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+          body,
         },
         timeoutMs,
       );
     }
-    return { name: upstream.name, ok: resp.ok || resp.status < 500, status: resp.status, latency_ms: Date.now() - started };
+    const error = resp.ok ? "" : await responseErrorMessage(resp);
+    try { await resp.body?.cancel("health check complete"); } catch {}
+    return { name: upstream.name, ok: resp.ok, status: resp.status, ...(error ? { error } : {}), latency_ms: Date.now() - started };
   } catch (err) {
     return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
   }
@@ -1799,21 +1810,49 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
 
 async function speedTestUpstream(runtime, upstream, model) {
   const started = Date.now();
+  if (!takeNimMinuteSlot(upstream)) {
+    return { name: upstream.name, ok: false, status: 429, error: "NVIDIA NIM RPM limit reached", latency_ms: 0 };
+  }
+  let active = false;
+  let resp = null;
   try {
-    const resp = await fetchWithTimeout(
-      buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
-      {
-        method: "POST",
-        headers: buildUpstreamHeaders(null, upstream),
-        body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
-      },
-      Math.min(runtime.requestTimeoutMs, 15000),
-    );
+    const bodyText = JSON.stringify({ model, messages: [{ role: "user", content: "Reply with OK." }], max_tokens: 8, stream: true });
+    const probeRequest = new Request("https://llmmerge.local/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream, application/json" },
+      body: bodyText,
+    });
+    active = true;
+    const result = await fetchProxyUpstream({ bodyText, pathname: CHAT_PATH, request: probeRequest, runtime, search: "", upstream });
+    resp = result.response;
+    if (!resp.ok) {
+      const error = await responseErrorMessage(resp);
+      return { name: upstream.name, ok: false, status: resp.status, ...(error ? { error } : {}), latency_ms: Date.now() - started };
+    }
+
+    const streaming = (resp.headers.get("content-type") || "").includes("text/event-stream");
+    if (streaming) {
+      const primed = await primeSseResponse(resp);
+      resp = primed.response;
+      const latency = Date.now() - started;
+      if (primed.error) return { name: upstream.name, ok: false, status: 502, error: primed.error, latency_ms: latency };
+      rememberUpstreamLatency(upstream, model, latency);
+      return { name: upstream.name, ok: true, status: 200, latency_ms: latency, metric: "first_output" };
+    }
+
+    const text = await resp.text();
+    const payload = safeJson(text);
+    const error = upstreamApplicationErrorMessage(payload || text);
+    const valid = payload && Array.isArray(payload.choices) && payload.choices.length > 0 && !looksLikeHtmlDocument(text) && !error;
     const latency = Date.now() - started;
-    if (resp.ok) rememberUpstreamLatency(upstream, model, latency);
-    return { name: upstream.name, ok: resp.ok, status: resp.status, latency_ms: latency };
+    if (!valid) return { name: upstream.name, ok: false, status: 502, error: error || "Upstream returned no valid model output.", latency_ms: latency };
+    rememberUpstreamLatency(upstream, model, latency);
+    return { name: upstream.name, ok: true, status: 200, latency_ms: latency, metric: "complete" };
   } catch (err) {
     return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
+  } finally {
+    try { await resp?.body?.cancel("speed test complete"); } catch {}
+    if (active) noteActiveUpstream(upstream, -1);
   }
 }
 
@@ -2249,9 +2288,10 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
 
     const openaiText = await upstreamResp.text();
     const openaiPayload = safeJson(openaiText);
-    if (!openaiPayload || looksLikeHtmlDocument(openaiText)) {
+    const applicationError = upstreamApplicationErrorMessage(openaiPayload || openaiText);
+    if (!openaiPayload || looksLikeHtmlDocument(openaiText) || applicationError) {
       recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx, traceId);
-      return upstreamBadGatewayResponse("Upstream returned a non-JSON API response.", headers);
+      return upstreamBadGatewayResponse(applicationError || "Upstream returned a non-JSON API response.", headers);
     }
     const choice = (openaiPayload.choices || [])[0] || {};
     const message = choice.message || {};
@@ -2259,7 +2299,10 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const reasoning = reasoningText(message.reasoning_content ?? message.reasoning ?? message.thinking);
     const responsePayload = makeResponsesPayload(translated.seed, { text, usage: openaiPayload.usage, toolCalls: message.tool_calls || [], reasoning });
     headers.set("content-type", "application/json; charset=utf-8");
-    recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId);
+    recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId, {
+      finish_reason: responseFinishReason(openaiPayload),
+      tool_calls_count: responseToolCallsCount(openaiPayload),
+    });
     return new Response(JSON.stringify(responsePayload), { status: 200, headers });
   } catch (error) {
     recordRequestLog(app, makeRequestLogEntry({
@@ -2472,14 +2515,14 @@ function makeResponsesPayload(seed, { text = "", usage = null, status = "complet
     tools: seed.tools,
     top_p: seed.topP,
     truncation: "disabled",
-    usage: normalizeResponsesUsage(usage),
+    usage: normalizeResponsesUsage(usage, estimateTokens([text, reasoning, ...toolCalls.map((call) => call?.function?.arguments || "")].join(""))),
     metadata: seed.metadata || {},
   };
 }
 
-function normalizeResponsesUsage(usage) {
+function normalizeResponsesUsage(usage, fallbackOutput = 0) {
   const input = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
-  const output = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? 0) || 0);
+  const output = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? fallbackOutput) || 0);
   return {
     input_tokens: input,
     input_tokens_details: { cached_tokens: Number(usage?.prompt_tokens_details?.cached_tokens || usage?.input_tokens_details?.cached_tokens || 0) || 0 },
@@ -2526,7 +2569,7 @@ function recordResponsesLog(app, client, upstreamName, model, started, status, b
     status: status || 200,
     started,
     promptTokens: usage?.input_tokens || Math.max(1, Math.round(bodyText.length / 4)),
-    completionTokens: usage?.output_tokens || 1,
+    completionTokens: usage?.output_tokens || 0,
     extra: { trace_id: traceId, ...extra },
   }), ctx);
 }
@@ -2542,6 +2585,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
     let buffer = "";
     let usage = null;
     let finishReason = "";
+    let outputText = "";
     let sawDone = false;
     let closeReason = "done";
     let textIndex = null;
@@ -2616,12 +2660,14 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       const delta = choice.delta || {};
       const thinking = reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
       if (thinking) {
+        outputText += thinking;
         const index = await ensureThinking();
         noteStreamToken(diag, now);
         await write("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } });
       }
       const text = chatContentToText(delta.content || "");
       if (text) {
+        outputText += text;
         const index = await ensureText();
         noteStreamToken(diag, now);
         await write("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text } });
@@ -2631,6 +2677,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
         const args = String(call.function?.arguments || "");
         if (args) {
           block.args += args;
+          outputText += args;
           await write("content_block_delta", { type: "content_block_delta", index: block.index, delta: { type: "input_json_delta", partial_json: args } });
         }
       }
@@ -2673,7 +2720,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       }
       await stopOpenBlocks();
       const stopReason = openAiFinishToAnthropicStop(finishReason);
-      const finalUsage = normalizeAnthropicUsage(usage, []);
+      const finalUsage = normalizeAnthropicUsage(usage, [{ text: outputText }]);
       await write("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: finalUsage.output_tokens } });
       await write("message_stop", { type: "message_stop" });
       if (onDone) onDone(finalUsage, {
@@ -2685,7 +2732,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
     } catch (error) {
       closeReason = "error";
       await write("error", { type: "error", error: { type: "api_error", message: error.message || "Stream error." } });
-      if (onDone) onDone(normalizeAnthropicUsage(usage, []), {
+      if (onDone) onDone(normalizeAnthropicUsage(usage, [{ text: outputText }]), {
         close_reason: closeReason,
         finish_reason: finishReason,
         tool_calls_count: toolBlocks.size,
@@ -2714,6 +2761,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     let reasoningOutputIndex = null;
     let usage = null;
     let streamError = "";
+    let finishReason = "";
     const toolCalls = new Map();
     let nextOutputIndex = 1;
     const diag = createStreamDiag(started);
@@ -2728,6 +2776,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     const processChunk = (chunk, now = Date.now()) => {
       streamError = streamEventErrorMessage(chunk) || streamError;
       usage = chunk.usage || usage;
+      finishReason = responseFinishReason(chunk) || finishReason;
       const delta = (chunk.choices || [])[0]?.delta || {};
       const reasoningDelta = reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
       if (reasoningDelta) {
@@ -2802,8 +2851,10 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       await write({ type: "response.failed", response: { ...makeResponsesPayload(seed, { text, usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } } });
       await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
     } finally {
-      if (onDone) onDone(normalizeResponsesUsage(usage), {
+      if (onDone) onDone(normalizeResponsesUsage(usage, estimateTokens(text + reasoning + [...toolCalls.values()].map((item) => item.arguments).join(""))), {
         close_reason: closeReason,
+        finish_reason: finishReason,
+        tool_calls_count: toolCalls.size,
         ...streamDiagExtra(diag),
       });
       await writer.close();
@@ -3521,6 +3572,8 @@ async function saveClientRecord(kv, record) {
 
   // ponytail: rewrite the full index in KV; move to D1 only if admin writes become frequent.
   await kv.put(clientIndexKey(), JSON.stringify(next));
+  delete _clientCache[stored.key];
+  delete _clientCacheTs[stored.key];
 }
 
 async function deleteClientRecord(kv, id) {
@@ -3537,6 +3590,8 @@ async function deleteClientRecord(kv, id) {
     clientIndexKey(),
     JSON.stringify(index.filter((item) => item.id !== id)),
   );
+  delete _clientCache[record.key];
+  delete _clientCacheTs[record.key];
 }
 
 async function listClientIndex(kv) {

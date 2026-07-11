@@ -27,6 +27,7 @@ const zhipuBodies = [];
 const fetchUrls = [];
 const speedHits = [];
 const speedBodies = [];
+const speedStreamHits = [];
 const hedgeHits = [];
 const hedgeStreamHits = [];
 const softFastHits = [];
@@ -311,6 +312,12 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("health-auth.example")) {
+    return new Response(JSON.stringify({ error: { message: "invalid token" } }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("kv-wrapped.example")) {
     wrappedHits.push(JSON.parse(init.body));
     return new Response(JSON.stringify({ id: "wrapped", choices: [{ message: { content: "ok" } }] }), {
@@ -325,6 +332,17 @@ globalThis.fetch = async (url, init) => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
+  }
+  if (String(url).includes("speed-stream.example")) {
+    speedStreamHits.push("start");
+    return new Response(new ReadableStream({
+      start(controller) {
+        setTimeout(() => controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"OK"}}]}\n\n')), 5);
+      },
+      cancel() {
+        speedStreamHits.push("cancel");
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("speed-fast.example")) {
     speedHits.push("fast");
@@ -452,6 +470,12 @@ assert.equal(adminPage.includes("Agentic"), true);
 assert.equal(adminPage.includes("\u5de5\u5177\u8c03\u7528"), true);
 assert.equal(adminPage.includes("\u2705"), true);
 assert.equal(adminPage.includes(".model-tag-filter button.active { background: #1f8f61; color: white; }"), true);
+
+const privateModelsResp = await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-test" },
+}), env);
+assert.equal(privateModelsResp.headers.get("cache-control"), "private, max-age=30");
+
 assert.equal(adminPage.includes("upstream-enable-toggle"), true);
 assert.equal(adminPage.includes("upstream-group"), true);
 assert.equal(adminPage.includes("model-entry-list"), true);
@@ -607,6 +631,20 @@ const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerg
 const logs = await logsResp.json();
 assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
 assert.equal(kvPuts.length, 0);
+
+const createdClientResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/clients", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "temporary-client" }),
+}), env);
+const createdClient = (await createdClientResp.json()).client;
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: `Bearer ${createdClient.api_key}` },
+}), env)).status, 200);
+await worker.default.fetch(new Request(`https://gw.test/llmmerge-admin/api/clients/${createdClient.id}`, { method: "DELETE" }), env);
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: `Bearer ${createdClient.api_key}` },
+}), env)).status, 401);
 
 const kimiBodyStart = bodies.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -1085,6 +1123,25 @@ const disabledHealth = await disabledHealthResp.json();
 assert.equal(disabledHealth.results.some((item) => item.name === "disabled" && item.ok), true);
 assert.equal(disabledHits.length, disabledHitStart + 1);
 
+const authHealthStore = new Map([["gateway:config", JSON.stringify({
+  routing: {},
+  settings: {},
+  upstreams: [
+    { name: "bad-auth", base_url: "https://health-auth.example/v1", api_key_encrypted: "bad", models: ["health-model"], paths: ["/v1/chat/completions"], enabled: true },
+  ],
+})]]);
+const authHealthEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = authHealthStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { authHealthStore.set(key, value); },
+    async delete(key) { authHealthStore.delete(key); },
+  },
+};
+const authHealth = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/health", { method: "POST" }), authHealthEnv)).json();
+assert.equal(authHealth.results[0].ok, false);
+assert.equal(authHealth.results[0].status, 401);
+
 const exportResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/upstreams/export"), env);
 const exported = await exportResp.json();
 assert.equal(exportResp.ok, true);
@@ -1124,6 +1181,11 @@ assert.equal(analyticsPoints.length > 0, true);
 assert.equal(analyticsPoints.at(-1).blobs[3], "qwen3");
 assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
 assert.equal(kvPuts.length, kvPutsBeforeAnalytics);
+const realDateNow = Date.now;
+Date.now = () => realDateNow() + 3 * 60 * 1000;
+const writeOnlyStats = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), analyticsEnv)).json();
+Date.now = realDateNow;
+assert.equal(writeOnlyStats.buckets.some((bucket) => bucket.models?.qwen3 >= 1), true);
 
 const analyticsQueryEnv = {
   ...analyticsEnv,
@@ -1268,6 +1330,7 @@ speedStore.set("gateway:config", JSON.stringify({
   upstreams: [
     { name: "slow", base_url: "https://speed-slow.example/v1", api_key_encrypted: "s", models: ["speed-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "fast", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["speed-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "stream", base_url: "https://speed-stream.example/v1", api_key_encrypted: "t", models: ["speed-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
   ],
 }));
 const speedEnv = {
@@ -1302,7 +1365,10 @@ const manualSpeedResp = await worker.default.fetch(new Request("https://gw.test/
 }), speedEnv);
 const manualSpeed = await manualSpeedResp.json();
 assert.equal(manualSpeedResp.status, 200);
-assert.equal(manualSpeed.results.filter((r) => r.ok).length, 2);
+assert.equal(manualSpeed.results.filter((r) => r.ok).length, 3);
+assert.equal(manualSpeed.results.find((r) => r.name === "stream").metric, "first_output");
+assert.equal(speedStreamHits.includes("cancel"), true);
+assert.equal(speedBodies.at(-1).stream, true);
 const selectedSpeedStart = speedHits.length;
 const selectedSpeedResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
   method: "POST",
@@ -1313,6 +1379,12 @@ const selectedSpeed = await selectedSpeedResp.json();
 assert.equal(selectedSpeedResp.status, 200);
 assert.deepEqual(selectedSpeed.results.map((r) => r.name), ["fast"]);
 assert.deepEqual(speedHits.slice(selectedSpeedStart), ["fast"]);
+const missingSpeedResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ model: "missing-model" }),
+}), speedEnv);
+assert.equal(missingSpeedResp.status, 404);
 const beforeSpeedChoice = speedHits.length;
 const speedResp = await speedRequest("sk-both");
 assert.equal(speedResp.headers.get("x-llm-gateway-upstream"), "fast");
@@ -1477,6 +1549,7 @@ responsesStore.set("gateway:config", JSON.stringify({
     { name: "responses", base_url: "https://responses.example/v1", api_key_encrypted: "r", models: ["resp-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "responses-stream", base_url: "https://responses-stream.example/v1", api_key_encrypted: "s", models: ["stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "responses-stream-error", base_url: "https://responses-stream.example/v1", api_key_encrypted: "e", models: ["stream-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "responses-app-error", base_url: "https://app-error.example/v1", api_key_encrypted: "a", models: ["responses-app-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const responsesEnv = {
@@ -1489,7 +1562,7 @@ const responsesEnv = {
     async put(key, value) { responsesStore.set(key, value); },
     async delete(key) { responsesStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "responses-client", key: "sk-resp", models: ["*"], upstreams: ["responses", "responses-stream", "responses-stream-error"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "responses-client", key: "sk-resp", models: ["*"], upstreams: ["responses", "responses-stream", "responses-stream-error", "responses-app-error"] }]),
 };
 const responsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
@@ -1528,6 +1601,10 @@ assert.equal(responsesPayload.output_text, "hello");
 assert.equal(responsesPayload.output.some((item) => item.type === "function_call" && item.name === "web_search"), true);
 assert.equal(responsesPayload.output.some((item) => item.type === "reasoning" && item.summary[0].text === "plan first"), true);
 assert.equal(responsesPayload.usage.input_tokens, 3);
+const responsesLogs = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), responsesEnv)).json();
+const responsesLog = responsesLogs.logs.find((entry) => entry.model === "resp-model");
+assert.equal(responsesLog.finish_reason, "tool_calls");
+assert.equal(responsesLog.tool_calls_count, 1);
 
 const responsesStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
@@ -1559,6 +1636,13 @@ const responsesErrorResp = await worker.default.fetch(new Request("https://gw.te
 const responsesErrorText = await responsesErrorResp.text();
 assert.equal(responsesErrorText.includes('"type":"response.failed"'), true, responsesErrorText);
 assert.equal(responsesErrorText.includes('"type":"response.completed"'), false);
+const responsesAppErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "responses-app-error-model", input: "hi" }),
+}), responsesEnv);
+assert.equal(responsesAppErrorResp.status, 502);
+assert.equal((await responsesAppErrorResp.text()).includes("Internal server error"), true);
 
 const anthropicStore = new Map();
 anthropicStore.set("gateway:config", JSON.stringify({
@@ -1708,13 +1792,21 @@ const appErrorEnv = {
   },
   CLIENTS_JSON: JSON.stringify([{ name: "app-error-client", key: "sk-app-error", models: ["*"], upstreams: ["app-error", "app-fallback"] }]),
 };
+const appErrorHitStart = appErrorHits.length;
 const appErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-app-error", "content-type": "application/json" },
   body: JSON.stringify({ model: "minimax-m3", messages: [] }),
 }), appErrorEnv);
-assert.equal(appErrorHits.length, 1);
+assert.equal(appErrorHits.length, appErrorHitStart + 1);
 assert.equal(appErrorResp.headers.get("x-llm-gateway-upstream"), "app-fallback");
+const appErrorSpeed = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ model: "minimax-m3", upstreams: ["app-error"] }),
+}), appErrorEnv)).json();
+assert.equal(appErrorSpeed.results[0].ok, false);
+assert.equal(appErrorSpeed.results[0].status, 502);
 
 const htmlStore = new Map();
 htmlStore.set("gateway:config", JSON.stringify({

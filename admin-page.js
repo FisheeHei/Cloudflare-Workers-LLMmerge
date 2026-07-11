@@ -1620,11 +1620,13 @@ function renderAdminScript(version) {
       const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
       if (!dot) return;
       dot.className = "health-dot " + (r.ok ? "ok" : "fail");
-      dot.title = (r.ok ? "\u6d4b\u901f " : "\u6d4b\u901f\u5931\u8d25 ") + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms";
+      dot.title = (r.ok ? "\u9996\u8f93\u51fa " : "\u6d4b\u901f\u5931\u8d25 ") + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms";
     });
     const best = (payload.results || []).filter((r) => r.ok).sort((a,b) => a.latency_ms - b.latency_ms)[0];
     showToast(best ? ("\u6700\u5feb: " + best.name + " " + best.latency_ms + "ms") : "\u6ca1\u6709\u4e0a\u6e38\u901a\u8fc7\u6d4b\u901f");
-    if (best) byId("speed-picker-status").textContent = best.name + " · " + best.latency_ms + "ms";
+    byId("speed-picker-status").textContent = best
+      ? best.name + " · \u9996\u8f93\u51fa " + best.latency_ms + "ms"
+      : ((payload.results || [])[0]?.error || "\u6d4b\u901f\u5931\u8d25");
   }
 
   async function detectCapability(upstreamName) {
