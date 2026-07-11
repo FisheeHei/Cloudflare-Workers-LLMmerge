@@ -5,16 +5,8 @@ export function isNvidiaNimUpstream(upstream) {
 export function sanitizeProxyBody(bodyText, upstream) {
   if (!bodyText) return bodyText;
 
-  const isNvidia = isNvidiaNimUpstream(upstream);
-  const isDeepSeekOfficial = isDeepSeekUpstream(upstream);
-  const isMoonshotOfficial = isMoonshotUpstream(upstream);
-  const isMiniMaxOfficial = isMiniMaxUpstream(upstream);
-  const isOpenRouterOfficial = isOpenRouterUpstream(upstream);
-  const isZhipuOfficial = isZhipuUpstream(upstream);
-  const isWorkersAiOfficial = isWorkersAiUpstream(upstream);
-  const isGenericOpenAi = isGenericOpenAiUpstream(upstream);
   const bodyLower = bodyText.toLowerCase();
-  if (!bodyNeedsSanitizing(bodyText, bodyLower, isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial || isOpenRouterOfficial || isZhipuOfficial || isGenericOpenAi)) return bodyText;
+  if (!bodyNeedsSanitizing(bodyText, bodyLower)) return bodyText;
 
   let payload;
   try {
@@ -25,20 +17,47 @@ export function sanitizeProxyBody(bodyText, upstream) {
 
   let changed = false;
   const modelName = String(payload.model || "").toLowerCase();
+  const bridge = providerModelBridge(upstream, modelName);
   const isGlm = isGlmModel(modelName);
-  const wantsKimiPreservedThinking = kimiPreservedThinkingRequested(payload, modelName);
+  const wantsKimiPreservedThinking = (bridge.provider === "nim" || bridge.provider === "moonshot") && kimiPreservedThinkingRequested(payload, modelName);
   changed = applyProviderReasoningOptions(payload) || changed;
-  changed = normalizeReasoningFields(payload, isGlm && !isZhipuOfficial, wantsKimiPreservedThinking || isNvidia || isDeepSeekOfficial || isMoonshotOfficial || isMiniMaxOfficial || isOpenRouterOfficial || isZhipuOfficial || isGenericOpenAi) || changed;
+  changed = normalizeReasoningFields(payload, isGlm && bridge.provider !== "zhipu", wantsKimiPreservedThinking || bridge.provider !== "none") || changed;
   changed = applyKimiPreservedThinking(payload, wantsKimiPreservedThinking) || changed;
-  if (isDeepSeekOfficial) changed = applyDeepSeekBridge(payload) || changed;
-  if (isMoonshotOfficial) changed = applyMoonshotBridge(payload, modelName) || changed;
-  if (isMiniMaxOfficial) changed = applyMiniMaxBridge(payload) || changed;
-  if (isOpenRouterOfficial) changed = applyOpenRouterBridge(payload) || changed;
-  if (isZhipuOfficial) changed = applyZhipuBridge(payload) || changed;
-  if (isGenericOpenAi && !isDeepSeekOfficial && !isMoonshotOfficial && !isMiniMaxOfficial && !isOpenRouterOfficial && !isZhipuOfficial) changed = applyGenericOpenAiBridge(payload, { keepReasoningEffort: !isWorkersAiOfficial }) || changed;
-  if (isNvidia) changed = applyNimBridge(payload, modelName) || changed;
+  if (bridge.provider === "deepseek") changed = applyDeepSeekBridge(payload) || changed;
+  if (bridge.provider === "moonshot") changed = applyMoonshotBridge(payload, modelName) || changed;
+  if (bridge.provider === "minimax") changed = applyMiniMaxBridge(payload) || changed;
+  if (bridge.provider === "openrouter") changed = applyOpenRouterBridge(payload) || changed;
+  if (bridge.provider === "zhipu") changed = applyZhipuBridge(payload) || changed;
+  if (bridge.provider === "openai") changed = applyGenericOpenAiBridge(payload, { keepReasoningEffort: bridge.family !== "workers-ai" }) || changed;
+  if (bridge.provider === "nim") changed = applyNimBridge(payload, modelName, bridge.family) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
+}
+
+function providerModelBridge(upstream, modelName) {
+  if (isNvidiaNimUpstream(upstream)) return { provider: "nim", family: modelFamily(modelName) };
+  if (isDeepSeekUpstream(upstream)) return { provider: "deepseek", family: modelFamily(modelName) };
+  if (isMoonshotUpstream(upstream)) return { provider: "moonshot", family: modelFamily(modelName) };
+  if (isMiniMaxUpstream(upstream)) return { provider: "minimax", family: modelFamily(modelName) };
+  if (isOpenRouterUpstream(upstream)) return { provider: "openrouter", family: modelFamily(modelName) };
+  if (isZhipuUpstream(upstream)) return { provider: "zhipu", family: modelFamily(modelName) };
+  if (isGenericOpenAiUpstream(upstream)) return { provider: "openai", family: isWorkersAiUpstream(upstream) ? "workers-ai" : modelFamily(modelName) };
+  return { provider: "none", family: modelFamily(modelName) };
+}
+
+function modelFamily(modelName) {
+  if (isGlmModel(modelName)) return "glm";
+  if (isMiniMaxM3Model(modelName)) return "minimax-m3";
+  if (isKimiModel(modelName)) return "kimi";
+  if (isDeepSeekModel(modelName)) return "deepseek";
+  if (String(modelName).includes("qwen")) return "qwen";
+  if (isNemotron3Model(modelName)) return "nemotron-3";
+  if (isNemotronModel(modelName)) return "nemotron";
+  if (isMistralModel(modelName)) return "mistral";
+  if (isStepModel(modelName)) return "step";
+  if (isGptOssModel(modelName)) return "gpt-oss";
+  if (isSarvamModel(modelName)) return "sarvam";
+  return "generic";
 }
 
 function glmThinkingRequested(payload) {
@@ -54,7 +73,7 @@ function glmThinkingRequested(payload) {
   );
 }
 
-function bodyNeedsSanitizing(bodyText, bodyLower, providerBridge) {
+function bodyNeedsSanitizing(bodyText, bodyLower) {
   return bodyText.includes('"thinking"') ||
     bodyText.includes('"reasoning"') ||
     bodyText.includes('"reasoning_effort"') ||
@@ -67,13 +86,11 @@ function bodyNeedsSanitizing(bodyText, bodyLower, providerBridge) {
     bodyText.includes('"enable_thinking"') ||
     bodyText.includes('"chat_template_kwargs"') ||
     bodyLower.includes("kimi-k2") ||
-    (providerBridge && (
-      bodyText.includes('"functions"') ||
-      bodyText.includes('"function_call"') ||
-      bodyText.includes('"tool_choice"') ||
-      bodyText.includes('"temperature"') ||
-      bodyLower.includes("minimax-m3")
-    ));
+    bodyText.includes('"functions"') ||
+    bodyText.includes('"function_call"') ||
+    bodyText.includes('"tool_choice"') ||
+    bodyText.includes('"temperature"') ||
+    bodyLower.includes("minimax-m3");
 }
 
 function applyProviderReasoningOptions(payload) {
@@ -306,7 +323,7 @@ function applyMoonshotBridge(payload, modelName) {
   if (isK27Code || isK26 || isK25) {
     changed = deleteKeys(payload, ["temperature", "top_p", "presence_penalty", "frequency_penalty"]) || changed;
   }
-  changed = normalizeLegacyToolPayload(payload) || changed;
+  changed = normalizeLegacyToolPayload(payload, true) || changed;
   changed = removeMoonshotIncompatibleReasoningFields(payload) || changed;
   return changed;
 }
@@ -322,7 +339,7 @@ function applyMiniMaxBridge(payload) {
     }
     changed = true;
   }
-  changed = normalizeLegacyToolPayload(payload) || changed;
+  changed = normalizeLegacyToolPayload(payload, true) || changed;
   changed = removeMiniMaxIncompatibleReasoningFields(payload) || changed;
   return changed;
 }
@@ -390,7 +407,7 @@ function bridgeReasoningEffortInput(payload) {
   return String(payload?.thinking?.type || "").toLowerCase() === "enabled" ? "high" : "";
 }
 
-function normalizeLegacyToolPayload(payload) {
+function normalizeLegacyToolPayload(payload, forceAutoChoice = false) {
   let changed = false;
   if (Array.isArray(payload.functions) && !Array.isArray(payload.tools)) {
     payload.tools = payload.functions.map((fn) => ({ type: "function", function: fn }));
@@ -407,7 +424,7 @@ function normalizeLegacyToolPayload(payload) {
     delete payload.function_call;
     changed = true;
   }
-  if (payload.tool_choice === "required" || (payload.tool_choice && typeof payload.tool_choice === "object")) {
+  if (forceAutoChoice && (payload.tool_choice === "required" || (payload.tool_choice && typeof payload.tool_choice === "object"))) {
     payload.tool_choice = "auto";
     changed = true;
   }
@@ -435,13 +452,13 @@ function deleteKeys(target, keys) {
   return changed;
 }
 
-function applyNimBridge(payload, modelName) {
+function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
   let changed = false;
-  const isGlm = isGlmModel(modelName);
-  const isQwen = modelName.includes("qwen");
-  const isKimi = isKimiModel(modelName);
-  const isNemotron3 = isNemotron3Model(modelName);
-  const reasoningEffort = nimFamilyReasoningEffort(modelName, payload);
+  const isGlm = family === "glm";
+  const isQwen = family === "qwen";
+  const isKimi = family === "kimi";
+  const isNemotron3 = family === "nemotron-3";
+  const reasoningEffort = nimFamilyReasoningEffort(family, payload);
   if (isGlm) {
     if (glmThinkingRequested(payload)) {
       setChatTemplateKwargs(payload, { enable_thinking: true, clear_thinking: false });
@@ -544,14 +561,14 @@ function setChatTemplateKwargs(payload, values) {
   };
 }
 
-function nimFamilyReasoningEffort(modelName, payload) {
+function nimFamilyReasoningEffort(family, payload) {
   if (!nimReasoningRequested(payload)) return "";
   const raw = nimReasoningEffortInput(payload);
-  if (isDeepSeekModel(modelName)) return mapNimReasoningEffort(raw, ["none", "high", "max"], "high");
-  if (isStepModel(modelName) || (isNemotronModel(modelName) && !isNemotron3Model(modelName)) || isGptOssModel(modelName) || isSarvamModel(modelName)) {
+  if (family === "deepseek") return mapNimReasoningEffort(raw, ["none", "high", "max"], "high");
+  if (["step", "nemotron", "gpt-oss", "sarvam"].includes(family)) {
     return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
   }
-  if (isMistralModel(modelName)) return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
+  if (family === "mistral") return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
   return "";
 }
 

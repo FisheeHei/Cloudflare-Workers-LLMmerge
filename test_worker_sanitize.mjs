@@ -28,6 +28,7 @@ const fetchUrls = [];
 const speedHits = [];
 const speedBodies = [];
 const hedgeHits = [];
+const hedgeStreamHits = [];
 const softFastHits = [];
 const nimHits = [];
 const responseHits = [];
@@ -183,9 +184,15 @@ globalThis.fetch = async (url, init) => {
     });
   }
   if (String(url).includes("responses-stream.example")) {
-    responseStreamHits.push(JSON.parse(init.body));
+    const body = JSON.parse(init.body);
+    responseStreamHits.push(body);
+    if (body.model === "stream-error-model") {
+      return new Response('data: {"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
     return new Response([
+      'data: {"choices":[{"delta":{"reasoning_content":"plan "}}]}\n\n',
       'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_stream_search","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"glm\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
       'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
       'data: [DONE]\n\n',
     ].join(""), {
@@ -197,7 +204,7 @@ globalThis.fetch = async (url, init) => {
     responseHits.push(JSON.parse(init.body));
     return new Response(JSON.stringify({
       id: "chatcmpl-resp",
-      choices: [{ message: { content: "hello" }, finish_reason: "stop" }],
+      choices: [{ message: { reasoning_content: "plan first", content: "hello", tool_calls: [{ id: "call_search", type: "function", function: { name: "web_search", arguments: "{\"query\":\"glm\"}" } }] }, finish_reason: "tool_calls" }],
       usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
     }), {
       status: 200,
@@ -205,8 +212,13 @@ globalThis.fetch = async (url, init) => {
     });
   }
   if (String(url).includes("anthropic-stream.example")) {
-    anthropicStreamHits.push(JSON.parse(init.body));
+    const body = JSON.parse(init.body);
+    anthropicStreamHits.push(body);
+    if (body.model === "anthropic-error-model") {
+      return new Response('data: {"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
     const chunks = [
+      { choices: [{ delta: { reasoning_content: "Checking sources. " } }] },
       { choices: [{ delta: { content: "Checking " } }] },
       { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_stream", type: "function", function: { name: "web_search", arguments: "{\"query\":" } }] } }] },
       { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "\"glm\"}" } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 13, completion_tokens: 5 } },
@@ -223,6 +235,7 @@ globalThis.fetch = async (url, init) => {
       model: "anthropic-model",
       choices: [{
         message: {
+          reasoning_content: "I should use a tool.",
           content: "I will search.",
           tool_calls: [{ id: "call_search", type: "function", function: { name: "web_search", arguments: "{\"query\":\"llm\"}" } }],
         },
@@ -241,6 +254,25 @@ globalThis.fetch = async (url, init) => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
+  }
+  if (String(url).includes("hedge-stream-slow.example")) {
+    hedgeStreamHits.push("slow");
+    return new Response(new ReadableStream({
+      start(controller) {
+        setTimeout(() => {
+          if (init.signal?.aborted) {
+            controller.error(new Error("aborted"));
+            return;
+          }
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"slow"}}]}\n\n'));
+          controller.close();
+        }, 350);
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("hedge-stream-fast.example")) {
+    hedgeStreamHits.push("fast");
+    return new Response('data: {"choices":[{"delta":{"content":"fast"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("hedge-fast.example")) {
     hedgeHits.push("fast");
@@ -1324,6 +1356,34 @@ const hedgeResp2 = await worker.default.fetch(new Request("https://gw.test/v1/ch
 assert.equal(hedgeResp2.headers.get("x-llm-gateway-upstream"), "hedge-fast");
 assert.equal(hedgeHits[hedgeSecondStart], "slow");
 
+const hedgeStreamStore = new Map();
+hedgeStreamStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 600, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "hedge-stream-slow", base_url: "https://hedge-stream-slow.example/v1", api_key_encrypted: "s", models: ["hedge-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "hedge-stream-fast", base_url: "https://hedge-stream-fast.example/v1", api_key_encrypted: "f", models: ["hedge-stream-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const hedgeStreamEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = hedgeStreamStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { hedgeStreamStore.set(key, value); },
+    async delete(key) { hedgeStreamStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "hedge-stream-client", key: "sk-hedge-stream", models: ["*"], upstreams: ["hedge-stream-slow", "hedge-stream-fast"] }]),
+};
+const hedgeStreamStart = hedgeStreamHits.length;
+const hedgeStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-hedge-stream", "content-type": "application/json" },
+  body: JSON.stringify({ model: "hedge-stream-model", messages: [], stream: true }),
+}), hedgeStreamEnv);
+assert.equal(hedgeStreamResp.headers.get("x-llm-gateway-upstream"), "hedge-stream-fast");
+assert.deepEqual(hedgeStreamHits.slice(hedgeStreamStart), ["slow", "fast"]);
+assert.equal((await hedgeStreamResp.text()).includes('"content":"fast"'), true);
+
 const softFastStore = new Map();
 softFastStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, fast_routing: true, hedge_enabled: false, hedge_max: 1, load_balance: false },
@@ -1416,6 +1476,7 @@ responsesStore.set("gateway:config", JSON.stringify({
   upstreams: [
     { name: "responses", base_url: "https://responses.example/v1", api_key_encrypted: "r", models: ["resp-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "responses-stream", base_url: "https://responses-stream.example/v1", api_key_encrypted: "s", models: ["stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "responses-stream-error", base_url: "https://responses-stream.example/v1", api_key_encrypted: "e", models: ["stream-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const responsesEnv = {
@@ -1428,12 +1489,25 @@ const responsesEnv = {
     async put(key, value) { responsesStore.set(key, value); },
     async delete(key) { responsesStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "responses-client", key: "sk-resp", models: ["*"], upstreams: ["responses", "responses-stream"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "responses-client", key: "sk-resp", models: ["*"], upstreams: ["responses", "responses-stream", "responses-stream-error"] }]),
 };
 const responsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
-  body: JSON.stringify({ model: "resp-model", instructions: "be terse", input: "hi", max_output_tokens: 8, reasoningEffort: "medium", reasoningSummary: "auto" }),
+  body: JSON.stringify({
+    model: "resp-model",
+    instructions: "be terse",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "hi" }] },
+      { type: "function_call", call_id: "call_old", name: "web_search", arguments: "{\"query\":\"old\"}" },
+      { type: "function_call_output", call_id: "call_old", output: "old result" },
+    ],
+    tools: [{ type: "function", name: "web_search", description: "Search", parameters: { type: "object", properties: { query: { type: "string" } } } }],
+    tool_choice: { type: "function", name: "web_search" },
+    max_output_tokens: 8,
+    reasoningEffort: "medium",
+    reasoningSummary: "auto",
+  }),
 }), responsesEnv);
 const responsesPayload = await responsesResp.json();
 assert.equal(responsesResp.status, 200);
@@ -1441,18 +1515,24 @@ assert.equal(responsesResp.headers.get("content-length"), null);
 assert.equal(responsesResp.headers.get("content-encoding"), null);
 assert.equal(responseHits[0].messages[0].role, "system");
 assert.equal(responseHits[0].messages[1].content, "hi");
+assert.equal(responseHits[0].messages.some((message) => message.tool_calls?.[0]?.id === "call_old"), true);
+assert.equal(responseHits[0].messages.some((message) => message.role === "tool" && message.tool_call_id === "call_old"), true);
+assert.equal(responseHits[0].tools[0].function.name, "web_search");
+assert.equal(responseHits[0].tool_choice.function.name, "web_search");
 assert.equal(responseHits[0].max_tokens, 8);
 assert.equal(responseHits[0].reasoning_effort, "medium");
 assert.equal("reasoningEffort" in responseHits[0], false);
 assert.equal("reasoningSummary" in responseHits[0], false);
 assert.equal(responsesPayload.object, "response");
 assert.equal(responsesPayload.output_text, "hello");
+assert.equal(responsesPayload.output.some((item) => item.type === "function_call" && item.name === "web_search"), true);
+assert.equal(responsesPayload.output.some((item) => item.type === "reasoning" && item.summary[0].text === "plan first"), true);
 assert.equal(responsesPayload.usage.input_tokens, 3);
 
 const responsesStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
-  body: JSON.stringify({ model: "stream-model", input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }], stream: true }),
+  body: JSON.stringify({ model: "stream-model", input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }], tools: [{ type: "function", name: "web_search", parameters: { type: "object" } }], stream: true }),
 }), responsesEnv);
 assert.equal(responsesStreamResp.headers.get("content-type").includes("text/event-stream"), true);
 assert.equal(responsesStreamResp.headers.get("cache-control"), "no-cache, no-transform");
@@ -1461,6 +1541,9 @@ const responsesStreamText = await responsesStreamResp.text();
 assert.equal(responseStreamHits[0].stream, true);
 assert.equal(responsesStreamText.includes('"type":"response.output_text.delta"'), true);
 assert.equal(responsesStreamText.includes('"delta":"hel"'), true);
+assert.equal(responsesStreamText.includes('"type":"response.function_call_arguments.delta"'), true);
+assert.equal(responsesStreamText.includes('"type":"response.function_call_arguments.done"'), true);
+assert.equal(responsesStreamText.includes('"type":"response.reasoning_summary_text.delta"'), true);
 assert.equal(responsesStreamText.includes('"type":"response.completed"'), true);
 const responsesStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), responsesEnv);
 const responsesStreamLogs = await responsesStreamLogsResp.json();
@@ -1468,6 +1551,14 @@ const responsesStreamLog = responsesStreamLogs.logs.find((entry) => entry.model 
 assert.equal(responsesStreamLog.completion_tokens >= 1, true);
 assert.equal(responsesStreamLog.close_reason, "done");
 assert.equal(Number.isFinite(responsesStreamLog.time_to_first_byte_ms), true);
+const responsesErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "stream-error-model", input: "hi", stream: true }),
+}), responsesEnv);
+const responsesErrorText = await responsesErrorResp.text();
+assert.equal(responsesErrorText.includes('"type":"response.failed"'), true, responsesErrorText);
+assert.equal(responsesErrorText.includes('"type":"response.completed"'), false);
 
 const anthropicStore = new Map();
 anthropicStore.set("gateway:config", JSON.stringify({
@@ -1476,6 +1567,7 @@ anthropicStore.set("gateway:config", JSON.stringify({
   upstreams: [
     { name: "anthropic", base_url: "https://anthropic.example/v1", api_key_encrypted: "a", models: ["anthropic-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "anthropic-stream", base_url: "https://anthropic-stream.example/v1", api_key_encrypted: "s", models: ["anthropic-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "anthropic-stream-error", base_url: "https://anthropic-stream.example/v1", api_key_encrypted: "e", models: ["anthropic-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const anthropicEnv = {
@@ -1488,7 +1580,7 @@ const anthropicEnv = {
     async put(key, value) { anthropicStore.set(key, value); },
     async delete(key) { anthropicStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "anthropic-client", key: "sk-anthropic", models: ["*"], upstreams: ["anthropic", "anthropic-stream"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "anthropic-client", key: "sk-anthropic", models: ["*"], upstreams: ["anthropic", "anthropic-stream", "anthropic-stream-error"] }]),
 };
 const anthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
@@ -1499,7 +1591,7 @@ const anthropicResp = await worker.default.fetch(new Request("https://gw.test/v1
     system: [{ type: "text", text: "System rules." }],
     messages: [
       { role: "user", content: [{ type: "text", text: "Find info." }] },
-      { role: "assistant", content: [{ type: "text", text: "Sure." }, { type: "tool_use", id: "call_prev", name: "web_search", input: { query: "old" } }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "private chain" }, { type: "text", text: "Sure." }, { type: "tool_use", id: "call_prev", name: "web_search", input: { query: "old" } }] },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "call_prev", content: [{ type: "text", text: "old result" }] }] },
     ],
     tools: [{ name: "web_search", description: "Search web", input_schema: { type: "object", properties: { query: { type: "string" } } } }],
@@ -1511,10 +1603,12 @@ assert.equal(anthropicResp.status, 200);
 assert.equal(anthropicHits[0].messages[0].role, "system");
 assert.equal(anthropicHits[0].messages.some((msg) => msg.role === "tool" && msg.tool_call_id === "call_prev"), true);
 assert.equal(anthropicHits[0].messages.some((msg) => msg.role === "assistant" && msg.tool_calls?.[0]?.function?.name === "web_search"), true);
+assert.equal(anthropicHits[0].messages.some((msg) => String(msg.content || "").includes("private chain")), false);
 assert.equal(anthropicHits[0].tools[0].function.parameters.properties.query.type, "string");
 assert.equal(anthropicHits[0].tool_choice === "auto" || anthropicHits[0].tool_choice?.function?.name === "web_search", true);
 assert.equal(anthropicPayload.type, "message");
 assert.equal(anthropicPayload.stop_reason, "tool_use");
+assert.equal(anthropicPayload.content.some((block) => block.type === "thinking" && block.thinking.includes("use a tool")), true);
 assert.equal(anthropicPayload.content.some((block) => block.type === "tool_use" && block.input.query === "llm"), true);
 assert.equal(anthropicPayload.usage.input_tokens, 17);
 assert.equal(anthropicPayload.usage.output_tokens, 8);
@@ -1544,6 +1638,8 @@ assert.equal("stop" in anthropicStreamHits[0], false);
 assert.equal("tools" in anthropicStreamHits[0], false);
 assert.equal("tool_choice" in anthropicStreamHits[0], false);
 assert.equal(anthropicStreamText.includes("event: message_start"), true);
+assert.equal(anthropicStreamText.includes("event: ping"), true);
+assert.equal(anthropicStreamText.includes('"type":"thinking_delta","thinking":"Checking sources. "'), true);
 assert.equal(anthropicStreamText.includes('"type":"text_delta","text":"Checking "'), true);
 assert.equal(anthropicStreamText.includes('"type":"input_json_delta","partial_json":"{\\"query\\":"'), true);
 assert.equal(anthropicStreamText.includes('"stop_reason":"tool_use"'), true);
@@ -1553,6 +1649,14 @@ const anthropicLogs = await anthropicLogsResp.json();
 const anthropicStreamLog = anthropicLogs.logs.find((entry) => entry.model === "anthropic-stream-model" && entry.path === "/v1/messages");
 assert.equal(anthropicStreamLog.finish_reason, "tool_calls");
 assert.equal(anthropicStreamLog.tool_calls_count, 1);
+const anthropicErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "anthropic-error-model", max_tokens: 8, messages: [{ role: "user", content: "hi" }], stream: true }),
+}), anthropicEnv);
+const anthropicErrorText = await anthropicErrorResp.text();
+assert.equal(anthropicErrorText.includes("event: error"), true, anthropicErrorText);
+assert.equal(anthropicErrorText.includes("event: message_stop"), false);
 
 const paymentStore = new Map();
 paymentStore.set("gateway:config", JSON.stringify({
