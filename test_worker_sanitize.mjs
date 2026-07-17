@@ -1674,9 +1674,39 @@ assert.equal(responsesPayload.output_text, "hello");
 assert.equal(responsesPayload.output.some((item) => item.type === "function_call" && item.name === "web_search"), true);
 assert.equal(responsesPayload.output.some((item) => item.type === "reasoning" && item.summary[0].text === "plan first"), true);
 assert.equal(responsesPayload.usage.input_tokens, 3);
+
+const compactHitStart = responseHits.length;
+const compactResp = await worker.default.fetch(new Request("https://gw.test/v1/responses/compact", {
+  method: "POST",
+  headers: {
+    authorization: "Bearer sk-resp",
+    "content-type": "application/json",
+    "session-id": "compact-session",
+    "x-codex-turn-metadata": JSON.stringify({ session_id: "compact-session", turn_id: "compact-turn" }),
+  },
+  body: JSON.stringify({
+    model: "resp-model",
+    instructions: "Keep implementation details.",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "Fix the worker." }] },
+      { type: "function_call", call_id: "call_compact", name: "shell", arguments: "{\"command\":\"test\"}" },
+      { type: "function_call_output", call_id: "call_compact", output: "ok" },
+    ],
+  }),
+}), responsesEnv);
+const compactPayload = await compactResp.json();
+assert.equal(compactResp.status, 200);
+assert.equal(responseHits.length, compactHitStart + 1);
+assert.equal(responseHits.at(-1).model, "resp-model");
+assert.equal(responseHits.at(-1).messages[0].content.includes("change models"), true);
+assert.equal(responseHits.at(-1).messages[1].content.includes("Fix the worker."), true);
+assert.equal(responseHits.at(-1).messages[1].content.includes("shell"), true);
+assert.equal(compactPayload.output[0].type, "message");
+assert.equal(compactPayload.output[0].content[0].text, "Conversation summary:\nhello");
 const responsesLogs = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), responsesEnv)).json();
-const responsesLog = responsesLogs.logs.find((entry) => entry.model === "resp-model");
+const responsesLog = responsesLogs.logs.find((entry) => entry.model === "resp-model" && entry.path === "/v1/responses");
 assert.equal(responsesLog.finish_reason, "tool_calls");
+assert.equal(responsesLogs.logs.some((entry) => entry.path === "/v1/responses/compact" && entry.model === "resp-model"), true);
 assert.equal(responsesLog.tool_calls_count, 1);
 
 const responsesStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {

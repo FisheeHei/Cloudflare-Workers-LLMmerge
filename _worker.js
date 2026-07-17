@@ -22,6 +22,7 @@ const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504]
 const MODEL_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
 const RESPONSES_PATH = "/v1/responses";
+const RESPONSES_COMPACT_PATH = "/v1/responses/compact";
 const EMBEDDINGS_PATH = "/v1/embeddings";
 const MESSAGES_PATH = "/v1/messages";
 const GATEWAY_CONFIG_KEY = "gateway:config";
@@ -47,10 +48,11 @@ const SSE_FINISH_GRACE_MS = 1000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
+const COMPACTION_PROMPT = "Compress the conversation for continued agent work. Preserve user requirements, decisions, file paths, commands, errors, tool results, unresolved tasks, and current state. Do not solve the task, call tools, change models, or add commentary. Output only a concise self-contained summary.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-18-turn-model-lock-ui-cleanup";
+const VERSION = "v26-07-18-selected-model-compaction";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -178,6 +180,10 @@ export default {
 
       if (pathname === RESPONSES_PATH && request.method === "POST") {
         return await handleResponsesRequest(request, url, app, ctx, requestTraceId(request));
+      }
+
+      if (pathname === RESPONSES_COMPACT_PATH && request.method === "POST") {
+        return await handleResponsesCompactRequest(request, url, app, ctx, requestTraceId(request));
       }
 
       if (pathname === MESSAGES_PATH && request.method === "POST") {
@@ -2396,6 +2402,86 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     }), ctx);
     return gatewayErrorResponse(error, traceId);
   }
+}
+
+async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await request.text());
+  const requestedModel = String(payload?.model || "").trim();
+  if (!requestedModel) throw httpError(400, "`model` is required.");
+
+  const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+  const transcript = compactTranscript(payload.input, payload.instructions);
+  if (!transcript) throw httpError(400, "`input` is required.");
+
+  const chat = {
+    model,
+    messages: [
+      { role: "system", content: COMPACTION_PROMPT },
+      { role: "user", content: transcript },
+    ],
+    max_tokens: 4096,
+    stream: false,
+  };
+  copyIfPresent(payload, chat, ["reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
+  const bodyText = JSON.stringify(chat);
+  const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
+  let upstreamName = "none";
+  const log = (status, usage, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model,
+    path: RESPONSES_COMPACT_PATH,
+    status,
+    started,
+    promptTokens: usage?.prompt_tokens ?? usage?.input_tokens ?? fallbackPrompt,
+    completionTokens: usage?.completion_tokens ?? usage?.output_tokens ?? 0,
+    extra: { trace_id: traceId, ...extra },
+  }), ctx);
+
+  try {
+    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search });
+    upstreamName = proxyResponse.upstream.name;
+    const upstreamResp = proxyResponse.response;
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+    if (!upstreamResp.ok) {
+      log(upstreamResp.status);
+      return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
+
+    const text = await upstreamResp.text();
+    const result = safeJson(text);
+    const applicationError = upstreamApplicationErrorMessage(result || text);
+    const summary = chatContentToText(result?.choices?.[0]?.message?.content || "").trim();
+    if (!result || looksLikeHtmlDocument(text) || applicationError || !summary) {
+      log(502);
+      return upstreamBadGatewayResponse(applicationError || "Upstream returned no compaction summary.", headers);
+    }
+
+    log(200, result.usage, { finish_reason: result.choices?.[0]?.finish_reason || "stop" });
+    headers.set("content-type", "application/json; charset=utf-8");
+    return new Response(JSON.stringify({
+      output: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `Conversation summary:\n${summary}` }],
+      }],
+    }), { status: 200, headers });
+  } catch (error) {
+    upstreamName = error.upstreamName || upstreamName;
+    log(error.statusCode || 502);
+    return gatewayErrorResponse(error, traceId);
+  }
+}
+
+function compactTranscript(input, instructions) {
+  const messages = responsesInputToMessages(input, instructions);
+  return messages.map((message) => {
+    const toolCalls = (message.tool_calls || []).map((call) => `${call.function?.name || "tool"}(${call.function?.arguments || ""})`).join("\n");
+    return `[${message.role}]\n${chatContentToText(message.content)}${toolCalls ? `\n${toolCalls}` : ""}`.trim();
+  }).filter(Boolean).join("\n\n");
 }
 
 function translateResponsesRequest(payload) {
