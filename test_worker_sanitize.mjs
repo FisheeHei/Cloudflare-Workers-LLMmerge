@@ -431,6 +431,8 @@ assert.equal(adminPage.includes("document.visibilityState"), true);
 assert.equal(adminPage.includes("Fast \\u52a0\\u901f\\u524d 2 \\u4e2a") || adminPage.includes("Fast 加速前 2 个"), true);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
+assert.equal(adminPage.includes("client-models"), true);
+assert.equal(adminPage.includes("data-client-save"), true);
 assert.equal(adminPage.includes("picker-apply-same-preset"), true);
 assert.equal(adminPage.includes("class=\"apply-models-same-preset\""), false);
 assert.equal(adminPage.includes("toggle-log-expanded"), true);
@@ -641,10 +643,81 @@ const createdClient = (await createdClientResp.json()).client;
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 200);
+const updateClientResp = await worker.default.fetch(new Request(`https://gw.test/llmmerge-admin/api/clients/${createdClient.id}`, {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ models: ["glm-4.6"] }),
+}), env);
+assert.equal(updateClientResp.status, 200);
+const updatedClient = (await updateClientResp.json()).client;
+assert.deepEqual(updatedClient.models, ["glm-4.6"]);
+const deniedAfterUpdateResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: `Bearer ${createdClient.api_key}`, "content-type": "application/json" },
+  body: JSON.stringify({ model: "gpt-5", messages: [] }),
+}), env);
+assert.equal(deniedAfterUpdateResp.status, 403);
 await worker.default.fetch(new Request(`https://gw.test/llmmerge-admin/api/clients/${createdClient.id}`, { method: "DELETE" }), env);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 401);
+
+const restrictedEnv = {
+  ...env,
+  KV: null,
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "nim-restricted", preset: "nvidia-nim", base_url: "https://integrate.api.nvidia.com/v1", api_key: "x", models: ["z-ai/glm-5.2", "openai/gpt-oss-120b"], paths: ["/v1/chat/completions"] },
+  ]),
+  CLIENTS_JSON: JSON.stringify([
+    { name: "glm-only", key: "sk-glm-only", models: ["z-ai/glm-5.2"], upstreams: ["nim-restricted"] },
+    { name: "session-locked", key: "sk-session-locked", models: ["*"], upstreams: ["nim-restricted"] },
+  ]),
+};
+const restrictedModelsResp = await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-glm-only" },
+}), restrictedEnv);
+const restrictedModels = await restrictedModelsResp.json();
+assert.equal(restrictedModels.data.some((item) => item.id.includes("glm-5.2")), true);
+assert.equal(restrictedModels.data.some((item) => item.id.includes("gpt-oss")), false);
+const allowedAliasResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-glm-only", "content-type": "application/json" },
+  body: JSON.stringify({ model: "nvidia-nim/glm-5.2", messages: [] }),
+}), restrictedEnv);
+assert.equal(allowedAliasResp.status, 200);
+const upstreamCallsBeforeDenied = bodies.length;
+for (const [path, body] of [
+  ["/v1/chat/completions", { model: "openai/gpt-oss-120b", messages: [] }],
+  ["/v1/responses", { model: "openai/gpt-oss-120b", input: "hi" }],
+  ["/v1/messages", { model: "openai/gpt-oss-120b", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }],
+]) {
+  const denied = await worker.default.fetch(new Request(`https://gw.test${path}`, {
+    method: "POST",
+    headers: { authorization: "Bearer sk-glm-only", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify(body),
+  }), restrictedEnv);
+  assert.equal(denied.status, 403);
+}
+assert.equal(bodies.length, upstreamCallsBeforeDenied);
+
+const sessionHeaders = {
+  authorization: "Bearer sk-session-locked", "content-type": "application/json", "session-id": "codex-session-mixed",
+  "x-codex-turn-metadata": JSON.stringify({ session_id: "codex-session-mixed", turn_id: "turn-glm" }),
+};
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST", headers: sessionHeaders,
+  body: JSON.stringify({ model: "z-ai/glm-5.2", input: "hi" }),
+}), restrictedEnv)).status, 200);
+const deniedSessionSwitch = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST", headers: sessionHeaders,
+  body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "switch" }),
+}), restrictedEnv);
+assert.equal(deniedSessionSwitch.status, 403);
+assert.equal((await deniedSessionSwitch.text()).includes("locked to model: z-ai/glm-5.2"), true);
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST", headers: { ...sessionHeaders, "x-codex-turn-metadata": JSON.stringify({ session_id: "codex-session-mixed", turn_id: "turn-gpt" }) },
+  body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "next turn" }),
+}), restrictedEnv)).status, 200);
 
 const kimiBodyStart = bodies.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {

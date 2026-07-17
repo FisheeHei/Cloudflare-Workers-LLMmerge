@@ -14,7 +14,7 @@ const HTML_HEADERS = {
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "access-control-allow-headers": "authorization,content-type,x-admin-token,x-api-key,anthropic-version,anthropic-beta",
+  "access-control-allow-headers": "authorization,content-type,x-admin-token,x-api-key,anthropic-version,anthropic-beta,session-id,thread-id,turn-id,x-turn-id,x-client-request-id,x-session-id,x-conversation-id,x-codex-turn-metadata",
   "access-control-max-age": "3600",
 };
 
@@ -49,7 +49,8 @@ const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
-const VERSION = "v26-07-12-full-function-speed-fix";
+const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
+const VERSION = "v26-07-18-turn-model-lock";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -125,7 +126,7 @@ export default {
             json(openAiError("`model` is required.", "invalid_request_error"), 400),
           );
         }
-        const model = await resolveClientModelAlias(client, runtime, requestedModel);
+        const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
         const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
 
         const started = Date.now();
@@ -225,6 +226,8 @@ var _stdTimeOffsetMs = 0;
 var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
 var _analyticsQueryCache = {};
+// ponytail: hot session locks stay local; KV is touched only on the first request per isolate/session.
+var _sessionModelLocks = {};
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -976,6 +979,22 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   const clientMatch = apiPath.match(/^\/api\/clients\/([^/]+)$/);
+  if (clientMatch && request.method === "PUT") {
+    const id = decodeURIComponent(clientMatch[1]);
+    const existing = await app.kv.get(clientIdKey(id), "json");
+    if (!existing?.key) throw httpError(404, "Client not found.");
+    const payload = parseJsonBody(await request.text());
+    const record = buildClientRecord({
+      ...existing,
+      ...payload,
+      id: existing.id,
+      key: existing.key,
+      created_at: existing.created_at,
+    });
+    await saveClientRecord(app.kv, record);
+    return withCorsResponse(json({ ok: true, client: publicClientRecord(record) }, 200));
+  }
+
   if (clientMatch && request.method === "DELETE") {
     const id = decodeURIComponent(clientMatch[1]);
     await deleteClientRecord(app.kv, id);
@@ -1576,13 +1595,15 @@ async function requireClient(request, runtime) {
 
 async function listModels(client, runtime) {
   const allResults = routeModelRows(runtime)
-    .filter((row) => clientAllowsUpstream(client, row.upstream.name) && clientAllowsModel(client, row.model));
+    .filter((row) => clientAllowsUpstream(client, row.upstream.name));
 
-  const rows = aliasRowsForModels(allResults).map((row) => ({
-    id: row.alias,
-    object: "model",
-    owned_by: row.upstream.note || row.upstream.name || "gateway",
-  }));
+  const rows = aliasRowsForModels(allResults)
+    .filter((row) => clientAllowsModelSelection(client, row.alias, row.model))
+    .map((row) => ({
+      id: row.alias,
+      object: "model",
+      owned_by: row.upstream.note || row.upstream.name || "gateway",
+    }));
 
   rows.sort((a, b) => a.id.localeCompare(b.id));
   return json(
@@ -1599,7 +1620,7 @@ async function resolveClientModelAlias(client, runtime, model) {
   if (!value || value.includes("@cf/")) return value;
   if (value.includes("/") || isLooseAliasModel(value)) {
     const allResults = routeModelRows(runtime)
-      .filter((row) => clientAllowsUpstream(client, row.upstream.name) && clientAllowsModel(client, row.model));
+      .filter((row) => clientAllowsUpstream(client, row.upstream.name));
     const rows = aliasRowsForModels(allResults);
     const hit = rows.find((row) => row.alias === value || row.model === value);
     if (hit) return hit.model;
@@ -1609,6 +1630,63 @@ async function resolveClientModelAlias(client, runtime, model) {
     if (fuzzy.length === 1) return fuzzy[0].model;
   }
   return value;
+}
+
+async function resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload) {
+  const model = await resolveClientModelAlias(client, runtime, requestedModel);
+  if (!clientAllowsModelSelection(client, requestedModel, model)) {
+    throw httpError(403, `Model is not allowed for this client key: ${requestedModel}`);
+  }
+  await enforceSessionModelLock(client, runtime, request, payload, model);
+  return model;
+}
+
+async function enforceSessionModelLock(client, runtime, request, payload, model) {
+  const scopeId = requestModelLockScope(request, payload);
+  if (!scopeId) return;
+
+  const cacheKey = `${client.id}\n${scopeId}`;
+  const now = Date.now();
+  let lock = _sessionModelLocks[cacheKey];
+  if (lock?.expires > now) {
+    if (lock.model !== model) throw httpError(403, `This session is locked to model: ${lock.model}`);
+    return;
+  }
+
+  lock = { model, expires: now + SESSION_MODEL_LOCK_TTL_SECONDS * 1000 };
+  _sessionModelLocks[cacheKey] = lock;
+  const lockKeys = Object.keys(_sessionModelLocks);
+  if (lockKeys.length > 500) delete _sessionModelLocks[lockKeys[0]];
+  if (!runtime.kv) return;
+
+  const storageKey = await sessionModelLockKey(cacheKey);
+  const stored = await runtime.kv.get(storageKey, "json");
+  if (stored?.model && stored.expires > now) {
+    _sessionModelLocks[cacheKey] = stored;
+    if (stored.model !== model) throw httpError(403, `This session is locked to model: ${stored.model}`);
+    return;
+  }
+  await runtime.kv.put(storageKey, JSON.stringify(lock), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS });
+}
+
+function requestModelLockScope(request, payload) {
+  const metadata = safeJson(request?.headers.get("x-codex-turn-metadata") || "") || {};
+  const bodyMetadata = payload?.metadata && typeof payload.metadata === "object" ? payload.metadata : {};
+  const session = request?.headers.get("session-id") || request?.headers.get("x-session-id") ||
+    metadata.session_id || bodyMetadata.session_id || request?.headers.get("thread-id") ||
+    request?.headers.get("x-client-request-id") || request?.headers.get("x-conversation-id") ||
+    metadata.thread_id || bodyMetadata.thread_id || bodyMetadata.conversation_id;
+  const turn = request?.headers.get("turn-id") || request?.headers.get("x-turn-id") ||
+    metadata.turn_id || bodyMetadata.turn_id;
+  const sessionId = String(session || "").trim();
+  const turnId = String(turn || "").trim();
+  if (turnId && turnId.length <= 256) return `${sessionId.slice(0, 256)}\nturn:${turnId}`;
+  return sessionId && sessionId.length <= 256 ? sessionId : "";
+}
+
+async function sessionModelLockKey(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return "session:model:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function routeModelRows(runtime) {
@@ -1926,7 +2004,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
   const client = await requireClient(request, runtime);
   const payload = parseJsonBody(await request.text());
   const translated = translateAnthropicMessagesRequest(payload);
-  const resolvedModel = await resolveClientModelAlias(client, runtime, translated.model);
+  const resolvedModel = await resolveAuthorizedClientModel(client, runtime, translated.model, request, payload);
   if (resolvedModel !== translated.model) {
     translated.model = resolvedModel;
     translated.seed.model = resolvedModel;
@@ -2255,7 +2333,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const client = await requireClient(request, runtime);
   const payload = parseJsonBody(await request.text());
   const translated = translateResponsesRequest(payload);
-  const resolvedModel = await resolveClientModelAlias(client, runtime, translated.model);
+  const resolvedModel = await resolveAuthorizedClientModel(client, runtime, translated.model, request, payload);
   if (resolvedModel !== translated.model) {
     translated.model = resolvedModel;
     translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
@@ -2942,7 +3020,6 @@ function proxyCandidates(runtime, client, model, pathname) {
   const pool = indexedPool && indexedPool.length ? indexedPool : runtime.upstreams;
   return pool.filter((upstream) =>
     clientAllowsUpstream(client, upstream.name) &&
-    clientAllowsModel(client, model) &&
     (indexedPool?.length || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
   );
 }
@@ -3492,11 +3569,13 @@ function clientAllowsUpstream(client, upstreamName) {
   return client.upstreams.includes(upstreamName);
 }
 
-function clientAllowsModel(client, model) {
-  if (!Array.isArray(client.models) || client.models.length === 0) {
+function clientAllowsModelSelection(client, requestedModel, resolvedModel = requestedModel) {
+  if (!Array.isArray(client.models) || client.models.length === 0 || client.models.includes("*")) {
     return true;
   }
-  return client.models.includes("*") || client.models.some((item) => modelsMatch(item, model));
+  return client.models.some((allowed) =>
+    modelsMatch(allowed, requestedModel) || modelsMatch(allowed, resolvedModel)
+  );
 }
 
 function upstreamSupportsModel(upstream, model) {
