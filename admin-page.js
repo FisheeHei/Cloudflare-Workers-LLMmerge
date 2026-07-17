@@ -176,9 +176,6 @@ function renderAdminStyle() {
     .client-item .client-meta .mono { color: var(--muted); word-break: break-all; }
     .client-create { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
     .client-create input { flex: 1; min-width: 160px; }
-    .client-models-input { min-width: min(360px, 100%); }
-    .client-model-editor { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
-    .client-model-editor input { flex: 1 1 320px; min-width: 180px; }
 
     .key-output {
       margin-top: 12px; padding: 14px; background: #f2e7d3;
@@ -401,11 +398,9 @@ function renderAdminMarkup(origin, version) {
 
   <div class="panel">
     <h2>\u5ba2\u6237\u7aef Keys</h2>
-    <p class="note" style="margin:4px 0 8px;font-size:12px">\u6bcf\u4e2a Key \u53ea\u80fd\u8c03\u7528\u201c\u5141\u8bb8\u6a21\u578b\u201d\u4e2d\u7684\u6a21\u578b\uff1b\u7559\u7a7a\u6216\u586b * \u8868\u793a\u4e0d\u9650\u5236\u3002</p>
     <div id="client-list"></div>
     <div class="client-create">
       <input id="client-name" placeholder="\u540d\u79f0 (\u53ef\u9009)">
-      <input id="client-models" class="client-models-input mono" placeholder="\u5141\u8bb8\u6a21\u578b\uff0c\u9017\u53f7\u5206\u9694\uff1a z-ai/glm-5.2">
       <button class="good" id="create-client">\u751f\u6210 Key</button>
       <button class="small secondary" id="refresh-client-key" hidden>\u5237\u65b0</button>
     </div>
@@ -2224,10 +2219,6 @@ function renderAdminScript(version) {
         '<div class="client-meta">' +
           '<strong>' + esc(c.name) + '</strong>' +
           '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
-          '<div class="client-model-editor">' +
-            '<input class="mono" data-client-models="' + esc(c.id) + '" value="' + esc((c.models || []).join(", ") || "*") + '" aria-label="\u5141\u8bb8\u6a21\u578b">' +
-            '<button type="button" class="small secondary" data-client-save="' + esc(c.id) + '">\u4fdd\u5b58\u6a21\u578b</button>' +
-          '</div>' +
         '</div>' +
         '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '">\u5220\u9664</button>' +
       '</div>'
@@ -2240,23 +2231,14 @@ function renderAdminScript(version) {
         });
       });
     });
-    host.querySelectorAll("button[data-client-save]").forEach((btn) => {
-      btn.addEventListener("click", () => withButtonBusy(btn, "\u4fdd\u5b58\u4e2d...", async () => {
-        const id = btn.dataset.clientSave;
-        const input = host.querySelector('[data-client-models="' + CSS.escape(id) + '"]');
-        await updateClientModels(id, splitList(input?.value || ""));
-        showToast("\u5df2\u66f4\u65b0\u6a21\u578b\u6743\u9650");
-      }).catch(showError));
-    });
   }
 
   async function createClient() {
     const payload = {
       name: byId("client-name").value.trim() || "generated-client",
-      models: splitList(byId("client-models").value).filter(Boolean),
+      models: ["*"],
       upstreams: [],
     };
-    if (!payload.models.length) payload.models = ["*"];
     const resp = await fetch(API_BASE + "/clients", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
@@ -2269,17 +2251,6 @@ function renderAdminScript(version) {
     byId("client-output-text").textContent = JSON.stringify(data.client, null, 2);
     byId("refresh-client-key").hidden = false;
     showToast("\u5ba2\u6237\u7aef Key \u5df2\u751f\u6210");
-    await loadClients();
-  }
-
-  async function updateClientModels(id, models) {
-    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(id), {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ models: models.length ? models : ["*"] }),
-    });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "\u66f4\u65b0\u6a21\u578b\u6743\u9650\u5931\u8d25");
     await loadClients();
   }
 

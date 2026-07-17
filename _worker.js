@@ -50,7 +50,7 @@ const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or i
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-18-turn-model-lock";
+const VERSION = "v26-07-18-turn-model-lock-ui-cleanup";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
