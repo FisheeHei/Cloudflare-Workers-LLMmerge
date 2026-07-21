@@ -52,7 +52,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-18-selected-model-compaction";
+const VERSION = "v26-07-22-anthropic-early-stream";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -830,6 +830,60 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
           if (safeEnqueue(controller, done)) safeClose(controller);
         }
       }
+    },
+    async cancel(reason) {
+      cleanup();
+      try { await reader?.cancel(reason); } catch {}
+    },
+  });
+}
+
+function streamPendingAnthropicResponse(open) {
+  const encoder = new TextEncoder();
+  const ping = encoder.encode('event: ping\ndata: {"type":"ping"}\n\n');
+  let reader = null;
+  let timer = null;
+  let closed = false;
+  const cleanup = () => {
+    closed = true;
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+  return new ReadableStream({
+    start(controller) {
+      const send = (chunk) => {
+        if (closed) return false;
+        try {
+          controller.enqueue(chunk);
+          return true;
+        } catch {
+          cleanup();
+          return false;
+        }
+      };
+      send(ping);
+      timer = setInterval(() => send(ping), SSE_KEEPALIVE_MS);
+      (async () => {
+        try {
+          const body = await open();
+          reader = body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!send(value)) {
+              try { await reader.cancel("client closed"); } catch {}
+              return;
+            }
+          }
+        } catch (error) {
+          const status = error.statusCode || 502;
+          const payload = { type: "error", error: { type: anthropicErrorType(status), message: error.message || "Upstream request failed." } };
+          send(encoder.encode(`event: error\ndata: ${JSON.stringify(payload)}\n\n`));
+        } finally {
+          cleanup();
+          try { controller.close(); } catch {}
+        }
+      })();
     },
     async cancel(reason) {
       cleanup();
@@ -2017,6 +2071,56 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
     translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
   }
 
+  if (translated.stream) {
+    const headers = new Headers(CORS_HEADERS);
+    setSseHeaders(headers);
+    headers.set("x-llm-gateway-client", client.name || client.id || "client");
+    headers.set("x-llm-gateway-trace-id", traceId);
+    const body = streamPendingAnthropicResponse(async () => {
+      let logged = false;
+      try {
+        const proxyResponse = await proxyRequest({
+          client,
+          model: translated.model,
+          pathname: CHAT_PATH,
+          request,
+          bodyText: translated.bodyText,
+          runtime,
+          search: url.search,
+        });
+        const upstreamResp = proxyResponse.response;
+        if (!upstreamResp.ok) {
+          const text = await upstreamResp.text().catch(() => "");
+          const payload = safeJson(text);
+          const message = upstreamApplicationErrorMessage(payload || text) || payload?.error?.message || payload?.message || text || `Upstream returned HTTP ${upstreamResp.status}.`;
+          recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId);
+          logged = true;
+          const error = httpError(upstreamResp.status || 502, looksLikeHtmlDocument(text) ? `Upstream returned HTTP ${upstreamResp.status} HTML error page.` : message);
+          error.upstreamName = proxyResponse.upstream.name;
+          throw error;
+        }
+        const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, extra);
+        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started);
+      } catch (error) {
+        if (!logged) {
+          recordRequestLog(app, makeRequestLogEntry({
+            client,
+            upstream: error.upstreamName || "none",
+            model: translated.model,
+            path: MESSAGES_PATH,
+            status: error.statusCode || 502,
+            started,
+            promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+            completionTokens: 0,
+            extra: { trace_id: traceId, tools_count: translated.toolsCount },
+          }), ctx);
+        }
+        throw error;
+      }
+    });
+    return new Response(body, { status: 200, headers });
+  }
+
   try {
     const proxyResponse = await proxyRequest({
       client,
@@ -2034,12 +2138,6 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
     if (!upstreamResp.ok) {
       recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId);
       return await anthropicUpstreamErrorResponse(upstreamResp, headers);
-    }
-
-    if (translated.stream) {
-      setSseHeaders(headers);
-      const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, extra);
-      return new Response(withSseKeepAlive(streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started)), { status: 200, headers });
     }
 
     const openaiText = await upstreamResp.text();
