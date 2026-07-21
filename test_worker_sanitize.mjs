@@ -37,6 +37,7 @@ const responseStreamHits = [];
 const anthropicHits = [];
 const anthropicStreamHits = [];
 const delayedAnthropicHits = [];
+const cloudflare524Hits = [];
 let releaseDelayedAnthropic = null;
 const paymentHits = [];
 const degradedHits = [];
@@ -237,6 +238,13 @@ globalThis.fetch = async (url, init) => {
     return new Response('data: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: [DONE]\n\n', {
       status: 200,
       headers: { "content-type": "text/event-stream" },
+    });
+  }
+  if (String(url).includes("cloudflare-524.example")) {
+    cloudflare524Hits.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ title: "Error 524: A timeout occurred", status: 524, detail: "origin_response_timeout" }), {
+      status: 524,
+      headers: { "content-type": "application/json" },
     });
   }
   if (String(url).includes("anthropic.example")) {
@@ -1794,6 +1802,7 @@ assert.ok(delayedAnthropicResp, "Anthropic stream must return before the upstrea
 const delayedReader = delayedAnthropicResp.body.getReader();
 const delayedFirst = await delayedReader.read();
 assert.equal(new TextDecoder().decode(delayedFirst.value).includes('"type":"ping"'), true);
+assert.equal(delayedFirst.value.byteLength > 2048, true);
 for (let i = 0; !releaseDelayedAnthropic && i < 20; i += 1) await new Promise((resolve) => setTimeout(resolve, 1));
 assert.equal(typeof releaseDelayedAnthropic, "function");
 releaseDelayedAnthropic();
@@ -1807,6 +1816,33 @@ assert.equal(delayedAnthropicText.includes('"type":"message_start"'), true);
 assert.equal(delayedAnthropicText.includes('"text":"late"'), true);
 assert.equal(delayedAnthropicText.includes('"type":"message_stop"'), true);
 assert.equal(delayedAnthropicHits.length, 1);
+
+const cloudflare524Store = new Map();
+cloudflare524Store.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "cloudflare-524", base_url: "https://cloudflare-524.example/v1", api_key_encrypted: "e", models: ["cloudflare-524-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "cloudflare-524-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["cloudflare-524-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const cloudflare524Env = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = cloudflare524Store.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { cloudflare524Store.set(key, value); },
+    async delete(key) { cloudflare524Store.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "cloudflare-524-client", key: "sk-cloudflare-524", models: ["*"], upstreams: ["cloudflare-524", "cloudflare-524-fallback"] }]),
+};
+const cloudflare524Resp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-cloudflare-524", "content-type": "application/json" },
+  body: JSON.stringify({ model: "cloudflare-524-model", messages: [] }),
+}), cloudflare524Env);
+assert.equal(cloudflare524Hits.length, 1);
+assert.equal(cloudflare524Resp.status, 200);
+assert.equal(cloudflare524Resp.headers.get("x-llm-gateway-upstream"), "cloudflare-524-fallback");
 const anthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
   headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },

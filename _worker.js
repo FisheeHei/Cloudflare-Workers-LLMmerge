@@ -18,7 +18,7 @@ const CORS_HEADERS = {
   "access-control-max-age": "3600",
 };
 
-const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504, 524]);
 const MODEL_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
 const RESPONSES_PATH = "/v1/responses";
@@ -52,7 +52,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-22-anthropic-early-stream";
+const VERSION = "v26-07-22-anthropic-524-failover";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -840,7 +840,8 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
 
 function streamPendingAnthropicResponse(open) {
   const encoder = new TextEncoder();
-  const ping = encoder.encode('event: ping\ndata: {"type":"ping"}\n\n');
+  // ponytail: padded SSE crosses buffering proxies that otherwise hold tiny first chunks.
+  const ping = encoder.encode(`: ${" ".repeat(2048)}\nevent: ping\ndata: {"type":"ping"}\n\n`);
   let reader = null;
   let timer = null;
   let closed = false;
@@ -862,7 +863,7 @@ function streamPendingAnthropicResponse(open) {
         }
       };
       send(ping);
-      timer = setInterval(() => send(ping), SSE_KEEPALIVE_MS);
+      timer = setInterval(() => { if (controller.desiredSize > 0) send(ping); }, SSE_KEEPALIVE_MS);
       (async () => {
         try {
           const body = await open();
