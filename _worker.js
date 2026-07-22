@@ -53,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-22-flow-audit";
+const VERSION = "v26-07-23-admin-navigation";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {

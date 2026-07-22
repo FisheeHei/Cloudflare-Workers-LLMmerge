@@ -33,8 +33,8 @@ function renderAdminStyle() {
       color: var(--ink);
       font: 15px/1.5 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
     }
-    html, body { overflow-x: hidden; }
-    .app-shell { min-height: 100vh; display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+    html, body { height: 100%; overflow: hidden; }
+    .app-shell { height: 100vh; display: grid; grid-template-columns: 232px minmax(0, 1fr); overflow: hidden; }
     .sidebar {
       position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column;
       padding: 20px 14px; background: var(--sidebar); color: white; overflow-y: auto;
@@ -61,7 +61,9 @@ function renderAdminStyle() {
     .nav-icon { width: 18px; color: #8fb8ff; text-align: center; font-size: 15px; }
     .sidebar-footer { margin-top: auto; padding: 16px 8px 4px; color: #7787a1; font-size: 11px; line-height: 1.7; }
     .sidebar-version { display: block; color: var(--sidebar-muted); font-family: Consolas, monospace; word-break: break-all; }
-    .main-shell { min-width: 0; }
+    .sidebar-source { display: block; color: #8fb8ff; overflow-wrap: anywhere; text-decoration: none; }
+    .sidebar-source:hover { color: white; }
+    .main-shell { min-width: 0; min-height: 0; height: 100vh; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
     .topbar {
       position: sticky; top: 0; z-index: 30; min-height: 68px; display: flex; align-items: center;
       justify-content: space-between; gap: 16px; padding: 12px 32px; background: rgba(255,255,255,.94);
@@ -321,10 +323,10 @@ function renderAdminStyle() {
       .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
       .url-card { max-width: none; }
-      #view-overview #stats-panel { grid-column: 1 / span 5; }
-      [data-view="overview"] #log-panel, [data-view="overview"] #request-log-panel { grid-column: 1 / -1; }
+      #view-overview #stats-panel { grid-column: 1 / span 7; }
+      #view-overview #client-panel { grid-column: 8 / -1; }
+      #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
       #view-upstreams #upstream-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
-      #view-clients #client-panel { grid-column: 1 / span 8; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
       .upstream-card summary { padding: 11px 12px; gap: 9px; }
       .upstream-card .card-body { padding: 0 12px 12px; }
@@ -389,11 +391,16 @@ function renderAdminStyle() {
     .log-badge.ok { background: #065f4620; color: var(--accent-2); }
     .log-badge.err { background: #8d2f2320; color: #8d2f23; }
     @media (min-width: 701px) and (max-width: 900px) {
-      .app-shell { display: block; }
+      html, body { height: auto; overflow: auto; }
+      .app-shell { display: block; height: auto; overflow: visible; }
+      .main-shell { height: auto; overflow: visible; }
       .sidebar { position: static; height: auto; padding: 12px 16px; }
-      .sidebar-label, .sidebar-footer { display: none; }
-      .sidebar-nav { display: flex; gap: 4px; margin-top: 12px; overflow-x: auto; padding-bottom: 2px; }
-      .nav-item { flex: 0 0 auto; min-height: 34px; padding: 7px 10px; }
+      .sidebar-label { display: none; }
+      .sidebar-nav { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; overflow: visible; }
+      .nav-item { justify-content: center; min-width: 0; min-height: 34px; padding: 7px 8px; }
+      .sidebar-footer { display: flex; align-items: flex-start; gap: 10px; margin: 10px 0 0; padding: 0 4px; }
+      .sidebar-version { flex: 0 0 auto; }
+      .sidebar-source { min-width: 0; }
       .topbar { position: static; padding: 10px 24px; }
     }
     @media (max-width: 700px) {
@@ -401,11 +408,16 @@ function renderAdminStyle() {
       .hero, .panel { margin-bottom: 10px; }
       .hero, .panel, .modal-card { padding: 14px; }
       .hero h1 { font-size: 24px; }
-      .app-shell { display: block; }
+      html, body { height: auto; overflow: auto; }
+      .app-shell { display: block; height: auto; overflow: visible; }
+      .main-shell { height: auto; overflow: visible; }
       .sidebar { position: static; height: auto; padding: 12px; }
-      .sidebar-label, .sidebar-footer { display: none; }
-      .sidebar-nav { display: flex; gap: 4px; margin-top: 12px; overflow-x: auto; padding-bottom: 2px; }
-      .nav-item { flex: 0 0 auto; min-height: 34px; padding: 7px 10px; }
+      .sidebar-label { display: none; }
+      .sidebar-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 12px; overflow: visible; }
+      .nav-item { justify-content: center; min-width: 0; min-height: 36px; padding: 7px 8px; }
+      .sidebar-footer { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; margin: 10px 0 0; padding: 0 4px; line-height: 1.35; }
+      .sidebar-version { word-break: normal; }
+      .sidebar-source { min-width: 0; }
       .topbar { position: static; min-height: 60px; padding: 10px 14px; }
       .topbar-badge { display: none; }
       .wrap { width: min(100%, calc(100vw - 12px)); }
@@ -455,12 +467,12 @@ function renderAdminMarkup(origin, version) {
     <nav class="sidebar-nav" aria-label="管理导航">
       <a class="nav-item active" href="#overview" data-view-target="overview"><span class="nav-icon">⌂</span><span>总览</span></a>
       <a class="nav-item" href="#upstreams" data-view-target="upstreams"><span class="nav-icon">⇄</span><span>上游配置</span></a>
-      <a class="nav-item" href="#clients" data-view-target="clients"><span class="nav-icon">⌁</span><span>客户端 Keys</span></a>
+      <a class="nav-item" href="#logs" data-view-target="logs"><span class="nav-icon">≡</span><span>调用日志</span></a>
       <a class="nav-item" href="#settings" data-view-target="settings"><span class="nav-icon">⚙</span><span>高级设置</span></a>
     </nav>
     <div class="sidebar-footer">
       <span class="sidebar-version">${version}</span>
-      <span>OpenAI + Claude Compatible</span>
+      <a class="sidebar-source" href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" target="_blank" rel="noreferrer">github.com/FisheeHei/Cloudflare-Workers-LLMmerge</a>
     </div>
   </aside>
 
@@ -515,8 +527,6 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
-  </section>
-  <section class="page-view" id="view-clients" data-view="clients" hidden>
   <div class="panel" id="client-panel">
     <h2>\u5ba2\u6237\u7aef Keys</h2>
     <div id="client-list"></div>
@@ -559,7 +569,7 @@ function renderAdminMarkup(origin, version) {
   </div>
 
   </section>
-  <section class="page-view" id="view-activity" data-view="overview">
+  <section class="page-view" id="view-activity" data-view="logs" hidden>
   <div class="panel" id="log-panel">
     <div class="toolbar">
       <h2>\u8c03\u7528\u65e5\u5fd7</h2>
@@ -615,11 +625,6 @@ function renderAdminMarkup(origin, version) {
 
   </section>
 
-  <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
-    ${version} ·
-    <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
-    · by FisheeHei
-  </footer>
 </div>
 
   </main>
