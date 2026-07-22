@@ -495,7 +495,9 @@ assert.equal(adminPage.includes("data-stat-kind"), true);
 assert.equal(adminPage.includes("bar-hit"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
-assert.equal(adminPage.includes("}, 2000);"), true);
+assert.equal(adminPage.includes("setInterval(refreshLivePanels, 2000)"), true);
+assert.equal(adminPage.includes("if (liveRefreshRunning || document.visibilityState"), true);
+assert.equal(adminPage.includes("Configuration error"), true);
 assert.equal(adminPage.includes("width: min(1216px"), true);
 assert.equal(adminPage.includes(".picker-actions button.small"), true);
 assert.equal(adminPage.includes("EXCLUSIVE_MODEL_TAGS"), true);
@@ -1862,6 +1864,17 @@ const anthropicEnv = {
   },
   CLIENTS_JSON: JSON.stringify([{ name: "anthropic-client", key: "sk-anthropic", models: ["*"], upstreams: ["anthropic", "anthropic-stream", "anthropic-delayed", "anthropic-stream-error", "anthropic-reset"] }]),
 };
+const invalidAnthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json", "x-request-id": "anthropic-invalid" },
+  body: JSON.stringify({ max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+}), anthropicEnv);
+const invalidAnthropicPayload = await invalidAnthropicResp.json();
+assert.equal(invalidAnthropicResp.status, 400);
+assert.equal(invalidAnthropicResp.headers.get("access-control-allow-origin"), "*");
+assert.equal(invalidAnthropicResp.headers.get("x-llm-gateway-trace-id"), "anthropic-invalid");
+assert.equal(invalidAnthropicPayload.type, "error");
+assert.equal(invalidAnthropicPayload.error.type, "invalid_request_error");
 const delayedAnthropicPromise = worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
   headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },

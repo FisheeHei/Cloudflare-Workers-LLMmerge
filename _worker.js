@@ -53,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-22-responsive-admin-layout";
+const VERSION = "v26-07-22-flow-audit";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -190,7 +190,12 @@ export default {
       }
 
       if (pathname === MESSAGES_PATH && request.method === "POST") {
-        return await handleAnthropicMessagesRequest(request, url, app, ctx, requestTraceId(request));
+        const traceId = requestTraceId(request);
+        try {
+          return await handleAnthropicMessagesRequest(request, url, app, ctx, traceId);
+        } catch (error) {
+          return anthropicGatewayErrorResponse(error, traceId);
+        }
       }
 
       if (env.ASSETS && request.method === "GET" && pathname !== "/") {
@@ -2097,12 +2102,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
   const client = await requireClient(request, runtime);
   const payload = parseJsonBody(await request.text());
   const translated = translateAnthropicMessagesRequest(payload);
-  const resolvedModel = await resolveAuthorizedClientModel(client, runtime, translated.model, request, payload);
-  translated.seed.model = publicModelId(client, runtime, translated.model, resolvedModel);
-  if (resolvedModel !== translated.model) {
-    translated.model = resolvedModel;
-    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
-  }
+  await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
 
   if (translated.stream) {
     const headers = new Headers(CORS_HEADERS);
@@ -2199,9 +2199,17 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
       completionTokens: 0,
       extra: { trace_id: traceId, tools_count: translated.toolsCount },
     }), ctx);
-    const headers = new Headers(JSON_HEADERS);
-    if (traceId) headers.set("x-llm-gateway-trace-id", traceId);
-    return anthropicErrorResponse(error.message || "Internal error.", error.statusCode || 500, headers);
+    return anthropicGatewayErrorResponse(error, traceId);
+  }
+}
+
+async function resolveTranslatedRequestModel(client, runtime, translated, request, payload) {
+  const requestedModel = translated.model;
+  const resolvedModel = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+  translated.seed.model = publicModelId(client, runtime, requestedModel, resolvedModel);
+  translated.model = resolvedModel;
+  if (resolvedModel !== requestedModel) {
+    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
   }
 }
 
@@ -2434,6 +2442,12 @@ function anthropicErrorResponse(message, status = 500, headers = new Headers()) 
   });
 }
 
+function anthropicGatewayErrorResponse(error, traceId) {
+  const headers = new Headers(CORS_HEADERS);
+  if (traceId) headers.set("x-llm-gateway-trace-id", traceId);
+  return anthropicErrorResponse(error?.message || "Internal error.", error?.statusCode || 500, headers);
+}
+
 async function anthropicUpstreamErrorResponse(upstreamResp, headers) {
   const text = await upstreamResp.text().catch(() => "");
   const payload = safeJson(text);
@@ -2470,12 +2484,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const client = await requireClient(request, runtime);
   const payload = parseJsonBody(await request.text());
   const translated = translateResponsesRequest(payload);
-  const resolvedModel = await resolveAuthorizedClientModel(client, runtime, translated.model, request, payload);
-  translated.seed.model = publicModelId(client, runtime, translated.model, resolvedModel);
-  if (resolvedModel !== translated.model) {
-    translated.model = resolvedModel;
-    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
-  }
+  await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
 
   try {
     const proxyResponse = await proxyRequest({

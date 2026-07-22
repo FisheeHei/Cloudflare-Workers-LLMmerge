@@ -13,15 +13,18 @@ ${renderAdminStyle()}${renderAdminMarkup(origin, version)}${renderAdminScript(ve
 function renderAdminStyle() {
   return `  <style>
     :root {
-      --bg: #f5f1e8;
-      --panel: #fffdf8;
-      --ink: #1f2937;
-      --muted: #6b7280;
-      --line: #d7c7aa;
-      --accent: #a54d2d;
-      --accent-2: #2f6f5e;
-      --bg-raised: #fff9ef;
-      --fg: #1f2937;
+      --bg: #eef2f7;
+      --panel: #ffffff;
+      --ink: #1e293b;
+      --muted: #64748b;
+      --line: #dbe3ed;
+      --accent: #2563eb;
+      --accent-2: #0f766e;
+      --bg-raised: #f8fafc;
+      --fg: #1e293b;
+      --sidebar: #172033;
+      --sidebar-line: #2b3850;
+      --sidebar-muted: #aebbd0;
     }
     * { box-sizing: border-box; }
     body {
@@ -31,34 +34,77 @@ function renderAdminStyle() {
       font: 15px/1.5 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
     }
     html, body { overflow-x: hidden; }
-    .wrap { width: min(1680px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 48px; }
+    .app-shell { min-height: 100vh; display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+    .sidebar {
+      position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column;
+      padding: 20px 14px; background: var(--sidebar); color: white; overflow-y: auto;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 2px 8px; }
+    .brand-mark {
+      display: grid; place-items: center; width: 34px; height: 34px; border-radius: 8px;
+      background: #3b82f6; color: white; font-weight: 800; font-size: 13px;
+    }
+    .brand-name { display: block; font-weight: 700; line-height: 1.2; }
+    .brand-caption { display: block; margin-top: 2px; color: var(--sidebar-muted); font-size: 11px; }
+    .sidebar-label {
+      display: block; margin: 28px 8px 8px; color: #7787a1; font-size: 11px;
+      font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    }
+    .sidebar-nav { display: grid; gap: 4px; scrollbar-width: none; }
+    .sidebar-nav::-webkit-scrollbar { display: none; }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 8px 10px;
+      border: 1px solid transparent; border-radius: 7px; color: var(--sidebar-muted);
+      text-decoration: none; font-size: 13px; font-weight: 600;
+    }
+    .nav-item:hover, .nav-item.active { background: #263653; border-color: var(--sidebar-line); color: white; }
+    .nav-icon { width: 18px; color: #8fb8ff; text-align: center; font-size: 15px; }
+    .sidebar-footer { margin-top: auto; padding: 16px 8px 4px; color: #7787a1; font-size: 11px; line-height: 1.7; }
+    .sidebar-version { display: block; color: var(--sidebar-muted); font-family: Consolas, monospace; word-break: break-all; }
+    .main-shell { min-width: 0; }
+    .topbar {
+      position: sticky; top: 0; z-index: 30; min-height: 68px; display: flex; align-items: center;
+      justify-content: space-between; gap: 16px; padding: 12px 32px; background: rgba(255,255,255,.94);
+      border-bottom: 1px solid var(--line); backdrop-filter: blur(12px);
+    }
+    .topbar-heading { display: grid; gap: 2px; }
+    .topbar-eyebrow { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .topbar-title { font-size: 17px; font-weight: 700; }
+    .topbar-actions { display: flex; align-items: center; gap: 10px; }
+    .topbar-badge { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .topbar-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; }
+    .topbar-badge.online::before { background: #22c55e; }
+    .wrap { width: min(1680px, calc(100% - 48px)); margin: 0 auto; padding: 24px 0 48px; }
     .wrap > * { min-width: 0; }
+    .page-view { min-width: 0; }
+    .page-view[hidden] { display: none !important; }
 
     .hero, .panel {
-      background: rgba(255,253,248,.94);
+      background: var(--panel);
       border: 1px solid var(--line);
-      box-shadow: 0 18px 40px rgba(38,28,18,.08);
-      backdrop-filter: blur(8px);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(15,23,42,.05);
       margin-bottom: 18px;
     }
-    .hero { padding: 24px; }
-    .hero h1 { margin: 0 0 10px; font: 700 30px/1.15 Georgia, serif; }
+    .hero { padding: 24px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .hero-copy { min-width: 0; }
+    .hero-kicker { display: block; margin-bottom: 7px; color: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .hero h1 { margin: 0 0 8px; font-size: 28px; line-height: 1.15; }
     .hero-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .hero code {
-      background: #f2e7d3; padding: 4px 10px; border-radius: 8px;
+      background: #eff6ff; padding: 4px 10px; border-radius: 6px;
       font-size: 14px; word-break: break-all;
     }
-    .gateway-urls { margin-top: 12px; }
+    .gateway-urls { flex: 0 1 560px; margin-top: 0; }
     .url-card {
       border: 1px solid var(--line);
-      background: rgba(255,253,248,.7); border-radius: 14px; padding: 14px;
-      max-width: 520px; overflow: hidden;
+      background: var(--bg-raised); border-radius: 8px; padding: 14px; overflow: hidden;
     }
     .url-card .url-card-head { font-weight: 600; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
     .url-card code { display: block; margin-bottom: 8px; }
     .url-card button { margin-right: 6px; }
-    .panel { padding: 20px; min-width: 0; }
-    .panel h2 { margin: 0 0 14px; font: 700 20px/1.2 Georgia, serif; }
+    .panel { padding: 20px; min-width: 0; scroll-margin-top: 88px; }
+    .panel h2 { margin: 0 0 14px; font-size: 19px; line-height: 1.2; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -68,7 +114,7 @@ function renderAdminStyle() {
     .menu {
       position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
       display: none; min-width: 150px; max-height: min(52vh, 320px); overflow-y: auto; padding: 6px;
-      background: #fffdfa; border: 1px solid #cfbea0; border-radius: 12px;
+      background: #fff; border: 1px solid var(--line); border-radius: 8px;
       box-shadow: 0 12px 24px rgba(38,28,18,.12);
       overscroll-behavior: contain;
     }
@@ -85,12 +131,12 @@ function renderAdminStyle() {
     button:active { transform: translateY(1px); }
     button[disabled] { opacity: .55; cursor: wait; }
     button.small { padding: 6px 12px; font-size: 12px; }
-    button.secondary { background: #eadcc5; color: #3a2b1f; }
+    button.secondary { background: #e8eef6; color: #334155; }
     button.good { background: var(--accent-2); }
     button.danger { background: #8d2f23; }
 
     input, textarea, select {
-      width: 100%; border: 1px solid #cdbda2; background: #fffdfa;
+      width: 100%; border: 1px solid #cbd5e1; background: #fff;
       color: var(--ink); border-radius: 10px; padding: 9px 12px; font: inherit;
     }
     input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent-2); flex: 0 0 auto; }
@@ -109,17 +155,17 @@ function renderAdminStyle() {
     .span-3 { grid-column: span 3; }
 
     .upstream-card {
-      border: 1px solid #cfbea0; background: #fff9ef;
+      border: 1px solid var(--line); background: #f8fafc;
       border-radius: 16px; margin-bottom: 10px; overflow: hidden;
     }
     .upstream-group {
-      border: 1px solid #cfbea0; border-radius: 14px; background: #fffdf8;
+      border: 1px solid var(--line); border-radius: 8px; background: #fff;
       margin-bottom: 12px; overflow: hidden;
     }
     .upstream-group > summary {
       cursor: pointer; list-style: none; user-select: none;
       display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      padding: 10px 14px; background: #eadcc5; color: #3a2b1f; font-weight: 700;
+      padding: 10px 14px; background: #f1f5f9; color: #334155; font-weight: 700;
     }
     .upstream-group-active { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
     .upstream-group > summary::-webkit-details-marker { display: none; }
@@ -138,7 +184,7 @@ function renderAdminStyle() {
     }
     .upstream-card[open] summary::before { transform: rotate(90deg); }
     .upstream-card summary .card-badge {
-      background: #eadcc5; color: #3a2b1f; padding: 3px 10px;
+      background: #e8eef6; color: #334155; padding: 3px 10px;
       border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
     }
     .upstream-status-emoji { width: 22px; text-align: center; font-size: 16px; line-height: 1; }
@@ -152,7 +198,7 @@ function renderAdminStyle() {
     .health-dot.checking { background: #f59e0b; animation: pulse .6s ease infinite alternate; }
     @keyframes pulse { to { opacity: .4; } }
     .capability-badge {
-      background: #e0d5c0; color: #3a2b1f; padding: 2px 8px;
+      background: #e8eef6; color: #334155; padding: 2px 8px;
       border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap;
     }
     .upstream-card summary .card-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
@@ -171,8 +217,8 @@ function renderAdminStyle() {
 
     .client-item {
       display: flex; align-items: center; gap: 12px;
-      padding: 10px 14px; border: 1px solid #cfbea0;
-      background: #fff9ef; border-radius: 12px; margin-bottom: 8px;
+      padding: 10px 14px; border: 1px solid var(--line);
+      background: #f8fafc; border-radius: 8px; margin-bottom: 8px;
     }
     .client-item .client-meta { flex: 1; min-width: 0; }
     .client-item .client-meta strong { display: block; }
@@ -268,21 +314,17 @@ function renderAdminStyle() {
     .picker-actions { display: flex; gap: 10px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 14px; }
     .picker-actions button.small { padding: 7px 13px; font-size: 13px; }
     @media (min-width: 980px) {
-      .wrap {
-        display: grid; grid-template-columns: repeat(12, minmax(0, 1fr));
-        gap: 16px; width: min(1680px, calc(100vw - 40px)); padding: 20px 0 40px;
-      }
-      .wrap > .hero, .wrap > footer { grid-column: 1 / -1; }
-      .wrap > .panel { margin-bottom: 0; padding: 16px; }
-      .hero { display: grid; grid-template-columns: minmax(240px, .7fr) minmax(0, 1.3fr); gap: 24px; align-items: center; }
+      .wrap { width: min(1680px, calc(100% - 48px)); padding: 20px 0 40px; }
+      .page-view { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; align-items: start; }
+      .page-view > .hero { grid-column: 1 / -1; margin-bottom: 0; }
+      .page-view > .panel { margin-bottom: 0; padding: 16px; }
+      .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
       .url-card { max-width: none; }
-      #stats-panel { grid-column: 1 / span 4; grid-row: 2; }
-      #client-panel { grid-column: 1 / span 4; grid-row: 3; }
-      #upstream-panel { grid-column: 5 / -1; grid-row: 2; }
-      #settings-panel { grid-column: 5 / -1; grid-row: 3; }
-      #log-panel { grid-column: 1 / -1; grid-row: 4; }
-      #request-log-panel { grid-column: 1 / -1; grid-row: 5; }
+      #view-overview #stats-panel { grid-column: 1 / span 5; }
+      [data-view="overview"] #log-panel, [data-view="overview"] #request-log-panel { grid-column: 1 / -1; }
+      #view-upstreams #upstream-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
+      #view-clients #client-panel { grid-column: 1 / span 8; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
       .upstream-card summary { padding: 11px 12px; gap: 9px; }
       .upstream-card .card-body { padding: 0 12px 12px; }
@@ -346,11 +388,29 @@ function renderAdminStyle() {
     .log-badge { display: inline-block; width: 28px; text-align: center; border-radius: 4px; font-size: 11px; font-weight: 700; padding: 2px 0; }
     .log-badge.ok { background: #065f4620; color: var(--accent-2); }
     .log-badge.err { background: #8d2f2320; color: #8d2f23; }
+    @media (min-width: 701px) and (max-width: 900px) {
+      .app-shell { display: block; }
+      .sidebar { position: static; height: auto; padding: 12px 16px; }
+      .sidebar-label, .sidebar-footer { display: none; }
+      .sidebar-nav { display: flex; gap: 4px; margin-top: 12px; overflow-x: auto; padding-bottom: 2px; }
+      .nav-item { flex: 0 0 auto; min-height: 34px; padding: 7px 10px; }
+      .topbar { position: static; padding: 10px 24px; }
+    }
     @media (max-width: 700px) {
       .wrap { width: min(100%, calc(100vw - 12px)); padding: 8px 0 28px; }
       .hero, .panel { margin-bottom: 10px; }
       .hero, .panel, .modal-card { padding: 14px; }
       .hero h1 { font-size: 24px; }
+      .app-shell { display: block; }
+      .sidebar { position: static; height: auto; padding: 12px; }
+      .sidebar-label, .sidebar-footer { display: none; }
+      .sidebar-nav { display: flex; gap: 4px; margin-top: 12px; overflow-x: auto; padding-bottom: 2px; }
+      .nav-item { flex: 0 0 auto; min-height: 34px; padding: 7px 10px; }
+      .topbar { position: static; min-height: 60px; padding: 10px 14px; }
+      .topbar-badge { display: none; }
+      .wrap { width: min(100%, calc(100vw - 12px)); }
+      .hero { align-items: stretch; flex-direction: column; gap: 16px; }
+      .gateway-urls { flex: none; }
       .url-card { max-width: 100%; }
       .toolbar { align-items: stretch; }
       .toolbar h2 { flex-basis: 100%; }
@@ -360,7 +420,8 @@ function renderAdminStyle() {
       .menu { position: static; width: 100%; margin-top: 6px; box-shadow: none; }
       .row { grid-template-columns: 1fr; }
       .span-3, .span-4, .span-6, .span-12 { grid-column: 1; }
-      .stats-grid, .stats-grid-2col { grid-template-columns: 1fr; }
+      .stats-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .stats-grid-2col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .upstream-card summary { align-items: flex-start; gap: 8px; }
       .upstream-card summary strong { flex-basis: calc(100% - 32px); white-space: normal; }
       .upstream-card summary .card-meta { white-space: normal; }
@@ -384,9 +445,41 @@ function renderAdminMarkup(origin, version) {
   return `
 </head>
 <body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">LM</span>
+      <span><span class="brand-name">LLM Merge</span><span class="brand-caption">Gateway Console</span></span>
+    </div>
+    <span class="sidebar-label">Workspace</span>
+    <nav class="sidebar-nav" aria-label="管理导航">
+      <a class="nav-item active" href="#overview" data-view-target="overview"><span class="nav-icon">⌂</span><span>总览</span></a>
+      <a class="nav-item" href="#upstreams" data-view-target="upstreams"><span class="nav-icon">⇄</span><span>上游配置</span></a>
+      <a class="nav-item" href="#clients" data-view-target="clients"><span class="nav-icon">⌁</span><span>客户端 Keys</span></a>
+      <a class="nav-item" href="#settings" data-view-target="settings"><span class="nav-icon">⚙</span><span>高级设置</span></a>
+    </nav>
+    <div class="sidebar-footer">
+      <span class="sidebar-version">${version}</span>
+      <span>OpenAI + Claude Compatible</span>
+    </div>
+  </aside>
+
+  <main class="main-shell">
+    <header class="topbar">
+      <div class="topbar-heading">
+        <span class="topbar-eyebrow">LLM MERGE / ADMIN</span>
+        <span class="topbar-title">Gateway Console</span>
+      </div>
+      <div class="topbar-actions"><span class="topbar-badge" id="topbar-status">Connecting</span></div>
+    </header>
+
 <div class="wrap">
-  <div class="hero">
-    <h1>LLM Gateway</h1>
+  <section class="page-view" id="view-overview" data-view="overview">
+  <div class="hero" id="gateway-overview">
+    <div class="hero-copy">
+      <span class="hero-kicker">Control plane</span>
+      <h1>LLM Gateway</h1>
+    </div>
     <div class="gateway-urls">
       <div class="url-card">
         <div class="url-card-head">Gateway URL <span class="note">(OpenAI + Claude Compatible)</span></div>
@@ -422,6 +515,8 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
+  </section>
+  <section class="page-view" id="view-clients" data-view="clients" hidden>
   <div class="panel" id="client-panel">
     <h2>\u5ba2\u6237\u7aef Keys</h2>
     <div id="client-list"></div>
@@ -439,6 +534,8 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
+  </section>
+  <section class="page-view" id="view-upstreams" data-view="upstreams" hidden>
   <div class="panel" id="upstream-panel">
     <div class="toolbar">
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
@@ -461,6 +558,8 @@ function renderAdminMarkup(origin, version) {
     <input type="file" id="import-upstreams-file" accept=".json,application/json" hidden>
   </div>
 
+  </section>
+  <section class="page-view" id="view-activity" data-view="overview">
   <div class="panel" id="log-panel">
     <div class="toolbar">
       <h2>\u8c03\u7528\u65e5\u5fd7</h2>
@@ -469,8 +568,17 @@ function renderAdminMarkup(origin, version) {
     </div>
     <div id="log-list"><div class="note">\u52a0\u8f7d\u4e2d...</div></div>
   </div>
+  <div class="panel" id="request-log-panel">
+    <div class="toolbar">
+      <h2>\u8bf7\u6c42\u65e5\u5fd7</h2>
+      <button class="small secondary" id="load-logs">\u5237\u65b0</button>
+    </div>
+    <div class="live-log" id="live-log"></div>
+  </div>
 
 
+  </section>
+  <section class="page-view" id="view-settings" data-view="settings" hidden>
   <details class="panel settings-panel" id="settings-panel">
     <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
     <div class="settings-body">
@@ -505,19 +613,16 @@ function renderAdminMarkup(origin, version) {
     </div>
   </details>
 
-  <div class="panel" id="request-log-panel">
-    <div class="toolbar">
-      <h2>请求日志</h2>
-      <button class="small secondary" id="load-logs">刷新</button>
-    </div>
-    <div class="live-log" id="live-log"></div>
-  </div>
+  </section>
 
   <footer style="text-align:center;padding:24px 0;color:var(--muted);font-size:13px;">
     ${version} ·
     <a href="https://github.com/FisheeHei/Cloudflare-Workers-LLMmerge" style="color:var(--accent);">FisheeHei/Cloudflare-Workers-LLMmerge</a>
     · by FisheeHei
   </footer>
+</div>
+
+  </main>
 </div>
 
 <div id="toast"></div>
@@ -666,6 +771,26 @@ function renderAdminScript(version) {
   const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all" };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
+  let liveRefreshRunning = false;
+
+  function setupAdminNav() {
+    const links = [...document.querySelectorAll("[data-view-target]")];
+    const views = [...document.querySelectorAll("[data-view]")];
+    const showView = (name, updateHash) => {
+      const selected = views.some((view) => view.dataset.view === name) ? name : "overview";
+      views.forEach((view) => { view.hidden = view.dataset.view !== selected; });
+      links.forEach((link) => link.classList.toggle("active", link.dataset.viewTarget === selected));
+      if (selected === "settings") byId("settings-panel").open = true;
+      if (updateHash) history.replaceState(null, "", "#" + selected);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    };
+    links.forEach((link) => link.addEventListener("click", (event) => {
+      event.preventDefault();
+      showView(link.dataset.viewTarget, true);
+    }));
+    window.addEventListener("hashchange", () => showView(location.hash.slice(1), false));
+    showView(location.hash.slice(1), false);
+  }
 
   function splitList(value) { return text(value).split(/[,\\n]/).map((s) => s.trim()).filter(Boolean); }
   function esc(value) { return text(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
@@ -1190,7 +1315,6 @@ function renderAdminScript(version) {
     state.gateway = payload.gateway || {};
     renderSettings();
     renderUpstreams();
-    loadRuntimeStatus().catch(function(){});
   }
 
   async function saveConfig() {
@@ -1566,6 +1690,11 @@ function renderAdminScript(version) {
     const resp = await fetch(API_BASE + "/runtime");
     const payload = await parseApiResponse(resp);
     if (!resp.ok) return;
+    const topbarStatus = byId("topbar-status");
+    if (topbarStatus) {
+      topbarStatus.textContent = "Gateway online";
+      topbarStatus.classList.add("online");
+    }
     const active = payload.active_upstreams || {};
     const last = payload.last_successful_upstream || "";
     document.querySelectorAll(".upstream-status-emoji").forEach(function(el) {
@@ -1605,6 +1734,21 @@ function renderAdminScript(version) {
       }
       el.title = seconds + "s \u540e\u6e05\u96f6";
     });
+  }
+
+  async function refreshLivePanels() {
+    if (liveRefreshRunning || document.visibilityState !== "visible") return;
+    liveRefreshRunning = true;
+    try {
+      const statsPanel = byId("stats-panel");
+      const logPanel = byId("log-panel");
+      const tasks = [loadRuntimeStatus()];
+      if (!statsPanel || statsPanel.offsetParent !== null) tasks.push(loadStats(true));
+      if (!logPanel || logPanel.offsetParent !== null) tasks.push(loadLogs());
+      await Promise.all(tasks.map((task) => task.catch(function(){})));
+    } finally {
+      liveRefreshRunning = false;
+    }
   }
 
   function updateUpstreamGroupActive(active) {
@@ -2459,23 +2603,18 @@ function renderAdminScript(version) {
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
       await Promise.all([loadConfig(), loadClients()]);
       if (bootSpan.parentNode) bootSpan.remove();
-      loadRuntimeStatus().catch(function(){});
-      loadStats(true).catch(function(){}); // ponytail: don't block boot on stats
-      loadLogs().catch(function(){});  // don't block on logs either
-      // ponytail: AE path is cheap enough; only refresh visible panels.
-      var statsPanel = byId("stats-panel");
-      var logPanel = byId("log-panel");
-      setInterval(function() {
-        if (document.visibilityState !== "visible") return;
-        var statsVisible = !statsPanel || statsPanel.offsetParent !== null;
-        var logVisible = !logPanel || logPanel.offsetParent !== null;
-        if (statsVisible) loadStats(true).catch(function(){});
-        if (logVisible) loadLogs().catch(function(){});
-      }, 2000);
-      setInterval(function() { if (document.visibilityState === "visible") loadRuntimeStatus().catch(function(){}); }, 2000);
+      refreshLivePanels();
+      // ponytail: one guarded poll prevents slow AE queries from piling up.
+      setInterval(refreshLivePanels, 2000);
 
 
     } catch (error) {
+      if (bootSpan?.parentNode) bootSpan.remove();
+      const topbarStatus = byId("topbar-status");
+      if (topbarStatus) {
+        topbarStatus.textContent = "Configuration error";
+        topbarStatus.classList.remove("online");
+      }
       showError(error);
       // ponytail: visible fallback so user sees something is wrong
       var hero = document.querySelector('.hero');
@@ -2488,6 +2627,7 @@ function renderAdminScript(version) {
     }
   }
 
+  setupAdminNav();
   boot();
 </script>`;
 }
