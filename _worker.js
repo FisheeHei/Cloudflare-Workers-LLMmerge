@@ -43,7 +43,8 @@ const STDTIME_URL = "https://stdtime.gov.hk/";
 const STDTIME_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
-const SSE_KEEPALIVE_MS = 15000;
+// Keep the SSE connection visibly active through an additional proxy layer.
+const SSE_KEEPALIVE_MS = 5000;
 const SSE_FINISH_GRACE_MS = 1000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
@@ -52,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-22-anthropic-524-failover";
+const VERSION = "v26-07-22-anthropic-502-stream-guard";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -2994,6 +2995,9 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       });
     } catch (error) {
       closeReason = "error";
+      // Never expose a provider reset as a raw errored response body. Outer
+      // Cloudflare proxies can otherwise replace the stream with HTTP 502.
+      try { await stopOpenBlocks(); } catch {}
       await write("error", { type: "error", error: { type: "api_error", message: error.message || "Stream error." } });
       if (onDone) onDone(normalizeAnthropicUsage(usage, [{ text: outputText }]), {
         close_reason: closeReason,

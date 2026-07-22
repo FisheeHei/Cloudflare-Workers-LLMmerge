@@ -240,6 +240,15 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "text/event-stream" },
     });
   }
+  if (String(url).includes("anthropic-reset.example")) {
+    const encoder = new TextEncoder();
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+        setTimeout(() => controller.error(new Error("CANCEL")), 5);
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
   if (String(url).includes("cloudflare-524.example")) {
     cloudflare524Hits.push(JSON.parse(init.body));
     return new Response(JSON.stringify({ title: "Error 524: A timeout occurred", status: 524, detail: "origin_response_timeout" }), {
@@ -1774,6 +1783,7 @@ anthropicStore.set("gateway:config", JSON.stringify({
     { name: "anthropic-stream", base_url: "https://anthropic-stream.example/v1", api_key_encrypted: "s", models: ["anthropic-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "anthropic-delayed", base_url: "https://anthropic-delayed.example/v1", api_key_encrypted: "d", models: ["anthropic-delayed-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "anthropic-stream-error", base_url: "https://anthropic-stream.example/v1", api_key_encrypted: "e", models: ["anthropic-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "anthropic-reset", base_url: "https://anthropic-reset.example/v1", api_key_encrypted: "r", models: ["anthropic-reset-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const anthropicEnv = {
@@ -1786,7 +1796,7 @@ const anthropicEnv = {
     async put(key, value) { anthropicStore.set(key, value); },
     async delete(key) { anthropicStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "anthropic-client", key: "sk-anthropic", models: ["*"], upstreams: ["anthropic", "anthropic-stream", "anthropic-delayed", "anthropic-stream-error"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "anthropic-client", key: "sk-anthropic", models: ["*"], upstreams: ["anthropic", "anthropic-stream", "anthropic-delayed", "anthropic-stream-error", "anthropic-reset"] }]),
 };
 const delayedAnthropicPromise = worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
@@ -1918,6 +1928,16 @@ const anthropicErrorResp = await worker.default.fetch(new Request("https://gw.te
 const anthropicErrorText = await anthropicErrorResp.text();
 assert.equal(anthropicErrorText.includes("event: error"), true, anthropicErrorText);
 assert.equal(anthropicErrorText.includes("event: message_stop"), false);
+
+const anthropicResetResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "anthropic-reset-model", max_tokens: 8, messages: [{ role: "user", content: "hi" }], stream: true }),
+}), anthropicEnv);
+assert.equal(anthropicResetResp.status, 200);
+const anthropicResetText = await anthropicResetResp.text();
+assert.equal(anthropicResetText.includes('"text":"partial"'), true);
+assert.equal(anthropicResetText.includes("event: error"), true, anthropicResetText);
 
 const paymentStore = new Map();
 paymentStore.set("gateway:config", JSON.stringify({
