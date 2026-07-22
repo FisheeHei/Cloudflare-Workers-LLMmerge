@@ -373,8 +373,9 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("speed-fast.example")) {
     speedHits.push("fast");
-    speedBodies.push(JSON.parse(init.body));
-    return new Response(JSON.stringify({ id: "fast", choices: [{ message: { content: "ok" } }] }), {
+    const body = JSON.parse(init.body);
+    speedBodies.push(body);
+    return new Response(JSON.stringify({ id: "fast", model: body.model, choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -1053,6 +1054,7 @@ const aliasChatResp = await worker.default.fetch(new Request("https://gw.test/v1
 assert.equal(aliasChatResp.headers.get("x-llm-gateway-upstream"), "nim-alias");
 assert.equal(aliasChatResp.headers.get("x-llm-gateway-trace-id"), "trace-alias");
 assert.equal(speedBodies[aliasBodyStart].model, "deepseek-ai/deepseek-v4-flash");
+assert.equal((await aliasChatResp.clone().json()).model, "nvidia-nim/deepseek-v4-flash");
 
 const qwenBodyStart = speedBodies.length;
 const qwenChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {

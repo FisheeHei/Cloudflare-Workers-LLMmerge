@@ -53,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-22-anthropic-502-stream-guard";
+const VERSION = "v26-07-22-client-model-alias-guard";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -170,6 +170,7 @@ export default {
           ctx,
           headers,
           model,
+          responseModel: requestedModel,
           pathname,
           requestPayload: payload,
           proxyResponse,
@@ -653,7 +654,7 @@ ORDER BY hour ASC
   return buckets;
 }
 
-async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
+async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, responseModel = model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
   const toolsCount = requestToolsCount(requestPayload);
   const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
@@ -700,7 +701,8 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
     }
     const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
     log(usage, 0, { finish_reason: responseFinishReason(payload), tool_calls_count: responseToolCallsCount(payload) });
-    return new Response(textBody, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    payload.model = responseModel;
+    return new Response(JSON.stringify(payload), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
   log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 });
@@ -2069,7 +2071,6 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
   const resolvedModel = await resolveAuthorizedClientModel(client, runtime, translated.model, request, payload);
   if (resolvedModel !== translated.model) {
     translated.model = resolvedModel;
-    translated.seed.model = resolvedModel;
     translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
   }
 
@@ -2332,7 +2333,7 @@ function openAiChatToAnthropicMessage(openaiPayload, seed) {
     id: seed.id,
     type: "message",
     role: "assistant",
-    model: openaiPayload?.model || seed.model,
+    model: seed.model,
     content,
     stop_reason: openAiFinishToAnthropicStop(choice.finish_reason),
     stop_sequence: null,
