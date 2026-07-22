@@ -380,6 +380,12 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("stream-alias.example")) {
+    return new Response([
+      'data: {"model":"deepseek-ai/deepseek-v4-flash","choices":[{"delta":{"content":"ok"}}]}\n\n',
+      "data: [DONE]\n\n",
+    ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
   if (String(url).includes("slow-first-byte.example")) {
     await new Promise((resolve) => setTimeout(resolve, 30));
     if (init.signal?.aborted) throw new Error("aborted before first byte");
@@ -1032,7 +1038,10 @@ const aliasEnv = {
     async put(key, value) { aliasStore.set(key, value); },
     async delete(key) { aliasStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "alias-client", key: "sk-alias", models: ["*"], upstreams: ["nim-alias", "cf-alias"] }]),
+  CLIENTS_JSON: JSON.stringify([
+    { name: "alias-client", key: "sk-alias", models: ["*"], upstreams: ["nim-alias", "cf-alias"] },
+    { name: "nim-suffix-client", key: "sk-nim-suffix", models: ["*"], upstreams: ["nim-alias"] },
+  ]),
 };
 const aliasModelsResp = await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: "Bearer sk-alias" },
@@ -1055,6 +1064,59 @@ assert.equal(aliasChatResp.headers.get("x-llm-gateway-upstream"), "nim-alias");
 assert.equal(aliasChatResp.headers.get("x-llm-gateway-trace-id"), "trace-alias");
 assert.equal(speedBodies[aliasBodyStart].model, "deepseek-ai/deepseek-v4-flash");
 assert.equal((await aliasChatResp.clone().json()).model, "nvidia-nim/deepseek-v4-flash");
+
+const rawModelChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash", messages: [] }),
+}), aliasEnv);
+assert.equal((await rawModelChatResp.json()).model, "nvidia-nim/deepseek-v4-flash");
+
+const suffixModelChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-suffix", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-flash", messages: [] }),
+}), aliasEnv);
+const suffixModelPayload = await suffixModelChatResp.json();
+assert.equal(suffixModelPayload.model, "nvidia-nim/deepseek-v4-flash", JSON.stringify({ status: suffixModelChatResp.status, payload: suffixModelPayload }));
+
+const rawModelResponsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash", input: "hi" }),
+}), aliasEnv);
+assert.equal((await rawModelResponsesResp.json()).model, "nvidia-nim/deepseek-v4-flash");
+
+const rawModelAnthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-alias", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+}), aliasEnv);
+assert.equal((await rawModelAnthropicResp.json()).model, "nvidia-nim/deepseek-v4-flash");
+
+const streamAliasStore = new Map();
+streamAliasStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [{ name: "nim-stream-alias", preset: "nvidia-nim", base_url: "https://stream-alias.example/v1", api_key_encrypted: "n", models: ["deepseek-ai/deepseek-v4-flash"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true }],
+}));
+const streamAliasEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = streamAliasStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { streamAliasStore.set(key, value); },
+    async delete(key) { streamAliasStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "stream-alias-client", key: "sk-stream-alias", models: ["*"], upstreams: ["nim-stream-alias"] }]),
+};
+const rawModelStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-stream-alias", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash", messages: [], stream: true }),
+}), streamAliasEnv);
+const rawModelStreamText = await rawModelStreamResp.text();
+assert.equal(rawModelStreamText.includes('"model":"nvidia-nim/deepseek-v4-flash"'), true);
+assert.equal(rawModelStreamText.includes('"model":"deepseek-ai/deepseek-v4-flash"'), false);
 
 const qwenBodyStart = speedBodies.length;
 const qwenChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -1999,6 +2061,10 @@ const appErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/
 }), appErrorEnv);
 assert.equal(appErrorHits.length, appErrorHitStart + 1);
 assert.equal(appErrorResp.headers.get("x-llm-gateway-upstream"), "app-fallback");
+await appErrorResp.text();
+const appErrorRuntime = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), appErrorEnv)).json();
+assert.equal(appErrorRuntime.active_upstreams["app-error"], undefined);
+assert.equal(appErrorRuntime.active_upstreams["app-fallback"], undefined);
 const appErrorSpeed = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
   method: "POST",
   headers: { "content-type": "application/json" },

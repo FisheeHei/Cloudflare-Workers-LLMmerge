@@ -53,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-22-client-model-alias-guard";
+const VERSION = "v26-07-22-stream-lifecycle-hardening";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -130,6 +130,7 @@ export default {
           );
         }
         const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+        const publicModel = publicModelId(client, runtime, requestedModel, model);
         const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
 
         const started = Date.now();
@@ -170,7 +171,7 @@ export default {
           ctx,
           headers,
           model,
-          responseModel: requestedModel,
+          responseModel: publicModel,
           pathname,
           requestPayload: payload,
           proxyResponse,
@@ -684,7 +685,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   }
   if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
     setSseHeaders(headers);
-    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started));
+    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : ""));
     return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -709,7 +710,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
 }
 
-function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now()) {
+function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "") {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const doneChunk = encoder.encode("data: [DONE]\n\n");
@@ -723,6 +724,18 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   let closeReason = "done";
   let finishReason = "";
   let sawDone = false;
+  const rewriteModel = Boolean(responseModel);
+  const emitRewritten = (controller, now = Date.now()) => {
+    let output = "";
+    buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
+      noteChunk(chunk, now);
+      output += `data: ${JSON.stringify({ ...chunk, model: responseModel })}\n\n`;
+    }, () => {
+      sawDone = true;
+      output += "data: [DONE]\n\n";
+    });
+    if (output) controller.enqueue(encoder.encode(output));
+  };
   const noteChunk = (chunk, now = Date.now()) => {
     if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
     usage = chunk.usage || usage;
@@ -766,11 +779,19 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
           const now = Date.now();
           noteStreamByte(diag, now);
           buffer += decoder.decode(value, { stream: true });
-          buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk, now), () => { sawDone = true; });
-          controller.enqueue(value);
+          if (rewriteModel) {
+            emitRewritten(controller, now);
+          } else {
+            buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk, now), () => { sawDone = true; });
+            controller.enqueue(value);
+          }
           if (sawDone) break;
         }
-        if (buffer) consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => noteChunk(chunk), () => { sawDone = true; });
+        if (buffer) {
+          buffer += "\n\n";
+          if (rewriteModel) emitRewritten(controller);
+          else consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk), () => { sawDone = true; });
+        }
         finish();
         controller.close();
       } catch (error) {
@@ -1658,10 +1679,8 @@ async function requireClient(request, runtime) {
 }
 
 async function listModels(client, runtime) {
-  const allResults = routeModelRows(runtime)
-    .filter((row) => clientAllowsUpstream(client, row.upstream.name));
-
-  const rows = aliasRowsForModels(allResults)
+  const rows = modelRegistryRows(runtime)
+    .filter((row) => clientAllowsUpstream(client, row.upstream.name))
     .filter((row) => clientAllowsModelSelection(client, row.alias, row.model))
     .map((row) => ({
       id: row.alias,
@@ -1682,18 +1701,22 @@ async function listModels(client, runtime) {
 async function resolveClientModelAlias(client, runtime, model) {
   const value = String(model || "").trim();
   if (!value || value.includes("@cf/")) return value;
-  if (value.includes("/") || isLooseAliasModel(value)) {
-    const allResults = routeModelRows(runtime)
-      .filter((row) => clientAllowsUpstream(client, row.upstream.name));
-    const rows = aliasRowsForModels(allResults);
-    const hit = rows.find((row) => row.alias === value || row.model === value);
-    if (hit) return hit.model;
-    const fuzzy = rows.filter((row) =>
-      isLooseAliasModel(row.model) && (modelsMatch(value, row.alias) || modelsMatch(value, row.model))
-    );
-    if (fuzzy.length === 1) return fuzzy[0].model;
-  }
+  const rows = modelRegistryRows(runtime).filter((row) => clientAllowsUpstream(client, row.upstream.name));
+  const hit = rows.find((row) => row.alias === value || row.model === value);
+  if (hit) return hit.model;
+  const fuzzy = rows.filter((row) =>
+    modelsMatch(value, row.alias) || modelsMatch(value, row.model) ||
+    (!value.includes("/") && modelSuffix(value).toLowerCase() === modelSuffix(row.alias).toLowerCase())
+  );
+  if (fuzzy.length === 1) return fuzzy[0].model;
   return value;
+}
+
+function publicModelId(client, runtime, requestedModel, resolvedModel = requestedModel) {
+  const value = String(requestedModel || "").trim();
+  const rows = modelRegistryRows(runtime).filter((row) => clientAllowsUpstream(client, row.upstream.name));
+  const hit = rows.find((row) => row.alias === value) || rows.find((row) => row.model === resolvedModel);
+  return hit?.alias || value;
 }
 
 async function resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload) {
@@ -1761,6 +1784,12 @@ function routeModelRows(runtime) {
       .map((model) => ({ model, upstream }))
   );
   return runtime._routeModelRows;
+}
+
+function modelRegistryRows(runtime) {
+  if (runtime._modelRegistryRows) return runtime._modelRegistryRows;
+  runtime._modelRegistryRows = aliasRowsForModels(routeModelRows(runtime));
+  return runtime._modelRegistryRows;
 }
 
 function aliasRowsForModels(items) {
@@ -1955,8 +1984,8 @@ async function speedTestUpstream(runtime, upstream, model) {
   if (!takeNimMinuteSlot(upstream)) {
     return { name: upstream.name, ok: false, status: 429, error: "NVIDIA NIM RPM limit reached", latency_ms: 0 };
   }
-  let active = false;
   let resp = null;
+  let release = null;
   try {
     const bodyText = JSON.stringify({ model, messages: [{ role: "user", content: "Reply with OK." }], max_tokens: 8, stream: true });
     const probeRequest = new Request("https://llmmerge.local/v1/chat/completions", {
@@ -1964,8 +1993,8 @@ async function speedTestUpstream(runtime, upstream, model) {
       headers: { "content-type": "application/json", accept: "text/event-stream, application/json" },
       body: bodyText,
     });
-    active = true;
     const result = await fetchProxyUpstream({ bodyText, pathname: CHAT_PATH, request: probeRequest, runtime, search: "", upstream });
+    release = result.release;
     resp = result.response;
     if (!resp.ok) {
       const error = await responseErrorMessage(resp);
@@ -1994,7 +2023,7 @@ async function speedTestUpstream(runtime, upstream, model) {
     return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
   } finally {
     try { await resp?.body?.cancel("speed test complete"); } catch {}
-    if (active) noteActiveUpstream(upstream, -1);
+    release?.();
   }
 }
 
@@ -2069,6 +2098,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
   const payload = parseJsonBody(await request.text());
   const translated = translateAnthropicMessagesRequest(payload);
   const resolvedModel = await resolveAuthorizedClientModel(client, runtime, translated.model, request, payload);
+  translated.seed.model = publicModelId(client, runtime, translated.model, resolvedModel);
   if (resolvedModel !== translated.model) {
     translated.model = resolvedModel;
     translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
@@ -2441,6 +2471,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const payload = parseJsonBody(await request.text());
   const translated = translateResponsesRequest(payload);
   const resolvedModel = await resolveAuthorizedClientModel(client, runtime, translated.model, request, payload);
+  translated.seed.model = publicModelId(client, runtime, translated.model, resolvedModel);
   if (resolvedModel !== translated.model) {
     translated.model = resolvedModel;
     translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
@@ -3155,6 +3186,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   for (let index = 0; index < maxAttempts; index += 1) {
     const upstream = attempts[index];
     const isLast = index === maxAttempts - 1;
+    let upstreamResult = null;
 
     try {
       if (!takeNimMinuteSlot(upstream)) {
@@ -3162,13 +3194,15 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         lastError.upstreamName = upstream.name;
         continue;
       }
-      const upstreamResult = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, upstream });
+      upstreamResult = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, upstream });
       let response = upstreamResult.response;
       const upstreamLatency = upstreamResult.latency;
 
       const shouldRetry = runtime.routing.failover !== false && await isRetryableUpstreamResponse(response);
       if (shouldRetry) {
-        noteActiveUpstream(upstream, -1);
+        if (!isLast) {
+          await discardUpstreamResponse(upstreamResult, "retryable upstream response");
+        }
         lastError = new Error(`HTTP ${response.status}`);
         lastError.upstreamName = upstream.name;
         markUpstreamFailure(runtime, upstream, model);
@@ -3176,7 +3210,6 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         clearUpstreamFailure(upstream, model);
         rememberUpstreamLatency(upstream, model, upstreamLatency);
         rememberSuccessfulUpstream(upstream, model);
-        response = releaseUpstreamWhenBodyCloses(response, upstream);
       }
 
       if (!shouldRetry || isLast) {
@@ -3187,7 +3220,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         };
       }
     } catch (error) {
-      noteActiveUpstream(upstream, -1);
+      await discardUpstreamResponse(upstreamResult, "upstream request failed");
       lastError = error;
       lastError.upstreamName = upstream.name;
       markUpstreamFailure(runtime, upstream, model);
@@ -3228,21 +3261,27 @@ function traceResponse(response, traceId) {
 
 async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal, upstream }) {
   const started = Date.now();
-  noteActiveUpstream(upstream, 1);
-  const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
-  const init = {
-    method: request.method,
-    headers: buildUpstreamHeaders(request, upstream),
-    body: sanitizedBody,
-  };
-  if (signal) init.signal = signal;
-  const response = await fetchWithTimeout(
-    buildUpstreamUrl(upstream.base_url, pathname, search),
-    init,
-    proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
-    runtime.streamIdleTimeoutMs,
-  );
-  return { response, latency: Date.now() - started, startedAt: started };
+  const release = trackActiveUpstream(upstream);
+  try {
+    const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
+    const init = {
+      method: request.method,
+      headers: buildUpstreamHeaders(request, upstream),
+      body: sanitizedBody,
+    };
+    if (signal) init.signal = signal;
+    const response = await fetchWithTimeout(
+      buildUpstreamUrl(upstream.base_url, pathname, search),
+      init,
+      proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
+      runtime.streamIdleTimeoutMs,
+      release,
+    );
+    return { response, release, latency: Date.now() - started, startedAt: started };
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
@@ -3411,6 +3450,11 @@ function upstreamBadGatewayResponse(message, headers) {
   });
 }
 
+async function discardUpstreamResponse(result, reason) {
+  try { await result?.response?.body?.cancel(reason); } catch {}
+  result?.release?.();
+}
+
 async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request, runtime, search }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
@@ -3429,8 +3473,9 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
       if (!takeNimMinuteSlot(upstream)) {
         return { limited: true, error: new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`), upstream, index };
       }
+      let result = null;
       try {
-        const result = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal: controllers[index].signal, upstream });
+        result = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal: controllers[index].signal, upstream });
         if (result.response.ok && streamRequest) {
           const primed = await primeSseResponse(result.response);
           result.response = primed.response;
@@ -3439,7 +3484,7 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
         }
         return { ...result, upstream, index };
       } catch (error) {
-        noteActiveUpstream(upstream, -1);
+        await discardUpstreamResponse(result, "hedged upstream request failed");
         return { error, upstream, index, latency: 0 };
       }
     });
@@ -3461,12 +3506,10 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
       clearUpstreamFailure(result.upstream, model);
       rememberUpstreamLatency(result.upstream, model, result.latency);
       rememberSuccessfulUpstream(result.upstream, model);
-      result.response = releaseUpstreamWhenBodyCloses(result.response, result.upstream);
       return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
     }
     if (result.response) {
-      try { await result.response.body?.cancel("retryable hedged response"); } catch {}
-      noteActiveUpstream(result.upstream, -1);
+      await discardUpstreamResponse(result, "retryable hedged response");
     }
     markUpstreamFailure(runtime, result.upstream, model);
   }
@@ -3648,43 +3691,18 @@ function noteActiveUpstream(upstream, delta) {
   else delete _activeUpstreams[name];
 }
 
-function getActiveUpstreamSnapshot() {
-  return { ..._activeUpstreams };
-}
-
-function releaseUpstreamWhenBodyCloses(response, upstream) {
-  if (!response.body) {
-    noteActiveUpstream(upstream, -1);
-    return response;
-  }
-  const reader = response.body.getReader();
+function trackActiveUpstream(upstream) {
+  noteActiveUpstream(upstream, 1);
   let released = false;
-  const release = () => {
+  return () => {
     if (released) return;
     released = true;
     noteActiveUpstream(upstream, -1);
   };
-  const body = new ReadableStream({
-    async start(controller) {
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
-        }
-        release();
-        controller.close();
-      } catch (error) {
-        release();
-        controller.error(error);
-      }
-    },
-    async cancel(reason) {
-      release();
-      try { await reader.cancel(reason); } catch {}
-    },
-  });
-  return new Response(body, { status: response.status, statusText: response.statusText, headers: responseBodyHeaders(response.headers) });
+}
+
+function getActiveUpstreamSnapshot() {
+  return { ..._activeUpstreams };
 }
 
 function rememberUpstreamLatency(upstream, model, latencyMs) {
@@ -4122,12 +4140,13 @@ function getBearerToken(request) {
   return (request.headers.get("x-api-key") || "").trim() || null;
 }
 
-async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs) {
+async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose) {
   const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
   const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
   const controller = new AbortController();
   const upstreamSignal = init?.signal;
   const abort = () => controller.abort(upstreamSignal?.reason || "timeout");
+  const cleanupSignal = () => upstreamSignal?.removeEventListener("abort", abort);
   if (upstreamSignal?.aborted) abort();
   else upstreamSignal?.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(() => controller.abort("timeout"), timeout);
@@ -4135,21 +4154,33 @@ async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs)
   try {
     const response = await fetch(url, { ...init, signal: controller.signal });
     clearTimeout(timer);
-    return wrapIdleTimeout(response, idleTimeout);
+    return wrapIdleTimeout(response, idleTimeout, () => {
+      cleanupSignal();
+      onClose?.();
+    });
   } catch (error) {
     clearTimeout(timer);
-    upstreamSignal?.removeEventListener("abort", abort);
+    cleanupSignal();
     throw error;
   }
 }
 
-function wrapIdleTimeout(response, timeoutMs) {
-  if (!response.body) return response;
+function wrapIdleTimeout(response, timeoutMs, onClose) {
+  if (!response.body) {
+    onClose?.();
+    return response;
+  }
   const stream = response.body;
   let reader = null;
   let closed = false;
   let timer = null;
+  let finished = false;
   const stop = () => { if (timer) clearTimeout(timer); timer = null; };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    onClose?.();
+  };
   return new Response(new ReadableStream({
     async start(controller) {
       reader = stream.getReader();
@@ -4159,6 +4190,8 @@ function wrapIdleTimeout(response, timeoutMs) {
           if (closed) return;
           closed = true;
           try { await reader.cancel("idle timeout"); } catch {}
+          stop();
+          finish();
           controller.error(new Error("Upstream idle timeout."));
         }, timeoutMs);
       };
@@ -4175,12 +4208,14 @@ function wrapIdleTimeout(response, timeoutMs) {
         if (!closed) {
           closed = true;
           stop();
+          finish();
           controller.close();
         }
       } catch (error) {
         if (!closed) {
           closed = true;
           stop();
+          finish();
           controller.error(error);
         }
       }
@@ -4188,6 +4223,7 @@ function wrapIdleTimeout(response, timeoutMs) {
     async cancel(reason) {
       closed = true;
       stop();
+      finish();
       try { await reader?.cancel(reason); } catch {}
     },
   }), {
