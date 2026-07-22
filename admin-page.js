@@ -26,13 +26,13 @@ function renderAdminStyle() {
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: radial-gradient(circle at top left, rgba(165,77,45,.18), transparent 28%),
-                  linear-gradient(180deg, #efe5d2 0%, var(--bg) 42%, #f8f4ec 100%);
+      background: var(--bg);
       color: var(--ink);
       font: 15px/1.5 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
     }
     html, body { overflow-x: hidden; }
-    .wrap { width: min(960px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 48px; }
+    .wrap { width: min(1680px, calc(100vw - 24px)); margin: 0 auto; padding: 24px 0 48px; }
+    .wrap > * { min-width: 0; }
 
     .hero, .panel {
       background: rgba(255,253,248,.94);
@@ -57,7 +57,7 @@ function renderAdminStyle() {
     .url-card .url-card-head { font-weight: 600; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
     .url-card code { display: block; margin-bottom: 8px; }
     .url-card button { margin-right: 6px; }
-    .panel { padding: 20px; }
+    .panel { padding: 20px; min-width: 0; }
     .panel h2 { margin: 0 0 14px; font: 700 20px/1.2 Georgia, serif; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
@@ -93,13 +93,16 @@ function renderAdminStyle() {
       width: 100%; border: 1px solid #cdbda2; background: #fffdfa;
       color: var(--ink); border-radius: 10px; padding: 9px 12px; font: inherit;
     }
+    input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent-2); flex: 0 0 auto; }
     textarea { min-height: 72px; resize: vertical; }
     .note { color: var(--muted); font-size: 13px; }
     .mono { font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 13px; }
 
-    .row { display: grid; gap: 12px; grid-template-columns: repeat(12, 1fr); margin-bottom: 10px; }
+    .row { display: grid; gap: 12px; grid-template-columns: repeat(12, minmax(0, 1fr)); margin-bottom: 10px; }
+    .row > * { min-width: 0; }
     .field { display: flex; flex-direction: column; gap: 5px; }
     .field label { color: var(--muted); font-size: 13px; }
+    .field > label:has(input[type="checkbox"]), .context-controls > label, .picker-actions > label { display: inline-flex; align-items: center; gap: 6px; }
     .span-12 { grid-column: span 12; }
     .span-6 { grid-column: span 6; }
     .span-4 { grid-column: span 4; }
@@ -264,6 +267,29 @@ function renderAdminStyle() {
     .model-tag-filter button.active { background: #1f8f61; color: white; }
     .picker-actions { display: flex; gap: 10px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 14px; }
     .picker-actions button.small { padding: 7px 13px; font-size: 13px; }
+    @media (min-width: 980px) {
+      .wrap {
+        display: grid; grid-template-columns: repeat(12, minmax(0, 1fr));
+        gap: 16px; width: min(1680px, calc(100vw - 40px)); padding: 20px 0 40px;
+      }
+      .wrap > .hero, .wrap > footer { grid-column: 1 / -1; }
+      .wrap > .panel { margin-bottom: 0; padding: 16px; }
+      .hero { display: grid; grid-template-columns: minmax(240px, .7fr) minmax(0, 1.3fr); gap: 24px; align-items: center; }
+      .gateway-urls { margin-top: 0; }
+      .url-card { max-width: none; }
+      #stats-panel { grid-column: 1 / span 4; grid-row: 2; }
+      #client-panel { grid-column: 1 / span 4; grid-row: 3; }
+      #upstream-panel { grid-column: 5 / -1; grid-row: 2; }
+      #settings-panel { grid-column: 5 / -1; grid-row: 3; }
+      #log-panel { grid-column: 1 / -1; grid-row: 4; }
+      #request-log-panel { grid-column: 1 / -1; grid-row: 5; }
+      #upstream-panel, #settings-panel { align-self: start; width: 100%; }
+      .upstream-card summary { padding: 11px 12px; gap: 9px; }
+      .upstream-card .card-body { padding: 0 12px 12px; }
+    }
+    @media (min-width: 980px) and (max-width: 1240px) {
+      .prompt-modal-grid { grid-template-columns: minmax(240px, .85fr) minmax(360px, 1.25fr) minmax(220px, .8fr); }
+    }
     @media (max-width: 760px) {
       .prompt-modal-grid { grid-template-columns: 1fr; }
       .prompt-client-scope { max-height: 130px; }
@@ -396,7 +422,7 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="client-panel">
     <h2>\u5ba2\u6237\u7aef Keys</h2>
     <div id="client-list"></div>
     <div class="client-create">
@@ -413,7 +439,7 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="upstream-panel">
     <div class="toolbar">
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
@@ -445,7 +471,7 @@ function renderAdminMarkup(origin, version) {
   </div>
 
 
-  <details class="panel settings-panel">
+  <details class="panel settings-panel" id="settings-panel">
     <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
     <div class="settings-body">
       <div class="row">
@@ -479,7 +505,7 @@ function renderAdminMarkup(origin, version) {
     </div>
   </details>
 
-  <div class="panel">
+  <div class="panel" id="request-log-panel">
     <div class="toolbar">
       <h2>请求日志</h2>
       <button class="small secondary" id="load-logs">刷新</button>
