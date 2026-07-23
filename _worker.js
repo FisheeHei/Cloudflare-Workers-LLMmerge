@@ -53,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-23-card-tones";
+const VERSION = "v26-07-23-routing-budget";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -3184,10 +3184,11 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   }
 
   const attempts = orderUpstreams(runtime, candidates, model);
-  const maxAttempts = runtime.routing.failover === false ? 1 : attempts.length;
+  const maxAttempts = runtime.routing.failover === false
+    ? 1
+    : Math.min(attempts.length, runtime.routing.hedge_max || 2);
   if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-    const limit = runtime.routing.hedge_enabled === true ? (runtime.routing.hedge_max || 2) : 2;
-    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, limit)), model);
+    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
     return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, model, pathname, request, runtime, search });
   }
   let lastError = null;
@@ -3464,6 +3465,12 @@ async function discardUpstreamResponse(result, reason) {
   result?.release?.();
 }
 
+function discardPendingHedgeLosers(pending) {
+  pending.forEach(({ promise }) => {
+    void promise.then((result) => discardUpstreamResponse(result, "hedged upstream lost")).catch(() => {});
+  });
+}
+
 async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request, runtime, search }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
@@ -3512,6 +3519,7 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
     if (result.response && !retryable) {
       done = true;
       controllers.forEach((controller, i) => { if (i !== result.index) controller.abort(); });
+      discardPendingHedgeLosers(pending);
       clearUpstreamFailure(result.upstream, model);
       rememberUpstreamLatency(result.upstream, model, result.latency);
       rememberSuccessfulUpstream(result.upstream, model);

@@ -609,11 +609,11 @@ function renderAdminMarkup(origin, version) {
           <label><input type="checkbox" id="routing-hedge"> Hedged Request</label>
         </div>
         <div class="field span-3">
-          <label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305\uff1b\u4e0e Hedged \u540c\u5f00\u65f6\uff0cHedged \u51b3\u5b9a\u5019\u9009\u6570\uff0cFast \u52a0\u901f\u524d 2 \u4e2a</span></label>
+          <label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305\uff1b\u524d 2 \u4e2a\u5019\u9009\u4f18\u5148\u542f\u52a8</span></label>
         </div>
       </div>
       <div class="row">
-        <div class="field span-3"><label>\u6700\u9ad8\u8bf7\u6c42\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
+        <div class="field span-3"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
       </div>
       <div class="row">
         <div class="field span-12"><label>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u63d0\u793a\u8bcd\u4e0e\u4e0a\u4e0b\u6587</button><span class="note" id="system-prompt-status"></span></div>
@@ -1772,7 +1772,7 @@ function renderAdminScript(version) {
         return;
       }
       if (Number(group.dataset.activeUntil || 0) > now && group.dataset.activeText) {
-        el.textContent = group.dataset.activeText;
+        el.textContent = String(group.dataset.activeText).replace(/^\u26a1 \u6d3b\u8dc3:/, "\u2713 \u6700\u8fd1:");
       } else {
         el.textContent = "";
         delete group.dataset.activeText;

@@ -30,7 +30,9 @@ const speedBodies = [];
 const speedStreamHits = [];
 const hedgeHits = [];
 const hedgeStreamHits = [];
+const hedgeCancels = [];
 const softFastHits = [];
+const attemptBudgetHits = [];
 const nimHits = [];
 const responseHits = [];
 const responseStreamHits = [];
@@ -278,7 +280,14 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("hedge-slow.example")) {
     hedgeHits.push("slow");
     await new Promise((resolve) => setTimeout(resolve, 260));
-    return new Response(JSON.stringify({ id: "hedge-slow", choices: [{ message: { content: "ok" } }] }), {
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ id: "hedge-slow", choices: [{ message: { content: "ok" } }] })));
+      },
+      cancel() {
+        hedgeCancels.push("slow");
+      },
+    }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -331,6 +340,14 @@ globalThis.fetch = async (url, init) => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
+  }
+  if (String(url).includes("attempt-budget-fail.example")) {
+    attemptBudgetHits.push("fail");
+    return new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("attempt-budget-ok.example")) {
+    attemptBudgetHits.push("ok");
+    return new Response(JSON.stringify({ id: "attempt-budget-ok", choices: [{ message: { content: "ok" } }] }), { status: 200, headers: { "content-type": "application/json" } });
   }
   if (String(url).includes("nim-limit.example")) {
     nimHits.push("nim");
@@ -462,7 +479,7 @@ const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
 assert.equal(adminPage.includes("routing-fast"), true);
 assert.equal(adminPage.includes("document.visibilityState"), true);
-assert.equal(adminPage.includes("Fast \\u52a0\\u901f\\u524d 2 \\u4e2a") || adminPage.includes("Fast 加速前 2 个"), true);
+assert.equal(adminPage.includes("Gateway Fast"), true);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("client-models"), false);
@@ -1578,6 +1595,7 @@ const hedgeEnv = {
   CLIENTS_JSON: JSON.stringify([{ name: "hedge-client", key: "sk-hedge", models: ["*"], upstreams: ["hedge-slow", "hedge-fast"] }]),
 };
 const hedgeStart = hedgeHits.length;
+const hedgeCancelStart = hedgeCancels.length;
 const hedgeResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-hedge", "content-type": "application/json" },
@@ -1585,6 +1603,8 @@ const hedgeResp = await worker.default.fetch(new Request("https://gw.test/v1/cha
 }), hedgeEnv);
 assert.equal(hedgeResp.headers.get("x-llm-gateway-upstream"), "hedge-fast");
 assert.deepEqual(hedgeHits.slice(hedgeStart), ["slow", "fast"]);
+await new Promise((resolve) => setTimeout(resolve, 100));
+assert.deepEqual(hedgeCancels.slice(hedgeCancelStart), ["slow"]);
 const hedgeSecondStart = hedgeHits.length;
 const hedgeResp2 = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -1624,11 +1644,12 @@ assert.equal((await hedgeStreamResp.text()).includes('"content":"fast"'), true);
 
 const softFastStore = new Map();
 softFastStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, fast_routing: true, hedge_enabled: false, hedge_max: 1, load_balance: false },
+  routing: { failover: true, fast_routing: true, hedge_enabled: false, hedge_max: 2, load_balance: false },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "soft-fast-slow", base_url: "https://soft-fast-slow.example/v1", api_key_encrypted: "s", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "soft-fast-fast", base_url: "https://soft-fast-fast.example/v1", api_key_encrypted: "f", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "soft-fast-third", base_url: "https://soft-fast-third.example/v1", api_key_encrypted: "t", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
   ],
 }));
 const softFastEnv = {
@@ -1669,6 +1690,33 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "soft-fast-model", messages: [] }),
 }), softFastHedgeEnv);
 assert.equal(softFastHits.slice(softFastHedgeStart).includes("third"), true);
+
+const attemptBudgetStore = new Map();
+attemptBudgetStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: false, fast_routing: false, hedge_max: 1, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "attempt-budget-fail", base_url: "https://attempt-budget-fail.example/v1", api_key_encrypted: "f", models: ["attempt-budget-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "attempt-budget-ok", base_url: "https://attempt-budget-ok.example/v1", api_key_encrypted: "o", models: ["attempt-budget-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const attemptBudgetEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = attemptBudgetStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { attemptBudgetStore.set(key, value); },
+    async delete(key) { attemptBudgetStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "attempt-budget-client", key: "sk-attempt-budget", models: ["*"], upstreams: ["attempt-budget-fail", "attempt-budget-ok"] }]),
+};
+const attemptBudgetStart = attemptBudgetHits.length;
+const attemptBudgetResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-attempt-budget", "content-type": "application/json" },
+  body: JSON.stringify({ model: "attempt-budget-model", messages: [] }),
+}), attemptBudgetEnv);
+assert.equal(attemptBudgetResp.status, 503);
+assert.deepEqual(attemptBudgetHits.slice(attemptBudgetStart), ["fail"]);
 
 const nimStore = new Map();
 nimStore.set("gateway:config", JSON.stringify({
