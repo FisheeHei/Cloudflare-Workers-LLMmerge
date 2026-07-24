@@ -772,6 +772,15 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/respons
   body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "next turn" }),
 }), restrictedEnv)).status, 200);
 
+const compactCurrentModelStart = bodies.length;
+const compactCurrentModelResp = await worker.default.fetch(new Request("https://gw.test/v1/responses/compact", {
+  method: "POST",
+  headers: { ...sessionHeaders, "x-codex-turn-metadata": JSON.stringify({ session_id: "codex-session-mixed", turn_id: "compact-turn" }) },
+  body: JSON.stringify({ model: "gpt-5", input: "Summarize this session." }),
+}), restrictedEnv);
+assert.equal(compactCurrentModelResp.status, 200);
+assert.equal(bodies[compactCurrentModelStart].model, "openai/gpt-oss-120b");
+
 const kimiBodyStart = bodies.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",

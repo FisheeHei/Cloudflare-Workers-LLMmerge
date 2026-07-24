@@ -53,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-23-routing-budget";
+const VERSION = "v26-07-24-codex-responses";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -236,12 +236,14 @@ var _nimMinuteCounters = {};
 var _runtimeCache = null;
 var _runtimeCacheTs = 0;
 var RUNTIME_CACHE_TTL_MS = 30000;
+var _runtimeLoading = null;
 var _stdTimeOffsetMs = 0;
 var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
 var _analyticsQueryCache = {};
-// ponytail: hot session locks stay local; KV is touched only on the first request per isolate/session.
+// ponytail: model state is isolate-local; Goal turns must not create KV reads/writes.
 var _sessionModelLocks = {};
+var _sessionCurrentModels = {};
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -1576,7 +1578,19 @@ async function loadRuntimeConfig(app) {
   if (_runtimeCache && _runtimeCache.app === app && now - _runtimeCacheTs < RUNTIME_CACHE_TTL_MS) {
     return _runtimeCache.runtime;
   }
+  if (_runtimeLoading?.app === app) return _runtimeLoading.promise;
 
+  const promise = buildRuntimeConfig(app);
+  _runtimeLoading = { app, promise };
+  try {
+    return await promise;
+  } finally {
+    if (_runtimeLoading?.promise === promise) _runtimeLoading = null;
+  }
+}
+
+async function buildRuntimeConfig(app) {
+  const now = Date.now();
   const editable = await getEditableConfig(app);
   const aesKey = await deriveAesKey(app.encryptionSecret);
 
@@ -1637,11 +1651,13 @@ async function loadHealthUpstreams(app) {
 function invalidateRuntimeCache() {
   _runtimeCache = null;
   _runtimeCacheTs = 0;
+  _runtimeLoading = null;
 }
 
 // ponytail: LRU cache per-isolate for client tokens �?saves KV read every proxy request
 var _clientCache = {};
 var _clientCacheTs = {};
+var _clientLoading = {};
 var CLIENT_CACHE_TTL_MS = 60000;
 
 async function requireClient(request, runtime) {
@@ -1657,7 +1673,14 @@ async function requireClient(request, runtime) {
   }
 
   if (runtime.kv) {
-    const kvClient = await runtime.kv.get(clientTokenKey(token), "json");
+    const load = _clientLoading[token] || (async () => runtime.kv.get(clientTokenKey(token), "json"))();
+    _clientLoading[token] = load;
+    let kvClient;
+    try {
+      kvClient = await load;
+    } finally {
+      if (_clientLoading[token] === load) delete _clientLoading[token];
+    }
     if (kvClient?.key) {
       var nc = normalizeClient(kvClient);
       _clientCache[token] = nc;
@@ -1730,6 +1753,7 @@ async function resolveAuthorizedClientModel(client, runtime, requestedModel, req
     throw httpError(403, `Model is not allowed for this client key: ${requestedModel}`);
   }
   await enforceSessionModelLock(client, runtime, request, payload, model);
+  rememberSessionCurrentModel(client, request, payload, model);
   return model;
 }
 
@@ -1749,16 +1773,59 @@ async function enforceSessionModelLock(client, runtime, request, payload, model)
   _sessionModelLocks[cacheKey] = lock;
   const lockKeys = Object.keys(_sessionModelLocks);
   if (lockKeys.length > 500) delete _sessionModelLocks[lockKeys[0]];
-  if (!runtime.kv) return;
+}
 
-  const storageKey = await sessionModelLockKey(cacheKey);
-  const stored = await runtime.kv.get(storageKey, "json");
-  if (stored?.model && stored.expires > now) {
-    _sessionModelLocks[cacheKey] = stored;
-    if (stored.model !== model) throw httpError(403, `This session is locked to model: ${stored.model}`);
-    return;
-  }
-  await runtime.kv.put(storageKey, JSON.stringify(lock), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS });
+function sessionCurrentModelKey(client, request, payload) {
+  const scopeId = requestModelLockScope(request, payload);
+  const sessionScope = scopeId.split("\nturn:")[0];
+  return sessionScope ? `${client.id}\n${sessionScope}` : "";
+}
+
+function rememberSessionCurrentModel(client, request, payload, model) {
+  const key = sessionCurrentModelKey(client, request, payload);
+  if (!key) return;
+  const previous = _sessionCurrentModels[key];
+  _sessionCurrentModels[key] = {
+    ...previous,
+    model,
+    expires: Date.now() + SESSION_MODEL_LOCK_TTL_SECONDS * 1000,
+    ...(previous?.model === model ? {} : { persistedModel: "" }),
+  };
+  const keys = Object.keys(_sessionCurrentModels);
+  if (keys.length > 500) delete _sessionCurrentModels[keys[0]];
+}
+
+async function persistSessionCurrentModel(runtime, client, request, payload, ctx) {
+  const key = sessionCurrentModelKey(client, request, payload);
+  const item = key && _sessionCurrentModels[key];
+  if (!runtime.kv || !item?.model || item.persistedModel === item.model) return;
+  item.persistedModel = item.model;
+  const task = sessionCurrentModelStorageKey(key)
+    .then((storageKey) => runtime.kv.put(storageKey, JSON.stringify({ model: item.model, expires: item.expires }), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS }))
+    .catch(() => { if (_sessionCurrentModels[key]?.model === item.model) _sessionCurrentModels[key].persistedModel = ""; });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+  else await task;
+}
+
+async function currentSessionModel(client, runtime, request, payload) {
+  const key = sessionCurrentModelKey(client, request, payload);
+  const item = key && _sessionCurrentModels[key];
+  if (item?.expires > Date.now()) return item.model;
+  if (key) delete _sessionCurrentModels[key];
+  if (!key || !runtime.kv) return "";
+  try {
+    const stored = await runtime.kv.get(await sessionCurrentModelStorageKey(key), "json");
+    if (stored?.model && stored.expires > Date.now()) {
+      _sessionCurrentModels[key] = { ...stored, persistedModel: stored.model };
+      return stored.model;
+    }
+  } catch {}
+  return "";
+}
+
+async function sessionCurrentModelStorageKey(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return "session:current-model:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function requestModelLockScope(request, payload) {
@@ -1774,11 +1841,6 @@ function requestModelLockScope(request, payload) {
   const turnId = String(turn || "").trim();
   if (turnId && turnId.length <= 256) return `${sessionId.slice(0, 256)}\nturn:${turnId}`;
   return sessionId && sessionId.length <= 256 ? sessionId : "";
-}
-
-async function sessionModelLockKey(value) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return "session:model:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function routeModelRows(runtime) {
@@ -2485,6 +2547,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const payload = parseJsonBody(await request.text());
   const translated = translateResponsesRequest(payload);
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
+  await persistSessionCurrentModel(runtime, client, request, payload, ctx);
 
   try {
     const proxyResponse = await proxyRequest({
@@ -2553,7 +2616,11 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   const requestedModel = String(payload?.model || "").trim();
   if (!requestedModel) throw httpError(400, "`model` is required.");
 
-  const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+  const sessionModel = await currentSessionModel(client, runtime, request, payload);
+  const model = sessionModel || await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+  if (sessionModel && !clientAllowsModelSelection(client, sessionModel, sessionModel)) {
+    throw httpError(403, `Model is not allowed for this client key: ${sessionModel}`);
+  }
   const transcript = compactTranscript(payload.input, payload.instructions);
   if (!transcript) throw httpError(400, "`input` is required.");
 
