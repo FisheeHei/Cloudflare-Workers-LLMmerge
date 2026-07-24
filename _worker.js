@@ -53,7 +53,7 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-24-codex-responses";
+const VERSION = "v26-07-24-response-stream-cpu";
 const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
 
 export default {
@@ -3131,8 +3131,9 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
 
   (async () => {
     let buffer = "";
-    let text = "";
-    let reasoning = "";
+    const textParts = [];
+    const reasoningParts = [];
+    let outputChars = 0;
     let reasoningOutputIndex = null;
     let usage = null;
     let streamError = "";
@@ -3157,20 +3158,22 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       if (reasoningDelta) {
         ensureReasoning();
         noteStreamToken(diag, now);
-        reasoning += reasoningDelta;
+        reasoningParts.push(reasoningDelta);
+        outputChars += reasoningDelta.length;
         writes.push(write({ type: "response.reasoning_summary_text.delta", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, delta: reasoningDelta }));
       }
       const content = chatContentToText(delta.content || "");
       if (content) {
         noteStreamToken(diag, now);
-        text += content;
+        textParts.push(content);
+        outputChars += content.length;
         writes.push(write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: 0, content_index: 0, delta: content }));
       }
       for (const call of (delta.tool_calls || [])) {
         const key = String(call.index ?? toolCalls.size);
         let item = toolCalls.get(key);
         if (!item) {
-          item = { id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`), name: String(call.function?.name || call.name || "tool"), arguments: "", outputIndex: nextOutputIndex++ };
+          item = { id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`), name: String(call.function?.name || call.name || "tool"), argumentParts: [], outputIndex: nextOutputIndex++ };
           toolCalls.set(key, item);
           writes.push(write({ type: "response.output_item.added", output_index: item.outputIndex, item: responsesFunctionCallItem(item, "in_progress") }));
         }
@@ -3178,7 +3181,8 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         if (call.function?.name) item.name = String(call.function.name);
         const args = String(call.function?.arguments || "");
         if (args) {
-          item.arguments += args;
+          item.argumentParts.push(args);
+          outputChars += args.length;
           writes.push(write({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: args }));
         }
       }
@@ -3205,6 +3209,9 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         if (streamError) throw new Error(streamError);
       }
 
+      const text = textParts.join("");
+      const reasoning = reasoningParts.join("");
+      for (const item of toolCalls.values()) item.arguments = item.argumentParts.join("");
       const donePart = { type: "output_text", text, annotations: [] };
       await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: 0, content_index: 0, text });
       await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: 0, content_index: 0, part: donePart });
@@ -3223,10 +3230,10 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       await writer.write(encoder.encode("data: [DONE]\n\n"));
     } catch (error) {
       closeReason = "error";
-      await write({ type: "response.failed", response: { ...makeResponsesPayload(seed, { text, usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } } });
+      await write({ type: "response.failed", response: { ...makeResponsesPayload(seed, { text: textParts.join(""), reasoning: reasoningParts.join(""), usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } } });
       await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
     } finally {
-      if (onDone) onDone(normalizeResponsesUsage(usage, estimateTokens(text + reasoning + [...toolCalls.values()].map((item) => item.arguments).join(""))), {
+      if (onDone) onDone(normalizeResponsesUsage(usage, Math.round(outputChars / 4)), {
         close_reason: closeReason,
         finish_reason: finishReason,
         tool_calls_count: toolCalls.size,

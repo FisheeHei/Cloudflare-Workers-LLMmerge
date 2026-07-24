@@ -1875,6 +1875,8 @@ assert.equal(responsesStreamText.includes('"type":"response.function_call_argume
 assert.equal(responsesStreamText.includes('"type":"response.function_call_arguments.done"'), true);
 assert.equal(responsesStreamText.includes('"type":"response.reasoning_summary_text.delta"'), true);
 assert.equal(responsesStreamText.includes('"type":"response.completed"'), true);
+assert.equal(responsesStreamText.includes('"output_text":"hello"'), true);
+assert.equal(responsesStreamText.includes('"arguments":"{\\"query\\":\\"glm\\"}"'), true);
 const responsesStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), responsesEnv);
 const responsesStreamLogs = await responsesStreamLogsResp.json();
 const responsesStreamLog = responsesStreamLogs.logs.find((entry) => entry.model === "stream-model" && entry.path === "/v1/responses");
