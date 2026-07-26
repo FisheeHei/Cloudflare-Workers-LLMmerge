@@ -725,6 +725,10 @@ const createdClientResp = await worker.default.fetch(new Request("https://gw.tes
   body: JSON.stringify({ name: "temporary-client" }),
 }), env);
 const createdClient = (await createdClientResp.json()).client;
+const copiedClientResp = await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/clients/${createdClient.id}`), env);
+const copiedClient = await copiedClientResp.json();
+assert.equal(copiedClientResp.status, 200);
+assert.equal(copiedClient.api_key, createdClient.api_key);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 200);

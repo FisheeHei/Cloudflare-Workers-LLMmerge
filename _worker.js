@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-26-free-cpu-guard";
+const VERSION = "v26-07-26-client-key-copy";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1091,6 +1091,13 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   const clientMatch = apiPath.match(/^\/api\/clients\/([^/]+)$/);
+  if (clientMatch && request.method === "GET") {
+    const id = decodeURIComponent(clientMatch[1]);
+    const existing = await app.kv.get(clientIdKey(id), "json");
+    if (!existing?.key) throw httpError(404, "Client not found.");
+    return withCorsResponse(json({ ...publicClientRecord(existing), api_key: existing.key }, 200));
+  }
+
   if (clientMatch && request.method === "PUT") {
     const id = decodeURIComponent(clientMatch[1]);
     const existing = await app.kv.get(clientIdKey(id), "json");

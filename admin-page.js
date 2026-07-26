@@ -2395,9 +2395,15 @@ function renderAdminScript(version) {
           '<strong>' + esc(c.name) + '</strong>' +
           '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
         '</div>' +
+        '<button type="button" class="small secondary" data-copy-client-id="' + esc(c.id) + '">\u590d\u5236 Key</button>' +
         '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '">\u5220\u9664</button>' +
       '</div>'
     ).join("");
+    host.querySelectorAll("button[data-copy-client-id]").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        withButtonBusy(btn, "\u590d\u5236\u4e2d...", () => copyClientKey(btn.dataset.copyClientId)).catch(showError)
+      );
+    });
     host.querySelectorAll("button[data-client-id]").forEach((btn) => {
       btn.addEventListener("click", async () => {
         await withButtonBusy(btn, "\u5220\u9664\u4e2d...", async () => {
@@ -2427,6 +2433,13 @@ function renderAdminScript(version) {
     byId("refresh-client-key").hidden = false;
     showToast("\u5ba2\u6237\u7aef Key \u5df2\u751f\u6210");
     await loadClients();
+  }
+
+  async function copyClientKey(id) {
+    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(id));
+    const client = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(client?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef Key \u5931\u8d25");
+    await copyText(client.api_key, "API Key \u5df2\u590d\u5236");
   }
 
   async function deleteClient(id) {
