@@ -195,6 +195,9 @@ globalThis.fetch = async (url, init) => {
     if (body.model === "stream-error-model") {
       return new Response('data: {"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
     }
+    if (body.model === "oversized-stream-model") {
+      return new Response("data: " + "x".repeat(1048577), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
     return new Response([
       'data: {"choices":[{"delta":{"reasoning_content":"plan "}}]}\n\n',
       'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
@@ -452,6 +455,7 @@ globalThis.fetch = async (url, init) => {
 };
 
 const env = {
+  ADMIN_TOKEN: "admin-test-token",
   KV: {
     async get(key, type) {
       const value = kvStore.get(key);
@@ -473,7 +477,9 @@ const env = {
   CLIENTS_JSON: JSON.stringify([{ name: "c", key: "sk-test", models: ["*"], upstreams: ["nim"] }]),
 };
 
-const adminPageResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin"), env);
+assert.equal((await worker.default.fetch(new Request("https://gw.test/health"), { ...env, ADMIN_TOKEN: "" })).status, 500);
+
+const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
@@ -537,9 +543,20 @@ assert.equal(adminPage.includes("model-entry-list"), true);
 assert.equal(adminPage.includes("model-context-input"), true);
 assert.equal(adminPage.includes("delete-model-row"), true);
 assert.equal(adminPage.includes("toolDiag"), true);
-const configResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), env);
+const configResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), env);
 const configPayload = await configResp.json();
 assert.equal(configPayload.config.settings.stream_idle_timeout_ms, 900000);
+const invalidUpstreamConfig = structuredClone(configPayload.config);
+invalidUpstreamConfig.upstreams[0].preset = "custom";
+invalidUpstreamConfig.upstreams[0].base_url = "ftp://invalid.example/v1";
+assert.equal((await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(invalidUpstreamConfig),
+}), env)).status, 400);
+const duplicateUpstreamConfig = structuredClone(configPayload.config);
+duplicateUpstreamConfig.upstreams[1].name = duplicateUpstreamConfig.upstreams[0].name;
+assert.equal((await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(duplicateUpstreamConfig),
+}), env)).status, 400);
 const openRouterPreset = configPayload.presets.find((item) => item.id === "openrouter");
 assert.equal(openRouterPreset.name, "OpenRouter");
 assert.equal(openRouterPreset.base_url, "https://openrouter.ai/api/v1");
@@ -564,6 +581,7 @@ zhipuStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const zhipuEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -674,7 +692,7 @@ assert.equal("reasoning_effort" in bodies[6], false);
 assert.equal("reasoningEffort" in bodies[6], false);
 assert.equal("thinking" in bodies[6], false);
 
-const statsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), env);
+const statsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), env);
 const stats = await statsResp.json();
 assert.equal(stats.buckets.some((b) => b.total >= 5), true);
 assert.equal(stats.last_model, "glm-4.6");
@@ -682,12 +700,12 @@ assert.equal(stats.time_zone, "Hong Kong Standard Time (UTC+8)");
 assert.equal(stats.now.endsWith("+08:00"), true);
 assert.equal(stats.buckets.some((b) => b.model_statuses?.["minimax-m3"]?.success >= 1), true);
 
-const logsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), env);
+const logsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), env);
 const logs = await logsResp.json();
 assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
 assert.equal(kvPuts.length, 0);
 
-const createdClientResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/clients", {
+const createdClientResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ name: "temporary-client" }),
@@ -696,7 +714,7 @@ const createdClient = (await createdClientResp.json()).client;
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 200);
-const updateClientResp = await worker.default.fetch(new Request(`https://gw.test/llmmerge-admin/api/clients/${createdClient.id}`, {
+const updateClientResp = await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/clients/${createdClient.id}`, {
   method: "PUT",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ models: ["glm-4.6"] }),
@@ -710,12 +728,13 @@ const deniedAfterUpdateResp = await worker.default.fetch(new Request("https://gw
   body: JSON.stringify({ model: "gpt-5", messages: [] }),
 }), env);
 assert.equal(deniedAfterUpdateResp.status, 403);
-await worker.default.fetch(new Request(`https://gw.test/llmmerge-admin/api/clients/${createdClient.id}`, { method: "DELETE" }), env);
+await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/clients/${createdClient.id}`, { method: "DELETE" }), env);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 401);
 
 const restrictedEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: null,
   UPSTREAMS_JSON: JSON.stringify([
@@ -865,6 +884,7 @@ assert.equal(bodies[nimFamilyBodyStart + 7].reasoning_effort, "medium");
 assert.equal("reasoning" in bodies[nimFamilyBodyStart + 7], false);
 
 const deepSeekOfficialEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get() { return null; },
@@ -899,6 +919,7 @@ assert.equal("reasoning_effort" in bodies[deepSeekOfficialStart + 1], false);
 assert.equal("chat_template_kwargs" in bodies[deepSeekOfficialStart + 1], false);
 
 const moonshotEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get() { return null; },
@@ -934,6 +955,7 @@ assert.equal("reasoning_effort" in bodies[moonshotStart + 1], false);
 assert.equal("temperature" in bodies[moonshotStart + 1], false);
 
 const minimaxEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get() { return null; },
@@ -970,6 +992,7 @@ assert.equal("enable_thinking" in bodies[minimaxStart + 1], false);
 assert.equal("chat_template_kwargs" in bodies[minimaxStart + 1], false);
 
 const nonNimBridgeEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get() { return null; },
@@ -1023,6 +1046,7 @@ const wrappedKvConfig = {
 };
 const wrappedStore = new Map([["gateway:config", JSON.stringify({ ok: true, config: wrappedKvConfig })]]);
 const wrappedEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1035,7 +1059,7 @@ const wrappedEnv = {
   UPSTREAMS_JSON: JSON.stringify([{ name: "env-only", base_url: "https://boom.example/v1", api_key: "env", models: ["env-model"], paths: ["/v1/chat/completions"] }]),
   CLIENTS_JSON: JSON.stringify([{ name: "wrapped-client", key: "sk-wrapped", models: ["*"], upstreams: ["kv-wrapped"] }]),
 };
-const wrappedConfigResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config"), wrappedEnv);
+const wrappedConfigResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), wrappedEnv);
 const wrappedConfigPayload = await wrappedConfigResp.json();
 assert.equal(wrappedConfigPayload.config.upstreams[0].name, "kv-wrapped");
 const wrappedHitStart = wrappedHits.length;
@@ -1057,6 +1081,7 @@ aliasStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const aliasEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1129,6 +1154,7 @@ streamAliasStore.set("gateway:config", JSON.stringify({
   upstreams: [{ name: "nim-stream-alias", preset: "nvidia-nim", base_url: "https://stream-alias.example/v1", api_key_encrypted: "n", models: ["deepseek-ai/deepseek-v4-flash"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true }],
 }));
 const streamAliasEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) { const value = streamAliasStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
@@ -1171,6 +1197,7 @@ assert.equal("reasoning_summary" in speedBodies[glmAliasBodyStart], false);
 assert.equal("thinking" in speedBodies[glmAliasBodyStart], false);
 
 const slowFirstByteEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   KV: null,
   REQUEST_TIMEOUT_MS: "10",
   UPSTREAMS_JSON: JSON.stringify([
@@ -1195,6 +1222,7 @@ fanoutStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const fanoutEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1231,7 +1259,7 @@ const routeFallbackResp = await worker.default.fetch(new Request("https://gw.tes
 assert.equal(routeFallbackResp.headers.get("x-llm-gateway-upstream"), "qwen-local");
 assert.equal(speedBodies[routeFallbackBodyStart].model, "qwen/qwen3-coder-480b-a35b-instruct");
 
-const modelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+const modelsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/fetch-models", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ base_url: "https://draft.example/v1", api_key: "sk-draft" }),
@@ -1239,7 +1267,7 @@ const modelsResp = await worker.default.fetch(new Request("https://gw.test/llmme
 const models = await modelsResp.json();
 assert.deepEqual(models.models, ["deepseek-ai/deepseek-v4-pro", "google/codegemma-7b"]);
 
-const workersModelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+const workersModelsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/fetch-models", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ name: "ai" }),
@@ -1250,7 +1278,7 @@ assert.equal(workersModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), t
 assert.equal(workersModels.models.includes("@cf/google/codegemma-7b"), true);
 assert.equal(fetchUrls.some((url) => url.includes("/ai/models/search") && url.includes("page=2")), true);
 
-const oldWorkersModelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+const oldWorkersModelsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/fetch-models", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ name: "ai-old" }),
@@ -1258,7 +1286,7 @@ const oldWorkersModelsResp = await worker.default.fetch(new Request("https://gw.
 const oldWorkersModels = await oldWorkersModelsResp.json();
 assert.equal(oldWorkersModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), true);
 
-const overrideModelsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/fetch-models", {
+const overrideModelsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/fetch-models", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
@@ -1271,7 +1299,7 @@ const overrideModelsResp = await worker.default.fetch(new Request("https://gw.te
 const overrideModels = await overrideModelsResp.json();
 assert.equal(overrideModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), true);
 
-const healthResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/health", {
+const healthResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", {
   method: "POST",
 }), env);
 const health = await healthResp.json();
@@ -1289,6 +1317,7 @@ disabledStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const disabledEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1308,7 +1337,7 @@ const disabledCallResp = await worker.default.fetch(new Request("https://gw.test
 }), disabledEnv);
 assert.equal(disabledCallResp.headers.get("x-llm-gateway-upstream"), "enabled");
 assert.equal(disabledHits.length, disabledHitStart);
-const disabledHealthResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/health", {
+const disabledHealthResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", {
   method: "POST",
 }), disabledEnv);
 const disabledHealth = await disabledHealthResp.json();
@@ -1323,6 +1352,7 @@ const authHealthStore = new Map([["gateway:config", JSON.stringify({
   ],
 })]]);
 const authHealthEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) { const value = authHealthStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
@@ -1330,11 +1360,11 @@ const authHealthEnv = {
     async delete(key) { authHealthStore.delete(key); },
   },
 };
-const authHealth = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/health", { method: "POST" }), authHealthEnv)).json();
+const authHealth = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", { method: "POST" }), authHealthEnv)).json();
 assert.equal(authHealth.results[0].ok, false);
 assert.equal(authHealth.results[0].status, 401);
 
-const exportResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/upstreams/export"), env);
+const exportResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/upstreams/export"), env);
 const exported = await exportResp.json();
 assert.equal(exportResp.ok, true);
 assert.equal(exported.upstreams[0].api_key, "x");
@@ -1356,6 +1386,7 @@ assert.equal(kvPuts.length, kvPutsBeforeWaitUntil);
 const analyticsTasks = [];
 const kvPutsBeforeAnalytics = kvPuts.length;
 const analyticsEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   ANALYTICS: {
     writeDataPoint(point) {
@@ -1375,25 +1406,26 @@ assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
 assert.equal(kvPuts.length, kvPutsBeforeAnalytics);
 const realDateNow = Date.now;
 Date.now = () => realDateNow() + 3 * 60 * 1000;
-const writeOnlyStats = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), analyticsEnv)).json();
+const writeOnlyStats = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), analyticsEnv)).json();
 Date.now = realDateNow;
 assert.equal(writeOnlyStats.buckets.some((bucket) => bucket.models?.qwen3 >= 1), true);
 
 const analyticsQueryEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...analyticsEnv,
   ANALYTICS_ACCOUNT_ID: "acct",
   ANALYTICS_API_TOKEN: "tok",
 };
-const analyticsStatsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/stats"), analyticsQueryEnv);
+const analyticsStatsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), analyticsQueryEnv);
 const analyticsStats = await analyticsStatsResp.json();
 assert.equal(analyticsStats.buckets.some((bucket) => bucket.models?.qwen3 >= 2), true);
-const analyticsLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), analyticsQueryEnv);
+const analyticsLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), analyticsQueryEnv);
 const analyticsLogs = await analyticsLogsResp.json();
 assert.equal(analyticsLogs.logs.some((entry) => entry.model === "qwen3"), true);
 assert.equal(analyticsSqlQueries.length >= 2, true);
 
 const cachedConfigHits = speedHits.length;
-const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {
+const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
   method: "PUT",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
@@ -1426,6 +1458,7 @@ assert.equal(savedConfigPayload.config.settings.context_items.length, 2);
 
 const snapshotStore = new Map();
 const snapshotEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1436,7 +1469,7 @@ const snapshotEnv = {
     async delete(key) { snapshotStore.delete(key); },
   },
 };
-await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {
+await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
   method: "PUT",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
@@ -1447,12 +1480,12 @@ await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/confi
     ],
   }),
 }), snapshotEnv);
-const snapshotListResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config/snapshots"), snapshotEnv);
+const snapshotListResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config/snapshots"), snapshotEnv);
 const snapshotList = await snapshotListResp.json();
 assert.equal(snapshotList.snapshots.length, 1);
 assert.equal(snapshotList.snapshots[0].upstream_count, 3);
 assert.equal("config" in snapshotList.snapshots[0], false);
-const snapshotRestoreResp = await worker.default.fetch(new Request(`https://gw.test/llmmerge-admin/api/config/snapshots/${snapshotList.snapshots[0].id}/restore`, { method: "POST" }), snapshotEnv);
+const snapshotRestoreResp = await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/config/snapshots/${snapshotList.snapshots[0].id}/restore`, { method: "POST" }), snapshotEnv);
 const snapshotRestored = await snapshotRestoreResp.json();
 assert.equal(snapshotRestored.config.upstreams.length, 3);
 assert.equal(snapshotRestored.config.upstreams.some((upstream) => upstream.name === "ai-old"), true);
@@ -1487,6 +1520,7 @@ scopedStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const scopedEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1526,6 +1560,7 @@ speedStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const speedEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1550,7 +1585,7 @@ async function speedRequest(key) {
 }
 await speedRequest("sk-slow");
 await speedRequest("sk-fast");
-const manualSpeedResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
+const manualSpeedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/speed-test", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ model: "speed-model" }),
@@ -1562,7 +1597,7 @@ assert.equal(manualSpeed.results.find((r) => r.name === "stream").metric, "first
 assert.equal(speedStreamHits.includes("cancel"), true);
 assert.equal(speedBodies.at(-1).stream, true);
 const selectedSpeedStart = speedHits.length;
-const selectedSpeedResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
+const selectedSpeedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/speed-test", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ model: "speed-model", upstreams: ["fast"] }),
@@ -1571,7 +1606,7 @@ const selectedSpeed = await selectedSpeedResp.json();
 assert.equal(selectedSpeedResp.status, 200);
 assert.deepEqual(selectedSpeed.results.map((r) => r.name), ["fast"]);
 assert.deepEqual(speedHits.slice(selectedSpeedStart), ["fast"]);
-const missingSpeedResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
+const missingSpeedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/speed-test", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ model: "missing-model" }),
@@ -1592,6 +1627,7 @@ hedgeStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const hedgeEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1633,6 +1669,7 @@ hedgeStreamStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const hedgeStreamEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) { const value = hedgeStreamStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
@@ -1662,6 +1699,7 @@ softFastStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const softFastEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1710,6 +1748,7 @@ attemptBudgetStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const attemptBudgetEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) { const value = attemptBudgetStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
@@ -1737,6 +1776,7 @@ nimStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const nimEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1758,7 +1798,7 @@ for (let i = 0; i < 41; i += 1) {
 }
 assert.equal(nimHits.length, 40);
 assert.equal(nimResp.headers.get("x-llm-gateway-upstream"), "nim-fallback");
-const runtimeResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), nimEnv);
+const runtimeResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), nimEnv);
 const runtimeStatus = await runtimeResp.json();
 assert.equal(runtimeStatus.nim_rpm["nim-limit"].count, 40);
 assert.equal(runtimeStatus.nim_rpm["nim-limit"].limit, 40);
@@ -1770,12 +1810,13 @@ responsesStore.set("gateway:config", JSON.stringify({
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "responses", base_url: "https://responses.example/v1", api_key_encrypted: "r", models: ["resp-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "responses-stream", base_url: "https://responses-stream.example/v1", api_key_encrypted: "s", models: ["stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "responses-stream", base_url: "https://responses-stream.example/v1", api_key_encrypted: "s", models: ["stream-model", "oversized-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "responses-stream-error", base_url: "https://responses-stream.example/v1", api_key_encrypted: "e", models: ["stream-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "responses-app-error", base_url: "https://app-error.example/v1", api_key_encrypted: "a", models: ["responses-app-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const responsesEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1853,7 +1894,7 @@ assert.equal(responseHits.at(-1).messages[1].content.includes("Fix the worker.")
 assert.equal(responseHits.at(-1).messages[1].content.includes("shell"), true);
 assert.equal(compactPayload.output[0].type, "message");
 assert.equal(compactPayload.output[0].content[0].text, "Conversation summary:\nhello");
-const responsesLogs = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), responsesEnv)).json();
+const responsesLogs = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), responsesEnv)).json();
 const responsesLog = responsesLogs.logs.find((entry) => entry.model === "resp-model" && entry.path === "/v1/responses");
 assert.equal(responsesLog.finish_reason, "tool_calls");
 assert.equal(responsesLogs.logs.some((entry) => entry.path === "/v1/responses/compact" && entry.model === "resp-model"), true);
@@ -1877,12 +1918,18 @@ assert.equal(responsesStreamText.includes('"type":"response.reasoning_summary_te
 assert.equal(responsesStreamText.includes('"type":"response.completed"'), true);
 assert.equal(responsesStreamText.includes('"output_text":"hello"'), true);
 assert.equal(responsesStreamText.includes('"arguments":"{\\"query\\":\\"glm\\"}"'), true);
-const responsesStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), responsesEnv);
+const responsesStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), responsesEnv);
 const responsesStreamLogs = await responsesStreamLogsResp.json();
 const responsesStreamLog = responsesStreamLogs.logs.find((entry) => entry.model === "stream-model" && entry.path === "/v1/responses");
 assert.equal(responsesStreamLog.completion_tokens >= 1, true);
 assert.equal(responsesStreamLog.close_reason, "done");
 assert.equal(Number.isFinite(responsesStreamLog.time_to_first_byte_ms), true);
+const oversizedResponsesStream = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "oversized-stream-model", input: "hi", stream: true }),
+}), responsesEnv);
+assert.equal((await oversizedResponsesStream.text()).includes('"type":"response.failed"'), true);
 const responsesErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
@@ -1912,6 +1959,7 @@ anthropicStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const anthropicEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -1973,6 +2021,7 @@ cloudflare524Store.set("gateway:config", JSON.stringify({
   ],
 }));
 const cloudflare524Env = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) { const value = cloudflare524Store.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
@@ -2051,7 +2100,7 @@ assert.equal(anthropicStreamText.includes('"type":"text_delta","text":"Checking 
 assert.equal(anthropicStreamText.includes('"type":"input_json_delta","partial_json":"{\\"query\\":"'), true);
 assert.equal(anthropicStreamText.includes('"stop_reason":"tool_use"'), true);
 assert.equal(anthropicStreamText.includes("event: message_stop"), true);
-const anthropicLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), anthropicEnv);
+const anthropicLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), anthropicEnv);
 const anthropicLogs = await anthropicLogsResp.json();
 const anthropicStreamLog = anthropicLogs.logs.find((entry) => entry.model === "anthropic-stream-model" && entry.path === "/v1/messages");
 assert.equal(anthropicStreamLog.finish_reason, "tool_calls");
@@ -2085,6 +2134,7 @@ paymentStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const paymentEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2114,6 +2164,7 @@ appErrorStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const appErrorEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2134,10 +2185,10 @@ const appErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/
 assert.equal(appErrorHits.length, appErrorHitStart + 1);
 assert.equal(appErrorResp.headers.get("x-llm-gateway-upstream"), "app-fallback");
 await appErrorResp.text();
-const appErrorRuntime = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), appErrorEnv)).json();
+const appErrorRuntime = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), appErrorEnv)).json();
 assert.equal(appErrorRuntime.active_upstreams["app-error"], undefined);
 assert.equal(appErrorRuntime.active_upstreams["app-fallback"], undefined);
-const appErrorSpeed = await (await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/speed-test", {
+const appErrorSpeed = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/speed-test", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ model: "minimax-m3", upstreams: ["app-error"] }),
@@ -2155,6 +2206,7 @@ htmlStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const htmlEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2184,6 +2236,7 @@ htmlResponsesStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const htmlResponsesEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2215,6 +2268,7 @@ degradedStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const degradedEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2244,6 +2298,7 @@ missingFunctionStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const missingFunctionEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2272,6 +2327,7 @@ longStreamStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const longStreamEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2288,11 +2344,11 @@ const longStreamResp = await worker.default.fetch(new Request("https://gw.test/v
   headers: { authorization: "Bearer sk-long-stream", "content-type": "application/json" },
   body: JSON.stringify({ model: "long-model", messages: [] }),
 }), longStreamEnv);
-const longActiveRuntimeResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), longStreamEnv);
+const longActiveRuntimeResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), longStreamEnv);
 const longActiveRuntime = await longActiveRuntimeResp.json();
 assert.equal(longActiveRuntime.active_upstreams["long-stream"] > 0, true);
 assert.equal(await longStreamResp.text(), "xxxxx");
-const longIdleRuntimeResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/runtime"), longStreamEnv);
+const longIdleRuntimeResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), longStreamEnv);
 const longIdleRuntime = await longIdleRuntimeResp.json();
 assert.equal(longIdleRuntime.active_upstreams["long-stream"], undefined);
 assert.equal(longStreamHits.length, 1);
@@ -2307,6 +2363,7 @@ spreadStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const spreadEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2341,6 +2398,7 @@ usageStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const usageEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2381,7 +2439,7 @@ assert.equal(usageStreamResp.headers.get("content-encoding"), null);
 assert.equal(usageStreamResp.headers.get("cache-control"), "no-cache, no-transform");
 assert.equal(usageStreamResp.headers.get("x-accel-buffering"), "no");
 await usageStreamResp.text();
-const usageLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), usageEnv);
+const usageLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), usageEnv);
 const usageLogs = await usageLogsResp.json();
 assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-json" && entry.prompt_tokens === 11 && entry.completion_tokens === 22), true);
 assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-stream" && entry.prompt_tokens === 7 && entry.completion_tokens === 9), true);
@@ -2400,6 +2458,7 @@ toolLogStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const toolLogEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2416,7 +2475,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   headers: { authorization: "Bearer sk-tool", "content-type": "application/json" },
   body: JSON.stringify({ model: "tool-model", messages: [], tools: [{ type: "function", function: { name: "web_search", parameters: {} } }] }),
 }), toolLogEnv);
-const toolLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), toolLogEnv);
+const toolLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), toolLogEnv);
 const toolLogs = await toolLogsResp.json();
 const toolLog = toolLogs.logs.find((entry) => entry.model === "tool-model");
 assert.equal(toolLog.tools_count, 1);
@@ -2431,6 +2490,7 @@ toolStreamStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const toolStreamEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2455,7 +2515,7 @@ const toolStreamResp = await worker.default.fetch(new Request("https://gw.test/v
 const toolStreamText = await toolStreamResp.text();
 assert.equal(toolStreamText.includes('"finish_reason":"tool_calls"'), true);
 assert.equal(toolStreamText.endsWith("data: [DONE]\n\n"), true);
-const toolStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), toolStreamEnv);
+const toolStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), toolStreamEnv);
 const toolStreamLogs = await toolStreamLogsResp.json();
 const toolStreamLog = toolStreamLogs.logs.find((entry) => entry.model === "tool-stream-model");
 assert.equal(toolStreamLog.close_reason, "finish_grace");
@@ -2472,6 +2532,7 @@ failStore.set("gateway:config", JSON.stringify({
   ],
 }));
 const failEnv = {
+  ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
@@ -2491,7 +2552,7 @@ const failResp = await worker.default.fetch(new Request("https://gw.test/v1/chat
 assert.equal(failResp.status, 502);
 assert.equal(failResp.headers.get("retry-after"), "1");
 assert.equal(failResp.headers.get("x-llm-gateway-trace-id"), "trace-fail");
-const failLogsResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/logs"), failEnv);
+const failLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), failEnv);
 const failLogs = await failLogsResp.json();
 assert.equal(failLogs.logs.some((entry) => entry.upstream === "boom" && entry.status === 502), true);
 assert.equal(failLogs.logs.some((entry) => entry.trace_id === "trace-fail"), true);

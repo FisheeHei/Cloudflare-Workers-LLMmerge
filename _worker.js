@@ -53,8 +53,10 @@ const COMPACTION_PROMPT = "Compress the conversation for continued agent work. P
 const ANALYTICS_LIVE_PENDING_MS = 120000;
 const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
-const VERSION = "v26-07-24-response-stream-cpu";
-const DEFAULT_ADMIN_TOKEN = "llmmerge-admin";
+const MAX_SSE_EVENT_CHARS = 1024 * 1024;
+const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
+const MAX_CLIENT_KEY_LENGTH = 512;
+const VERSION = "v26-07-26-runtime-hardening";
 
 export default {
   async fetch(request, env, ctx) {
@@ -249,6 +251,9 @@ function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
   const adminToken = pickAdminToken(env);
 
+  if (!adminToken) {
+    throw badConfig("ADMIN_TOKEN is required.");
+  }
   if (!/^[A-Za-z0-9._~-]+$/.test(adminToken)) {
     throw badConfig("ADMIN_TOKEN may only contain URL-safe characters.");
   }
@@ -428,11 +433,16 @@ async function _doFlush(app) {
   if (_pendingLogs.length > 0) {
     var logsToFlush = _pendingLogs.splice(0);
     logPromise = (async () => {
-      var raw = await app.kv.get(LOG_KEY, "json");
-      var existing = Array.isArray(raw) ? raw : [];
-      existing.push(...logsToFlush);
-      if (existing.length > 50) existing.splice(0, existing.length - 50);
-      await app.kv.put(LOG_KEY, JSON.stringify(existing));
+      try {
+        var raw = await app.kv.get(LOG_KEY, "json");
+        var existing = Array.isArray(raw) ? raw : [];
+        existing.push(...logsToFlush);
+        if (existing.length > 50) existing.splice(0, existing.length - 50);
+        await app.kv.put(LOG_KEY, JSON.stringify(existing));
+      } catch {
+        _pendingLogs.unshift(...logsToFlush);
+        _lastFlush = 0;
+      }
     })();
   }
   var statsPromise = Promise.resolve();
@@ -442,9 +452,14 @@ async function _doFlush(app) {
     for (var k of keys) { deltas[k] = _pendingStats[k]; delete _pendingStats[k]; }
     statsPromise = Promise.all(keys.map(async function(hourKey) {
       var delta = deltas[hourKey];
-      var raw = await app.kv.get(STATS_PREFIX + hourKey, "json");
-      var bucket = mergeStatsBucket(raw, delta);
-      await app.kv.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
+      try {
+        var raw = await app.kv.get(STATS_PREFIX + hourKey, "json");
+        var bucket = mergeStatsBucket(raw, delta);
+        await app.kv.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
+      } catch {
+        _pendingStats[hourKey] = mergeStatsBucket(_pendingStats[hourKey], delta);
+        _lastFlush = 0;
+      }
     }));
   }
   await Promise.all([logPromise, statsPromise]);
@@ -927,6 +942,7 @@ function streamPendingAnthropicResponse(open) {
 function consumeOpenAiStreamBuffer(text, onChunk, onDone = null) {
   const blocks = text.split(/\r?\n\r?\n/);
   const rest = blocks.pop() || "";
+  if (rest.length > MAX_SSE_EVENT_CHARS) throw new Error("Upstream SSE event exceeds 1 MiB.");
   for (const block of blocks) {
     const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
     if (!data) continue;
@@ -1395,7 +1411,7 @@ async function repairStoredGatewayConfig(config, app) {
       preset,
     });
   }));
-  const validUpstreams = upstreams.filter((item) => item.name && item.base_url && item.api_key_encrypted);
+  const validUpstreams = uniqueValidUpstreams(upstreams);
 
   return {
     routing: normalizeGatewayRouting(routing),
@@ -1437,7 +1453,7 @@ async function buildGatewayConfigFromEnv(app) {
       system_prompt: String(app.env.SYSTEM_PROMPT || app.env.GLOBAL_SYSTEM_PROMPT || ""),
       global_context: String(app.env.GLOBAL_CONTEXT || app.env.GLOBAL_SYSTEM_CONTEXT || ""),
     }, app),
-    upstreams,
+    upstreams: uniqueValidUpstreams(upstreams),
     version: 1,
   };
 }
@@ -1451,6 +1467,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
   const routing = payload.routing && typeof payload.routing === "object" ? payload.routing : {};
   const upstreamEntries = Array.isArray(payload.upstreams) ? payload.upstreams : [];
   const upstreams = [];
+  const names = new Set();
 
   for (let index = 0; index < upstreamEntries.length; index += 1) {
     const item = upstreamEntries[index];
@@ -1465,10 +1482,14 @@ async function normalizeGatewayConfigPayload(payload, app) {
 
     if (!name) throw httpError(400, "Each upstream needs a name.");
     if (!baseUrl) throw httpError(400, `Upstream ${name} is missing base_url.`);
+    if (!isAllowedUpstreamUrl(baseUrl)) throw httpError(400, `Upstream ${name} must use an HTTP(S) base_url without embedded credentials.`);
     if (!apiKeyValue) throw httpError(400, `Upstream ${name} is missing api_key.`);
     if (presetById(preset)?.requires_account_id && !accountId && !String(item.base_url || "").trim()) {
       throw httpError(400, `Upstream ${name} is missing account_id.`);
     }
+    const nameKey = name.toLowerCase();
+    if (names.has(nameKey)) throw httpError(400, `Upstream names must be unique: ${name}`);
+    names.add(nameKey);
 
     const models = normalizeStringArray(item.models);
     upstreams.push(buildUpstreamConfigRecord(item, index, {
@@ -1500,6 +1521,16 @@ function toPublicGatewayConfig(config) {
     })),
     version: config.version || 1,
   };
+}
+
+function uniqueValidUpstreams(upstreams) {
+  const seenNames = new Set();
+  return upstreams.filter((item) => {
+    const name = String(item?.name || "").toLowerCase();
+    if (!name || !item.base_url || !item.api_key_encrypted || !isAllowedUpstreamUrl(item.base_url) || seenNames.has(name)) return false;
+    seenNames.add(name);
+    return true;
+  });
 }
 
 async function listConfigSnapshots(kv) {
@@ -3627,13 +3658,23 @@ async function primeSseResponse(response) {
   const chunks = [];
   let text = "";
   let error = "";
+  let bufferedBytes = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    bufferedBytes += value.byteLength;
+    if (bufferedBytes > MAX_SSE_PRIME_BYTES) {
+      try { await reader.cancel("SSE priming limit"); } catch {}
+      throw new Error("Upstream SSE did not produce output within 2 MiB.");
+    }
     chunks.push(value);
     text += decoder.decode(value, { stream: true });
     const events = text.split(/\r?\n\r?\n/);
     text = events.pop() || "";
+    if (text.length > MAX_SSE_EVENT_CHARS) {
+      try { await reader.cancel("SSE event limit"); } catch {}
+      throw new Error("Upstream SSE event exceeds 1 MiB.");
+    }
     for (const event of events) {
       const data = event.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
       if (!data || data === "[DONE]") continue;
@@ -3917,6 +3958,9 @@ function buildClientRecord(payload) {
   if (!key.startsWith("sk-")) {
     throw httpError(400, "Client key must start with `sk-`.");
   }
+  if (key.length > MAX_CLIENT_KEY_LENGTH) {
+    throw httpError(400, "Client key is too long.");
+  }
 
   const now = hkNowIso();
   return normalizeClient({
@@ -4101,6 +4145,8 @@ function normalizePathname(pathname) {
 function pickAdminToken(env) {
   const candidates = [
     env.ADMIN_TOKEN,
+    env.ADMINTOKEN,
+    env.admintoken,
     env.ADMIN,
     env.admin,
     env.TOKEN,
@@ -4114,7 +4160,7 @@ function pickAdminToken(env) {
     }
   }
 
-  return DEFAULT_ADMIN_TOKEN;
+  return "";
 }
 
 function buildAdminPathAliases(adminToken) {
@@ -4223,12 +4269,21 @@ function resolveBaseUrl(presetId, inputBaseUrl, defaultBaseUrl, accountId) {
   return String(inputBaseUrl || defaultBaseUrl || "").trim();
 }
 
+function isAllowedUpstreamUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 function getBearerToken(request) {
   const auth = request.headers.get("authorization") || "";
-  if (auth.startsWith("Bearer ")) {
-    return auth.slice("Bearer ".length).trim();
-  }
-  return (request.headers.get("x-api-key") || "").trim() || null;
+  const token = auth.startsWith("Bearer ")
+    ? auth.slice("Bearer ".length).trim()
+    : (request.headers.get("x-api-key") || "").trim();
+  return token && token.length <= MAX_CLIENT_KEY_LENGTH ? token : null;
 }
 
 async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose) {
