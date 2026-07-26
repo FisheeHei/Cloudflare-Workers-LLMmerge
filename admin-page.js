@@ -190,6 +190,8 @@ function renderAdminStyle() {
       border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
     }
     .upstream-status-emoji { width: 22px; text-align: center; font-size: 16px; line-height: 1; }
+    .upstream-status-emoji.active { animation: upstream-active .55s ease-in-out infinite alternate; }
+    @keyframes upstream-active { to { transform: scale(1.22); opacity: .5; } }
     .upstream-card summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .health-dot {
       width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
@@ -227,6 +229,10 @@ function renderAdminStyle() {
     .client-item .client-meta .mono { color: var(--muted); word-break: break-all; }
     .client-create { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
     .client-create input { flex: 1; min-width: 160px; }
+    .upstream-live-summary { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+    .upstream-live-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+    .upstream-live-summary strong { color: var(--ink); }
+    .upstream-live-summary-list { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     .key-output {
       margin-top: 12px; padding: 14px; background: #eaf2ff;
@@ -525,6 +531,10 @@ function renderAdminMarkup(origin, version) {
       <div class="stat-box"><span class="stat-num" id="stat-pt-session">0</span><span class="stat-label">会话 Input</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-ct-session">0</span><span class="stat-label">会话 Output</span></div>
     </div>
+    <div class="upstream-live-summary" aria-live="polite">
+      <div class="upstream-live-summary-head"><strong>上游实时状态</strong><span class="note" id="live-upstream-count">连接中...</span></div>
+      <div class="note mono upstream-live-summary-list" id="live-upstream-list">暂无活跃请求</div>
+    </div>
   </div>
 
   <div class="panel" id="client-panel">
@@ -777,6 +787,7 @@ function renderAdminScript(version) {
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
   let liveRefreshRunning = false;
+  let runtimeRefreshRunning = false;
 
   function setupAdminNav() {
     const links = [...document.querySelectorAll("[data-view-target]")];
@@ -1692,26 +1703,32 @@ function renderAdminScript(version) {
   }
 
   async function loadRuntimeStatus() {
-    const resp = await fetch(API_BASE + "/runtime");
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) return;
+    if (runtimeRefreshRunning || document.visibilityState !== "visible") return;
+    runtimeRefreshRunning = true;
+    try {
+      const resp = await fetch(API_BASE + "/runtime");
+      const payload = await parseApiResponse(resp);
+      if (!resp.ok) return;
     const topbarStatus = byId("topbar-status");
     if (topbarStatus) {
       topbarStatus.textContent = "Gateway online";
       topbarStatus.classList.add("online");
     }
     const active = payload.active_upstreams || {};
-    const last = payload.last_successful_upstream || "";
+    const last = payload.last_successful_upstream || {};
+    const recent = new Set(typeof last === "string" ? [last] : Object.values(last));
     document.querySelectorAll(".upstream-status-emoji").forEach(function(el) {
       const card = el.closest(".upstream-card");
       const name = el.dataset.upstream;
+      const isActive = !(card && card.classList.contains("disabled")) && Number(active[name] || 0) > 0;
+      el.classList.toggle("active", isActive);
       if (card && card.classList.contains("disabled")) {
         el.textContent = "\u26d4";
         el.title = "\u5df2\u505c\u7528";
-      } else if (Number(active[name] || 0) > 0) {
+      } else if (isActive) {
         el.textContent = "\u26a1";
         el.title = "\u6b63\u5728\u8bf7\u6c42: " + active[name];
-      } else if (name && name === last) {
+      } else if (name && recent.has(name)) {
         el.textContent = "\u2705";
         el.title = "\u4e0a\u6b21\u6210\u529f\u4f7f\u7528";
       } else {
@@ -1720,6 +1737,7 @@ function renderAdminScript(version) {
       }
     });
     updateUpstreamGroupActive(active);
+    updateUpstreamLiveSummary(active, recent);
     const nim = payload.nim_rpm || {};
     document.querySelectorAll(".nim-rpm").forEach(function(el) {
       const item = nim[el.dataset.upstream];
@@ -1739,6 +1757,9 @@ function renderAdminScript(version) {
       }
       el.title = seconds + "s \u540e\u6e05\u96f6";
     });
+    } finally {
+      runtimeRefreshRunning = false;
+    }
   }
 
   async function refreshLivePanels() {
@@ -1754,6 +1775,17 @@ function renderAdminScript(version) {
     } finally {
       liveRefreshRunning = false;
     }
+  }
+
+  function updateUpstreamLiveSummary(active, recent) {
+    const count = Object.values(active).reduce((sum, value) => sum + Number(value || 0), 0);
+    const names = Object.keys(active).filter((name) => Number(active[name] || 0) > 0);
+    const countEl = byId("live-upstream-count");
+    const listEl = byId("live-upstream-list");
+    if (countEl) countEl.textContent = count ? "\u26a1 " + count + " \u4e2a\u6d3b\u8dc3\u8bf7\u6c42" : "\u25cb \u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42";
+    if (listEl) listEl.textContent = names.length
+      ? names.map((name) => name + " (" + active[name] + ")").join(" \u00b7 ")
+      : (recent.size ? "\u6700\u8fd1\u6210\u529f: " + [...recent].filter(Boolean).join(" \u00b7 ") : "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42");
   }
 
   function updateUpstreamGroupActive(active) {
@@ -2624,6 +2656,8 @@ function renderAdminScript(version) {
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
       setInterval(refreshLivePanels, 2000);
+      // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
+      setInterval(loadRuntimeStatus, 1000);
 
 
     } catch (error) {

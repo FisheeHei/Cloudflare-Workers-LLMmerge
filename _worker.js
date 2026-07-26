@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-26-client-key-copy";
+const VERSION = "v26-07-26-runtime-ui-simplified";
 
 export default {
   async fetch(request, env, ctx) {
