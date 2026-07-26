@@ -229,7 +229,7 @@ function renderAdminStyle() {
     .client-item .client-meta .mono { color: var(--muted); word-break: break-all; }
     .client-create { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
     .client-create input { flex: 1; min-width: 160px; }
-    .upstream-live-summary { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+    .upstream-live-summary { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
     .upstream-live-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
     .upstream-live-summary strong { color: var(--ink); }
     .upstream-live-summary-list { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -503,6 +503,10 @@ function renderAdminMarkup(origin, version) {
         <div class="url-card-head">Gateway URL <span class="note">(OpenAI + Claude Compatible)</span></div>
         <code id="gateway-url-pill">${origin}/v1</code>
         <button class="small secondary" id="copy-gateway-url">\u590d\u5236</button>
+        <div class="upstream-live-summary" aria-live="polite">
+          <div class="upstream-live-summary-head"><strong>上游实时状态</strong><span class="note" id="live-upstream-count">连接中...</span></div>
+          <div class="note mono upstream-live-summary-list" id="live-upstream-list">暂无活跃请求</div>
+        </div>
       </div>
     </div>
   </div>
@@ -530,10 +534,6 @@ function renderAdminMarkup(origin, version) {
     <div class="stats-grid stats-grid-2col" style="margin-top:4px">
       <div class="stat-box"><span class="stat-num" id="stat-pt-session">0</span><span class="stat-label">会话 Input</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-ct-session">0</span><span class="stat-label">会话 Output</span></div>
-    </div>
-    <div class="upstream-live-summary" aria-live="polite">
-      <div class="upstream-live-summary-head"><strong>上游实时状态</strong><span class="note" id="live-upstream-count">连接中...</span></div>
-      <div class="note mono upstream-live-summary-list" id="live-upstream-list">暂无活跃请求</div>
     </div>
   </div>
 
