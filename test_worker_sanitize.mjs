@@ -477,7 +477,16 @@ const env = {
   CLIENTS_JSON: JSON.stringify([{ name: "c", key: "sk-test", models: ["*"], upstreams: ["nim"] }]),
 };
 
-assert.equal((await worker.default.fetch(new Request("https://gw.test/health"), { ...env, ADMIN_TOKEN: "" })).status, 500);
+const unconfiguredEnv = {
+  ...env,
+  ADMIN_TOKEN: "",
+  ASSETS: { async fetch() { return new Response("asset", { status: 200 }); } },
+};
+const unconfiguredHealth = await worker.default.fetch(new Request("https://gw.test/health"), unconfiguredEnv);
+assert.equal(unconfiguredHealth.status, 200);
+assert.equal((await unconfiguredHealth.json()).admin_configured, false);
+assert.equal((await worker.default.fetch(new Request("https://gw.test/favicon.ico"), unconfiguredEnv)).status, 200);
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", { method: "OPTIONS" }), unconfiguredEnv)).status, 204);
 
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
@@ -536,6 +545,11 @@ const privateModelsResp = await worker.default.fetch(new Request("https://gw.tes
   headers: { authorization: "Bearer sk-test" },
 }), env);
 assert.equal(privateModelsResp.headers.get("cache-control"), "private, max-age=30");
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [{ role: "user", content: "x".repeat(2 * 1024 * 1024 + 1) }] }),
+}), env)).status, 413);
 
 assert.equal(adminPage.includes("upstream-enable-toggle"), true);
 assert.equal(adminPage.includes("upstream-group"), true);

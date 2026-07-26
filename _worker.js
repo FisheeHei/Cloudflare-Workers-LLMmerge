@@ -56,7 +56,8 @@ const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
 const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
-const VERSION = "v26-07-26-runtime-hardening";
+const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
+const VERSION = "v26-07-26-free-cpu-guard";
 
 export default {
   async fetch(request, env, ctx) {
@@ -64,9 +65,6 @@ export default {
       const url = new URL(request.url);
       const pathname = normalizePathname(url.pathname);
       const pathnameLower = pathname.toLowerCase();
-      const app = createApp(env);
-      scheduleStdTimeSync(app, ctx);
-      const adminRoute = matchAdminRoute(pathnameLower, app);
 
       if (request.method === "OPTIONS") {
         return new Response(null, {
@@ -81,7 +79,8 @@ export default {
             {
               ok: true,
               mode: "openai-compatible-gateway",
-              has_kv: Boolean(app.kv),
+              has_kv: Boolean(env.KV),
+              admin_configured: Boolean(pickAdminToken(env)),
               now: hkNowIso(),
               time_zone: HK_TIME_ZONE_LABEL,
             },
@@ -89,6 +88,15 @@ export default {
           ),
         );
       }
+
+      if (env.ASSETS && request.method === "GET" && pathname !== "/" && pathname !== MODEL_PATH) {
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) return assetResponse;
+      }
+
+      const app = createApp(env);
+      scheduleStdTimeSync(app, ctx);
+      const adminRoute = matchAdminRoute(pathnameLower, app);
 
       if (request.method === "GET" && adminRoute?.kind === "page") {
         // ponytail: ETag-based conditional request �?CDN caches, revalidates with 304
@@ -122,7 +130,7 @@ export default {
         const traceId = requestTraceId(request);
         const runtime = await loadRuntimeConfig(app);
         const client = await requireClient(request, runtime);
-        const bodyText = await request.text();
+        const bodyText = await readRequestText(request);
         const payload = parseJsonBody(bodyText);
         const requestedModel = payload.model;
 
@@ -200,13 +208,6 @@ export default {
         }
       }
 
-      if (env.ASSETS && request.method === "GET" && pathname !== "/") {
-        const assetResponse = await env.ASSETS.fetch(request);
-        if (assetResponse.status !== 404) {
-          return assetResponse;
-        }
-      }
-
       if (request.method === "GET") {
         return html(renderNginxWelcomePage());
       }
@@ -237,8 +238,11 @@ var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
 var _runtimeCache = null;
 var _runtimeCacheTs = 0;
-var RUNTIME_CACHE_TTL_MS = 30000;
+var RUNTIME_CACHE_TTL_MS = 120000;
 var _runtimeLoading = null;
+// ponytail: encryption secret changes only on redeploy; reuse its imported CryptoKey per isolate.
+var _aesKeySecret = "";
+var _aesKeyPromise = null;
 var _stdTimeOffsetMs = 0;
 var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
@@ -1067,7 +1071,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/clients" && request.method === "POST") {
-    const payload = parseJsonBody(await request.text());
+    const payload = parseJsonBody(await readRequestText(request));
     const record = buildClientRecord(payload);
     await saveClientRecord(app.kv, record);
 
@@ -1091,7 +1095,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     const id = decodeURIComponent(clientMatch[1]);
     const existing = await app.kv.get(clientIdKey(id), "json");
     if (!existing?.key) throw httpError(404, "Client not found.");
-    const payload = parseJsonBody(await request.text());
+    const payload = parseJsonBody(await readRequestText(request));
     const record = buildClientRecord({
       ...existing,
       ...payload,
@@ -1181,7 +1185,7 @@ async function adminConfigResponse(url, app) {
 }
 
 async function saveAdminConfig(request, app) {
-  const payload = parseJsonBody(await request.text());
+  const payload = parseJsonBody(await readRequestText(request));
   // ponytail: merge into existing so a partial payload never wipes upstreams
   const existing = await getEditableConfig(app);
   const hasUpstreams = Object.prototype.hasOwnProperty.call(payload, "upstreams");
@@ -1202,7 +1206,7 @@ async function saveAdminConfig(request, app) {
 }
 
 async function fetchAdminModels(request, app) {
-  const payload = parseJsonBody(await request.text());
+  const payload = parseJsonBody(await readRequestText(request));
   const upstream = await resolveModelFetchUpstream(payload, app);
   if (upstream.response) return upstream.response;
   try {
@@ -1245,7 +1249,7 @@ async function resolveModelFetchUpstream(payload, app) {
 
 async function speedTestAdminUpstreams(request, app) {
   const runtime = await loadRuntimeConfig(app);
-  const payload = parseJsonBody(await request.text());
+  const payload = parseJsonBody(await readRequestText(request));
   const model = String(payload.model || "").trim();
   if (!model) {
     return withCorsResponse(json(openAiError("Model is required for speed test.", "invalid_request_error"), 400));
@@ -2193,7 +2197,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
   const started = Date.now();
   const runtime = await loadRuntimeConfig(app);
   const client = await requireClient(request, runtime);
-  const payload = parseJsonBody(await request.text());
+  const payload = parseJsonBody(await readRequestText(request));
   const translated = translateAnthropicMessagesRequest(payload);
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
 
@@ -2575,7 +2579,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const started = Date.now();
   const runtime = await loadRuntimeConfig(app);
   const client = await requireClient(request, runtime);
-  const payload = parseJsonBody(await request.text());
+  const payload = parseJsonBody(await readRequestText(request));
   const translated = translateResponsesRequest(payload);
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
@@ -2643,7 +2647,7 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   const started = Date.now();
   const runtime = await loadRuntimeConfig(app);
   const client = await requireClient(request, runtime);
-  const payload = parseJsonBody(await request.text());
+  const payload = parseJsonBody(await readRequestText(request));
   const requestedModel = String(payload?.model || "").trim();
   if (!requestedModel) throw httpError(400, "`model` is required.");
 
@@ -4072,8 +4076,16 @@ async function decryptValue(value, secret, preDerivedKey) {
 }
 
 async function deriveAesKey(secret) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
-  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
+  if (_aesKeyPromise && _aesKeySecret === secret) return _aesKeyPromise;
+  _aesKeySecret = secret;
+  _aesKeyPromise = crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret))
+    .then((digest) => crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]));
+  try {
+    return await _aesKeyPromise;
+  } catch (error) {
+    if (_aesKeySecret === secret) _aesKeyPromise = null;
+    throw error;
+  }
 }
 
 function joinBytes(first, second) {
@@ -4119,6 +4131,16 @@ function parseJsonEnvArray(value, name) {
   } catch {
     throw badConfig(`${name} must be a JSON array.`);
   }
+}
+
+async function readRequestText(request) {
+  const declaredLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_CHARS) {
+    throw httpError(413, "Request body is too large.");
+  }
+  const text = await request.text();
+  if (text.length > MAX_REQUEST_BODY_CHARS) throw httpError(413, "Request body is too large.");
+  return text;
 }
 
 function parseJsonBody(bodyText) {
