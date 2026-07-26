@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-26-runtime-ui-simplified";
+const VERSION = "v26-07-26-route-status-hardening";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1095,7 +1095,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     const id = decodeURIComponent(clientMatch[1]);
     const existing = await app.kv.get(clientIdKey(id), "json");
     if (!existing?.key) throw httpError(404, "Client not found.");
-    return withCorsResponse(json({ ...publicClientRecord(existing), api_key: existing.key }, 200));
+    const response = withCorsResponse(json({ ...publicClientRecord(existing), api_key: existing.key }, 200));
+    const headers = new Headers(response.headers);
+    headers.set("cache-control", "private, no-store");
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
   }
 
   if (clientMatch && request.method === "PUT") {
@@ -3581,7 +3584,10 @@ async function discardUpstreamResponse(result, reason) {
   result?.release?.();
 }
 
-function discardPendingHedgeLosers(pending) {
+function stopHedgeLosers(pending, controllers, winnerIndex) {
+  controllers.forEach((controller, index) => {
+    if (index !== winnerIndex) controller.abort("hedged upstream lost");
+  });
   pending.forEach(({ promise }) => {
     void promise.then((result) => discardUpstreamResponse(result, "hedged upstream lost")).catch(() => {});
   });
@@ -3634,8 +3640,7 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
     const retryable = Boolean(result.streamError) || (result.response && await isRetryableUpstreamResponse(result.response));
     if (result.response && !retryable) {
       done = true;
-      controllers.forEach((controller, i) => { if (i !== result.index) controller.abort(); });
-      discardPendingHedgeLosers(pending);
+      stopHedgeLosers(pending, controllers, result.index);
       clearUpstreamFailure(result.upstream, model);
       rememberUpstreamLatency(result.upstream, model, result.latency);
       rememberSuccessfulUpstream(result.upstream, model);

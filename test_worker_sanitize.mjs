@@ -30,6 +30,7 @@ const speedBodies = [];
 const speedStreamHits = [];
 const hedgeHits = [];
 const hedgeStreamHits = [];
+const hedgeStreamAborts = [];
 const hedgeCancels = [];
 const softFastHits = [];
 const attemptBudgetHits = [];
@@ -299,6 +300,10 @@ globalThis.fetch = async (url, init) => {
     hedgeStreamHits.push("slow");
     return new Response(new ReadableStream({
       start(controller) {
+        init.signal?.addEventListener("abort", () => {
+          hedgeStreamAborts.push("slow");
+          controller.error(new Error("aborted"));
+        }, { once: true });
         setTimeout(() => {
           if (init.signal?.aborted) {
             controller.error(new Error("aborted"));
@@ -529,7 +534,7 @@ assert.equal(adminPage.includes("bar-hit"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
 assert.equal(adminPage.includes("setInterval(refreshLivePanels, 2000)"), true);
-assert.equal(adminPage.includes("setInterval(loadRuntimeStatus, 1000)"), true);
+assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000)"), true);
 assert.equal(adminPage.includes("if (liveRefreshRunning || document.visibilityState"), true);
 assert.equal(adminPage.includes("Configuration error"), true);
 assert.equal(adminPage.includes("width: min(1216px"), true);
@@ -731,6 +736,7 @@ const copiedClientResp = await worker.default.fetch(new Request(`https://gw.test
 const copiedClient = await copiedClientResp.json();
 assert.equal(copiedClientResp.status, 200);
 assert.equal(copiedClient.api_key, createdClient.api_key);
+assert.equal(copiedClientResp.headers.get("cache-control"), "private, no-store");
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 200);
@@ -1707,6 +1713,8 @@ const hedgeStreamResp = await worker.default.fetch(new Request("https://gw.test/
 assert.equal(hedgeStreamResp.headers.get("x-llm-gateway-upstream"), "hedge-stream-fast");
 assert.deepEqual(hedgeStreamHits.slice(hedgeStreamStart), ["slow", "fast"]);
 assert.equal((await hedgeStreamResp.text()).includes('"content":"fast"'), true);
+await new Promise((resolve) => setTimeout(resolve, 100));
+assert.equal(hedgeStreamAborts.includes("slow"), true);
 
 const softFastStore = new Map();
 softFastStore.set("gateway:config", JSON.stringify({

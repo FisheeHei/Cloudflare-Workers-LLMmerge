@@ -2657,7 +2657,7 @@ function renderAdminScript(version) {
       // ponytail: one guarded poll prevents slow AE queries from piling up.
       setInterval(refreshLivePanels, 2000);
       // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
-      setInterval(loadRuntimeStatus, 1000);
+      setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000);
 
 
     } catch (error) {
