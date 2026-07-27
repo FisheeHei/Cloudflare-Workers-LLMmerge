@@ -2464,6 +2464,71 @@ const spreadResp = await worker.default.fetch(new Request("https://gw.test/v1/ch
 assert.equal(spreadResp.headers.get("x-llm-gateway-upstream"), "idle");
 await spreadBusyResp.text();
 
+const groupLoadStore = new Map();
+groupLoadStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: true },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "group-a-active", preset: "nvidia-nim", base_url: "https://long-stream.example/v1", api_key_encrypted: "a", models: ["group-warm", "group-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "group-a-idle", preset: "nvidia-nim", base_url: "https://speed-fast.example/v1", api_key_encrypted: "a", models: ["group-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "group-b", preset: "openrouter", base_url: "https://speed-slow.example/v1", api_key_encrypted: "b", models: ["group-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+  ],
+}));
+const groupLoadEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = groupLoadStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { groupLoadStore.set(key, value); },
+    async delete(key) { groupLoadStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "group-load-client", key: "sk-group-load", models: ["*"], upstreams: ["group-a-active", "group-a-idle", "group-b"] }]),
+};
+const groupWarmResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-group-load", "content-type": "application/json" },
+  body: JSON.stringify({ model: "group-warm", messages: [] }),
+}), groupLoadEnv);
+const groupLoadResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-group-load", "content-type": "application/json" },
+  body: JSON.stringify({ model: "group-model", messages: [] }),
+}), groupLoadEnv);
+assert.equal(groupLoadResp.headers.get("x-llm-gateway-upstream"), "group-b");
+await groupWarmResp.text();
+
+const groupInternalStore = new Map();
+groupInternalStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: true },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "internal-active", preset: "nvidia-nim", base_url: "https://long-stream.example/v1", api_key_encrypted: "a", models: ["internal-warm", "internal-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "internal-idle", preset: "nvidia-nim", base_url: "https://speed-fast.example/v1", api_key_encrypted: "a", models: ["internal-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const groupInternalEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = groupInternalStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { groupInternalStore.set(key, value); },
+    async delete(key) { groupInternalStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "group-internal-client", key: "sk-group-internal", models: ["*"], upstreams: ["internal-active", "internal-idle"] }]),
+};
+const internalWarmResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-group-internal", "content-type": "application/json" },
+  body: JSON.stringify({ model: "internal-warm", messages: [] }),
+}), groupInternalEnv);
+const internalLoadResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-group-internal", "content-type": "application/json" },
+  body: JSON.stringify({ model: "internal-model", messages: [] }),
+}), groupInternalEnv);
+assert.equal(internalLoadResp.headers.get("x-llm-gateway-upstream"), "internal-idle");
+await internalWarmResp.text();
+
 const usageStore = new Map();
 usageStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },

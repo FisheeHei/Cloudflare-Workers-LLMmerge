@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-27-active-release";
+const VERSION = "v26-07-27-group-load-balance";
 
 export default {
   async fetch(request, env, ctx) {
@@ -3793,11 +3793,11 @@ function orderUpstreams(runtime, candidates, model) {
 
   const orderedHealthy = runtime.routing.load_balance === false
     ? activeSort(latencySort(prioritySort(healthy), model))
-    : activeSort(latencySort(weightedShuffle(healthy), model));
+    : groupLoadSort(runtime, latencySort(weightedShuffle(healthy), model));
 
   const orderedCooling = runtime.routing.load_balance === false
     ? activeSort(latencySort(prioritySort(cooling), model))
-    : activeSort(latencySort(weightedShuffle(cooling), model));
+    : groupLoadSort(runtime, latencySort(weightedShuffle(cooling), model));
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
   if (runtime.routing.failover === false) {
@@ -3818,6 +3818,27 @@ function latencySort(items, model) {
 
 function activeSort(items) {
   return [...items].sort((a, b) => activeUpstreamCount(a) - activeUpstreamCount(b));
+}
+
+function groupLoadSort(runtime, items) {
+  const groupActive = {};
+  const groupCapacity = {};
+  // ponytail: isolate-local pressure; a Durable Object is only needed for cross-instance balancing.
+  (runtime.upstreams || []).forEach((upstream) => {
+    const group = aliasPresetId(upstream);
+    groupActive[group] = (groupActive[group] || 0) + activeUpstreamCount(upstream);
+  });
+  items.forEach((upstream) => {
+    const group = aliasPresetId(upstream);
+    groupCapacity[group] = (groupCapacity[group] || 0) + 1;
+  });
+  return [...items].sort((a, b) => {
+    const groupA = aliasPresetId(a);
+    const groupB = aliasPresetId(b);
+    const pressureA = (groupActive[groupA] || 0) / groupCapacity[groupA];
+    const pressureB = (groupActive[groupB] || 0) / groupCapacity[groupB];
+    return pressureA - pressureB || activeUpstreamCount(a) - activeUpstreamCount(b);
+  });
 }
 
 function activeUpstreamCount(upstream) {
