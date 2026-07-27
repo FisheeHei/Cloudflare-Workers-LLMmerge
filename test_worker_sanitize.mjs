@@ -2560,6 +2560,10 @@ const bareScopeChat = await worker.default.fetch(new Request("https://gw.test/v1
   method: "POST", headers: { authorization: "Bearer sk-nim-scope", "content-type": "application/json" }, body: JSON.stringify({ model: "nim-scope-model", messages: [] }),
 }), nimScopeEnv);
 assert.equal(bareScopeChat.headers.get("x-llm-gateway-upstream"), "scope-other");
+const openrouterScopedChat = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-nim-scope", "content-type": "application/json" }, body: JSON.stringify({ model: "openrouter/nim-scope-model", messages: [] }),
+}), nimScopeEnv);
+assert.equal(openrouterScopedChat.headers.get("x-llm-gateway-upstream"), "scope-other");
 const rawNimNamedModel = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST", headers: { authorization: "Bearer sk-nim-scope", "content-type": "application/json" }, body: JSON.stringify({ model: "nvidia-nim/raw-model", messages: [] }),
 }), nimScopeEnv);

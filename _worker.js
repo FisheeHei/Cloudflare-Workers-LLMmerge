@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-27-nim-group-balance-r1";
+const VERSION = "v26-07-27-alias-group-balance";
 
 export default {
   async fetch(request, env, ctx) {
@@ -139,7 +139,7 @@ export default {
             json(openAiError("`model` is required.", "invalid_request_error"), 400),
           );
         }
-        const presetScope = resolveNimAliasScope(client, runtime, requestedModel);
+        const presetScope = resolveAliasPresetScope(client, runtime, requestedModel);
         const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
         const publicModel = publicModelId(client, runtime, requestedModel, model);
         const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
@@ -1792,14 +1792,13 @@ async function resolveClientModelAlias(client, runtime, model) {
   return value;
 }
 
-function resolveNimAliasScope(client, runtime, model) {
+function resolveAliasPresetScope(client, runtime, model) {
   const value = String(model || "").trim();
-  if (!value.startsWith("nvidia-nim/")) return "";
-  return modelRegistryRows(runtime).some((row) =>
+  const row = modelRegistryRows(runtime).find((row) =>
     row.alias === value &&
-    aliasPresetId(row.upstream) === "nvidia-nim" &&
     clientAllowsUpstream(client, row.upstream.name)
-  ) ? "nvidia-nim" : "";
+  );
+  return row ? aliasPresetId(row.upstream) : "";
 }
 
 function publicModelId(client, runtime, requestedModel, resolvedModel = requestedModel) {
@@ -2331,7 +2330,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
 
 async function resolveTranslatedRequestModel(client, runtime, translated, request, payload) {
   const requestedModel = translated.model;
-  translated.presetScope = resolveNimAliasScope(client, runtime, requestedModel);
+  translated.presetScope = resolveAliasPresetScope(client, runtime, requestedModel);
   const resolvedModel = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
   translated.seed.model = publicModelId(client, runtime, requestedModel, resolvedModel);
   translated.model = resolvedModel;
@@ -2684,7 +2683,7 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
 
   const sessionModel = await currentSessionModel(client, runtime, request, payload);
   const model = sessionModel || await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
-  const presetScope = resolveNimAliasScope(client, runtime, requestedModel);
+  const presetScope = resolveAliasPresetScope(client, runtime, requestedModel);
   if (sessionModel && !clientAllowsModelSelection(client, sessionModel, sessionModel)) {
     throw httpError(403, `Model is not allowed for this client key: ${sessionModel}`);
   }
