@@ -2529,6 +2529,63 @@ const internalLoadResp = await worker.default.fetch(new Request("https://gw.test
 assert.equal(internalLoadResp.headers.get("x-llm-gateway-upstream"), "internal-idle");
 await internalWarmResp.text();
 
+const aliasScopeStore = new Map();
+aliasScopeStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: true },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "scope-nim-active", preset: "nvidia-nim", base_url: "https://long-stream.example/v1", api_key_encrypted: "a", models: ["scope-warm", "scope-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "scope-nim-idle", preset: "nvidia-nim", base_url: "https://speed-fast.example/v1", api_key_encrypted: "i", models: ["scope-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "scope-openrouter", preset: "openrouter", base_url: "https://speed-slow.example/v1", api_key_encrypted: "o", models: ["scope-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+  ],
+}));
+const aliasScopeEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = aliasScopeStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { aliasScopeStore.set(key, value); },
+    async delete(key) { aliasScopeStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "alias-scope-client", key: "sk-alias-scope", models: ["*"], upstreams: ["scope-nim-active", "scope-nim-idle", "scope-openrouter"] }]),
+};
+const aliasScopeWarm = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias-scope", "content-type": "application/json" },
+  body: JSON.stringify({ model: "scope-warm", messages: [] }),
+}), aliasScopeEnv);
+const scopedChat = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias-scope", "content-type": "application/json" },
+  body: JSON.stringify({ model: "nvidia-nim/scope-model", messages: [] }),
+}), aliasScopeEnv);
+assert.equal(scopedChat.headers.get("x-llm-gateway-upstream"), "scope-nim-idle");
+const bareScopeChat = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias-scope", "content-type": "application/json" },
+  body: JSON.stringify({ model: "scope-model", messages: [] }),
+}), aliasScopeEnv);
+assert.equal(bareScopeChat.headers.get("x-llm-gateway-upstream"), "scope-openrouter");
+const scopedResponses = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias-scope", "content-type": "application/json", "x-session-id": "alias-scope-session" },
+  body: JSON.stringify({ model: "nvidia-nim/scope-model", input: "hi" }),
+}), aliasScopeEnv);
+assert.equal(scopedResponses.headers.get("x-llm-gateway-upstream"), "scope-nim-idle");
+const scopedCompact = await worker.default.fetch(new Request("https://gw.test/v1/responses/compact", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-alias-scope", "content-type": "application/json", "x-session-id": "alias-scope-session" },
+  body: JSON.stringify({ model: "scope-model", input: "Summarize this." }),
+}), aliasScopeEnv);
+assert.equal(scopedCompact.headers.get("x-llm-gateway-upstream"), "scope-nim-idle");
+const scopedAnthropic = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-alias-scope", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "nvidia-nim/scope-model", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+}), aliasScopeEnv);
+assert.equal(scopedAnthropic.headers.get("x-llm-gateway-upstream"), "scope-nim-idle");
+await aliasScopeWarm.text();
+
 const usageStore = new Map();
 usageStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },

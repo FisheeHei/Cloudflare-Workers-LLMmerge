@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-27-group-load-balance";
+const VERSION = "v26-07-27-alias-route-scope";
 
 export default {
   async fetch(request, env, ctx) {
@@ -139,7 +139,8 @@ export default {
             json(openAiError("`model` is required.", "invalid_request_error"), 400),
           );
         }
-        const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+        const route = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+        const model = route.model;
         const publicModel = publicModelId(client, runtime, requestedModel, model);
         const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
 
@@ -150,6 +151,7 @@ export default {
           proxyResponse = await proxyRequest({
             client,
             model,
+            presetScope: route.preset,
             pathname,
             request,
             bodyText: proxyBodyText,
@@ -1776,18 +1778,20 @@ async function listModels(client, runtime) {
   );
 }
 
-async function resolveClientModelAlias(client, runtime, model) {
+async function resolveClientModelRoute(client, runtime, model) {
   const value = String(model || "").trim();
-  if (!value || value.includes("@cf/")) return value;
+  if (!value || value.includes("@cf/")) return { model: value, preset: "" };
   const rows = modelRegistryRows(runtime).filter((row) => clientAllowsUpstream(client, row.upstream.name));
-  const hit = rows.find((row) => row.alias === value || row.model === value);
-  if (hit) return hit.model;
+  const aliasHit = rows.find((row) => row.alias === value);
+  if (aliasHit) return { model: aliasHit.model, preset: aliasPresetId(aliasHit.upstream) };
+  const modelHit = rows.find((row) => row.model === value);
+  if (modelHit) return { model: modelHit.model, preset: "" };
   const fuzzy = rows.filter((row) =>
     modelsMatch(value, row.alias) || modelsMatch(value, row.model) ||
     (!value.includes("/") && modelSuffix(value).toLowerCase() === modelSuffix(row.alias).toLowerCase())
   );
-  if (fuzzy.length === 1) return fuzzy[0].model;
-  return value;
+  if (fuzzy.length === 1) return { model: fuzzy[0].model, preset: "" };
+  return { model: value, preset: "" };
 }
 
 function publicModelId(client, runtime, requestedModel, resolvedModel = requestedModel) {
@@ -1798,13 +1802,13 @@ function publicModelId(client, runtime, requestedModel, resolvedModel = requeste
 }
 
 async function resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload) {
-  const model = await resolveClientModelAlias(client, runtime, requestedModel);
-  if (!clientAllowsModelSelection(client, requestedModel, model)) {
+  const route = await resolveClientModelRoute(client, runtime, requestedModel);
+  if (!clientAllowsModelSelection(client, requestedModel, route.model)) {
     throw httpError(403, `Model is not allowed for this client key: ${requestedModel}`);
   }
-  await enforceSessionModelLock(client, runtime, request, payload, model);
-  rememberSessionCurrentModel(client, request, payload, model);
-  return model;
+  await enforceSessionModelLock(client, runtime, request, payload, route.model);
+  rememberSessionCurrentModel(client, request, payload, route);
+  return route;
 }
 
 async function enforceSessionModelLock(client, runtime, request, payload, model) {
@@ -1831,15 +1835,18 @@ function sessionCurrentModelKey(client, request, payload) {
   return sessionScope ? `${client.id}\n${sessionScope}` : "";
 }
 
-function rememberSessionCurrentModel(client, request, payload, model) {
+function rememberSessionCurrentModel(client, request, payload, route) {
   const key = sessionCurrentModelKey(client, request, payload);
   if (!key) return;
   const previous = _sessionCurrentModels[key];
+  const model = route.model;
+  const preset = route.preset || "";
   _sessionCurrentModels[key] = {
     ...previous,
     model,
+    preset,
     expires: Date.now() + SESSION_MODEL_LOCK_TTL_SECONDS * 1000,
-    ...(previous?.model === model ? {} : { persistedModel: "" }),
+    ...(previous?.model === model && previous?.preset === preset ? {} : { persistedModel: "", persistedPreset: "" }),
   };
   const keys = Object.keys(_sessionCurrentModels);
   if (keys.length > 500) delete _sessionCurrentModels[keys[0]];
@@ -1848,11 +1855,17 @@ function rememberSessionCurrentModel(client, request, payload, model) {
 async function persistSessionCurrentModel(runtime, client, request, payload, ctx) {
   const key = sessionCurrentModelKey(client, request, payload);
   const item = key && _sessionCurrentModels[key];
-  if (!runtime.kv || !item?.model || item.persistedModel === item.model) return;
+  if (!runtime.kv || !item?.model || (item.persistedModel === item.model && item.persistedPreset === item.preset)) return;
   item.persistedModel = item.model;
+  item.persistedPreset = item.preset;
   const task = sessionCurrentModelStorageKey(key)
-    .then((storageKey) => runtime.kv.put(storageKey, JSON.stringify({ model: item.model, expires: item.expires }), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS }))
-    .catch(() => { if (_sessionCurrentModels[key]?.model === item.model) _sessionCurrentModels[key].persistedModel = ""; });
+    .then((storageKey) => runtime.kv.put(storageKey, JSON.stringify({ model: item.model, preset: item.preset || "", expires: item.expires }), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS }))
+    .catch(() => {
+      if (_sessionCurrentModels[key]?.model === item.model && _sessionCurrentModels[key]?.preset === item.preset) {
+        _sessionCurrentModels[key].persistedModel = "";
+        _sessionCurrentModels[key].persistedPreset = "";
+      }
+    });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
   else await task;
 }
@@ -1860,17 +1873,17 @@ async function persistSessionCurrentModel(runtime, client, request, payload, ctx
 async function currentSessionModel(client, runtime, request, payload) {
   const key = sessionCurrentModelKey(client, request, payload);
   const item = key && _sessionCurrentModels[key];
-  if (item?.expires > Date.now()) return item.model;
+  if (item?.expires > Date.now()) return { model: item.model, preset: item.preset || "" };
   if (key) delete _sessionCurrentModels[key];
   if (!key || !runtime.kv) return "";
   try {
     const stored = await runtime.kv.get(await sessionCurrentModelStorageKey(key), "json");
     if (stored?.model && stored.expires > Date.now()) {
-      _sessionCurrentModels[key] = { ...stored, persistedModel: stored.model };
-      return stored.model;
+      _sessionCurrentModels[key] = { ...stored, preset: stored.preset || "", persistedModel: stored.model, persistedPreset: stored.preset || "" };
+      return { model: stored.model, preset: stored.preset || "" };
     }
   } catch {}
-  return "";
+  return null;
 }
 
 async function sessionCurrentModelStorageKey(value) {
@@ -2227,6 +2240,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
         const proxyResponse = await proxyRequest({
           client,
           model: translated.model,
+          presetScope: translated.preset,
           pathname: CHAT_PATH,
           request,
           bodyText: translated.bodyText,
@@ -2270,6 +2284,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
     const proxyResponse = await proxyRequest({
       client,
       model: translated.model,
+      presetScope: translated.preset,
       pathname: CHAT_PATH,
       request,
       bodyText: translated.bodyText,
@@ -2317,11 +2332,12 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
 
 async function resolveTranslatedRequestModel(client, runtime, translated, request, payload) {
   const requestedModel = translated.model;
-  const resolvedModel = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
-  translated.seed.model = publicModelId(client, runtime, requestedModel, resolvedModel);
-  translated.model = resolvedModel;
-  if (resolvedModel !== requestedModel) {
-    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
+  const route = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+  translated.seed.model = publicModelId(client, runtime, requestedModel, route.model);
+  translated.model = route.model;
+  translated.preset = route.preset;
+  if (route.model !== requestedModel) {
+    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: route.model });
   }
 }
 
@@ -2603,6 +2619,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const proxyResponse = await proxyRequest({
       client,
       model: translated.model,
+      presetScope: translated.preset,
       pathname: CHAT_PATH,
       request,
       bodyText: translated.bodyText,
@@ -2666,10 +2683,11 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   const requestedModel = String(payload?.model || "").trim();
   if (!requestedModel) throw httpError(400, "`model` is required.");
 
-  const sessionModel = await currentSessionModel(client, runtime, request, payload);
-  const model = sessionModel || await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
-  if (sessionModel && !clientAllowsModelSelection(client, sessionModel, sessionModel)) {
-    throw httpError(403, `Model is not allowed for this client key: ${sessionModel}`);
+  const sessionRoute = await currentSessionModel(client, runtime, request, payload);
+  const route = sessionRoute || await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+  const model = route.model;
+  if (sessionRoute && !clientAllowsModelSelection(client, model, model)) {
+    throw httpError(403, `Model is not allowed for this client key: ${model}`);
   }
   const transcript = compactTranscript(payload.input, payload.instructions);
   if (!transcript) throw httpError(400, "`input` is required.");
@@ -2700,7 +2718,7 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   }), ctx);
 
   try {
-    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search });
+    const proxyResponse = await proxyRequest({ client, model, presetScope: route.preset, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search });
     upstreamName = proxyResponse.upstream.name;
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
@@ -3296,12 +3314,12 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
   return readable;
 }
 
-async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {
+async function proxyRequest({ client, model, presetScope, pathname, request, bodyText, runtime, search }) {
   if (pathname === CHAT_PATH) {
     bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
 
-  const candidates = proxyCandidates(runtime, client, model, pathname);
+  const candidates = proxyCandidates(runtime, client, model, pathname, presetScope);
 
   if (candidates.length === 0) {
     throw httpError(404, `No upstream available for model: ${model}`);
@@ -3369,7 +3387,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   throw err;
 }
 
-function proxyCandidates(runtime, client, model, pathname) {
+function proxyCandidates(runtime, client, model, pathname, presetScope = "") {
   const indexed = runtime.routeIndex?.[pathname];
   const indexedPool = indexed
     ? [...(indexed.models[model] || []), ...indexed.wildcard]
@@ -3377,6 +3395,7 @@ function proxyCandidates(runtime, client, model, pathname) {
   const pool = indexedPool && indexedPool.length ? indexedPool : runtime.upstreams;
   return pool.filter((upstream) =>
     clientAllowsUpstream(client, upstream.name) &&
+    (!presetScope || aliasPresetId(upstream) === presetScope) &&
     (indexedPool?.length || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
   );
 }
