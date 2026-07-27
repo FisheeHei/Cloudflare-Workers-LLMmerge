@@ -2536,7 +2536,7 @@ nimScopeStore.set("gateway:config", JSON.stringify({
   upstreams: [
     { name: "nim-scope-active", preset: "nvidia-nim", base_url: "https://long-stream.example/v1", api_key_encrypted: "a", models: ["nim-scope-warm", "nim-scope-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "nim-scope-idle", preset: "nvidia-nim", base_url: "https://speed-fast.example/v1", api_key_encrypted: "i", models: ["nim-scope-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
-    { name: "scope-other", preset: "openrouter", base_url: "https://speed-slow.example/v1", api_key_encrypted: "o", models: ["nim-scope-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+    { name: "scope-other", preset: "openrouter", base_url: "https://speed-slow.example/v1", api_key_encrypted: "o", models: ["nim-scope-model", "nvidia-nim/raw-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
   ],
 }));
 const nimScopeEnv = {
@@ -2560,6 +2560,10 @@ const bareScopeChat = await worker.default.fetch(new Request("https://gw.test/v1
   method: "POST", headers: { authorization: "Bearer sk-nim-scope", "content-type": "application/json" }, body: JSON.stringify({ model: "nim-scope-model", messages: [] }),
 }), nimScopeEnv);
 assert.equal(bareScopeChat.headers.get("x-llm-gateway-upstream"), "scope-other");
+const rawNimNamedModel = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-nim-scope", "content-type": "application/json" }, body: JSON.stringify({ model: "nvidia-nim/raw-model", messages: [] }),
+}), nimScopeEnv);
+assert.equal(rawNimNamedModel.headers.get("x-llm-gateway-upstream"), "scope-other");
 const nimScopedResponses = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST", headers: { authorization: "Bearer sk-nim-scope", "content-type": "application/json" }, body: JSON.stringify({ model: "nvidia-nim/nim-scope-model", input: "hi" }),
 }), nimScopeEnv);
