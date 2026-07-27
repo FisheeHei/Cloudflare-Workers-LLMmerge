@@ -55,10 +55,9 @@ const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
 const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
-const HEDGE_FOLLOWUP_DELAY_MS = 10000;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-27-routing-hardened";
+const VERSION = "v26-07-26-gateway-status-layout";
 
 export default {
   async fetch(request, env, ctx) {
@@ -234,10 +233,6 @@ var _upstreamCooldowns = {};
 // ponytail: per-isolate and per-model; DO if strict global rotation ever matters
 var _lastSuccessfulUpstreamName = {};
 var _activeUpstreams = {};
-var _activeUpstreamControllers = {};
-// ponytail: isolate-local reservations only coordinate overlapping Hedge/Fast batches.
-var _hedgeReservations = {};
-var _hedgePrimaryReservations = {};
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -357,11 +352,6 @@ function recordStats(app, entry) {
     _pendingStats[hour] = emptyStatsBucket();
   }
   addStatsEntry(_pendingStats[hour], entry);
-  // AE persists the durable copy; retain only the live admin window in memory.
-  if (hasAnalyticsEngine(app)) {
-    var hours = Object.keys(_pendingStats).sort();
-    while (hours.length > STATS_WINDOW_HOURS + 1) delete _pendingStats[hours.shift()];
-  }
 }
 
 function recordRequestLog(app, entry, ctx) {
@@ -1162,10 +1152,6 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
   }
 
-  if (apiPath === "/api/runtime/release" && request.method === "POST") {
-    return withCorsResponse(json({ ok: true, released: releaseActiveUpstreams() }, 200));
-  }
-
       // ponytail: fetch model list from a saved or draft upstream for picker
   if (apiPath === "/api/fetch-models" && request.method === "POST") {
     return fetchAdminModels(request, app);
@@ -1424,8 +1410,7 @@ async function repairStoredGatewayConfig(config, app) {
   const routing = config.routing && typeof config.routing === "object" ? config.routing : {};
   const upstreamEntries = Array.isArray(config.upstreams) ? config.upstreams : [];
   const upstreams = await Promise.all(upstreamEntries.map(async (item, index) => {
-    const requestedPreset = String(item?.preset || inferPresetId(item?.base_url)).trim();
-    const preset = presetById(requestedPreset) ? requestedPreset : "custom";
+    const preset = presetById(item?.preset) ? item.preset : "custom";
     const defaults = presetById(preset) || presetById("custom");
     const accountId = String(item?.account_id || "").trim();
     const models = normalizeStringArray(item?.models);
@@ -1502,8 +1487,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
     const item = upstreamEntries[index];
     if (!item || typeof item !== "object") continue;
 
-    const requestedPreset = String(item.preset || inferPresetId(item.base_url)).trim();
-    const preset = presetById(requestedPreset) ? requestedPreset : "custom";
+    const preset = presetById(item.preset) ? item.preset : "custom";
     const defaults = presetById(preset) || presetById("custom");
     const apiKeyValue = String(item.api_key_value || item.api_key_encrypted || item.api_key || "").trim();
     const accountId = String(item.account_id || "").trim();
@@ -3323,26 +3307,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     ? 1
     : Math.min(attempts.length, runtime.routing.hedge_max || 2);
   if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-    const orderedAttempts = avoidLastSuccessfulUpstream(attempts, model);
-    const hedgedAttempts = selectHedgeAttempts(orderedAttempts, maxAttempts, model);
-    const remainingAttempts = orderedAttempts.filter((upstream) => !hedgedAttempts.includes(upstream));
-    const reservation = reserveHedgeAttempts(hedgedAttempts);
-    try {
-      return await hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, model, pathname, request, runtime, search });
-    } catch (hedgeError) {
-      const fallback = selectHedgeAttempts(remainingAttempts, 1, model)[0];
-      if (!fallback || request.signal?.aborted) throw hedgeError;
-      const result = await proxySequentialRequest({ attempts: [fallback], maxAttempts: 1, bodyText, model, pathname, request, runtime, search });
-      return { ...result, attempts: hedgedAttempts.length + result.attempts };
-    } finally {
-      reservation.release();
-    }
+    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
+    return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, model, pathname, request, runtime, search });
   }
-
-  return proxySequentialRequest({ attempts, maxAttempts, bodyText, model, pathname, request, runtime, search });
-}
-
-async function proxySequentialRequest({ attempts, maxAttempts, bodyText, model, pathname, request, runtime, search }) {
   let lastError = null;
 
   for (let index = 0; index < maxAttempts; index += 1) {
@@ -3423,8 +3390,7 @@ function traceResponse(response, traceId) {
 
 async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal, upstream }) {
   const started = Date.now();
-  const active = trackActiveUpstream(upstream);
-  const release = active.release;
+  const release = trackActiveUpstream(upstream);
   try {
     const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
     const init = {
@@ -3439,8 +3405,6 @@ async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search
       proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
       runtime.streamIdleTimeoutMs,
       release,
-      request.signal,
-      active.signal,
     );
     return { response, release, latency: Date.now() - started, startedAt: started };
   } catch (error) {
@@ -3635,18 +3599,15 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
   const knownTtft = upstreamLatencyScore(attempts[0], model);
   const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
-  const secondDelayMs = runtime.routing.fast_routing === true ? fastDelayMs : hedgeDelayMs;
-  const launchDelay = (index) => index === 0
-    ? 0
-    : index === 1
-      ? secondDelayMs
-      : secondDelayMs + (index - 1) * HEDGE_FOLLOWUP_DELAY_MS;
+  const launchDelay = (index) => runtime.routing.fast_routing === true && index < 2
+    ? index * fastDelayMs
+    : index * hedgeDelayMs;
   let done = false;
 
   function launchLater(index) {
     const upstream = attempts[index];
-    return sleep(launchDelay(index), [controllers[index].signal, request.signal]).then(async () => {
-      if (done || request.signal?.aborted || controllers[index].signal.aborted) return { cancelled: true, upstream, index };
+    return sleep(launchDelay(index)).then(async () => {
+      if (done) return { cancelled: true, upstream, index };
       if (!takeNimMinuteSlot(upstream)) {
         return { limited: true, error: new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`), upstream, index };
       }
@@ -3696,24 +3657,8 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
   throw err;
 }
 
-function sleep(ms, signals = []) {
-  const list = (Array.isArray(signals) ? signals : [signals]).filter(Boolean);
-  if (!list.length) return new Promise((resolve) => setTimeout(resolve, ms));
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      list.forEach((signal) => signal.removeEventListener("abort", finish));
-      resolve();
-    };
-    const timer = setTimeout(finish, ms);
-    list.forEach((signal) => {
-      if (signal.aborted) finish();
-      else signal.addEventListener("abort", finish, { once: true });
-    });
-  });
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function requestBodyStreams(bodyText) {
@@ -3867,82 +3812,6 @@ function activeSort(items) {
   return [...items].sort((a, b) => activeUpstreamCount(a) - activeUpstreamCount(b));
 }
 
-function selectHedgeAttempts(attempts, maxAttempts, model) {
-  const available = [...attempts];
-  const order = new Map(available.map((upstream, index) => [upstream, index]));
-  const selected = [];
-  const primaryCount = Math.min(2, maxAttempts, available.length);
-
-  for (let index = 0; index < primaryCount; index += 1) {
-    selected.push(takeHedgeCandidate(available, (a, b) => compareHedgeCandidates(a, b, model, order, true)));
-  }
-  while (selected.length < maxAttempts && available.length) {
-    selected.push(takeHedgeCandidate(available, (a, b) => compareHedgeCandidates(a, b, model, order, false)));
-  }
-  return selected;
-}
-
-function takeHedgeCandidate(items, compare) {
-  let best = 0;
-  for (let index = 1; index < items.length; index += 1) {
-    if (compare(items[index], items[best]) < 0) best = index;
-  }
-  return items.splice(best, 1)[0];
-}
-
-function compareHedgeCandidates(a, b, model, order, primary) {
-  const coolingA = upstreamCoolingRank(a, model);
-  const coolingB = upstreamCoolingRank(b, model);
-  if (coolingA !== coolingB) return coolingA - coolingB;
-  if (primary) {
-    const reservedA = hedgePrimaryReservationCount(a);
-    const reservedB = hedgePrimaryReservationCount(b);
-    if (reservedA !== reservedB) return reservedA - reservedB;
-  }
-  const pressureA = hedgePressure(a);
-  const pressureB = hedgePressure(b);
-  return pressureA - pressureB || order.get(a) - order.get(b);
-}
-
-function upstreamCoolingRank(upstream, model) {
-  return Number(_upstreamCooldowns[upstreamModelKey(upstream, model)]?.until || 0) > Date.now() ? 1 : 0;
-}
-
-function hedgePressure(upstream) {
-  return activeUpstreamCount(upstream) + hedgeReservationCount(upstream);
-}
-
-function hedgeReservationCount(upstream) {
-  return Number(_hedgeReservations[String(upstream?.name || "").trim()] || 0) || 0;
-}
-
-function hedgePrimaryReservationCount(upstream) {
-  return Number(_hedgePrimaryReservations[String(upstream?.name || "").trim()] || 0) || 0;
-}
-
-function reserveHedgeAttempts(attempts) {
-  const primary = attempts.slice(0, 2);
-  attempts.forEach((upstream) => noteHedgeReservation(_hedgeReservations, upstream, 1));
-  primary.forEach((upstream) => noteHedgeReservation(_hedgePrimaryReservations, upstream, 1));
-  let released = false;
-  return {
-    release() {
-      if (released) return;
-      released = true;
-      attempts.forEach((upstream) => noteHedgeReservation(_hedgeReservations, upstream, -1));
-      primary.forEach((upstream) => noteHedgeReservation(_hedgePrimaryReservations, upstream, -1));
-    },
-  };
-}
-
-function noteHedgeReservation(store, upstream, delta) {
-  const name = String(upstream?.name || "").trim();
-  if (!name) return;
-  const next = Math.max(0, Number(store[name] || 0) + delta);
-  if (next) store[name] = next;
-  else delete store[name];
-}
-
 function activeUpstreamCount(upstream) {
   return Number(_activeUpstreams[String(upstream?.name || "").trim()] || 0) || 0;
 }
@@ -3971,30 +3840,13 @@ function noteActiveUpstream(upstream, delta) {
 }
 
 function trackActiveUpstream(upstream) {
-  const name = String(upstream?.name || "").trim();
-  const controller = new AbortController();
-  const controllers = _activeUpstreamControllers[name] || (_activeUpstreamControllers[name] = new Set());
-  controllers.add(controller);
   noteActiveUpstream(upstream, 1);
   let released = false;
-  const release = () => {
+  return () => {
     if (released) return;
     released = true;
-    controllers.delete(controller);
-    if (!controllers.size) delete _activeUpstreamControllers[name];
     noteActiveUpstream(upstream, -1);
   };
-  return { release, signal: controller.signal };
-}
-
-function releaseActiveUpstreams() {
-  const upstreams = Object.keys(_activeUpstreamControllers);
-  let requests = 0;
-  upstreams.forEach((name) => _activeUpstreamControllers[name].forEach((controller) => {
-    requests += 1;
-    controller.abort("manual active release");
-  }));
-  return { upstreams, requests };
 }
 
 function getActiveUpstreamSnapshot() {
@@ -4141,10 +3993,6 @@ function buildClientRecord(payload) {
 
 async function saveClientRecord(kv, record) {
   const existing = await kv.get(clientIdKey(record.id), "json");
-  const keyOwner = await kv.get(clientTokenKey(record.key), "json");
-  if (keyOwner?.id && keyOwner.id !== record.id) {
-    throw httpError(409, "Client key already exists.");
-  }
   const createdAt = existing?.created_at || record.created_at;
   const stored = {
     ...record,
@@ -4152,7 +4000,6 @@ async function saveClientRecord(kv, record) {
     updated_at: hkNowIso(),
   };
 
-  if (existing?.key && existing.key !== stored.key) await kv.delete(clientTokenKey(existing.key));
   await kv.put(clientIdKey(stored.id), JSON.stringify(stored));
   await kv.put(clientTokenKey(stored.key), JSON.stringify(stored));
 
@@ -4165,10 +4012,6 @@ async function saveClientRecord(kv, record) {
   await kv.put(clientIndexKey(), JSON.stringify(next));
   delete _clientCache[stored.key];
   delete _clientCacheTs[stored.key];
-  if (existing?.key && existing.key !== stored.key) {
-    delete _clientCache[existing.key];
-    delete _clientCacheTs[existing.key];
-  }
 }
 
 async function deleteClientRecord(kv, id) {
@@ -4190,8 +4033,7 @@ async function deleteClientRecord(kv, id) {
 }
 
 async function listClientIndex(kv) {
-  const index = await kv.get(clientIndexKey(), "json");
-  return Array.isArray(index) ? index : [];
+  return (await kv.get(clientIndexKey(), "json")) || [];
 }
 
 function publicClientRecord(record) {
@@ -4478,17 +4320,15 @@ function getBearerToken(request) {
   return token && token.length <= MAX_CLIENT_KEY_LENGTH ? token : null;
 }
 
-async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose, clientSignal, releaseSignal) {
+async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose) {
   const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
   const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
   const controller = new AbortController();
-  const signals = [...new Set([init?.signal, clientSignal, releaseSignal].filter(Boolean))];
-  const listeners = signals.map((signal) => [signal, () => controller.abort(signal.reason || "aborted")]);
-  const cleanupSignal = () => listeners.forEach(([signal, listener]) => signal.removeEventListener("abort", listener));
-  listeners.forEach(([signal, listener]) => {
-    if (signal.aborted) listener();
-    else signal.addEventListener("abort", listener, { once: true });
-  });
+  const upstreamSignal = init?.signal;
+  const abort = () => controller.abort(upstreamSignal?.reason || "timeout");
+  const cleanupSignal = () => upstreamSignal?.removeEventListener("abort", abort);
+  if (upstreamSignal?.aborted) abort();
+  else upstreamSignal?.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(() => controller.abort("timeout"), timeout);
 
   try {
