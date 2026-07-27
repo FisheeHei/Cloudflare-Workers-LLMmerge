@@ -564,6 +564,7 @@ function renderAdminMarkup(origin, version) {
       <button type="button" class="secondary" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
       <button type="button" class="secondary" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
       <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
+      <button type="button" class="secondary" id="release-active-upstreams">\u91ca\u653e\u6d3b\u8dc3\u8bf7\u6c42</button>
       <span class="toolbar-spacer"></span>
       <div class="menu-wrap" id="upstream-actions">
         <button type="button" class="secondary" id="upstream-actions-toggle">\u66f4\u591a\u64cd\u4f5c</button>
@@ -1687,6 +1688,15 @@ function renderAdminScript(version) {
     showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
   }
 
+  async function releaseActiveUpstreams() {
+    if (!confirm("\u8fd9\u4f1a\u4e2d\u65ad\u5f53\u524d\u6d3b\u8dc3\u7684\u4e0a\u6e38\u8bf7\u6c42\u3002\u7ee7\u7eed\uff1f")) return;
+    const resp = await fetch(API_BASE + "/runtime/release", { method: "POST" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u91ca\u653e\u6d3b\u8dc3\u8bf7\u6c42\u5931\u8d25");
+    showToast("\u5df2\u91ca\u653e " + (payload.released?.requests || 0) + " \u4e2a\u6d3b\u8dc3\u8bf7\u6c42");
+    await loadRuntimeStatus();
+  }
+
   function updateUpstreamGroupHealth() {
     document.querySelectorAll(".upstream-group").forEach((group) => {
       const status = group.querySelector(".upstream-group-health");
@@ -2349,6 +2359,16 @@ function renderAdminScript(version) {
     return (Number(l?.tools_count || 0)) + "/" + (Number(l?.tool_calls_count || 0));
   }
 
+  function logTimeUtc8(value) {
+    const raw = text(value).trim();
+    const source = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : raw.replace(" ", "T") + "Z";
+    const ms = Date.parse(source);
+    if (!Number.isFinite(ms)) return raw;
+    const d = new Date(ms + 8 * 3600000);
+    return [d.getUTCFullYear(), String(d.getUTCMonth() + 1).padStart(2, "0"), String(d.getUTCDate()).padStart(2, "0")].join("-") +
+      " " + [String(d.getUTCHours()).padStart(2, "0"), String(d.getUTCMinutes()).padStart(2, "0"), String(d.getUTCSeconds()).padStart(2, "0")].join(":") + " UTC+8";
+  }
+
   function filterLogs(logs) {
     if (state.logFilter === "stream") return logs.filter((l) => l.time_to_first_byte_ms != null);
     if (state.logFilter === "error") return logs.filter((l) => Number(l.status || 0) >= 400 || l.close_reason === "error");
@@ -2379,10 +2399,10 @@ function renderAdminScript(version) {
     ].map((item) => '<button type="button" class="small secondary log-filter' + (state.logFilter === item[0] ? ' active' : '') + '" data-log-filter="' + item[0] + '">' + item[1] + '</button>').join("");
     byId("log-list").innerHTML = '<div class="log-tools">' + filters + '<span class="note">' + filtered.length + '/' + logs.length + '</span>' + toggle + '</div>' +
     (filtered.length ? '<table class="log-table"><thead><tr>' +
-      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tools</th><th>Tokens</th>' +
+      '<th>\u65f6\u95f4 (UTC+8)</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tools</th><th>Tokens</th>' +
     '</tr></thead><tbody>' +
     visibleLogs.map((l) => '<tr>' +
-      '<td>' + esc((l.ts || "").slice(11, 19)) + '</td>' +
+      '<td class="mono">' + esc(logTimeUtc8(l.ts)) + '</td>' +
       '<td>' + esc(l.client || "") + '</td>' +
       '<td>' + esc(l.upstream || "") + '</td>' +
       '<td class="mono">' + esc(l.model || "") + '</td>' +
@@ -2608,6 +2628,9 @@ function renderAdminScript(version) {
       );
       byId("check-health").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", checkHealth).catch(showError)
+      );
+      byId("release-active-upstreams").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u91ca\u653e\u4e2d...", releaseActiveUpstreams).catch(showError)
       );
       byId("speed-test").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u6253\u5f00\u4e2d...", openSpeedPicker).catch(showError)

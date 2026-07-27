@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-27-connection-abort";
+const VERSION = "v26-07-27-active-release";
 
 export default {
   async fetch(request, env, ctx) {
@@ -233,6 +233,7 @@ var _upstreamCooldowns = {};
 // ponytail: per-isolate and per-model; DO if strict global rotation ever matters
 var _lastSuccessfulUpstreamName = {};
 var _activeUpstreams = {};
+var _activeUpstreamControllers = {};
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -1150,6 +1151,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   if (apiPath === "/api/runtime" && request.method === "GET") {
     return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
+  }
+
+  if (apiPath === "/api/runtime/release" && request.method === "POST") {
+    return withCorsResponse(json({ ok: true, released: releaseActiveUpstreams() }, 200));
   }
 
       // ponytail: fetch model list from a saved or draft upstream for picker
@@ -3390,7 +3395,8 @@ function traceResponse(response, traceId) {
 
 async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal, upstream }) {
   const started = Date.now();
-  const release = trackActiveUpstream(upstream);
+  const active = trackActiveUpstream(upstream);
+  const release = active.release;
   try {
     const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
     const init = {
@@ -3406,6 +3412,7 @@ async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search
       runtime.streamIdleTimeoutMs,
       release,
       request.signal,
+      active.signal,
     );
     return { response, release, latency: Date.now() - started, startedAt: started };
   } catch (error) {
@@ -3841,13 +3848,30 @@ function noteActiveUpstream(upstream, delta) {
 }
 
 function trackActiveUpstream(upstream) {
+  const name = String(upstream?.name || "").trim();
+  const controller = new AbortController();
+  const controllers = _activeUpstreamControllers[name] || (_activeUpstreamControllers[name] = new Set());
+  controllers.add(controller);
   noteActiveUpstream(upstream, 1);
   let released = false;
-  return () => {
+  const release = () => {
     if (released) return;
     released = true;
+    controllers.delete(controller);
+    if (!controllers.size) delete _activeUpstreamControllers[name];
     noteActiveUpstream(upstream, -1);
   };
+  return { release, signal: controller.signal };
+}
+
+function releaseActiveUpstreams() {
+  const upstreams = Object.keys(_activeUpstreamControllers);
+  let requests = 0;
+  upstreams.forEach((name) => _activeUpstreamControllers[name].forEach((controller) => {
+    requests += 1;
+    controller.abort("manual active release");
+  }));
+  return { upstreams, requests };
 }
 
 function getActiveUpstreamSnapshot() {
@@ -4321,11 +4345,11 @@ function getBearerToken(request) {
   return token && token.length <= MAX_CLIENT_KEY_LENGTH ? token : null;
 }
 
-async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose, clientSignal) {
+async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose, clientSignal, releaseSignal) {
   const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
   const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
   const controller = new AbortController();
-  const signals = [...new Set([init?.signal, clientSignal].filter(Boolean))];
+  const signals = [...new Set([init?.signal, clientSignal, releaseSignal].filter(Boolean))];
   const listeners = signals.map((signal) => [signal, () => controller.abort(signal.reason || "aborted")]);
   const cleanupSignal = () => listeners.forEach(([signal, listener]) => signal.removeEventListener("abort", listener));
   listeners.forEach(([signal, listener]) => {

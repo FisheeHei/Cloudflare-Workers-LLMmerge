@@ -544,6 +544,9 @@ assert.equal(adminPage.includes("data-stat-kind"), true);
 assert.equal(adminPage.includes("bar-hit"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
+assert.equal(adminPage.includes("function logTimeUtc8(value)"), true);
+assert.equal(adminPage.includes("\u65f6\u95f4 (UTC+8)"), true);
+assert.equal(adminPage.includes("release-active-upstreams"), true);
 assert.equal(adminPage.includes("setInterval(refreshLivePanels, 2000)"), true);
 assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000)"), true);
 assert.equal(adminPage.includes("if (liveRefreshRunning || document.visibilityState"), true);
@@ -2410,6 +2413,21 @@ const longIdleRuntimeResp = await worker.default.fetch(new Request("https://gw.t
 const longIdleRuntime = await longIdleRuntimeResp.json();
 assert.equal(longIdleRuntime.active_upstreams["long-stream"], undefined);
 assert.equal(longStreamHits.length, 1);
+
+const releasedLongStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-long-stream", "content-type": "application/json" },
+  body: JSON.stringify({ model: "long-model", messages: [] }),
+}), longStreamEnv);
+const releaseActiveResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime/release", { method: "POST" }), longStreamEnv);
+const releaseActive = await releaseActiveResp.json();
+assert.equal(releaseActiveResp.status, 200);
+assert.equal(releaseActive.released.requests >= 1, true);
+assert.equal(releaseActive.released.upstreams.includes("long-stream"), true);
+await new Promise((resolve) => setTimeout(resolve, 60));
+await releasedLongStreamResp.text().catch(() => "");
+const releasedIdleRuntime = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), longStreamEnv)).json();
+assert.equal(releasedIdleRuntime.active_upstreams["long-stream"], undefined);
 
 const spreadStore = new Map();
 spreadStore.set("gateway:config", JSON.stringify({
