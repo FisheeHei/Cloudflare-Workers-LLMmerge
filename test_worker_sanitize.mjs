@@ -32,6 +32,9 @@ const hedgeHits = [];
 const hedgeStreamHits = [];
 const hedgeStreamAborts = [];
 const hedgeCancels = [];
+const hedgeReservationHits = [];
+const hedgeFallbackHits = [];
+const hedgeTimingHits = [];
 const clientAbortHits = [];
 let notifyClientAbortStarted = null;
 const softFastHits = [];
@@ -288,6 +291,46 @@ globalThis.fetch = async (url, init) => {
       }],
       usage: { prompt_tokens: 17, completion_tokens: 8, total_tokens: 25 },
     }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-reservation-")) {
+    const payload = JSON.parse(init.body);
+    const client = String(payload.messages?.[0]?.content || "");
+    const upstream = new URL(String(url)).hostname.split(".")[0].replace("hedge-reservation-", "");
+    hedgeReservationHits.push({ client, upstream });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return new Response(JSON.stringify({ id: "hedge-reservation", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-fallback-fail.example")) {
+    hedgeFallbackHits.push("fail");
+    return new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("hedge-fallback-ok.example")) {
+    hedgeFallbackHits.push("ok");
+    return new Response(JSON.stringify({ id: "hedge-fallback-ok", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-fallback-fourth.example")) {
+    hedgeFallbackHits.push("fourth");
+    return new Response(JSON.stringify({ id: "hedge-fallback-fourth", choices: [{ message: { content: "unexpected" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-timing-fail.example")) {
+    hedgeTimingHits.push({ name: "fail", at: Date.now() });
+    return new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("hedge-timing-third.example")) {
+    hedgeTimingHits.push({ name: "third", at: Date.now() });
+    return new Response(JSON.stringify({ id: "hedge-timing-third", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -746,6 +789,12 @@ const createdClientResp = await worker.default.fetch(new Request("https://gw.tes
   body: JSON.stringify({ name: "temporary-client" }),
 }), env);
 const createdClient = (await createdClientResp.json()).client;
+const duplicateClientResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "duplicate-client", key: createdClient.api_key }),
+}), env);
+assert.equal(duplicateClientResp.status, 409);
 const copiedClientResp = await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/clients/${createdClient.id}`), env);
 const copiedClient = await copiedClientResp.json();
 assert.equal(copiedClientResp.status, 200);
@@ -1129,6 +1178,21 @@ const wrappedChatResp = await worker.default.fetch(new Request("https://gw.test/
 }), wrappedEnv);
 assert.equal(wrappedChatResp.status, 200);
 assert.equal(wrappedHits.length, wrappedHitStart + 1);
+
+const legacyPresetStore = new Map([["gateway:config", JSON.stringify({
+  routing: {}, settings: {}, upstreams: [{ name: "legacy-nim", base_url: "https://integrate.api.nvidia.com/v1", api_key_encrypted: "legacy-key", models: ["legacy-model"] }],
+})]]);
+const legacyPresetEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = legacyPresetStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { legacyPresetStore.set(key, value); },
+    async delete(key) { legacyPresetStore.delete(key); },
+  },
+};
+const legacyPresetConfig = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), legacyPresetEnv)).json();
+assert.equal(legacyPresetConfig.config.upstreams[0].preset, "nvidia-nim");
 
 const aliasStore = new Map();
 aliasStore.set("gateway:config", JSON.stringify({
@@ -1717,6 +1781,127 @@ const hedgeResp2 = await worker.default.fetch(new Request("https://gw.test/v1/ch
 }), hedgeEnv);
 assert.equal(hedgeResp2.headers.get("x-llm-gateway-upstream"), "hedge-fast");
 assert.equal(hedgeHits[hedgeSecondStart], "slow");
+
+const hedgeReservationStore = new Map();
+hedgeReservationStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, fast_routing: true, hedge_max: 3, load_balance: true },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 900, upstream_cooldown_ttl: 60 },
+  upstreams: "abcdefg".split("").map((name, index) => ({ name: `reserve-${name}`, base_url: `https://hedge-reservation-${name}.example/v1`, api_key_encrypted: name, models: ["reserve-model"], paths: ["/v1/chat/completions"], priority: index + 1, weight: 1, enabled: true })),
+}));
+const hedgeReservationEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = hedgeReservationStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { hedgeReservationStore.set(key, value); },
+    async delete(key) { hedgeReservationStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify(["1", "2", "3"].map((id) => ({ name: `reserve-client-${id}`, key: `sk-reserve-${id}`, models: ["*"], upstreams: "abcdefg".split("").map((name) => `reserve-${name}`) }))),
+};
+function reserveRequest(id) {
+  return worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer sk-reserve-${id}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "reserve-model", messages: [{ role: "user", content: `reserve-${id}` }] }),
+  }), hedgeReservationEnv);
+}
+const reserveHitStart = hedgeReservationHits.length;
+const reserveResponses = [reserveRequest("1"), reserveRequest("2"), reserveRequest("3")];
+await new Promise((resolve) => setTimeout(resolve, 180));
+const reservePairs = ["reserve-1", "reserve-2", "reserve-3"].map((client) => hedgeReservationHits
+  .slice(reserveHitStart)
+  .filter((hit) => hit.client === client)
+  .slice(0, 2)
+  .map((hit) => hit.upstream));
+assert.equal(reservePairs.every((pair) => pair.length === 2), true, JSON.stringify(reservePairs));
+assert.equal(new Set(reservePairs.flat()).size, 6, JSON.stringify(reservePairs));
+const reserveCompleted = await Promise.all(reserveResponses);
+await Promise.all(reserveCompleted.map((response) => response.text()));
+
+const hedgeFallbackStore = new Map();
+hedgeFallbackStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 500, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "fallback-fail-a", base_url: "https://hedge-fallback-fail.example/v1", api_key_encrypted: "a", models: ["hedge-fallback-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "fallback-fail-b", base_url: "https://hedge-fallback-fail.example/v1", api_key_encrypted: "b", models: ["hedge-fallback-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "fallback-ok", base_url: "https://hedge-fallback-ok.example/v1", api_key_encrypted: "c", models: ["hedge-fallback-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+    { name: "fallback-fourth", base_url: "https://hedge-fallback-fourth.example/v1", api_key_encrypted: "d", models: ["hedge-fallback-model"], paths: ["/v1/chat/completions"], priority: 4, weight: 1, enabled: true },
+  ],
+}));
+const hedgeFallbackEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = hedgeFallbackStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { hedgeFallbackStore.set(key, value); },
+    async delete(key) { hedgeFallbackStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "hedge-fallback-client", key: "sk-hedge-fallback", models: ["*"], upstreams: ["fallback-fail-a", "fallback-fail-b", "fallback-ok", "fallback-fourth"] }]),
+};
+const hedgeFallbackStart = hedgeFallbackHits.length;
+const hedgeFallbackResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-hedge-fallback", "content-type": "application/json" }, body: JSON.stringify({ model: "hedge-fallback-model", messages: [] }),
+}), hedgeFallbackEnv);
+assert.equal(hedgeFallbackResp.headers.get("x-llm-gateway-upstream"), "fallback-ok");
+assert.deepEqual(hedgeFallbackHits.slice(hedgeFallbackStart), ["fail", "fail", "ok"]);
+
+const hedgeFallbackFailStore = new Map();
+hedgeFallbackFailStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 500, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "fallback2-fail-a", base_url: "https://hedge-fallback-fail.example/v1", api_key_encrypted: "a", models: ["hedge-fallback-fail-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "fallback2-fail-b", base_url: "https://hedge-fallback-fail.example/v1", api_key_encrypted: "b", models: ["hedge-fallback-fail-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "fallback2-fail-c", base_url: "https://hedge-fallback-fail.example/v1", api_key_encrypted: "c", models: ["hedge-fallback-fail-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+    { name: "fallback2-fourth", base_url: "https://hedge-fallback-fourth.example/v1", api_key_encrypted: "d", models: ["hedge-fallback-fail-model"], paths: ["/v1/chat/completions"], priority: 4, weight: 1, enabled: true },
+  ],
+}));
+const hedgeFallbackFailEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = hedgeFallbackFailStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { hedgeFallbackFailStore.set(key, value); },
+    async delete(key) { hedgeFallbackFailStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "hedge-fallback-fail-client", key: "sk-hedge-fallback-fail", models: ["*"], upstreams: ["fallback2-fail-a", "fallback2-fail-b", "fallback2-fail-c", "fallback2-fourth"] }]),
+};
+const hedgeFallbackFailStart = hedgeFallbackHits.length;
+const hedgeFallbackFailResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-hedge-fallback-fail", "content-type": "application/json" }, body: JSON.stringify({ model: "hedge-fallback-fail-model", messages: [] }),
+}), hedgeFallbackFailEnv);
+assert.equal(hedgeFallbackFailResp.status, 503);
+assert.deepEqual(hedgeFallbackHits.slice(hedgeFallbackFailStart), ["fail", "fail", "fail"]);
+
+const hedgeTimingStore = new Map();
+hedgeTimingStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, fast_routing: true, hedge_max: 3, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 1200, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "timing-fail-a", base_url: "https://hedge-timing-fail.example/v1", api_key_encrypted: "a", models: ["hedge-timing-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "timing-fail-b", base_url: "https://hedge-timing-fail.example/v1", api_key_encrypted: "b", models: ["hedge-timing-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "timing-third", base_url: "https://hedge-timing-third.example/v1", api_key_encrypted: "c", models: ["hedge-timing-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+  ],
+}));
+const hedgeTimingEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = hedgeTimingStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { hedgeTimingStore.set(key, value); },
+    async delete(key) { hedgeTimingStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "hedge-timing-client", key: "sk-hedge-timing", models: ["*"], upstreams: ["timing-fail-a", "timing-fail-b", "timing-third"] }]),
+};
+const hedgeTimingStart = hedgeTimingHits.length;
+const hedgeTimingResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-hedge-timing", "content-type": "application/json" }, body: JSON.stringify({ model: "hedge-timing-model", messages: [] }),
+}), hedgeTimingEnv);
+const hedgeTiming = hedgeTimingHits.slice(hedgeTimingStart);
+assert.equal(hedgeTimingResp.headers.get("x-llm-gateway-upstream"), "timing-third");
+assert.equal(hedgeTiming.filter((hit) => hit.name === "fail").length, 2);
+assert.equal(hedgeTiming.find((hit) => hit.name === "third").at - hedgeTiming.filter((hit) => hit.name === "fail")[1].at >= 9800, true, JSON.stringify(hedgeTiming));
 
 const hedgeStreamStore = new Map();
 hedgeStreamStore.set("gateway:config", JSON.stringify({

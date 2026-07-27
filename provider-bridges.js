@@ -104,10 +104,6 @@ function applyProviderReasoningOptions(payload) {
       payload.reasoning_effort = openaiOptions.reasoningEffort;
       changed = true;
     }
-    if (openaiOptions.reasoning_effort != null && !("reasoning_effort" in payload)) {
-      payload.reasoning_effort = openaiOptions.reasoning_effort;
-      changed = true;
-    }
     if (openaiOptions.reasoning != null && !("reasoning" in payload)) {
       payload.reasoning = openaiOptions.reasoning;
       changed = true;
