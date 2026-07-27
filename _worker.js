@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-26-gateway-status-layout";
+const VERSION = "v26-07-27-connection-abort";
 
 export default {
   async fetch(request, env, ctx) {
@@ -3405,6 +3405,7 @@ async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search
       proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
       runtime.streamIdleTimeoutMs,
       release,
+      request.signal,
     );
     return { response, release, latency: Date.now() - started, startedAt: started };
   } catch (error) {
@@ -4320,15 +4321,17 @@ function getBearerToken(request) {
   return token && token.length <= MAX_CLIENT_KEY_LENGTH ? token : null;
 }
 
-async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose) {
+async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose, clientSignal) {
   const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
   const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
   const controller = new AbortController();
-  const upstreamSignal = init?.signal;
-  const abort = () => controller.abort(upstreamSignal?.reason || "timeout");
-  const cleanupSignal = () => upstreamSignal?.removeEventListener("abort", abort);
-  if (upstreamSignal?.aborted) abort();
-  else upstreamSignal?.addEventListener("abort", abort, { once: true });
+  const signals = [...new Set([init?.signal, clientSignal].filter(Boolean))];
+  const listeners = signals.map((signal) => [signal, () => controller.abort(signal.reason || "aborted")]);
+  const cleanupSignal = () => listeners.forEach(([signal, listener]) => signal.removeEventListener("abort", listener));
+  listeners.forEach(([signal, listener]) => {
+    if (signal.aborted) listener();
+    else signal.addEventListener("abort", listener, { once: true });
+  });
   const timer = setTimeout(() => controller.abort("timeout"), timeout);
 
   try {

@@ -32,6 +32,8 @@ const hedgeHits = [];
 const hedgeStreamHits = [];
 const hedgeStreamAborts = [];
 const hedgeCancels = [];
+const clientAbortHits = [];
+let notifyClientAbortStarted = null;
 const softFastHits = [];
 const attemptBudgetHits = [];
 const nimHits = [];
@@ -62,6 +64,15 @@ globalThis.fetch = async (url, init) => {
     return new Response(null, {
       status: 200,
       headers: { date: "Sat, 04 Jul 2026 04:00:00 GMT" },
+    });
+  }
+  if (String(url).includes("client-abort.example")) {
+    notifyClientAbortStarted?.();
+    return new Promise((resolve, reject) => {
+      init.signal.addEventListener("abort", () => {
+        clientAbortHits.push(String(init.signal.reason || ""));
+        reject(new Error("client aborted"));
+      }, { once: true });
     });
   }
   if (String(url).includes("/analytics_engine/sql")) {
@@ -758,6 +769,25 @@ await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/cli
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 401);
+
+const clientAbortEnv = {
+  ...env,
+  KV: null,
+  UPSTREAMS_JSON: JSON.stringify([{ name: "client-abort", base_url: "https://client-abort.example/v1", api_key: "x", models: ["abort-model"], paths: ["/v1/chat/completions"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "client-abort", key: "sk-client-abort", models: ["*"], upstreams: ["client-abort"] }]),
+};
+const incomingAbort = new AbortController();
+const upstreamStarted = new Promise((resolve) => { notifyClientAbortStarted = resolve; });
+const abortedRequest = worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  signal: incomingAbort.signal,
+  headers: { authorization: "Bearer sk-client-abort", "content-type": "application/json" },
+  body: JSON.stringify({ model: "abort-model", messages: [] }),
+}), clientAbortEnv);
+await upstreamStarted;
+incomingAbort.abort("client disconnected");
+assert.equal((await abortedRequest).status, 502);
+assert.deepEqual(clientAbortHits, ["client disconnected"]);
 
 const restrictedEnv = {
   ADMIN_TOKEN: "admin-test-token",
