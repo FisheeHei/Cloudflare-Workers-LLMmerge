@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-27-alias-group-balance";
+const VERSION = "v26-07-27-active-release";
 
 export default {
   async fetch(request, env, ctx) {
@@ -139,7 +139,6 @@ export default {
             json(openAiError("`model` is required.", "invalid_request_error"), 400),
           );
         }
-        const presetScope = resolveAliasPresetScope(client, runtime, requestedModel);
         const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
         const publicModel = publicModelId(client, runtime, requestedModel, model);
         const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
@@ -151,7 +150,6 @@ export default {
           proxyResponse = await proxyRequest({
             client,
             model,
-            presetScope,
             pathname,
             request,
             bodyText: proxyBodyText,
@@ -1792,15 +1790,6 @@ async function resolveClientModelAlias(client, runtime, model) {
   return value;
 }
 
-function resolveAliasPresetScope(client, runtime, model) {
-  const value = String(model || "").trim();
-  const row = modelRegistryRows(runtime).find((row) =>
-    row.alias === value &&
-    clientAllowsUpstream(client, row.upstream.name)
-  );
-  return row ? aliasPresetId(row.upstream) : "";
-}
-
 function publicModelId(client, runtime, requestedModel, resolvedModel = requestedModel) {
   const value = String(requestedModel || "").trim();
   const rows = modelRegistryRows(runtime).filter((row) => clientAllowsUpstream(client, row.upstream.name));
@@ -2238,7 +2227,6 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
         const proxyResponse = await proxyRequest({
           client,
           model: translated.model,
-          presetScope: translated.presetScope,
           pathname: CHAT_PATH,
           request,
           bodyText: translated.bodyText,
@@ -2282,7 +2270,6 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
     const proxyResponse = await proxyRequest({
       client,
       model: translated.model,
-      presetScope: translated.presetScope,
       pathname: CHAT_PATH,
       request,
       bodyText: translated.bodyText,
@@ -2330,7 +2317,6 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
 
 async function resolveTranslatedRequestModel(client, runtime, translated, request, payload) {
   const requestedModel = translated.model;
-  translated.presetScope = resolveAliasPresetScope(client, runtime, requestedModel);
   const resolvedModel = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
   translated.seed.model = publicModelId(client, runtime, requestedModel, resolvedModel);
   translated.model = resolvedModel;
@@ -2617,7 +2603,6 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const proxyResponse = await proxyRequest({
       client,
       model: translated.model,
-      presetScope: translated.presetScope,
       pathname: CHAT_PATH,
       request,
       bodyText: translated.bodyText,
@@ -2683,7 +2668,6 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
 
   const sessionModel = await currentSessionModel(client, runtime, request, payload);
   const model = sessionModel || await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
-  const presetScope = resolveAliasPresetScope(client, runtime, requestedModel);
   if (sessionModel && !clientAllowsModelSelection(client, sessionModel, sessionModel)) {
     throw httpError(403, `Model is not allowed for this client key: ${sessionModel}`);
   }
@@ -2716,7 +2700,7 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   }), ctx);
 
   try {
-    const proxyResponse = await proxyRequest({ client, model, presetScope, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search });
+    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search });
     upstreamName = proxyResponse.upstream.name;
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
@@ -3312,12 +3296,12 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
   return readable;
 }
 
-async function proxyRequest({ client, model, presetScope = "", pathname, request, bodyText, runtime, search }) {
+async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {
   if (pathname === CHAT_PATH) {
     bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
 
-  const candidates = proxyCandidates(runtime, client, model, pathname, presetScope);
+  const candidates = proxyCandidates(runtime, client, model, pathname);
 
   if (candidates.length === 0) {
     throw httpError(404, `No upstream available for model: ${model}`);
@@ -3385,7 +3369,7 @@ async function proxyRequest({ client, model, presetScope = "", pathname, request
   throw err;
 }
 
-function proxyCandidates(runtime, client, model, pathname, presetScope = "") {
+function proxyCandidates(runtime, client, model, pathname) {
   const indexed = runtime.routeIndex?.[pathname];
   const indexedPool = indexed
     ? [...(indexed.models[model] || []), ...indexed.wildcard]
@@ -3393,7 +3377,6 @@ function proxyCandidates(runtime, client, model, pathname, presetScope = "") {
   const pool = indexedPool && indexedPool.length ? indexedPool : runtime.upstreams;
   return pool.filter((upstream) =>
     clientAllowsUpstream(client, upstream.name) &&
-    (!presetScope || aliasPresetId(upstream) === presetScope) &&
     (indexedPool?.length || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
   );
 }
@@ -3810,11 +3793,11 @@ function orderUpstreams(runtime, candidates, model) {
 
   const orderedHealthy = runtime.routing.load_balance === false
     ? activeSort(latencySort(prioritySort(healthy), model))
-    : groupLoadSort(runtime, latencySort(weightedShuffle(healthy), model));
+    : activeSort(latencySort(weightedShuffle(healthy), model));
 
   const orderedCooling = runtime.routing.load_balance === false
     ? activeSort(latencySort(prioritySort(cooling), model))
-    : groupLoadSort(runtime, latencySort(weightedShuffle(cooling), model));
+    : activeSort(latencySort(weightedShuffle(cooling), model));
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
   if (runtime.routing.failover === false) {
@@ -3835,27 +3818,6 @@ function latencySort(items, model) {
 
 function activeSort(items) {
   return [...items].sort((a, b) => activeUpstreamCount(a) - activeUpstreamCount(b));
-}
-
-function groupLoadSort(runtime, items) {
-  const groupActive = {};
-  const groupCapacity = {};
-  // ponytail: isolate-local pressure; a Durable Object is only needed for cross-instance balancing.
-  (runtime.upstreams || []).forEach((upstream) => {
-    const group = aliasPresetId(upstream);
-    groupActive[group] = (groupActive[group] || 0) + activeUpstreamCount(upstream);
-  });
-  items.forEach((upstream) => {
-    const group = aliasPresetId(upstream);
-    groupCapacity[group] = (groupCapacity[group] || 0) + 1;
-  });
-  return [...items].sort((a, b) => {
-    const groupA = aliasPresetId(a);
-    const groupB = aliasPresetId(b);
-    const pressureA = (groupActive[groupA] || 0) / groupCapacity[groupA];
-    const pressureB = (groupActive[groupB] || 0) / groupCapacity[groupB];
-    return pressureA - pressureB || activeUpstreamCount(a) - activeUpstreamCount(b);
-  });
 }
 
 function activeUpstreamCount(upstream) {
