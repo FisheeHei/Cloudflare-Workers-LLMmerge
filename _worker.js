@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-26-gateway-status-layout";
+const VERSION = "v26-07-28-active-client-status";
 
 export default {
   async fetch(request, env, ctx) {
@@ -233,6 +233,7 @@ var _upstreamCooldowns = {};
 // ponytail: per-isolate and per-model; DO if strict global rotation ever matters
 var _lastSuccessfulUpstreamName = {};
 var _activeUpstreams = {};
+var _activeUpstreamClients = {};
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -1149,7 +1150,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/runtime" && request.method === "GET") {
-    return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
+    return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), active_upstream_clients: getActiveUpstreamClientSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
   }
 
       // ponytail: fetch model list from a saved or draft upstream for picker
@@ -3308,7 +3309,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     : Math.min(attempts.length, runtime.routing.hedge_max || 2);
   if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
     const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
-    return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, model, pathname, request, runtime, search });
+    return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, client, model, pathname, request, runtime, search });
   }
   let lastError = null;
 
@@ -3323,7 +3324,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         lastError.upstreamName = upstream.name;
         continue;
       }
-      upstreamResult = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, upstream });
+      upstreamResult = await fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, upstream });
       let response = upstreamResult.response;
       const upstreamLatency = upstreamResult.latency;
 
@@ -3388,9 +3389,9 @@ function traceResponse(response, traceId) {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-async function fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal, upstream }) {
+async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal, upstream }) {
   const started = Date.now();
-  const release = trackActiveUpstream(upstream);
+  const release = trackActiveUpstream(upstream, client);
   try {
     const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
     const init = {
@@ -3593,7 +3594,7 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request, runtime, search }) {
+async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname, request, runtime, search }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
@@ -3613,7 +3614,7 @@ async function hedgedProxyRequest({ attempts, bodyText, model, pathname, request
       }
       let result = null;
       try {
-        result = await fetchProxyUpstream({ bodyText, pathname, request, runtime, search, signal: controllers[index].signal, upstream });
+        result = await fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream });
         if (result.response.ok && streamRequest) {
           const primed = await primeSseResponse(result.response);
           result.response = primed.response;
@@ -3831,26 +3832,37 @@ function rememberSuccessfulUpstream(upstream, model) {
   _lastSuccessfulUpstreamName[String(model || "*")] = String(upstream?.name || "").trim();
 }
 
-function noteActiveUpstream(upstream, delta) {
+function noteActiveUpstream(upstream, client, delta) {
   const name = String(upstream?.name || "").trim();
   if (!name) return;
   const next = Math.max(0, Number(_activeUpstreams[name] || 0) + delta);
   if (next) _activeUpstreams[name] = next;
   else delete _activeUpstreams[name];
+  const label = String(client?.name || client?.id || "admin").trim() || "admin";
+  const clients = _activeUpstreamClients[name] || {};
+  const clientNext = Math.max(0, Number(clients[label] || 0) + delta);
+  if (clientNext) clients[label] = clientNext;
+  else delete clients[label];
+  if (Object.keys(clients).length) _activeUpstreamClients[name] = clients;
+  else delete _activeUpstreamClients[name];
 }
 
-function trackActiveUpstream(upstream) {
-  noteActiveUpstream(upstream, 1);
+function trackActiveUpstream(upstream, client) {
+  noteActiveUpstream(upstream, client, 1);
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    noteActiveUpstream(upstream, -1);
+    noteActiveUpstream(upstream, client, -1);
   };
 }
 
 function getActiveUpstreamSnapshot() {
   return { ..._activeUpstreams };
+}
+
+function getActiveUpstreamClientSnapshot() {
+  return Object.fromEntries(Object.entries(_activeUpstreamClients).map(([name, clients]) => [name, { ...clients }]));
 }
 
 function rememberUpstreamLatency(upstream, model, latencyMs) {

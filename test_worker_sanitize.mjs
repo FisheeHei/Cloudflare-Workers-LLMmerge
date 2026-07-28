@@ -2375,10 +2375,13 @@ const longStreamResp = await worker.default.fetch(new Request("https://gw.test/v
 const longActiveRuntimeResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), longStreamEnv);
 const longActiveRuntime = await longActiveRuntimeResp.json();
 assert.equal(longActiveRuntime.active_upstreams["long-stream"] > 0, true);
+assert.equal(Object.keys(longActiveRuntime.active_upstream_clients["long-stream"] || {}).length, 1);
+assert.equal(Object.keys(longActiveRuntime.active_upstream_clients["long-stream"] || {})[0], "long-stream-client");
 assert.equal(await longStreamResp.text(), "xxxxx");
 const longIdleRuntimeResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), longStreamEnv);
 const longIdleRuntime = await longIdleRuntimeResp.json();
 assert.equal(longIdleRuntime.active_upstreams["long-stream"], undefined);
+assert.equal(longIdleRuntime.active_upstream_clients["long-stream"], undefined);
 assert.equal(longStreamHits.length, 1);
 
 const spreadStore = new Map();

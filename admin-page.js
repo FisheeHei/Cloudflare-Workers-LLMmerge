@@ -191,6 +191,7 @@ function renderAdminStyle() {
     }
     .upstream-status-emoji { width: 22px; text-align: center; font-size: 16px; line-height: 1; }
     .upstream-status-emoji.active { animation: upstream-active .55s ease-in-out infinite alternate; }
+    .upstream-active-client { max-width: 148px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     @keyframes upstream-active { to { transform: scale(1.22); opacity: .5; } }
     .upstream-card summary strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .health-dot {
@@ -1128,6 +1129,7 @@ function renderAdminScript(version) {
           '<span class="card-badge">' + esc(badge) + '</span>' +
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
           '<span class="upstream-status-emoji" data-upstream="' + esc(item.name) + '" title="' + (item.enabled ? '' : '\u5df2\u505c\u7528') + '">' + (item.enabled ? '' : '\u26d4') + '</span>' +
+          '<span class="note upstream-active-client" data-upstream="' + esc(item.name) + '"></span>' +
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u5df2\u542f\u7528' : '\u5df2\u505c\u7528') + '</span>' +
@@ -1715,19 +1717,23 @@ function renderAdminScript(version) {
       topbarStatus.classList.add("online");
     }
     const active = payload.active_upstreams || {};
+    const activeClients = payload.active_upstream_clients || {};
     const last = payload.last_successful_upstream || {};
     const recent = new Set(typeof last === "string" ? [last] : Object.values(last));
     document.querySelectorAll(".upstream-status-emoji").forEach(function(el) {
       const card = el.closest(".upstream-card");
       const name = el.dataset.upstream;
       const isActive = !(card && card.classList.contains("disabled")) && Number(active[name] || 0) > 0;
+      const clientText = activeClientText(activeClients[name]);
+      const clientEl = card && card.querySelector(".upstream-active-client");
       el.classList.toggle("active", isActive);
+      if (clientEl) clientEl.textContent = isActive ? clientText : "";
       if (card && card.classList.contains("disabled")) {
         el.textContent = "\u26d4";
         el.title = "\u5df2\u505c\u7528";
       } else if (isActive) {
         el.textContent = "\u26a1";
-        el.title = "\u6b63\u5728\u8bf7\u6c42: " + active[name];
+        el.title = "\u6b63\u5728\u8bf7\u6c42: " + active[name] + (clientText ? " · " + clientText : "");
       } else if (name && recent.has(name)) {
         el.textContent = "\u2705";
         el.title = "\u4e0a\u6b21\u6210\u529f\u4f7f\u7528";
@@ -1736,8 +1742,8 @@ function renderAdminScript(version) {
         el.title = "";
       }
     });
-    updateUpstreamGroupActive(active);
-    updateUpstreamLiveSummary(active, recent);
+    updateUpstreamGroupActive(active, activeClients);
+    updateUpstreamLiveSummary(active, activeClients, recent);
     const nim = payload.nim_rpm || {};
     document.querySelectorAll(".nim-rpm").forEach(function(el) {
       const item = nim[el.dataset.upstream];
@@ -1777,18 +1783,25 @@ function renderAdminScript(version) {
     }
   }
 
-  function updateUpstreamLiveSummary(active, recent) {
+  function activeClientText(clients) {
+    const labels = Object.entries(clients || {}).filter(function(entry) { return Number(entry[1] || 0) > 0; }).map(function(entry) {
+      return entry[0] + (Number(entry[1]) > 1 ? " x" + entry[1] : "");
+    });
+    return labels.length > 2 ? labels.slice(0, 2).join(", ") + " +" + (labels.length - 2) : labels.join(", ");
+  }
+
+  function updateUpstreamLiveSummary(active, activeClients, recent) {
     const count = Object.values(active).reduce((sum, value) => sum + Number(value || 0), 0);
     const names = Object.keys(active).filter((name) => Number(active[name] || 0) > 0);
     const countEl = byId("live-upstream-count");
     const listEl = byId("live-upstream-list");
     if (countEl) countEl.textContent = count ? "\u26a1 " + count + " \u4e2a\u6d3b\u8dc3\u8bf7\u6c42" : "\u25cb \u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42";
     if (listEl) listEl.textContent = names.length
-      ? names.map((name) => name + " (" + active[name] + ")").join(" \u00b7 ")
+      ? names.map((name) => name + " (" + active[name] + ")" + (activeClientText(activeClients[name]) ? " " + activeClientText(activeClients[name]) : "")).join(" \u00b7 ")
       : (recent.size ? "\u6700\u8fd1\u6210\u529f: " + [...recent].filter(Boolean).join(" \u00b7 ") : "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42");
   }
 
-  function updateUpstreamGroupActive(active) {
+  function updateUpstreamGroupActive(active, activeClients) {
     const now = Date.now();
     document.querySelectorAll(".upstream-group").forEach(function(group) {
       const el = group.querySelector(".upstream-group-active");
@@ -1797,7 +1810,7 @@ function renderAdminScript(version) {
         .map((item) => item.dataset.upstream)
         .filter((name) => name && Number(active[name] || 0) > 0);
       if (names.length) {
-        const textValue = "\u26a1 \u6d3b\u8dc3: " + names.join(", ");
+        const textValue = "\u26a1 \u6d3b\u8dc3: " + names.map(function(name) { return name + (activeClientText(activeClients[name]) ? " " + activeClientText(activeClients[name]) : ""); }).join(", ");
         el.textContent = textValue;
         group.dataset.activeText = textValue;
         group.dataset.activeUntil = String(now + 30000);
