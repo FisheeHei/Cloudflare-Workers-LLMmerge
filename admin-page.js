@@ -1693,15 +1693,33 @@ function renderAdminScript(version) {
   }
 
   async function runCloudflareSelfCheck() {
+    const client = await getSelfCheckClient();
     const started = performance.now();
-    const runtimeResp = await fetch(API_BASE + "/runtime", { cache: "no-store" });
+    const gatewayUrl = (state.gateway && state.gateway.base_url) || (location.origin + "/v1");
+    const runtimeResp = await fetch(client ? gatewayUrl + "/models" : API_BASE + "/runtime", {
+      cache: "no-store",
+      headers: client ? { authorization: "Bearer " + client.api_key } : {},
+    });
     const runtime = await parseApiResponse(runtimeResp);
-    if (!runtimeResp.ok || !runtime?.ok) throw new Error(runtime?.error?.message || "\u7f51\u5173\u8fde\u63a5\u5931\u8d25");
+    if (!runtimeResp.ok || (client ? !Array.isArray(runtime?.data) : !runtime?.ok)) {
+      throw new Error(runtime?.error?.message || "\u7f51\u5173\u8fde\u63a5\u6216 Key \u9a8c\u8bc1\u5931\u8d25");
+    }
     const gatewayMs = Math.round(performance.now() - started);
     const upstream = await checkHealth(true);
-    const text = "Cloudflare \u81ea\u68c0: \u5ba2\u6237\u7aef->\u7f51\u5173 " + gatewayMs + "ms \u00b7 \u7f51\u5173->\u4e0a\u6e38 " + upstream.ok + "/" + upstream.total;
+    const source = client ? ("Key " + client.name) : "\u7ba1\u7406\u7aef";
+    const text = "Cloudflare \u81ea\u68c0: " + source + "->\u7f51\u5173 " + gatewayMs + "ms \u00b7 \u7f51\u5173->\u4e0a\u6e38 " + upstream.ok + "/" + upstream.total;
     byId("config-status").textContent = "\u2713 " + text;
     showToast(text);
+  }
+
+  async function getSelfCheckClient() {
+    if (state.lastCreatedClient?.api_key) return state.lastCreatedClient;
+    const item = state.clients[0];
+    if (!item) return null;
+    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(item.id), { cache: "no-store" });
+    const client = await parseApiResponse(resp);
+    if (!resp.ok || !client?.api_key) throw new Error(client?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef Key \u5931\u8d25");
+    return client;
   }
 
   async function releaseActiveUpstreams() {

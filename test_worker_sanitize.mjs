@@ -505,6 +505,7 @@ assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("live-upstream-count"), true);
 assert.equal(adminPage.includes("run-cloudflare-self-check"), true);
 assert.equal(adminPage.includes("release-active-upstreams"), true);
+assert.equal(adminPage.includes("getSelfCheckClient"), true);
 assert.equal(adminPage.includes("client-models"), false);
 assert.equal(adminPage.includes("data-client-save"), false);
 assert.equal(adminPage.includes("picker-apply-same-preset"), true);
