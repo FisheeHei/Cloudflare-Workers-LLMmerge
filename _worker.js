@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-28-active-client-status";
+const VERSION = "v26-07-29-runtime-self-check";
 
 export default {
   async fetch(request, env, ctx) {
@@ -234,6 +234,7 @@ var _upstreamCooldowns = {};
 var _lastSuccessfulUpstreamName = {};
 var _activeUpstreams = {};
 var _activeUpstreamClients = {};
+var _activeUpstreamEpoch = 0;
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -1151,6 +1152,11 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   if (apiPath === "/api/runtime" && request.method === "GET") {
     return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), active_upstream_clients: getActiveUpstreamClientSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
+  }
+
+  if (apiPath === "/api/runtime/release" && request.method === "POST") {
+    clearActiveUpstreamState();
+    return withCorsResponse(json({ ok: true }, 200));
   }
 
       // ponytail: fetch model list from a saved or draft upstream for picker
@@ -3848,10 +3854,11 @@ function noteActiveUpstream(upstream, client, delta) {
 }
 
 function trackActiveUpstream(upstream, client) {
+  const epoch = _activeUpstreamEpoch;
   noteActiveUpstream(upstream, client, 1);
   let released = false;
   return () => {
-    if (released) return;
+    if (released || epoch !== _activeUpstreamEpoch) return;
     released = true;
     noteActiveUpstream(upstream, client, -1);
   };
@@ -3863,6 +3870,12 @@ function getActiveUpstreamSnapshot() {
 
 function getActiveUpstreamClientSnapshot() {
   return Object.fromEntries(Object.entries(_activeUpstreamClients).map(([name, clients]) => [name, { ...clients }]));
+}
+
+function clearActiveUpstreamState() {
+  _activeUpstreams = {};
+  _activeUpstreamClients = {};
+  _activeUpstreamEpoch += 1;
 }
 
 function rememberUpstreamLatency(upstream, model, latencyMs) {

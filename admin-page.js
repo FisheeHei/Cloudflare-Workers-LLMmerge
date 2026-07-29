@@ -565,6 +565,8 @@ function renderAdminMarkup(origin, version) {
       <button type="button" class="secondary" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
       <button type="button" class="secondary" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
       <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
+      <button type="button" class="secondary" id="run-cloudflare-self-check">Cloudflare \u81ea\u68c0</button>
+      <button type="button" class="secondary" id="release-active-upstreams">\u6e05\u9664\u6d3b\u8dc3\u6807\u8bb0</button>
       <span class="toolbar-spacer"></span>
       <div class="menu-wrap" id="upstream-actions">
         <button type="button" class="secondary" id="upstream-actions-toggle">\u66f4\u591a\u64cd\u4f5c</button>
@@ -1670,7 +1672,7 @@ function renderAdminScript(version) {
     setTimeout(() => byId("config-status").textContent = "", 5000);
   }
 
-  async function checkHealth() {
+  async function checkHealth(silent) {
     const dots = document.querySelectorAll(".health-dot");
     dots.forEach((d) => { d.className = "health-dot checking"; d.title = "\u68c0\u67e5\u4e2d..."; });
     updateUpstreamGroupHealth();
@@ -1686,7 +1688,28 @@ function renderAdminScript(version) {
     const ok = (payload.results || []).filter((r) => r.ok).length;
     const total = (payload.results || []).length;
     updateUpstreamGroupHealth();
-    showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
+    if (!silent) showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
+    return { ok, total };
+  }
+
+  async function runCloudflareSelfCheck() {
+    const started = performance.now();
+    const runtimeResp = await fetch(API_BASE + "/runtime", { cache: "no-store" });
+    const runtime = await parseApiResponse(runtimeResp);
+    if (!runtimeResp.ok || !runtime?.ok) throw new Error(runtime?.error?.message || "\u7f51\u5173\u8fde\u63a5\u5931\u8d25");
+    const gatewayMs = Math.round(performance.now() - started);
+    const upstream = await checkHealth(true);
+    const text = "Cloudflare \u81ea\u68c0: \u5ba2\u6237\u7aef->\u7f51\u5173 " + gatewayMs + "ms \u00b7 \u7f51\u5173->\u4e0a\u6e38 " + upstream.ok + "/" + upstream.total;
+    byId("config-status").textContent = "\u2713 " + text;
+    showToast(text);
+  }
+
+  async function releaseActiveUpstreams() {
+    const resp = await fetch(API_BASE + "/runtime/release", { method: "POST" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u6e05\u9664\u5931\u8d25");
+    await loadRuntimeStatus();
+    showToast("\u5df2\u6e05\u9664\u6d3b\u8dc3\u4e0a\u6e38\u6807\u8bb0");
   }
 
   function updateUpstreamGroupHealth() {
@@ -2621,6 +2644,12 @@ function renderAdminScript(version) {
       );
       byId("check-health").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", checkHealth).catch(showError)
+      );
+      byId("run-cloudflare-self-check").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u81ea\u68c0\u4e2d...", runCloudflareSelfCheck).catch(showError)
+      );
+      byId("release-active-upstreams").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u6e05\u9664\u4e2d...", releaseActiveUpstreams).catch(showError)
       );
       byId("speed-test").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u6253\u5f00\u4e2d...", openSpeedPicker).catch(showError)
