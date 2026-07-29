@@ -32,6 +32,7 @@ const hedgeHits = [];
 const hedgeStreamHits = [];
 const hedgeStreamAborts = [];
 const hedgeCancels = [];
+const bodyIsolationHits = [];
 const softFastHits = [];
 const attemptBudgetHits = [];
 const nimHits = [];
@@ -42,6 +43,7 @@ const anthropicStreamHits = [];
 const delayedAnthropicHits = [];
 const cloudflare524Hits = [];
 let releaseDelayedAnthropic = null;
+let notifyAdminAbortStarted = null;
 const paymentHits = [];
 const degradedHits = [];
 const missingFunctionHits = [];
@@ -62,6 +64,21 @@ globalThis.fetch = async (url, init) => {
     return new Response(null, {
       status: 200,
       headers: { date: "Sat, 04 Jul 2026 04:00:00 GMT" },
+    });
+  }
+  if (String(url).includes("admin-abort.example")) {
+    notifyAdminAbortStarted?.();
+    return new Promise((resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error(String(init.signal.reason || "aborted"))), { once: true });
+    });
+  }
+  if (String(url).includes("body-isolation.example")) {
+    const payload = JSON.parse(init.body);
+    const content = payload.messages?.[0]?.content || "";
+    bodyIsolationHits.push(content);
+    await new Promise((resolve) => setTimeout(resolve, content === "key-a" ? 15 : 1));
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+      status: 200, headers: { "content-type": "application/json" },
     });
   }
   if (String(url).includes("/analytics_engine/sql")) {
@@ -2563,6 +2580,55 @@ assert.equal(toolStreamLog.close_reason, "finish_grace");
 assert.equal(toolStreamLog.finish_reason, "tool_calls");
 assert.equal(toolStreamLog.tools_count, 1);
 assert.equal(toolStreamLog.tool_calls_count, 1);
+
+const bodyIsolationStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false }, settings: {},
+  upstreams: [{ name: "body-isolation", base_url: "https://body-isolation.example/v1", api_key_encrypted: "i", models: ["isolation-model"], paths: ["/v1/chat/completions"], enabled: true }],
+})]]);
+const bodyIsolationEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = bodyIsolationStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { bodyIsolationStore.set(key, value); },
+    async delete(key) { bodyIsolationStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([
+    { name: "isolation-a", key: "sk-isolation-a", models: ["*"], upstreams: ["body-isolation"] },
+    { name: "isolation-b", key: "sk-isolation-b", models: ["*"], upstreams: ["body-isolation"] },
+  ]),
+};
+const isolationStart = bodyIsolationHits.length;
+const isolationRequests = ["a", "b"].map((key) => worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-isolation-" + key, "content-type": "application/json" },
+  body: JSON.stringify({ model: "isolation-model", messages: [{ role: "user", content: "key-" + key }] }),
+}), bodyIsolationEnv));
+const isolationResponses = await Promise.all(isolationRequests);
+const isolationBodies = await Promise.all(isolationResponses.map((response) => response.json()));
+assert.deepEqual(isolationBodies.map((body) => body.choices[0].message.content).sort(), ["key-a", "key-b"]);
+assert.deepEqual(bodyIsolationHits.slice(isolationStart).sort(), ["key-a", "key-b"]);
+
+const adminAbortStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false }, settings: {},
+  upstreams: [{ name: "admin-abort", base_url: "https://admin-abort.example/v1", api_key_encrypted: "a", models: ["admin-abort-model"], paths: ["/v1/chat/completions"], enabled: true }],
+})]]);
+const adminAbortEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = adminAbortStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { adminAbortStore.set(key, value); },
+    async delete(key) { adminAbortStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "admin-abort-client", key: "sk-admin-abort", models: ["*"], upstreams: ["admin-abort"] }]),
+};
+const adminAbortStarted = new Promise((resolve) => { notifyAdminAbortStarted = resolve; });
+const adminAbortRequest = worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-admin-abort", "content-type": "application/json" },
+  body: JSON.stringify({ model: "admin-abort-model", messages: [] }),
+}), adminAbortEnv);
+await adminAbortStarted;
+const adminAbortRelease = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime/release", { method: "POST" }), adminAbortEnv);
+assert.equal(adminAbortRelease.status, 200);
+assert.equal((await adminAbortRequest).status, 499);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({

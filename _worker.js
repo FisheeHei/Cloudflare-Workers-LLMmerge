@@ -55,9 +55,10 @@ const ANALYTICS_QUERY_CACHE_MS = 2000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
 const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
+const ACTIVE_UPSTREAM_ABORT_REASON = "admin released active upstreams";
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-29-key-self-check";
+const VERSION = "v26-07-29-request-isolation";
 
 export default {
   async fetch(request, env, ctx) {
@@ -3357,6 +3358,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
     } catch (error) {
       await discardUpstreamResponse(upstreamResult, "upstream request failed");
+      if (error.statusCode === 499) throw error;
       lastError = error;
       lastError.upstreamName = upstream.name;
       markUpstreamFailure(runtime, upstream, model);
@@ -3424,6 +3426,11 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
     return { response, release, latency: Date.now() - started, startedAt: started };
   } catch (error) {
     release();
+    if (controller.signal.aborted && controller.signal.reason === ACTIVE_UPSTREAM_ABORT_REASON) {
+      const cancelled = httpError(499, "Request stopped by gateway administrator.");
+      cancelled.upstreamName = upstream.name;
+      throw cancelled;
+    }
     throw error;
   }
 }
@@ -3651,6 +3658,11 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
     const result = raced.result;
     if (result.cancelled) continue;
     lastResult = result;
+    if (result.error?.statusCode === 499) {
+      done = true;
+      stopHedgeLosers(pending, controllers, -1);
+      throw result.error;
+    }
     if (result.limited) continue;
     const retryable = Boolean(result.streamError) || (result.response && await isRetryableUpstreamResponse(result.response));
     if (result.response && !retryable) {
@@ -3886,7 +3898,7 @@ function getActiveUpstreamClientSnapshot() {
 function clearActiveUpstreamState() {
   const released = _activeUpstreamControllers.size;
   _activeUpstreamEpoch += 1;
-  _activeUpstreamControllers.forEach((controller) => controller.abort("admin released active upstreams"));
+  _activeUpstreamControllers.forEach((controller) => controller.abort(ACTIVE_UPSTREAM_ABORT_REASON));
   _activeUpstreamControllers.clear();
   _activeUpstreams = {};
   _activeUpstreamClients = {};
