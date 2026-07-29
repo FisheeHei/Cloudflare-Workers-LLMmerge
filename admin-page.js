@@ -562,17 +562,17 @@ function renderAdminMarkup(origin, version) {
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
-      <button type="button" class="secondary" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
-      <button type="button" class="secondary" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
       <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
-      <button type="button" class="secondary" id="run-cloudflare-self-check">Cloudflare \u81ea\u68c0</button>
-      <button type="button" class="secondary" id="release-active-upstreams">\u6e05\u9664\u6d3b\u8dc3\u6807\u8bb0</button>
       <span class="toolbar-spacer"></span>
       <div class="menu-wrap" id="upstream-actions">
         <button type="button" class="secondary" id="upstream-actions-toggle">\u66f4\u591a\u64cd\u4f5c</button>
         <div class="menu">
+          <button type="button" class="secondary small" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
+          <button type="button" class="secondary small" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
           <button type="button" class="secondary small" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
           <button type="button" class="secondary small" id="speed-test">\u6a21\u578b\u6d4b\u901f</button>
+          <button type="button" class="secondary small" id="run-cloudflare-self-check">Cloudflare \u81ea\u68c0</button>
+          <button type="button" class="secondary small" id="release-active-upstreams">\u7ec8\u6b62\u6d3b\u8dc3\u8bf7\u6c42</button>
         </div>
       </div>
       <span class="note" id="config-status"></span>
@@ -1709,7 +1709,7 @@ function renderAdminScript(version) {
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "\u6e05\u9664\u5931\u8d25");
     await loadRuntimeStatus();
-    showToast("\u5df2\u6e05\u9664\u6d3b\u8dc3\u4e0a\u6e38\u6807\u8bb0");
+    showToast("\u5df2\u7ec8\u6b62 " + Number(payload.released || 0) + " \u4e2a\u6d3b\u8dc3\u4e0a\u6e38\u8bf7\u6c42");
   }
 
   function updateUpstreamGroupHealth() {

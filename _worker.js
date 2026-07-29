@@ -57,7 +57,7 @@ const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-29-runtime-self-check";
+const VERSION = "v26-07-29-upstream-actions";
 
 export default {
   async fetch(request, env, ctx) {
@@ -235,6 +235,7 @@ var _lastSuccessfulUpstreamName = {};
 var _activeUpstreams = {};
 var _activeUpstreamClients = {};
 var _activeUpstreamEpoch = 0;
+var _activeUpstreamControllers = new Set();
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -1155,8 +1156,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/runtime/release" && request.method === "POST") {
-    clearActiveUpstreamState();
-    return withCorsResponse(json({ ok: true }, 200));
+    return withCorsResponse(json({ ok: true, released: clearActiveUpstreamState() }, 200));
   }
 
       // ponytail: fetch model list from a saved or draft upstream for picker
@@ -3397,7 +3397,15 @@ function traceResponse(response, traceId) {
 
 async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal, upstream }) {
   const started = Date.now();
-  const release = trackActiveUpstream(upstream, client);
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason || "request aborted");
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const activeRelease = trackActiveUpstream(upstream, client, controller);
+  const release = () => {
+    signal?.removeEventListener("abort", abort);
+    activeRelease();
+  };
   try {
     const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
     const init = {
@@ -3405,7 +3413,7 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
       headers: buildUpstreamHeaders(request, upstream),
       body: sanitizedBody,
     };
-    if (signal) init.signal = signal;
+    init.signal = controller.signal;
     const response = await fetchWithTimeout(
       buildUpstreamUrl(upstream.base_url, pathname, search),
       init,
@@ -3853,13 +3861,16 @@ function noteActiveUpstream(upstream, client, delta) {
   else delete _activeUpstreamClients[name];
 }
 
-function trackActiveUpstream(upstream, client) {
+function trackActiveUpstream(upstream, client, controller) {
   const epoch = _activeUpstreamEpoch;
+  if (controller) _activeUpstreamControllers.add(controller);
   noteActiveUpstream(upstream, client, 1);
   let released = false;
   return () => {
-    if (released || epoch !== _activeUpstreamEpoch) return;
+    if (released) return;
     released = true;
+    if (controller) _activeUpstreamControllers.delete(controller);
+    if (epoch !== _activeUpstreamEpoch) return;
     noteActiveUpstream(upstream, client, -1);
   };
 }
@@ -3873,9 +3884,13 @@ function getActiveUpstreamClientSnapshot() {
 }
 
 function clearActiveUpstreamState() {
+  const released = _activeUpstreamControllers.size;
+  _activeUpstreamEpoch += 1;
+  _activeUpstreamControllers.forEach((controller) => controller.abort("admin released active upstreams"));
+  _activeUpstreamControllers.clear();
   _activeUpstreams = {};
   _activeUpstreamClients = {};
-  _activeUpstreamEpoch += 1;
+  return released;
 }
 
 function rememberUpstreamLatency(upstream, model, latencyMs) {
