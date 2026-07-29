@@ -481,7 +481,7 @@ const env = {
   KV: {
     async get(key, type) {
       const value = kvStore.get(key);
-      return type === "json" && value ? JSON.parse(value) : value || null;
+      return (type === "json" || type?.type === "json") && value ? JSON.parse(value) : value || null;
     },
     async put(key, value) {
       kvPuts.push(key);
@@ -1718,7 +1718,7 @@ const hedgeStreamEnv = {
   ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
-    async get(key, type) { const value = hedgeStreamStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async get(key, type) { const value = hedgeStreamStore.get(key); return (type === "json" || type?.type === "json") && value ? JSON.parse(value) : value || null; },
     async put(key, value) { hedgeStreamStore.set(key, value); },
     async delete(key) { hedgeStreamStore.delete(key); },
   },
@@ -1730,9 +1730,9 @@ const hedgeStreamResp = await worker.default.fetch(new Request("https://gw.test/
   headers: { authorization: "Bearer sk-hedge-stream", "content-type": "application/json" },
   body: JSON.stringify({ model: "hedge-stream-model", messages: [], stream: true }),
 }), hedgeStreamEnv);
-assert.equal(hedgeStreamResp.headers.get("x-llm-gateway-upstream"), "hedge-stream-fast");
-assert.deepEqual(hedgeStreamHits.slice(hedgeStreamStart), ["slow", "fast"]);
+assert.equal(hedgeStreamResp.headers.get("x-llm-gateway-upstream"), "pending");
 assert.equal((await hedgeStreamResp.text()).includes('"content":"fast"'), true);
+assert.deepEqual(hedgeStreamHits.slice(hedgeStreamStart), ["slow", "fast"]);
 await new Promise((resolve) => setTimeout(resolve, 100));
 assert.equal(hedgeStreamAborts.includes("slow"), true);
 

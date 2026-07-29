@@ -58,7 +58,8 @@ const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const ACTIVE_UPSTREAM_ABORT_REASON = "admin released active upstreams";
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const VERSION = "v26-07-29-request-isolation";
+const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
+const VERSION = "v26-07-29-stream-resilience";
 
 export default {
   async fetch(request, env, ctx) {
@@ -146,6 +147,41 @@ export default {
 
         const started = Date.now();
         var pt = Math.max(1, Math.round(proxyBodyText.length / 4));
+        if (pathname === CHAT_PATH && payload.stream === true) {
+          const headers = pendingSseHeaders(client, traceId);
+          const body = streamPendingOpenAiResponse(async () => {
+            let proxyResponse;
+            let logged = false;
+            try {
+              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: proxyBodyText, runtime, search: url.search });
+              const upstreamResp = proxyResponse.response;
+              const responseHeaders = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+              const response = await buildLoggedProxyResponse({ app, bodyText: proxyBodyText, client, ctx, headers: responseHeaders, model, responseModel: publicModel, pathname, requestPayload: payload, proxyResponse, started, traceId, upstreamResp });
+              if (!response.ok) {
+                logged = true;
+                throw httpError(response.status, await response.text());
+              }
+              return response.body;
+            } catch (error) {
+              if (!logged) {
+                recordRequestLog(app, makeRequestLogEntry({
+                  client,
+                  upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
+                  model,
+                  path: pathname,
+                  status: error.statusCode || 502,
+                  started,
+                  promptTokens: pt,
+                  completionTokens: 0,
+                  extra: { trace_id: traceId, tools_count: requestToolsCount(payload) },
+                }), ctx);
+              }
+              throw error;
+            }
+          });
+          return new Response(body, { status: 200, headers });
+        }
+
         let proxyResponse;
         try {
           proxyResponse = await proxyRequest({
@@ -336,7 +372,7 @@ function hkHourKey(value) {
     String(d.getUTCHours()).padStart(2, "0");
 }
 
-// ponytail: in-memory batch for stats + logs, flush every 90s to KV
+// ponytail: in-memory batch; KV fallback flushes every 15 minutes, AE writes per request.
 var _pendingLogs = [];
 var _pendingStats = {}; // hourKey -> bucket
 var _lastFlush = Date.now();
@@ -532,6 +568,8 @@ async function getMergedLogs(app) {
 async function getBestLogs(app) {
   const analyticsLogs = await getAnalyticsLogs(app).catch(() => null);
   if (analyticsLogs) return mergeRecentLogs(analyticsLogs, recentPendingLogs());
+  // ponytail: AE is the log store; without its query token show only live logs, never burn KV reads.
+  if (hasAnalyticsEngine(app)) return recentPendingLogs();
   return await getMergedLogs(app);
 }
 
@@ -893,9 +931,19 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
 }
 
 function streamPendingAnthropicResponse(open) {
-  const encoder = new TextEncoder();
   // ponytail: padded SSE crosses buffering proxies that otherwise hold tiny first chunks.
-  const ping = encoder.encode(`: ${" ".repeat(2048)}\nevent: ping\ndata: {"type":"ping"}\n\n`);
+  const ping = `: ${" ".repeat(2048)}\nevent: ping\ndata: {"type":"ping"}\n\n`;
+  return streamPendingSseResponse(open, ping, ping, (error) => {
+    const status = error.statusCode || 502;
+    const payload = { type: "error", error: { type: anthropicErrorType(status), message: error.message || "Upstream request failed." } };
+    return `event: error\ndata: ${JSON.stringify(payload)}\n\n`;
+  });
+}
+
+function streamPendingSseResponse(open, initial, heartbeat, errorEvent) {
+  const encoder = new TextEncoder();
+  const initialChunk = encoder.encode(initial);
+  const heartbeatChunk = encoder.encode(heartbeat);
   let reader = null;
   let timer = null;
   let closed = false;
@@ -916,12 +964,13 @@ function streamPendingAnthropicResponse(open) {
           return false;
         }
       };
-      send(ping);
-      timer = setInterval(() => { if (controller.desiredSize > 0) send(ping); }, SSE_KEEPALIVE_MS);
+      send(initialChunk);
+      timer = setInterval(() => { if (controller.desiredSize > 0) send(heartbeatChunk); }, SSE_KEEPALIVE_MS);
       (async () => {
         try {
           const body = await open();
-          reader = body.getReader();
+          reader = body?.getReader();
+          if (!reader) throw new Error("Upstream returned an empty response.");
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -931,9 +980,7 @@ function streamPendingAnthropicResponse(open) {
             }
           }
         } catch (error) {
-          const status = error.statusCode || 502;
-          const payload = { type: "error", error: { type: anthropicErrorType(status), message: error.message || "Upstream request failed." } };
-          send(encoder.encode(`event: error\ndata: ${JSON.stringify(payload)}\n\n`));
+          send(encoder.encode(errorEvent(error)));
         } finally {
           cleanup();
           try { controller.close(); } catch {}
@@ -1140,13 +1187,13 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       hourKeys.push(hkHourKey(now - h * 3600000));
     }
     const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
-    const useAnalyticsForStats = analyticsBuckets !== null;
+    const useAnalyticsForStats = analyticsBuckets !== null || hasAnalyticsEngine(app);
     const raws = useAnalyticsForStats ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
     // Keep all isolate-local stats when AE is write-only; the two-minute merge window is only for readable AE data.
-    const liveStats = useAnalyticsForStats ? recentPendingStats() : _pendingStats;
+    const liveStats = analyticsBuckets ? recentPendingStats() : _pendingStats;
     const logs = await getBestLogs(app);
     const buckets = hourKeys.map((hour, i) => {
-      const raw = analyticsBuckets ? analyticsBuckets[hour] : raws[i];
+      const raw = analyticsBuckets ? analyticsBuckets[hour] : raws?.[i];
       return { hour, ...mergeStatsBucket(raw, liveStats[hour]) };
     });
     return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: hkNowIso(), time_zone: HK_TIME_ZONE_LABEL }, 200));
@@ -1322,7 +1369,7 @@ async function detectAdminUpstream(app, upstreamName) {
 }
 
 async function getEditableConfig(app) {
-  const stored = app.kv ? await app.kv.get(GATEWAY_CONFIG_KEY, "json") : null;
+  const stored = app.kv ? await getKvJson(app.kv, GATEWAY_CONFIG_KEY) : null;
   const config = unwrapGatewayConfig(stored);
   if (config) {
     return repairStoredGatewayConfig(config, app);
@@ -1726,7 +1773,7 @@ async function requireClient(request, runtime) {
   }
 
   if (runtime.kv) {
-    const load = _clientLoading[token] || (async () => runtime.kv.get(clientTokenKey(token), "json"))();
+    const load = _clientLoading[token] || getKvJson(runtime.kv, clientTokenKey(token));
     _clientLoading[token] = load;
     let kvClient;
     try {
@@ -2602,6 +2649,34 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
 
+  if (translated.stream) {
+    const headers = pendingSseHeaders(client, traceId);
+    const body = streamPendingOpenAiResponse(async () => {
+      let proxyResponse;
+      try {
+        proxyResponse = await proxyRequest({ client, model: translated.model, pathname: CHAT_PATH, request, bodyText: translated.bodyText, runtime, search: url.search });
+        const upstreamResp = proxyResponse.response;
+        if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
+        const onDone = (usage, extra) => recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
+        return streamResponsesFromChat(upstreamResp, translated.seed, onDone, started);
+      } catch (error) {
+        recordRequestLog(app, makeRequestLogEntry({
+          client,
+          upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
+          model: translated.model,
+          path: RESPONSES_PATH,
+          status: error.statusCode || 502,
+          started,
+          promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+          completionTokens: 0,
+          extra: { trace_id: traceId },
+        }), ctx);
+        throw error;
+      }
+    });
+    return new Response(body, { status: 200, headers });
+  }
+
   try {
     const proxyResponse = await proxyRequest({
       client,
@@ -2619,12 +2694,6 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     if (!upstreamResp.ok) {
       recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId);
       return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
-    }
-
-    if (translated.stream) {
-      setSseHeaders(headers);
-      const onDone = (usage, extra) => recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
-      return new Response(withSseKeepAlive(streamResponsesFromChat(upstreamResp, translated.seed, onDone, started)), { status: 200, headers });
     }
 
     const openaiText = await upstreamResp.text();
@@ -3873,6 +3942,22 @@ function noteActiveUpstream(upstream, client, delta) {
   else delete _activeUpstreamClients[name];
 }
 
+function getKvJson(kv, key) {
+  return kv.get(key, { type: "json", cacheTtl: KV_HOT_READ_CACHE_TTL_SECONDS });
+}
+
+function streamPendingOpenAiResponse(open) {
+  return streamPendingSseResponse(
+    open,
+    `: ${" ".repeat(2048)}\n\n`,
+    ": keepalive\n\n",
+    (error) => {
+      const status = error.statusCode || 502;
+      return `data: ${JSON.stringify({ error: { message: error.message || "Upstream request failed.", type: mapErrorType(status) } })}\n\ndata: [DONE]\n\n`;
+    },
+  );
+}
+
 function trackActiveUpstream(upstream, client, controller) {
   const epoch = _activeUpstreamEpoch;
   if (controller) _activeUpstreamControllers.add(controller);
@@ -4486,6 +4571,16 @@ function setSseHeaders(headers) {
   headers.set("cache-control", "no-cache, no-transform");
   headers.set("x-accel-buffering", "no");
   headers.delete("content-length");
+}
+
+function pendingSseHeaders(client, traceId) {
+  const headers = new Headers(CORS_HEADERS);
+  setSseHeaders(headers);
+  headers.set("x-llm-gateway-client", client.name || client.id || "client");
+  headers.set("x-llm-gateway-trace-id", traceId);
+  headers.set("x-llm-gateway-upstream", "pending");
+  headers.set("x-llm-gateway-attempts", "0");
+  return headers;
 }
 
 function generateClientKey() {
