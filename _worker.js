@@ -18,7 +18,7 @@ const CORS_HEADERS = {
   "access-control-max-age": "3600",
 };
 
-const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504, 524]);
+const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529]);
 const MODEL_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
 const RESPONSES_PATH = "/v1/responses";
@@ -33,6 +33,7 @@ const STATS_PREFIX = "gateway:stats:";
 const STATS_WINDOW_HOURS = 24;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
+const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
 const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
@@ -59,7 +60,7 @@ const ACTIVE_UPSTREAM_ABORT_REASON = "admin released active upstreams";
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-29-stream-resilience";
+const VERSION = "v26-07-30-timeout-failover";
 
 export default {
   async fetch(request, env, ctx) {
@@ -3400,7 +3401,10 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         lastError.upstreamName = upstream.name;
         continue;
       }
-      upstreamResult = await fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, upstream });
+      upstreamResult = await fetchProxyUpstream({
+        bodyText, client, pathname, request, runtime, search, upstream,
+        firstByteTimeoutMs: requestBodyStreams(bodyText) ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
+      });
       let response = upstreamResult.response;
       const upstreamLatency = upstreamResult.latency;
 
@@ -3466,7 +3470,7 @@ function traceResponse(response, traceId) {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
-async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal, upstream }) {
+async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal, upstream, firstByteTimeoutMs }) {
   const started = Date.now();
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason || "request aborted");
@@ -3488,7 +3492,7 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
     const response = await fetchWithTimeout(
       buildUpstreamUrl(upstream.base_url, pathname, search),
       init,
-      proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
+      firstByteTimeoutMs || proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
       runtime.streamIdleTimeoutMs,
       release,
     );
@@ -3704,7 +3708,10 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
       }
       let result = null;
       try {
-        result = await fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream });
+        result = await fetchProxyUpstream({
+          bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
+          firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+        });
         if (result.response.ok && streamRequest) {
           const primed = await primeSseResponse(result.response);
           result.response = primed.response;

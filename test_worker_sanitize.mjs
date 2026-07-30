@@ -273,9 +273,11 @@ globalThis.fetch = async (url, init) => {
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("cloudflare-524.example")) {
-    cloudflare524Hits.push(JSON.parse(init.body));
-    return new Response(JSON.stringify({ title: "Error 524: A timeout occurred", status: 524, detail: "origin_response_timeout" }), {
-      status: 524,
+    const payload = JSON.parse(init.body);
+    cloudflare524Hits.push(payload);
+    const status = payload.model === "cloudflare-529-model" ? 529 : 524;
+    return new Response(JSON.stringify(status === 529 ? { message: "Service temporarily overloaded", type: "Overloaded", code: 529 } : { title: "Error 524: A timeout occurred", status: 524, detail: "origin_response_timeout" }), {
+      status,
       headers: { "content-type": "application/json" },
     });
   }
@@ -2064,8 +2066,8 @@ cloudflare524Store.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
   upstreams: [
-    { name: "cloudflare-524", base_url: "https://cloudflare-524.example/v1", api_key_encrypted: "e", models: ["cloudflare-524-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "cloudflare-524-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["cloudflare-524-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "cloudflare-524", base_url: "https://cloudflare-524.example/v1", api_key_encrypted: "e", models: ["cloudflare-524-model", "cloudflare-529-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "cloudflare-524-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["cloudflare-524-model", "cloudflare-529-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
   ],
 }));
 const cloudflare524Env = {
@@ -2086,6 +2088,13 @@ const cloudflare524Resp = await worker.default.fetch(new Request("https://gw.tes
 assert.equal(cloudflare524Hits.length, 1);
 assert.equal(cloudflare524Resp.status, 200);
 assert.equal(cloudflare524Resp.headers.get("x-llm-gateway-upstream"), "cloudflare-524-fallback");
+const cloudflare529Resp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-cloudflare-524", "content-type": "application/json" },
+  body: JSON.stringify({ model: "cloudflare-529-model", messages: [] }),
+}), cloudflare524Env);
+assert.equal(cloudflare529Resp.status, 200);
+assert.equal(cloudflare529Resp.headers.get("x-llm-gateway-upstream"), "cloudflare-524-fallback");
 const anthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
   headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },
