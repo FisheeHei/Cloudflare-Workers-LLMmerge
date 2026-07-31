@@ -75,8 +75,10 @@ const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
 const TRANSLATOR_ACTIVE_KEY = "translator:active";
 const TRANSLATOR_JOB_PREFIX = "translator:job:";
 const TRANSLATOR_JOB_TTL_SECONDS = 8 * 24 * 3600;
+const TRANSLATOR_MAX_CLIENTS = 4;
+const TRANSLATOR_SECOND_LANE_DELAY_MS = 30000;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-31-json-translator-download";
+const VERSION = "v26-07-31-json-translator-pool";
 
 export default {
   async fetch(request, env, ctx) {
@@ -277,12 +279,20 @@ export default {
     }
   },
   async scheduled(controller, env, ctx) {
+    if (_translatorCronRunning) return;
+    _translatorCronRunning = true;
     try {
       const app = createApp(env);
       scheduleStdTimeSync(app, ctx);
-      await runTranslatorCron(app, ctx);
+      const first = await runTranslatorCron(app, ctx, 0);
+      if (first.running && first.client_count > 1) {
+        await sleep(TRANSLATOR_SECOND_LANE_DELAY_MS);
+        await runTranslatorCron(app, ctx, 1);
+      }
     } catch (error) {
       console.error("translator cron failed", error);
+    } finally {
+      _translatorCronRunning = false;
     }
   },
 };
@@ -316,7 +326,7 @@ var _analyticsQueryCache = {};
 // ponytail: model state is isolate-local; Goal turns must not create KV reads/writes.
 var _sessionModelLocks = {};
 var _sessionCurrentModels = {};
-// ponytail: isolate-local cron guard; use Durable Objects only if cross-instance exactly-once is required.
+// ponytail: isolate-local cycle guard; use Durable Objects only if cross-instance exactly-once is required.
 var _translatorCronRunning = false;
 
 function createApp(env) {
@@ -1286,9 +1296,12 @@ async function createTranslatorJob(request, app) {
   const source = payload?.source && typeof payload.source === "object" && !Array.isArray(payload.source)
     ? payload.source
     : payload;
-  const clientId = String(payload?.client_id || request.headers.get("x-translator-client-id") || "").trim();
+  const clientIds = uniqueTranslatorClientIds(
+    Array.isArray(payload?.client_ids) ? payload.client_ids : [payload?.client_id || request.headers.get("x-translator-client-id")],
+  );
   const requestedModel = String(payload?.model || request.headers.get("x-translator-model") || "").trim();
-  if (!clientId || !requestedModel) throw httpError(400, "client_id and model are required.");
+  if (!clientIds.length || !requestedModel) throw httpError(400, "At least one client_id and model are required.");
+  if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
   try {
     validateSource(source);
   } catch (error) {
@@ -1304,16 +1317,20 @@ async function createTranslatorJob(request, app) {
     await app.kv.delete(TRANSLATOR_ACTIVE_KEY);
   }
 
-  const client = await loadTranslatorClient(app, clientId);
-  if (!client) throw httpError(404, "Client key not found.");
+  const clients = await Promise.all(clientIds.map((id) => loadTranslatorClient(app, id)));
+  if (clients.some((client) => !client)) throw httpError(404, "One or more client keys were not found.");
   const runtime = await loadRuntimeConfig(app);
-  const model = await resolveAuthorizedClientModel(
+  const models = await Promise.all(clients.map((client) => resolveAuthorizedClientModel(
     client,
     runtime,
     requestedModel,
     new Request("https://translator.internal/v1/chat/completions", { headers: { "x-translator": "1" } }),
     { model: requestedModel },
-  );
+  )));
+  const model = models[0];
+  if (models.some((candidate) => candidate !== model)) {
+    throw httpError(400, "Selected client keys resolve the requested model differently.");
+  }
   const items = buildTranslationItems(source);
   const batches = buildBatches(items);
   const now = hkNowIso();
@@ -1323,8 +1340,10 @@ async function createTranslatorJob(request, app) {
     phase: "translate",
     source,
     result: sourceToResult(source, items),
-    client_id: client.id,
-    client_name: client.name,
+    client_id: clients[0].id,
+    client_name: clients[0].name,
+    client_ids: clients.map((client) => client.id),
+    client_names: clients.map((client) => client.name),
     requested_model: requestedModel,
     model,
     current_batch: 0,
@@ -1400,6 +1419,8 @@ function publicTranslatorJob(job) {
     phase: job.phase,
     client_id: job.client_id,
     client_name: job.client_name,
+    client_ids: translatorJobClientIds(job),
+    client_names: Array.isArray(job.client_names) ? job.client_names : [job.client_name].filter(Boolean),
     model: job.requested_model || job.model,
     total_items: job.total_items,
     total_batches: job.total_batches,
@@ -1412,65 +1433,80 @@ function publicTranslatorJob(job) {
   };
 }
 
-async function runTranslatorCron(app, ctx) {
-  if (_translatorCronRunning || !app.kv) return;
-  _translatorCronRunning = true;
+async function runTranslatorCron(app, ctx, lane = 0) {
+  if (!app.kv) return { running: false, client_count: 0 };
+  const id = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
+  if (!id) return { running: false, client_count: 0 };
+  const job = await getTranslatorJob(app.kv, id);
+  if (!job || job.status !== "running") {
+    await clearTranslatorActive(app.kv, id);
+    return { running: false, client_count: 0 };
+  }
+  const clientCount = translatorJobClientIds(job).length;
+  const items = buildTranslationItems(job.source);
+  const batches = buildBatches(items);
+  const batch = batches[job.current_batch];
+  if (!batch) {
+    job.status = "completed";
+    job.updated_at = hkNowIso();
+    await saveTranslatorJob(app.kv, job);
+    await clearTranslatorActive(app.kv, id);
+    return { running: false, client_count: clientCount };
+  }
+  const revision = job.updated_at;
   try {
-    const id = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
-    if (!id) return;
-    const job = await getTranslatorJob(app.kv, id);
-    if (!job || job.status !== "running") {
-      await clearTranslatorActive(app.kv, id);
-      return;
+    const payload = job.phase === "review"
+      ? reviewRequestBody(job.model, batch, Object.fromEntries(batch.map((item) => [item.id, job.result[item.key] || item.source])))
+      : translationRequestBody(job.model, batch);
+    const responsePayload = await runTranslatorModelRequest(app, job, payload, ctx, lane);
+    const current = await getTranslatorJob(app.kv, id);
+    if (!current || current.status !== "running" || current.updated_at !== revision || current.current_batch !== job.current_batch) {
+      return { running: Boolean(current?.status === "running"), client_count: clientCount };
     }
-    const items = buildTranslationItems(job.source);
-    const batches = buildBatches(items);
-    const batch = batches[job.current_batch];
-    if (!batch) {
-      job.status = "completed";
-      job.updated_at = hkNowIso();
-      await saveTranslatorJob(app.kv, job);
-      await clearTranslatorActive(app.kv, id);
-      return;
+    if (job.phase === "review") {
+      const reviews = parseReviewResponse(responsePayload, batch);
+      applyTranslatorReview(current, batch, reviews);
+      current.review_issues = [...(current.review_issues || []), ...reviewIssues(reviews)];
+    } else {
+      const translations = parseTranslationResponse(responsePayload, batch);
+      applyTranslatorTranslations(current, batch, translations);
     }
-    const revision = job.updated_at;
-    try {
-      const payload = job.phase === "review"
-        ? reviewRequestBody(job.model, batch, Object.fromEntries(batch.map((item) => [item.id, job.result[item.key] || item.source])))
-        : translationRequestBody(job.model, batch);
-      const responsePayload = await runTranslatorModelRequest(app, job, payload, ctx);
-      const current = await getTranslatorJob(app.kv, id);
-      if (!current || current.status !== "running" || current.updated_at !== revision || current.current_batch !== job.current_batch) return;
-      if (job.phase === "review") {
-        const reviews = parseReviewResponse(responsePayload, batch);
-        applyTranslatorReview(current, batch, reviews);
-        current.review_issues = [...(current.review_issues || []), ...reviewIssues(reviews)];
-      } else {
-        const translations = parseTranslationResponse(responsePayload, batch);
-        applyTranslatorTranslations(current, batch, translations);
-      }
-      current.current_batch += 1;
-      current.last_error = "";
-      current.updated_at = hkNowIso();
-      if (current.current_batch >= batches.length) {
-        current.status = "completed";
-        if (current.phase === "review") current.review_issues = current.review_issues || [];
-      }
-      ensureTranslatorStateSize(current);
-      await saveTranslatorJob(app.kv, current);
-      if (current.status === "completed") await clearTranslatorActive(app.kv, id);
-    } catch (error) {
-      await markTranslatorFailure(app.kv, id, revision, error);
+    current.current_batch += 1;
+    current.last_error = "";
+    current.updated_at = hkNowIso();
+    if (current.current_batch >= batches.length) {
+      current.status = "completed";
+      if (current.phase === "review") current.review_issues = current.review_issues || [];
     }
-  } finally {
-    _translatorCronRunning = false;
+    ensureTranslatorStateSize(current);
+    await saveTranslatorJob(app.kv, current);
+    if (current.status === "completed") await clearTranslatorActive(app.kv, id);
+    return { running: current.status === "running", client_count: clientCount };
+  } catch (error) {
+    await markTranslatorFailure(app.kv, id, revision, error);
+    return { running: true, client_count: clientCount };
   }
 }
 
-async function runTranslatorModelRequest(app, job, payload, ctx) {
+async function runTranslatorModelRequest(app, job, payload, ctx, lane) {
+  let lastError = null;
+  for (const clientId of translatorClientAttemptIds(job, lane)) {
+    const client = await loadTranslatorClient(app, clientId);
+    if (!client) {
+      lastError = httpError(404, "A translation client key no longer exists.");
+      continue;
+    }
+    try {
+      return await runTranslatorClientRequest(app, job, payload, ctx, lane, client);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || httpError(502, "No translation client key is available.");
+}
+
+async function runTranslatorClientRequest(app, job, payload, ctx, lane, client) {
   const bodyText = JSON.stringify(payload);
-  const client = await loadTranslatorClient(app, job.client_id);
-  if (!client) throw httpError(404, "Client key no longer exists.");
   const request = new Request("https://translator.internal" + CHAT_PATH, {
     method: "POST",
     headers: { authorization: `Bearer ${client.key}`, "content-type": "application/json" },
@@ -1482,7 +1518,8 @@ async function runTranslatorModelRequest(app, job, payload, ctx) {
   let logged = false;
   try {
     proxyResponse = await proxyRequest({ client, model: job.model, pathname: CHAT_PATH, request, bodyText, runtime, search: "" });
-    const headers = proxyResponseHeaders(proxyResponse.response, proxyResponse, client, `translator-${job.id}-${job.current_batch}`);
+    const traceId = `translator-${job.id}-${job.current_batch}-${lane}-${client.id}`;
+    const headers = proxyResponseHeaders(proxyResponse.response, proxyResponse, client, traceId);
     const response = await buildLoggedProxyResponse({
       app,
       bodyText,
@@ -1495,7 +1532,7 @@ async function runTranslatorModelRequest(app, job, payload, ctx) {
       requestPayload: payload,
       proxyResponse,
       started,
-      traceId: `translator-${job.id}-${job.current_batch}`,
+      traceId,
       upstreamResp: proxyResponse.response,
     });
     logged = true;
@@ -1517,11 +1554,27 @@ async function runTranslatorModelRequest(app, job, payload, ctx) {
         started,
         promptTokens: Math.max(1, Math.round(bodyText.length / 4)),
         completionTokens: 0,
-        extra: { translator_job: job.id, translator_phase: job.phase },
+        extra: { translator_job: job.id, translator_phase: job.phase, translator_lane: lane },
       }), ctx);
     }
     throw error;
   }
+}
+
+function uniqueTranslatorClientIds(values) {
+  return [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function translatorJobClientIds(job) {
+  const ids = uniqueTranslatorClientIds(job?.client_ids);
+  return ids.length ? ids : uniqueTranslatorClientIds([job?.client_id]);
+}
+
+function translatorClientAttemptIds(job, lane) {
+  const ids = translatorJobClientIds(job);
+  if (ids.length <= 1) return ids;
+  const primary = ids[Math.min(Math.max(0, lane), 1)] || ids[0];
+  return uniqueTranslatorClientIds([primary, ...ids.slice(2), ...ids.slice(0, 2)]);
 }
 
 async function loadTranslatorClient(app, id) {

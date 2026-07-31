@@ -132,6 +132,8 @@ function renderAdminStyle() {
     .translator-error { margin: 14px 0 0; color: #9a3412; font-size: 12px; overflow-wrap: anywhere; }
     .translator-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
     .translator-actions button { flex: 0 0 auto; }
+    .translator-client-pool { min-height: 118px; padding: 5px; }
+    .translator-pool-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -622,13 +624,13 @@ function renderAdminMarkup(origin, version) {
     </div>
     <div class="translator-hero-status">
       <strong>Cloudflare Cron</strong>
-      <span>每分钟推进一个分片</span>
+      <span>双 Key 时分片之间至少间隔 30 秒</span>
     </div>
   </div>
   <div class="panel translator-form-panel" id="translator-panel">
     <div class="translator-section-head"><h2>任务配置</h2><span class="note">顶层 JSON 对象，所有 value 必须是字符串</span></div>
     <div class="row">
-      <div class="field span-4"><label>客户端 Key</label><select id="translator-client"></select></div>
+      <div class="field span-4"><label>客户端 Key 池</label><select class="translator-client-pool" id="translator-client" multiple size="4"></select><span class="translator-pool-note">最多 4 个；前 2 个轮换，其余仅用于回退。</span></div>
       <div class="field span-4"><label>模型</label><input id="translator-model" class="mono" placeholder="例如 nvidia-nim/qwen..."></div>
       <div class="field span-4"><label>JSON 文件</label><input id="translator-file" type="file" accept=".json,application/json"></div>
     </div>
@@ -642,6 +644,7 @@ function renderAdminMarkup(origin, version) {
       <div class="translator-status-row"><span class="translator-status-label">当前状态</span><strong class="translator-status-value" id="translator-status" data-state="idle">尚未创建任务</strong></div>
       <div class="translator-status-row"><span class="translator-status-label">进度</span><strong class="translator-status-value" id="translator-progress">-</strong></div>
       <div class="translator-status-row"><span class="translator-status-label">模型</span><strong class="translator-status-value mono" id="translator-current-model">-</strong></div>
+      <div class="translator-status-row"><span class="translator-status-label">Key 池</span><strong class="translator-status-value" id="translator-current-clients">-</strong></div>
     </div>
     <p class="translator-error" id="translator-error" hidden></p>
     <div class="translator-actions">
@@ -2542,9 +2545,8 @@ function renderAdminScript(version) {
   function renderTranslatorClients() {
     const select = byId("translator-client");
     if (!select) return;
-    const previous = select.value;
-    select.innerHTML = state.clients.map((client) => '<option value="' + esc(client.id) + '">' + esc(client.name || client.id) + '</option>').join("");
-    if (previous && state.clients.some((client) => client.id === previous)) select.value = previous;
+    const previous = new Set([...select.selectedOptions].map((option) => option.value));
+    select.innerHTML = state.clients.map((client) => '<option value="' + esc(client.id) + '"' + (previous.has(client.id) ? ' selected' : '') + '>' + esc(client.name || client.id) + '</option>').join("");
   }
 
   let translatorPollTimer = null;
@@ -2559,6 +2561,7 @@ function renderAdminScript(version) {
     status.dataset.state = job.status || "idle";
     byId("translator-progress").textContent = progress;
     byId("translator-current-model").textContent = job.model || "-";
+    byId("translator-current-clients").textContent = (job.client_names || []).join(", ") || "-";
     const error = byId("translator-error");
     error.hidden = !job.last_error;
     error.textContent = job.last_error || "";
@@ -2580,15 +2583,15 @@ function renderAdminScript(version) {
 
   async function createTranslatorJob() {
     const file = byId("translator-file").files[0];
-    const clientId = byId("translator-client").value;
+    const clientIds = [...byId("translator-client").selectedOptions].map((option) => option.value);
     const model = byId("translator-model").value.trim();
     if (!file) throw new Error("请选择 JSON 文件");
-    if (!clientId || !model) throw new Error("客户端 Key 和模型不能为空");
+    if (!clientIds.length || !model) throw new Error("至少选择一个客户端 Key 并填写模型");
     const source = JSON.parse(await file.text());
     const resp = await fetch(API_BASE + "/translator/jobs", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ source, client_id: clientId, model }),
+      body: JSON.stringify({ source, client_ids: clientIds, model }),
     });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "创建翻译任务失败");

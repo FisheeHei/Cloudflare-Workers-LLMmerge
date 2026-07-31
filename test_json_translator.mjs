@@ -35,7 +35,10 @@ const env = {
     async delete(key) { store.delete(key); },
   },
   UPSTREAMS_JSON: JSON.stringify([{ name: "translate", base_url: "https://translate.example/v1", api_key: "test", models: ["translate-model"], paths: ["/v1/chat/completions"] }]),
-  CLIENTS_JSON: JSON.stringify([{ id: "translator-client", name: "translator-client", key: "sk-translator", models: ["*"], upstreams: ["translate"] }]),
+  CLIENTS_JSON: JSON.stringify([
+    { id: "translator-client", name: "translator-client", key: "sk-translator", models: ["*"], upstreams: ["translate"] },
+    { id: "translator-client-2", name: "translator-client-2", key: "sk-translator-2", models: ["*"], upstreams: ["translate"] },
+  ]),
 };
 const ctx = { waitUntil() {} };
 const admin = (path, init) => worker.default.fetch(new Request(`https://gw.test/admin/api${path}`, init), env, ctx);
@@ -72,5 +75,25 @@ const reviewedResult = await (await admin(`/translator/jobs/${created.job.id}/do
 assert.equal(reviewedResult.greeting, "复核后的中文");
 assert.equal(reviewedResult.japanese, "复核后的中文");
 assert.equal(reviewedResult.code, "MENU_START");
+
+const poolSource = Object.fromEntries(Array.from({ length: 46 }, (_, index) => [`line_${index}`, `Hello line ${index}.`]));
+const poolCreate = await admin("/translator/jobs", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ source: poolSource, client_ids: ["translator-client", "translator-client-2"], model: "translate-model" }),
+});
+assert.equal(poolCreate.status, 201);
+const poolJob = await poolCreate.json();
+assert.equal(poolJob.job.client_ids.length, 2);
+const originalSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) => originalSetTimeout(callback, Number(delay) === 30000 ? 0 : delay, ...args);
+try {
+  await worker.default.scheduled({}, env, ctx);
+} finally {
+  globalThis.setTimeout = originalSetTimeout;
+}
+const poolStatus = await (await admin(`/translator/jobs/${poolJob.job.id}`)).json();
+assert.equal(poolStatus.job.status, "completed");
+assert.equal(poolStatus.job.completed_batches, 2);
 
 console.log("json translator ok");

@@ -520,6 +520,7 @@ assert.equal(adminPage.includes("routing-fast"), true);
 assert.equal(adminPage.includes("translator-hero"), true);
 assert.equal(adminPage.includes("translator-progress-panel"), true);
 assert.equal(adminPage.includes("translator-status-grid"), true);
+assert.equal(adminPage.includes("translator-client-pool"), true);
 assert.equal(adminPage.includes("document.visibilityState"), true);
 assert.equal(adminPage.includes("Gateway Fast"), true);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
