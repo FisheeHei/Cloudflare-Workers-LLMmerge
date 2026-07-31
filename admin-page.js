@@ -134,6 +134,14 @@ function renderAdminStyle() {
     .translator-actions button { flex: 0 0 auto; }
     .translator-client-pool { min-height: 118px; padding: 5px; }
     .translator-pool-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+    .translator-client-scope { min-height: 70px; }
+    .translator-model-control { display: flex; gap: 8px; }
+    .translator-model-control input { min-width: 0; flex: 1; }
+    .translator-preview { margin-top: 14px; display: grid; gap: 8px; max-height: 280px; overflow: auto; }
+    .translator-preview-row { border-top: 1px solid var(--line); padding-top: 8px; }
+    .translator-preview-row:first-child { border-top: 0; padding-top: 0; }
+    .translator-preview-label { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+    .translator-preview-value { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 12px; line-height: 1.45; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -630,10 +638,11 @@ function renderAdminMarkup(origin, version) {
   <div class="panel translator-form-panel" id="translator-panel">
     <div class="translator-section-head"><h2>任务配置</h2><span class="note">顶层 JSON 对象，所有 value 必须是字符串</span></div>
     <div class="row">
-      <div class="field span-4"><label>客户端 Key 池</label><select class="translator-client-pool" id="translator-client" multiple size="4"></select><span class="translator-pool-note">最多 4 个；前 2 个轮换，其余仅用于回退。</span></div>
-      <div class="field span-4"><label>模型</label><input id="translator-model" class="mono" placeholder="例如 nvidia-nim/qwen..."></div>
+      <div class="field span-4"><label>客户端 Key 池</label><div class="prompt-client-scope translator-client-scope" id="translator-client-scope"></div><span class="translator-pool-note">最多 3 个；前 2 个轮换，第三个仅用于回退。</span></div>
+      <div class="field span-4"><label>模型</label><div class="translator-model-control"><input id="translator-model" class="mono" readonly placeholder="选择一个模型"><button type="button" class="secondary small" id="translator-model-picker">选择</button></div></div>
       <div class="field span-4"><label>JSON 文件</label><input id="translator-file" type="file" accept=".json,application/json"></div>
     </div>
+    <div class="field"><label>额外翻译要求</label><textarea id="translator-extra-prompt" rows="3" maxlength="4000" placeholder="可选；仅附加到本任务的翻译提示词"></textarea></div>
     <div class="translator-actions">
       <button class="good" id="translator-start">创建翻译任务</button>
     </div>
@@ -647,6 +656,7 @@ function renderAdminMarkup(origin, version) {
       <div class="translator-status-row"><span class="translator-status-label">Key 池</span><strong class="translator-status-value" id="translator-current-clients">-</strong></div>
     </div>
     <p class="translator-error" id="translator-error" hidden></p>
+    <div class="translator-preview" id="translator-preview"><div class="note">等待首个分片完成</div></div>
     <div class="translator-actions">
       <button class="secondary" id="translator-stop" disabled>停止</button>
       <button class="secondary" id="translator-download" disabled>下载当前结果</button>
@@ -2282,7 +2292,8 @@ function renderAdminScript(version) {
     const picker = state.modelPicker;
     if (!picker || !picker.target) return;
     const picked = Array.from(picker.selected).sort();
-    picker.target.value = picked.join(picker.target.tagName === "TEXTAREA" ? "\\n" : ", ");
+    if (picker.single && picked.length !== 1) throw new Error("请选择一个模型");
+    picker.target.value = picker.single ? picked[0] : picked.join(picker.target.tagName === "TEXTAREA" ? "\\n" : ", ");
     if (picker.sourceCard) renderModelEditor(picker.sourceCard);
     if (picker.sourceCard && byId("picker-apply-same-preset").checked) {
       const preset = picker.sourceCard.querySelector('[data-field="preset"]')?.value || "";
@@ -2543,10 +2554,32 @@ function renderAdminScript(version) {
   }
 
   function renderTranslatorClients() {
-    const select = byId("translator-client");
-    if (!select) return;
-    const previous = new Set([...select.selectedOptions].map((option) => option.value));
-    select.innerHTML = state.clients.map((client) => '<option value="' + esc(client.id) + '"' + (previous.has(client.id) ? ' selected' : '') + '>' + esc(client.name || client.id) + '</option>').join("");
+    const host = byId("translator-client-scope");
+    if (!host) return;
+    const previous = new Set([...host.querySelectorAll('input:checked')].map((input) => input.value));
+    host.innerHTML = (state.clients || []).map(function(client) {
+      return clientScopeChip(client.id, client.name || client.id, previous.has(client.id));
+    }).join("") || '<div class="note">暂无客户端 Key</div>';
+    host.querySelectorAll('input').forEach(function(input) {
+      input.addEventListener("change", function() {
+        const checked = [...host.querySelectorAll('input:checked')];
+        if (checked.length > 3) input.checked = false;
+        syncClientScopeChips(host);
+      });
+    });
+    syncClientScopeChips(host);
+  }
+
+  function selectedTranslatorClients() {
+    return [...byId("translator-client-scope").querySelectorAll('input:checked')].map((input) => input.value);
+  }
+
+  function openTranslatorModelPicker() {
+    const models = (collectConfig().upstreams || []).flatMap((upstream) => upstream.enabled === false ? [] : (upstream.models || []))
+      .filter((model) => model && model !== "*");
+    if (!models.length) throw new Error("没有可选择的上游模型");
+    showModelPicker("翻译模型", models, byId("translator-model"));
+    state.modelPicker.single = true;
   }
 
   let translatorPollTimer = null;
@@ -2562,6 +2595,10 @@ function renderAdminScript(version) {
     byId("translator-progress").textContent = progress;
     byId("translator-current-model").textContent = job.model || "-";
     byId("translator-current-clients").textContent = (job.client_names || []).join(", ") || "-";
+    const previews = Array.isArray(job.previews) ? job.previews : [];
+    byId("translator-preview").innerHTML = previews.length
+      ? previews.map((preview) => '<div class="translator-preview-row"><span class="translator-preview-label">分片 ' + esc(preview.batch) + ' 原文</span><p class="translator-preview-value">' + esc(preview.source) + '</p><span class="translator-preview-label" style="margin-top:7px">译文</span><p class="translator-preview-value">' + esc(preview.translation) + '</p></div>').join("")
+      : '<div class="note">等待首个分片完成</div>';
     const error = byId("translator-error");
     error.hidden = !job.last_error;
     error.textContent = job.last_error || "";
@@ -2583,15 +2620,16 @@ function renderAdminScript(version) {
 
   async function createTranslatorJob() {
     const file = byId("translator-file").files[0];
-    const clientIds = [...byId("translator-client").selectedOptions].map((option) => option.value);
+    const clientIds = selectedTranslatorClients();
     const model = byId("translator-model").value.trim();
+    const extraPrompt = byId("translator-extra-prompt").value.trim();
     if (!file) throw new Error("请选择 JSON 文件");
     if (!clientIds.length || !model) throw new Error("至少选择一个客户端 Key 并填写模型");
     const source = JSON.parse(await file.text());
     const resp = await fetch(API_BASE + "/translator/jobs", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ source, client_ids: clientIds, model }),
+      body: JSON.stringify({ source, client_ids: clientIds, model, extra_prompt: extraPrompt }),
     });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "创建翻译任务失败");
@@ -2780,6 +2818,9 @@ function renderAdminScript(version) {
       byId("picker-select-visible").addEventListener("click", () => selectVisibleModels(true));
       byId("picker-clear-visible").addEventListener("click", () => selectVisibleModels(false));
       byId("model-picker-search").addEventListener("input", renderModelPicker);
+      byId("translator-model-picker").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "打开中...", openTranslatorModelPicker).catch(showError)
+      );
       byId("vendor-account-id").addEventListener("input", applyVendorPreset);
       byId("vendor-fetch-models").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5bfc\u5165\u4e2d...", async () => {

@@ -75,10 +75,11 @@ const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
 const TRANSLATOR_ACTIVE_KEY = "translator:active";
 const TRANSLATOR_JOB_PREFIX = "translator:job:";
 const TRANSLATOR_JOB_TTL_SECONDS = 8 * 24 * 3600;
-const TRANSLATOR_MAX_CLIENTS = 4;
+const TRANSLATOR_MAX_CLIENTS = 3;
+const TRANSLATOR_EXTRA_PROMPT_MAX_CHARS = 4000;
 const TRANSLATOR_SECOND_LANE_DELAY_MS = 30000;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-31-json-translator-pool";
+const VERSION = "v26-07-31-json-translator-preview";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1300,8 +1301,10 @@ async function createTranslatorJob(request, app) {
     Array.isArray(payload?.client_ids) ? payload.client_ids : [payload?.client_id || request.headers.get("x-translator-client-id")],
   );
   const requestedModel = String(payload?.model || request.headers.get("x-translator-model") || "").trim();
+  const extraPrompt = String(payload?.extra_prompt || "").trim();
   if (!clientIds.length || !requestedModel) throw httpError(400, "At least one client_id and model are required.");
   if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
+  if (extraPrompt.length > TRANSLATOR_EXTRA_PROMPT_MAX_CHARS) throw httpError(400, `Translation extra prompt must be at most ${TRANSLATOR_EXTRA_PROMPT_MAX_CHARS} characters.`);
   try {
     validateSource(source);
   } catch (error) {
@@ -1346,6 +1349,8 @@ async function createTranslatorJob(request, app) {
     client_names: clients.map((client) => client.name),
     requested_model: requestedModel,
     model,
+    extra_prompt: extraPrompt,
+    previews: [],
     current_batch: 0,
     total_batches: batches.length,
     total_items: items.length,
@@ -1422,12 +1427,14 @@ function publicTranslatorJob(job) {
     client_ids: translatorJobClientIds(job),
     client_names: Array.isArray(job.client_names) ? job.client_names : [job.client_name].filter(Boolean),
     model: job.requested_model || job.model,
+    extra_prompt: job.extra_prompt || "",
     total_items: job.total_items,
     total_batches: job.total_batches,
     completed_batches: Math.min(job.current_batch || 0, job.total_batches || 0),
     failed_attempts: job.failed_attempts || 0,
     last_error: job.last_error || "",
     review_issues: job.review_issues || [],
+    previews: Array.isArray(job.previews) ? job.previews.slice(-4) : [],
     created_at: job.created_at,
     updated_at: job.updated_at,
   };
@@ -1457,7 +1464,7 @@ async function runTranslatorCron(app, ctx, lane = 0) {
   try {
     const payload = job.phase === "review"
       ? reviewRequestBody(job.model, batch, Object.fromEntries(batch.map((item) => [item.id, job.result[item.key] || item.source])))
-      : translationRequestBody(job.model, batch);
+      : translationRequestBody(job.model, batch, job.extra_prompt);
     const responsePayload = await runTranslatorModelRequest(app, job, payload, ctx, lane);
     const current = await getTranslatorJob(app.kv, id);
     if (!current || current.status !== "running" || current.updated_at !== revision || current.current_batch !== job.current_batch) {
@@ -1470,6 +1477,7 @@ async function runTranslatorCron(app, ctx, lane = 0) {
     } else {
       const translations = parseTranslationResponse(responsePayload, batch);
       applyTranslatorTranslations(current, batch, translations);
+      appendTranslatorPreview(current, batch, translations);
     }
     current.current_batch += 1;
     current.last_error = "";
@@ -1586,6 +1594,23 @@ async function loadTranslatorClient(app, id) {
 
 function applyTranslatorTranslations(job, batch, translations) {
   for (const item of batch) setTranslatorResult(job.result, item.key, translations[item.id] || item.source);
+}
+
+function appendTranslatorPreview(job, batch, translations) {
+  const sample = batch[0];
+  if (!sample) return;
+  const previews = Array.isArray(job.previews) ? job.previews : [];
+  previews.push({
+    batch: Number(job.current_batch || 0) + 1,
+    source: translatorPreviewText(sample.source),
+    translation: translatorPreviewText(translations[sample.id] || sample.source),
+  });
+  job.previews = previews.slice(-4);
+}
+
+function translatorPreviewText(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > 700 ? text.slice(0, 697) + "..." : text;
 }
 
 function applyTranslatorReview(job, batch, reviews) {

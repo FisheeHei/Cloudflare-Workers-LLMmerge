@@ -12,6 +12,7 @@ globalThis.fetch = async (url, init = {}) => {
     const request = JSON.parse(init.body);
     const items = JSON.parse(request.messages[1].content).items;
     const isReview = request.messages[0].content.includes("Review Japanese or English game translations");
+    if (!isReview && request.messages[0].content.includes("Additional translation requirement")) assert.match(request.messages[0].content, /Keep honorifics/);
     const content = isReview
       ? { reviews: items.map((item) => ({ id: item.id, ok: false, reason: "test", suggestion: "", translation: "复核后的中文" })) }
       : { translations: items.map((item) => ({ id: item.id, text: "测试中文" })) };
@@ -57,6 +58,7 @@ const statusResponse = await admin(`/translator/jobs/${created.job.id}`);
 const status = await statusResponse.json();
 assert.equal(status.job.status, "completed");
 assert.equal(status.job.completed_batches, 1);
+assert.equal(status.job.previews.length, 1);
 
 const download = await admin(`/translator/jobs/${created.job.id}/download`);
 assert.equal(download.status, 200);
@@ -80,7 +82,7 @@ const poolSource = Object.fromEntries(Array.from({ length: 46 }, (_, index) => [
 const poolCreate = await admin("/translator/jobs", {
   method: "POST",
   headers: { "content-type": "application/json" },
-  body: JSON.stringify({ source: poolSource, client_ids: ["translator-client", "translator-client-2"], model: "translate-model" }),
+  body: JSON.stringify({ source: poolSource, client_ids: ["translator-client", "translator-client-2"], model: "translate-model", extra_prompt: "Keep honorifics." }),
 });
 assert.equal(poolCreate.status, 201);
 const poolJob = await poolCreate.json();

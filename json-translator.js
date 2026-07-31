@@ -88,14 +88,17 @@ export function buildBatches(items, size = TRANSLATOR_BATCH_SIZE, maxChars = TRA
   return batches;
 }
 
-export function translationRequestBody(model, batch) {
+export function translationRequestBody(model, batch, extraPrompt = "") {
+  const systemPrompt = extraPrompt
+    ? TRANSLATOR_SYSTEM_PROMPT + "\n\nAdditional translation requirement:\n" + String(extraPrompt).trim()
+    : TRANSLATOR_SYSTEM_PROMPT;
   return {
     model,
     stream: false,
     temperature: 0.2,
     response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: TRANSLATOR_SYSTEM_PROMPT },
+      { role: "system", content: systemPrompt },
       { role: "user", content: JSON.stringify({ items: batch.map(({ id, text }) => ({ id, text })) }) },
     ],
   };
