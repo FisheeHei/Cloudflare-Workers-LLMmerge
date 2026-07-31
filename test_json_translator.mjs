@@ -63,12 +63,25 @@ assert.equal(create.status, 201);
 const created = await create.json();
 assert.equal(created.job.status, "running");
 
+const active = await admin("/translator/jobs/active");
+assert.equal(active.status, 200);
+assert.equal((await active.json()).job.id, created.job.id);
+
+const blocked = await admin("/translator/jobs", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ source: { line: "Hello." }, client_id: "translator-client", model: "translate-model" }),
+});
+assert.equal(blocked.status, 409);
+
 await worker.default.scheduled({}, env, ctx);
 const statusResponse = await admin(`/translator/jobs/${created.job.id}`);
 const status = await statusResponse.json();
 assert.equal(status.job.status, "completed");
 assert.equal(status.job.completed_batches, 1);
 assert.equal(status.job.previews.length, 1);
+const noActive = await admin("/translator/jobs/active");
+assert.equal((await noActive.json()).job, null);
 
 const download = await admin(`/translator/jobs/${created.job.id}/download`);
 assert.equal(download.status, 200);

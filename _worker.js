@@ -80,7 +80,7 @@ const TRANSLATOR_EXTRA_PROMPT_MAX_CHARS = 4000;
 const TRANSLATOR_REASONING_EFFORTS = new Set(["none", "low", "medium", "high"]);
 const TRANSLATOR_SECOND_LANE_DELAY_MS = 30000;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-31-json-translator-reasoning";
+const VERSION = "v26-07-31-json-translator-force-stop";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1134,6 +1134,9 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   const apiPath = pathname.slice(adminBasePath.length);
 
   const translatorJobMatch = apiPath.match(/^\/api\/translator\/jobs\/([^/]+)(?:\/(stop|download|review))?$/);
+  if (apiPath === "/api/translator/jobs/active" && request.method === "GET") {
+    return translatorActiveJob(app);
+  }
   if (apiPath === "/api/translator/models" && request.method === "POST") {
     return translatorModels(request, app);
   }
@@ -1319,12 +1322,7 @@ async function createTranslatorJob(request, app) {
   const sourceBytes = new TextEncoder().encode(JSON.stringify(source)).byteLength;
   if (sourceBytes > TRANSLATOR_MAX_INPUT_BYTES) throw httpError(413, "Translation input is larger than 8 MiB.");
 
-  const activeId = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
-  if (activeId) {
-    const active = await getTranslatorJob(app.kv, activeId);
-    if (active?.status === "running") throw httpError(409, "Another translation task is already running.");
-    await app.kv.delete(TRANSLATOR_ACTIVE_KEY);
-  }
+  if (await getActiveTranslatorJob(app.kv)) throw httpError(409, "Another translation task is already running.");
 
   const clients = await Promise.all(clientIds.map((id) => loadTranslatorClient(app, id)));
   if (clients.some((client) => !client)) throw httpError(404, "One or more client keys were not found.");
@@ -1397,6 +1395,11 @@ async function translatorJobStatus(app, id) {
   return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 200));
 }
 
+async function translatorActiveJob(app) {
+  const job = await getActiveTranslatorJob(app.kv);
+  return withCorsResponse(json({ ok: true, job: job ? publicTranslatorJob(job) : null }, 200));
+}
+
 async function stopTranslatorJob(app, id) {
   const job = await getTranslatorJob(app.kv, id);
   if (!job) throw httpError(404, "Translation task not found.");
@@ -1424,11 +1427,7 @@ async function startTranslatorReview(app, id) {
   if (job.status === "running") throw httpError(409, "The translation task is still running.");
   if (job.phase === "review") throw httpError(409, "This task has already been reviewed.");
   if (job.status !== "completed") throw httpError(409, "Only completed translations can be reviewed.");
-  const activeId = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
-  if (activeId) {
-    const active = await getTranslatorJob(app.kv, activeId);
-    if (active?.status === "running") throw httpError(409, "Another translation task is already running.");
-  }
+  if (await getActiveTranslatorJob(app.kv)) throw httpError(409, "Another translation task is already running.");
   job.phase = "review";
   job.status = job.total_batches ? "running" : "completed";
   job.current_batch = 0;
@@ -1661,6 +1660,15 @@ function translatorJobKey(id) {
 
 async function getTranslatorJob(kv, id) {
   return kv.get(translatorJobKey(id), "json");
+}
+
+async function getActiveTranslatorJob(kv) {
+  const id = await kv.get(TRANSLATOR_ACTIVE_KEY);
+  if (!id) return null;
+  const job = await getTranslatorJob(kv, id);
+  if (job?.status === "running") return job;
+  await kv.delete(TRANSLATOR_ACTIVE_KEY);
+  return null;
 }
 
 async function saveTranslatorJob(kv, job) {

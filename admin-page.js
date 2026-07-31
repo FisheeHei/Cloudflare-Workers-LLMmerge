@@ -2583,6 +2583,11 @@ function renderAdminScript(version) {
     if (label) label.textContent = "网关模型别名";
     byId("translator-model").placeholder = "先选择客户端 Key";
     if (!modelField?.querySelector(".translator-model-alias-note")) modelField?.insertAdjacentHTML("beforeend", '<span class="translator-pool-note translator-model-alias-note">只显示所选 Key 共同可调用的网关别名。</span>');
+    const stop = byId("translator-stop");
+    if (stop) {
+      stop.textContent = "强制中断";
+      stop.title = "停止任务并丢弃当前分片结果";
+    }
     if (byId("translator-reasoning-effort")) return;
     byId("translator-extra-prompt").insertAdjacentHTML("afterend", '<div class="field"><label>推理强度</label><select id="translator-reasoning-effort"><option value="none">关闭</option><option value="low" selected>低</option><option value="medium">中</option><option value="high">高</option></select></div>');
   }
@@ -2648,6 +2653,14 @@ function renderAdminScript(version) {
     renderTranslatorJob(payload.job);
   }
 
+  async function loadActiveTranslatorJob() {
+    const resp = await fetch(API_BASE + "/translator/jobs/active");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "Unable to load active translation task.");
+    if (payload.job) renderTranslatorJob(payload.job);
+    return payload.job;
+  }
+
   async function createTranslatorJob() {
     const file = byId("translator-file").files[0];
     const clientIds = selectedTranslatorClients();
@@ -2663,7 +2676,13 @@ function renderAdminScript(version) {
       body: JSON.stringify({ source, client_ids: clientIds, model, extra_prompt: extraPrompt, reasoning_effort: reasoningEffort }),
     });
     const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "创建翻译任务失败");
+    if (!resp.ok) {
+      if (resp.status === 409) {
+        const active = await loadActiveTranslatorJob();
+        if (active) throw new Error("An existing translation task has been loaded.");
+      }
+      throw new Error(payload?.error?.message || "创建翻译任务失败");
+    }
     renderTranslatorJob(payload.job);
     showToast("翻译任务已创建");
   }
@@ -2671,6 +2690,7 @@ function renderAdminScript(version) {
   async function stopTranslatorJob() {
     const id = state.translatorJob?.id;
     if (!id) return;
+    if (!confirm("强制中断当前翻译任务？当前分片即使随后返回也会被丢弃。")) return;
     const resp = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "停止任务失败");
@@ -2962,7 +2982,7 @@ function renderAdminScript(version) {
       bootSpan.className = 'note';
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
-      await Promise.all([loadConfig(), loadClients()]);
+      await Promise.all([loadConfig(), loadClients(), loadActiveTranslatorJob()]);
       if (bootSpan.parentNode) bootSpan.remove();
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
