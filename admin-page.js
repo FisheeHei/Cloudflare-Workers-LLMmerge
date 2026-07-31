@@ -107,6 +107,7 @@ function renderAdminStyle() {
     .url-card button { margin-right: 6px; }
     .panel { padding: 20px; min-width: 0; scroll-margin-top: 88px; }
     .panel h2 { margin: 0 0 14px; font-size: 19px; line-height: 1.2; }
+    .translator-card { border-top: 3px solid var(--accent-2); }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -413,7 +414,7 @@ function renderAdminStyle() {
     @media (max-width: 700px) {
       .wrap { width: min(100%, calc(100vw - 12px)); padding: 8px 0 28px; }
       .hero, .panel { margin-bottom: 10px; }
-      .hero, .panel, .modal-card { padding: 14px; }
+      .hero, .panel, .translator-card, .modal-card { padding: 14px; }
       .hero h1 { font-size: 24px; }
       html, body { height: auto; overflow: auto; }
       .app-shell { display: block; height: auto; overflow: visible; }
@@ -476,6 +477,7 @@ function renderAdminMarkup(origin, version) {
       <a class="nav-item" href="#upstreams" data-view-target="upstreams"><span class="nav-icon">⇄</span><span>上游配置</span></a>
       <a class="nav-item" href="#logs" data-view-target="logs"><span class="nav-icon">≡</span><span>调用日志</span></a>
       <a class="nav-item" href="#settings" data-view-target="settings"><span class="nav-icon">⚙</span><span>高级设置</span></a>
+      <a class="nav-item" href="#translator" data-view-target="translator"><span class="nav-icon">文</span><span>JSON 翻译</span></a>
     </nav>
     <div class="sidebar-footer">
       <span class="sidebar-version">${version}</span>
@@ -581,6 +583,23 @@ function renderAdminMarkup(origin, version) {
     <input type="file" id="import-upstreams-file" accept=".json,application/json" hidden>
   </div>
 
+  </section>
+  <section class="page-view" id="view-translator" data-view="translator" hidden>
+  <div class="panel translator-card" id="translator-panel">
+    <div class="toolbar"><h2>在线 JSON 翻译</h2><span class="note">每分钟推进一个分片，关闭页面后仍会继续。</span></div>
+    <div class="row">
+      <div class="field span-4"><label>客户端 Key</label><select id="translator-client"></select></div>
+      <div class="field span-4"><label>模型</label><input id="translator-model" class="mono" placeholder="例如 nvidia-nim/qwen..."></div>
+      <div class="field span-4"><label>JSON 文件（顶层对象，value 必须是字符串）</label><input id="translator-file" type="file" accept=".json,application/json"></div>
+    </div>
+    <div class="toolbar">
+      <button class="good" id="translator-start">创建翻译任务</button>
+      <button class="secondary" id="translator-stop" disabled>停止</button>
+      <button class="secondary" id="translator-download" disabled>下载当前结果</button>
+      <button class="secondary" id="translator-review" disabled>启动复核</button>
+    </div>
+    <div class="note" id="translator-status">尚未创建任务</div>
+  </div>
   </section>
   <section class="page-view" id="view-activity" data-view="logs" hidden>
   <div class="panel" id="log-panel">
@@ -2466,7 +2485,92 @@ function renderAdminScript(version) {
     if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u5931\u8d25");
     state.clients = payload;
     renderClients();
+    renderTranslatorClients();
     renderPromptClientScopes();
+  }
+
+  function renderTranslatorClients() {
+    const select = byId("translator-client");
+    if (!select) return;
+    const previous = select.value;
+    select.innerHTML = state.clients.map((client) => '<option value="' + esc(client.id) + '">' + esc(client.name || client.id) + '</option>').join("");
+    if (previous && state.clients.some((client) => client.id === previous)) select.value = previous;
+  }
+
+  let translatorPollTimer = null;
+  function renderTranslatorJob(job) {
+    state.translatorJob = job;
+    const status = byId("translator-status");
+    if (!job) return;
+    const progress = job.total_batches ? job.completed_batches + "/" + job.total_batches + " 分片" : "无可翻译分片";
+    status.textContent = job.status + " / " + job.phase + " / " + progress + (job.last_error ? " / " + job.last_error : "");
+    byId("translator-stop").disabled = job.status !== "running";
+    byId("translator-download").disabled = !job.id;
+    byId("translator-review").disabled = job.status !== "completed" || job.phase === "review";
+    if (job.status === "running") {
+      clearTimeout(translatorPollTimer);
+      translatorPollTimer = setTimeout(() => pollTranslatorJob(job.id), 5000);
+    }
+  }
+
+  async function pollTranslatorJob(id) {
+    const resp = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id));
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "读取翻译任务失败");
+    renderTranslatorJob(payload.job);
+  }
+
+  async function createTranslatorJob() {
+    const file = byId("translator-file").files[0];
+    const clientId = byId("translator-client").value;
+    const model = byId("translator-model").value.trim();
+    if (!file) throw new Error("请选择 JSON 文件");
+    if (!clientId || !model) throw new Error("客户端 Key 和模型不能为空");
+    const source = JSON.parse(await file.text());
+    const resp = await fetch(API_BASE + "/translator/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source, client_id: clientId, model }),
+    });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "创建翻译任务失败");
+    renderTranslatorJob(payload.job);
+    showToast("翻译任务已创建");
+  }
+
+  async function stopTranslatorJob() {
+    const id = state.translatorJob?.id;
+    if (!id) return;
+    const resp = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "停止任务失败");
+    renderTranslatorJob(payload.job);
+  }
+
+  async function downloadTranslatorJob() {
+    const id = state.translatorJob?.id;
+    if (!id) return;
+    const response = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/download");
+    if (!response.ok) {
+      const payload = await parseApiResponse(response);
+      throw new Error(payload?.error?.message || "下载翻译结果失败");
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = "translation-" + id + ".json";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  }
+
+  async function reviewTranslatorJob() {
+    const id = state.translatorJob?.id;
+    if (!id) return;
+    const resp = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/review", { method: "POST" });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "启动复核失败");
+    renderTranslatorJob(payload.job);
   }
 
   function renderClients() {
@@ -2706,6 +2810,19 @@ function renderAdminScript(version) {
       );
 
       // ponytail: parallel boot — config + clients fetch together
+      byId("translator-start").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "创建中...", createTranslatorJob).catch(showError)
+      );
+      byId("translator-stop").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "停止中...", stopTranslatorJob).catch(showError)
+      );
+      byId("translator-download").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "下载中...", downloadTranslatorJob).catch(showError)
+      );
+      byId("translator-review").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "启动中...", reviewTranslatorJob).catch(showError)
+      );
+
       var hero = document.querySelector('.hero');
       var bootSpan = document.createElement('span');
       bootSpan.className = 'note';

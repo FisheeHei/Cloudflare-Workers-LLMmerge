@@ -85,7 +85,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `ANALYTICS_ACCOUNT_ID` | 可选 | 查询 Analytics Engine 所需 Account ID |
 | `ANALYTICS_API_TOKEN` | 可选 | 需要 `Account Analytics Read` 权限 |
 | `ANALYTICS_DATASET` | 可选 | 默认 `llmmerge_requests` |
-| `REQUEST_TIMEOUT_MS` | 可选 | 默认 `180000` |
+| `REQUEST_TIMEOUT_MS` | 可选 | 默认 `180000`；非流式请求最多等待 90 秒以避免自定义域名 524 |
 | `STREAM_IDLE_TIMEOUT_MS` | 可选 | 默认 `900000` |
 | `UPSTREAM_COOLDOWN_TTL` | 可选 | 默认 `60` 秒 |
 | `MODEL_CACHE_TTL` | 可选 | 默认 `3600` 秒 |

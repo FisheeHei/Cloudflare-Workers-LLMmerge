@@ -85,7 +85,7 @@ If `ADMIN_TOKEN` is not set, the default admin path is `/llmmerge-admin`. Do not
 | `ANALYTICS_ACCOUNT_ID` | Optional | Account ID for Analytics Engine SQL queries |
 | `ANALYTICS_API_TOKEN` | Optional | Requires `Account Analytics Read` |
 | `ANALYTICS_DATASET` | Optional | Defaults to `llmmerge_requests` |
-| `REQUEST_TIMEOUT_MS` | Optional | Defaults to `180000` |
+| `REQUEST_TIMEOUT_MS` | Optional | Defaults to `180000`; non-streaming requests wait at most 90 seconds to avoid custom-domain 524s |
 | `STREAM_IDLE_TIMEOUT_MS` | Optional | Defaults to `900000` |
 | `UPSTREAM_COOLDOWN_TTL` | Optional | Defaults to `60` seconds |
 | `MODEL_CACHE_TTL` | Optional | Defaults to `3600` seconds |
