@@ -142,6 +142,10 @@ function renderAdminStyle() {
     .translator-preview-row:first-child { border-top: 0; padding-top: 0; }
     .translator-preview-label { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
     .translator-preview-value { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 12px; line-height: 1.45; }
+    .translator-route-results { margin-top: 10px; display: grid; gap: 6px; font-size: 12px; }
+    .translator-route-result { border-top: 1px solid var(--line); padding-top: 6px; overflow-wrap: anywhere; }
+    .translator-route-result.ok { color: #166534; }
+    .translator-route-result.fail { color: #9a3412; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -2590,6 +2594,8 @@ function renderAdminScript(version) {
     }
     if (byId("translator-reasoning-effort")) return;
     byId("translator-extra-prompt").insertAdjacentHTML("afterend", '<div class="field"><label>推理强度</label><select id="translator-reasoning-effort"><option value="none">关闭</option><option value="low" selected>低</option><option value="medium">中</option><option value="high">高</option></select></div>');
+    byId("translator-start").insertAdjacentHTML("afterend", '<button type="button" class="secondary" id="translator-route-probe">测试所选路由</button>');
+    byId("translator-error").insertAdjacentHTML("afterend", '<div class="translator-route-results" id="translator-route-results"></div>');
   }
 
   async function openTranslatorAliasPicker() {
@@ -2659,6 +2665,31 @@ function renderAdminScript(version) {
     if (!resp.ok) throw new Error(payload?.error?.message || "Unable to load active translation task.");
     if (payload.job) renderTranslatorJob(payload.job);
     return payload.job;
+  }
+
+  function renderTranslatorProbe(results) {
+    const host = byId("translator-route-results");
+    if (!host) return;
+    host.innerHTML = (results || []).map(function(result) {
+      const status = result.ok ? "ok" : "fail";
+      const detail = result.ok ? "Gateway OK -> " + result.upstream + " | " + result.status + " | " + result.latency_ms + "ms" : "Gateway failed -> " + result.upstream + " | " + result.status + " | " + result.error;
+      return '<div class="translator-route-result ' + status + '"><strong>' + esc(result.client_name || result.client_id) + '</strong> · ' + esc(result.model) + '<br>' + esc(detail) + '</div>';
+    }).join("") || '<div class="note">暂无路由测试结果</div>';
+  }
+
+  async function probeTranslatorRoute() {
+    const clientIds = selectedTranslatorClients();
+    const model = byId("translator-model").value.trim();
+    const reasoningEffort = byId("translator-reasoning-effort")?.value || "low";
+    if (!clientIds.length || !model) throw new Error("请先选择客户端 Key 和模型");
+    const resp = await fetch(API_BASE + "/translator/probe", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_ids: clientIds, model, reasoning_effort: reasoningEffort }),
+    });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "路由测试失败");
+    renderTranslatorProbe(payload.results);
   }
 
   async function createTranslatorJob() {
@@ -2872,6 +2903,9 @@ function renderAdminScript(version) {
       byId("model-picker-search").addEventListener("input", renderModelPicker);
       byId("translator-model-picker").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "打开中...", openTranslatorAliasPicker).catch(showError)
+      );
+      byId("translator-route-probe").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "测试中...", probeTranslatorRoute).catch(showError)
       );
       byId("vendor-account-id").addEventListener("input", applyVendorPreset);
       byId("vendor-fetch-models").addEventListener("click", (e) =>

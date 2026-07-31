@@ -4,8 +4,12 @@ import { isGlmModel, isMiniMaxM3Model, isNvidiaNimUpstream, sanitizeProxyBody } 
 import {
   TRANSLATOR_MAX_INPUT_BYTES,
   TRANSLATOR_MAX_STATE_BYTES,
+  TRANSLATOR_BATCH_MAX_CHARS,
+  TRANSLATOR_REVIEW_PROMPT,
+  TRANSLATOR_SYSTEM_PROMPT,
   buildBatches,
   buildTranslationItems,
+  estimateTranslationTokens,
   parseReviewResponse,
   parseTranslationResponse,
   reviewIssues,
@@ -80,7 +84,7 @@ const TRANSLATOR_EXTRA_PROMPT_MAX_CHARS = 4000;
 const TRANSLATOR_REASONING_EFFORTS = new Set(["none", "low", "medium", "high"]);
 const TRANSLATOR_SECOND_LANE_DELAY_MS = 30000;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-31-json-translator-force-stop";
+const VERSION = "v26-07-31-json-translator-route-probe";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1140,6 +1144,9 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   if (apiPath === "/api/translator/models" && request.method === "POST") {
     return translatorModels(request, app);
   }
+  if (apiPath === "/api/translator/probe" && request.method === "POST") {
+    return translatorProbe(request, app);
+  }
   if (apiPath === "/api/translator/jobs" && request.method === "POST") {
     return createTranslatorJob(request, app);
   }
@@ -1339,7 +1346,8 @@ async function createTranslatorJob(request, app) {
     throw httpError(400, "Selected client keys resolve the requested model differently.");
   }
   const items = buildTranslationItems(source);
-  const batches = buildBatches(items);
+  const batchPlan = translatorBatchPlan(runtime, clients, model, extraPrompt, reasoningEffort);
+  const batches = buildBatches(items, undefined, undefined, batchPlan.translation_tokens);
   const now = hkNowIso();
   const job = {
     id: crypto.randomUUID(),
@@ -1355,6 +1363,9 @@ async function createTranslatorJob(request, app) {
     model,
     extra_prompt: extraPrompt,
     reasoning_effort: reasoningEffort,
+    context_window_tokens: batchPlan.context_tokens,
+    batch_token_limit: batchPlan.translation_tokens,
+    review_batch_token_limit: batchPlan.review_tokens,
     previews: [],
     current_batch: 0,
     total_batches: batches.length,
@@ -1387,6 +1398,66 @@ async function translatorModels(request, app) {
   ));
   const models = [...modelMaps[0]].filter(([alias, model]) => modelMaps.every((map) => map.get(alias) === model)).map(([id]) => id).sort();
   return withCorsResponse(json({ ok: true, models }, 200));
+}
+
+async function translatorProbe(request, app) {
+  const payload = parseJsonBody(await readRequestText(request, 65536, 65536));
+  const clientIds = uniqueTranslatorClientIds(payload?.client_ids);
+  const requestedModel = String(payload?.model || "").trim();
+  const reasoningEffort = String(payload?.reasoning_effort || "low").trim().toLowerCase();
+  if (!clientIds.length || !requestedModel) throw httpError(400, "Select at least one client key and model first.");
+  if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
+  if (!TRANSLATOR_REASONING_EFFORTS.has(reasoningEffort)) throw httpError(400, "Translation reasoning effort must be none, low, medium, or high.");
+  const clients = await Promise.all(clientIds.map((id) => loadTranslatorClient(app, id)));
+  if (clients.some((client) => !client)) throw httpError(404, "One or more client keys were not found.");
+  const runtime = await loadRuntimeConfig(app);
+  const models = await Promise.all(clients.map((client) => resolveAuthorizedClientModel(
+    client,
+    runtime,
+    requestedModel,
+    new Request("https://translator.internal/v1/chat/completions", { headers: { "x-translator": "1" } }),
+    { model: requestedModel },
+  )));
+  if (models.some((model) => model !== models[0])) throw httpError(400, "Selected client keys resolve the requested model differently.");
+  const results = await Promise.all(clients.map((client) => translatorProbeClient(runtime, client, requestedModel, models[0], reasoningEffort)));
+  return withCorsResponse(json({ ok: true, model: requestedModel, results }, 200));
+}
+
+async function translatorProbeClient(runtime, client, requestedModel, model, reasoningEffort) {
+  const started = Date.now();
+  const bodyText = JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false, temperature: 0, reasoning_effort: reasoningEffort });
+  const request = new Request("https://translator.internal" + CHAT_PATH, {
+    method: "POST",
+    headers: { authorization: `Bearer ${client.key}`, "content-type": "application/json" },
+    body: bodyText,
+  });
+  try {
+    const result = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: "" });
+    const responseText = await result.response.text();
+    return {
+      client_id: client.id,
+      client_name: client.name || client.id,
+      gateway: "ok",
+      model: requestedModel,
+      upstream: result.upstream?.name || "unknown",
+      status: result.response.status,
+      ok: result.response.ok,
+      latency_ms: Date.now() - started,
+      error: result.response.ok ? "" : (safeJson(responseText)?.error?.message || responseText.slice(0, 240)),
+    };
+  } catch (error) {
+    return {
+      client_id: client.id,
+      client_name: client.name || client.id,
+      gateway: "failed",
+      model: requestedModel,
+      upstream: error?.upstreamName || "none",
+      status: error?.statusCode || 502,
+      ok: false,
+      latency_ms: Date.now() - started,
+      error: String(error?.message || error || "Route probe failed").slice(0, 240),
+    };
+  }
 }
 
 async function translatorJobStatus(app, id) {
@@ -1429,6 +1500,7 @@ async function startTranslatorReview(app, id) {
   if (job.status !== "completed") throw httpError(409, "Only completed translations can be reviewed.");
   if (await getActiveTranslatorJob(app.kv)) throw httpError(409, "Another translation task is already running.");
   job.phase = "review";
+  job.total_batches = translatorBatches(job, "review").length;
   job.status = job.total_batches ? "running" : "completed";
   job.current_batch = 0;
   job.failed_attempts = 0;
@@ -1453,6 +1525,8 @@ function publicTranslatorJob(job) {
     model: job.requested_model || job.model,
     extra_prompt: job.extra_prompt || "",
     reasoning_effort: job.reasoning_effort || "low",
+    context_window_tokens: job.context_window_tokens || null,
+    batch_token_limit: job.batch_token_limit || null,
     total_items: job.total_items,
     total_batches: job.total_batches,
     completed_batches: Math.min(job.current_batch || 0, job.total_batches || 0),
@@ -1475,8 +1549,7 @@ async function runTranslatorCron(app, ctx, lane = 0) {
     return { running: false, client_count: 0 };
   }
   const clientCount = translatorJobClientIds(job).length;
-  const items = buildTranslationItems(job.source);
-  const batches = buildBatches(items);
+  const batches = translatorBatches(job, job.phase);
   const batch = batches[job.current_batch];
   if (!batch) {
     job.status = "completed";
@@ -1608,6 +1681,51 @@ function translatorClientAttemptIds(job, lane) {
   if (ids.length <= 1) return ids;
   const primary = ids[Math.min(Math.max(0, lane), 1)] || ids[0];
   return uniqueTranslatorClientIds([primary, ...ids.slice(2), ...ids.slice(0, 2)]);
+}
+
+function translatorBatchPlan(runtime, clients, model, extraPrompt, reasoningEffort) {
+  const upstreams = [...new Map(clients.flatMap((client) => proxyCandidates(runtime, client, model, CHAT_PATH)).map((upstream) => [upstream.name, upstream])).values()];
+  const contextTokens = Math.min(...upstreams.map((upstream) => translatorContextTokens(upstream, model)));
+  const injectedTokens = Math.max(0, ...clients.map((client) => translatorInjectedTokens(runtime.settings, client, model)));
+  const reasoningTokens = ({ none: 0, low: 256, medium: 768, high: 1536 })[reasoningEffort] || 256;
+  const translationFixed = estimateTranslationTokens(TRANSLATOR_SYSTEM_PROMPT + "\n" + extraPrompt) + injectedTokens + reasoningTokens + 96;
+  const reviewFixed = estimateTranslationTokens(TRANSLATOR_REVIEW_PROMPT) + injectedTokens + reasoningTokens + 96;
+  const translationTokens = Math.floor((contextTokens - translationFixed) / 1.9);
+  const reviewTokens = Math.floor((contextTokens - reviewFixed) / 2.8);
+  if (translationTokens < 128 || reviewTokens < 128) throw httpError(400, "Configured model context is too small after prompts, context, and reasoning reserve.");
+  return { context_tokens: contextTokens, translation_tokens: translationTokens, review_tokens: reviewTokens };
+}
+
+function translatorContextTokens(upstream, model) {
+  const value = String(upstream?.model_contexts?.[model] || "1m").trim().toLowerCase();
+  const match = value.match(/^(\d+(?:\.\d+)?)\s*([km])?$/);
+  if (!match) return 1000000;
+  const multiplier = match[2] === "k" ? 1000 : match[2] === "m" ? 1000000 : 1;
+  return Math.max(256, Math.floor(Number(match[1]) * multiplier));
+}
+
+function translatorInjectedTokens(settings, client, model) {
+  const clientIds = clientIdentitySet(client);
+  let chars = 0;
+  if (promptAppliesToClient(settings?.system_prompt_clients, client, clientIds)) chars += String(settings?.system_prompt || "").length;
+  if (normalizeStringArray(settings?.subagent_prompt_clients).length && promptAppliesToClient(settings?.subagent_prompt_clients, client, clientIds)) chars += SUBAGENT_PROMPT.length;
+  if (promptAppliesToClient(settings?.global_context_clients, client, clientIds)) chars += String(settings?.global_context || "").length;
+  if (settings?.context_on_demand === true && (settings?.context_items || []).some((item) => item?.enabled !== false && contextScopeMatches(item.clients, client, clientIds) && contextModelMatches(item.models, model))) {
+    chars += Number(settings.context_max_chars || 4000);
+  }
+  return Math.max(0, Math.ceil(chars / 2));
+}
+
+function translatorBatches(job, phase) {
+  const review = phase === "review";
+  const tokenLimit = Number(review ? job.review_batch_token_limit : job.batch_token_limit);
+  return buildBatches(
+    buildTranslationItems(job.source),
+    undefined,
+    review ? Math.floor(TRANSLATOR_BATCH_MAX_CHARS / 2) : undefined,
+    Number.isFinite(tokenLimit) && tokenLimit > 0 ? tokenLimit : Infinity,
+    review ? 2 : 1,
+  );
 }
 
 async function loadTranslatorClient(app, id) {

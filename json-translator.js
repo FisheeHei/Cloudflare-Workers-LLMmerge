@@ -70,19 +70,27 @@ export function buildTranslationItems(source) {
   });
 }
 
-export function buildBatches(items, size = TRANSLATOR_BATCH_SIZE, maxChars = TRANSLATOR_BATCH_MAX_CHARS) {
+export function estimateTranslationTokens(value) {
+  return Math.max(1, Math.ceil(String(value || "").length / 2));
+}
+
+export function buildBatches(items, size = TRANSLATOR_BATCH_SIZE, maxChars = TRANSLATOR_BATCH_MAX_CHARS, maxTokens = Infinity, tokenMultiplier = 1) {
   const batches = [];
   let batch = [];
   let chars = 0;
+  let tokens = 0;
   for (const item of items) {
     const itemChars = item.text.length;
-    if (batch.length && (batch.length >= size || chars + itemChars > maxChars)) {
+    const itemTokens = estimateTranslationTokens(item.text) * tokenMultiplier + 12;
+    if (batch.length && (batch.length >= size || chars + itemChars > maxChars || tokens + itemTokens > maxTokens)) {
       batches.push(batch);
       batch = [];
       chars = 0;
+      tokens = 0;
     }
     batch.push(item);
     chars += itemChars;
+    tokens += itemTokens;
   }
   if (batch.length) batches.push(batch);
   return batches;

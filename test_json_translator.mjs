@@ -11,7 +11,7 @@ globalThis.fetch = async (url, init = {}) => {
   if (target.includes("translate.example")) {
     const request = JSON.parse(init.body);
     assert.equal(request.reasoning_effort, "low");
-    const items = JSON.parse(request.messages[1].content).items;
+    const items = request.messages[1] ? JSON.parse(request.messages[1].content).items : [];
     const isReview = request.messages[0].content.includes("Review Japanese or English game translations");
     if (!isReview && request.messages[0].content.includes("Additional translation requirement")) assert.match(request.messages[0].content, /Keep honorifics/);
     const content = isReview
@@ -36,7 +36,7 @@ const env = {
     async put(key, value) { store.set(key, value); },
     async delete(key) { store.delete(key); },
   },
-  UPSTREAMS_JSON: JSON.stringify([{ name: "translate", base_url: "https://translate.example/v1", api_key: "test", models: ["translate-model"], paths: ["/v1/chat/completions"] }]),
+  UPSTREAMS_JSON: JSON.stringify([{ name: "translate", base_url: "https://translate.example/v1", api_key: "test", models: ["translate-model"], model_contexts: { "translate-model": "4k" }, paths: ["/v1/chat/completions"] }]),
   CLIENTS_JSON: JSON.stringify([
     { id: "translator-client", name: "translator-client", key: "sk-translator", models: ["*"], upstreams: ["translate"] },
     { id: "translator-client-2", name: "translator-client-2", key: "sk-translator-2", models: ["*"], upstreams: ["translate"] },
@@ -54,6 +54,16 @@ assert.equal(aliasesResponse.status, 200);
 const aliases = await aliasesResponse.json();
 assert.equal(aliases.models.length, 1);
 
+const probe = await admin("/translator/probe", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ client_ids: ["translator-client", "translator-client-2"], model: aliases.models[0], reasoning_effort: "low" }),
+});
+assert.equal(probe.status, 200);
+const probeResult = await probe.json();
+assert.equal(probeResult.results.length, 2);
+assert.ok(probeResult.results.every((result) => result.ok && result.upstream === "translate"), JSON.stringify(probeResult));
+
 const create = await admin("/translator/jobs", {
   method: "POST",
   headers: { "content-type": "application/json" },
@@ -62,6 +72,8 @@ const create = await admin("/translator/jobs", {
 assert.equal(create.status, 201);
 const created = await create.json();
 assert.equal(created.job.status, "running");
+assert.equal(created.job.context_window_tokens, 4000);
+assert.ok(created.job.batch_token_limit < 2000);
 
 const active = await admin("/translator/jobs/active");
 assert.equal(active.status, 200);
