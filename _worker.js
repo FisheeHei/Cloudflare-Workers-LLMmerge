@@ -1,6 +1,19 @@
 import { renderAdminPage } from "./admin-page.js";
 import { PRESET_TEMPLATES, inferPresetId, presetById } from "./presets.js";
 import { isGlmModel, isMiniMaxM3Model, isNvidiaNimUpstream, sanitizeProxyBody } from "./provider-bridges.js";
+import {
+  TRANSLATOR_MAX_INPUT_BYTES,
+  TRANSLATOR_MAX_STATE_BYTES,
+  buildBatches,
+  buildTranslationItems,
+  parseReviewResponse,
+  parseTranslationResponse,
+  reviewIssues,
+  reviewRequestBody,
+  sourceToResult,
+  translationRequestBody,
+  validateSource,
+} from "./json-translator.js";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -59,8 +72,11 @@ const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const ACTIVE_UPSTREAM_ABORT_REASON = "admin released active upstreams";
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
+const TRANSLATOR_ACTIVE_KEY = "translator:active";
+const TRANSLATOR_JOB_PREFIX = "translator:job:";
+const TRANSLATOR_JOB_TTL_SECONDS = 8 * 24 * 3600;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-30-timeout-failover";
+const VERSION = "v26-07-31-json-translator";
 
 export default {
   async fetch(request, env, ctx) {
@@ -260,6 +276,15 @@ export default {
       );
     }
   },
+  async scheduled(controller, env, ctx) {
+    try {
+      const app = createApp(env);
+      scheduleStdTimeSync(app, ctx);
+      await runTranslatorCron(app, ctx);
+    } catch (error) {
+      console.error("translator cron failed", error);
+    }
+  },
 };
 
 // ponytail: cache createApp result per-isolate since env is stable across requests
@@ -291,6 +316,8 @@ var _analyticsQueryCache = {};
 // ponytail: model state is isolate-local; Goal turns must not create KV reads/writes.
 var _sessionModelLocks = {};
 var _sessionCurrentModels = {};
+// ponytail: isolate-local cron guard; use Durable Objects only if cross-instance exactly-once is required.
+var _translatorCronRunning = false;
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -1094,6 +1121,19 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   const apiPath = pathname.slice(adminBasePath.length);
 
+  const translatorJobMatch = apiPath.match(/^\/api\/translator\/jobs\/([^/]+)(?:\/(stop|download|review))?$/);
+  if (apiPath === "/api/translator/jobs" && request.method === "POST") {
+    return createTranslatorJob(request, app);
+  }
+  if (translatorJobMatch) {
+    const jobId = decodeURIComponent(translatorJobMatch[1]);
+    const action = translatorJobMatch[2] || "status";
+    if (action === "status" && request.method === "GET") return translatorJobStatus(app, jobId);
+    if (action === "stop" && request.method === "POST") return stopTranslatorJob(app, jobId);
+    if (action === "download" && request.method === "GET") return downloadTranslatorJob(app, jobId);
+    if (action === "review" && request.method === "POST") return startTranslatorReview(app, jobId);
+  }
+
   if (apiPath === "/api/config" && request.method === "GET") {
     return adminConfigResponse(url, app);
   }
@@ -1238,6 +1278,302 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   return withCorsResponse(json(openAiError("Admin route not found.", "not_found_error"), 404));
+}
+
+async function createTranslatorJob(request, app) {
+  const bodyText = await readRequestText(request, TRANSLATOR_MAX_INPUT_BYTES + 32768, TRANSLATOR_MAX_INPUT_BYTES + 32768);
+  const payload = parseJsonBody(bodyText);
+  const source = payload?.source && typeof payload.source === "object" && !Array.isArray(payload.source)
+    ? payload.source
+    : payload;
+  const clientId = String(payload?.client_id || request.headers.get("x-translator-client-id") || "").trim();
+  const requestedModel = String(payload?.model || request.headers.get("x-translator-model") || "").trim();
+  if (!clientId || !requestedModel) throw httpError(400, "client_id and model are required.");
+  try {
+    validateSource(source);
+  } catch (error) {
+    throw httpError(400, error.message || "Source must be a JSON object of string values.");
+  }
+  const sourceBytes = new TextEncoder().encode(JSON.stringify(source)).byteLength;
+  if (sourceBytes > TRANSLATOR_MAX_INPUT_BYTES) throw httpError(413, "Translation input is larger than 8 MiB.");
+
+  const activeId = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
+  if (activeId) {
+    const active = await getTranslatorJob(app.kv, activeId);
+    if (active?.status === "running") throw httpError(409, "Another translation task is already running.");
+    await app.kv.delete(TRANSLATOR_ACTIVE_KEY);
+  }
+
+  const client = await loadTranslatorClient(app, clientId);
+  if (!client) throw httpError(404, "Client key not found.");
+  const runtime = await loadRuntimeConfig(app);
+  const model = await resolveAuthorizedClientModel(
+    client,
+    runtime,
+    requestedModel,
+    new Request("https://translator.internal/v1/chat/completions", { headers: { "x-translator": "1" } }),
+    { model: requestedModel },
+  );
+  const items = buildTranslationItems(source);
+  const batches = buildBatches(items);
+  const now = hkNowIso();
+  const job = {
+    id: crypto.randomUUID(),
+    status: batches.length ? "running" : "completed",
+    phase: "translate",
+    source,
+    result: sourceToResult(source, items),
+    client_id: client.id,
+    client_name: client.name,
+    requested_model: requestedModel,
+    model,
+    current_batch: 0,
+    total_batches: batches.length,
+    total_items: items.length,
+    failed_attempts: 0,
+    last_error: "",
+    review_issues: [],
+    created_at: now,
+    updated_at: now,
+  };
+  ensureTranslatorStateSize(job);
+  await saveTranslatorJob(app.kv, job);
+  if (job.status === "running") await app.kv.put(TRANSLATOR_ACTIVE_KEY, job.id, { expirationTtl: TRANSLATOR_JOB_TTL_SECONDS });
+  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 201));
+}
+
+async function translatorJobStatus(app, id) {
+  const job = await getTranslatorJob(app.kv, id);
+  if (!job) throw httpError(404, "Translation task not found.");
+  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 200));
+}
+
+async function stopTranslatorJob(app, id) {
+  const job = await getTranslatorJob(app.kv, id);
+  if (!job) throw httpError(404, "Translation task not found.");
+  if (job.status === "running") {
+    job.status = "stopped";
+    job.updated_at = hkNowIso();
+    await saveTranslatorJob(app.kv, job);
+    await clearTranslatorActive(app.kv, id);
+  }
+  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 200));
+}
+
+async function downloadTranslatorJob(app, id) {
+  const job = await getTranslatorJob(app.kv, id);
+  if (!job) throw httpError(404, "Translation task not found.");
+  const headers = new Headers(JSON_HEADERS);
+  headers.set("content-disposition", `attachment; filename="translation-${id}.json"`);
+  headers.set("cache-control", "private, no-store");
+  return withCorsResponse(new Response(JSON.stringify(job.result, null, 2), { status: 200, headers }));
+}
+
+async function startTranslatorReview(app, id) {
+  const job = await getTranslatorJob(app.kv, id);
+  if (!job) throw httpError(404, "Translation task not found.");
+  if (job.status === "running") throw httpError(409, "The translation task is still running.");
+  if (job.phase === "review") throw httpError(409, "This task has already been reviewed.");
+  if (job.status !== "completed") throw httpError(409, "Only completed translations can be reviewed.");
+  const activeId = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
+  if (activeId) {
+    const active = await getTranslatorJob(app.kv, activeId);
+    if (active?.status === "running") throw httpError(409, "Another translation task is already running.");
+  }
+  job.phase = "review";
+  job.status = job.total_batches ? "running" : "completed";
+  job.current_batch = 0;
+  job.failed_attempts = 0;
+  job.last_error = "";
+  job.review_issues = [];
+  job.updated_at = hkNowIso();
+  ensureTranslatorStateSize(job);
+  await saveTranslatorJob(app.kv, job);
+  if (job.status === "running") await app.kv.put(TRANSLATOR_ACTIVE_KEY, job.id, { expirationTtl: TRANSLATOR_JOB_TTL_SECONDS });
+  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 202));
+}
+
+function publicTranslatorJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    phase: job.phase,
+    client_id: job.client_id,
+    client_name: job.client_name,
+    model: job.requested_model || job.model,
+    total_items: job.total_items,
+    total_batches: job.total_batches,
+    completed_batches: Math.min(job.current_batch || 0, job.total_batches || 0),
+    failed_attempts: job.failed_attempts || 0,
+    last_error: job.last_error || "",
+    review_issues: job.review_issues || [],
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+  };
+}
+
+async function runTranslatorCron(app, ctx) {
+  if (_translatorCronRunning || !app.kv) return;
+  _translatorCronRunning = true;
+  try {
+    const id = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
+    if (!id) return;
+    const job = await getTranslatorJob(app.kv, id);
+    if (!job || job.status !== "running") {
+      await clearTranslatorActive(app.kv, id);
+      return;
+    }
+    const items = buildTranslationItems(job.source);
+    const batches = buildBatches(items);
+    const batch = batches[job.current_batch];
+    if (!batch) {
+      job.status = "completed";
+      job.updated_at = hkNowIso();
+      await saveTranslatorJob(app.kv, job);
+      await clearTranslatorActive(app.kv, id);
+      return;
+    }
+    const revision = job.updated_at;
+    try {
+      const payload = job.phase === "review"
+        ? reviewRequestBody(job.model, batch, Object.fromEntries(batch.map((item) => [item.id, job.result[item.key] || item.source])))
+        : translationRequestBody(job.model, batch);
+      const responsePayload = await runTranslatorModelRequest(app, job, payload, ctx);
+      const current = await getTranslatorJob(app.kv, id);
+      if (!current || current.status !== "running" || current.updated_at !== revision || current.current_batch !== job.current_batch) return;
+      if (job.phase === "review") {
+        const reviews = parseReviewResponse(responsePayload, batch);
+        applyTranslatorReview(current, batch, reviews);
+        current.review_issues = [...(current.review_issues || []), ...reviewIssues(reviews)];
+      } else {
+        const translations = parseTranslationResponse(responsePayload, batch);
+        applyTranslatorTranslations(current, batch, translations);
+      }
+      current.current_batch += 1;
+      current.last_error = "";
+      current.updated_at = hkNowIso();
+      if (current.current_batch >= batches.length) {
+        current.status = "completed";
+        if (current.phase === "review") current.review_issues = current.review_issues || [];
+      }
+      ensureTranslatorStateSize(current);
+      await saveTranslatorJob(app.kv, current);
+      if (current.status === "completed") await clearTranslatorActive(app.kv, id);
+    } catch (error) {
+      await markTranslatorFailure(app.kv, id, revision, error);
+    }
+  } finally {
+    _translatorCronRunning = false;
+  }
+}
+
+async function runTranslatorModelRequest(app, job, payload, ctx) {
+  const bodyText = JSON.stringify(payload);
+  const client = await loadTranslatorClient(app, job.client_id);
+  if (!client) throw httpError(404, "Client key no longer exists.");
+  const request = new Request("https://translator.internal" + CHAT_PATH, {
+    method: "POST",
+    headers: { authorization: `Bearer ${client.key}`, "content-type": "application/json" },
+    body: bodyText,
+  });
+  const runtime = await loadRuntimeConfig(app);
+  const started = Date.now();
+  let proxyResponse;
+  let logged = false;
+  try {
+    proxyResponse = await proxyRequest({ client, model: job.model, pathname: CHAT_PATH, request, bodyText, runtime, search: "" });
+    const headers = proxyResponseHeaders(proxyResponse.response, proxyResponse, client, `translator-${job.id}-${job.current_batch}`);
+    const response = await buildLoggedProxyResponse({
+      app,
+      bodyText,
+      client,
+      ctx,
+      headers,
+      model: job.model,
+      responseModel: job.model,
+      pathname: CHAT_PATH,
+      requestPayload: payload,
+      proxyResponse,
+      started,
+      traceId: `translator-${job.id}-${job.current_batch}`,
+      upstreamResp: proxyResponse.response,
+    });
+    logged = true;
+    const textBody = await response.text();
+    const parsed = safeJson(textBody);
+    if (!response.ok) throw httpError(response.status, parsed?.error?.message || textBody.slice(0, 300) || "Translator model request failed.");
+    if (!parsed) throw new Error("Translator model returned invalid JSON.");
+    const content = parsed?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" && !Array.isArray(content)) throw new Error("Translator model returned no message content.");
+    return parsed;
+  } catch (error) {
+    if (!logged) {
+      recordRequestLog(app, makeRequestLogEntry({
+        client,
+        upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
+        model: job.model,
+        path: CHAT_PATH,
+        status: error.statusCode || 502,
+        started,
+        promptTokens: Math.max(1, Math.round(bodyText.length / 4)),
+        completionTokens: 0,
+        extra: { translator_job: job.id, translator_phase: job.phase },
+      }), ctx);
+    }
+    throw error;
+  }
+}
+
+async function loadTranslatorClient(app, id) {
+  const stored = await app.kv.get(clientIdKey(id), "json").catch(() => null);
+  if (stored?.key) return normalizeClient(stored);
+  const envClient = app.envClients.find((client) => String(client.id || client.name || client.key) === String(id));
+  return envClient?.key ? normalizeClient(envClient) : null;
+}
+
+function applyTranslatorTranslations(job, batch, translations) {
+  for (const item of batch) setTranslatorResult(job.result, item.key, translations[item.id] || item.source);
+}
+
+function applyTranslatorReview(job, batch, reviews) {
+  for (const item of batch) {
+    const review = reviews[item.id];
+    if (review?.ok !== true && typeof review?.translation === "string") setTranslatorResult(job.result, item.key, review.translation);
+  }
+}
+
+function setTranslatorResult(result, key, value) {
+  Object.defineProperty(result, key, { value, enumerable: true, configurable: true, writable: true });
+}
+
+function ensureTranslatorStateSize(job) {
+  const bytes = new TextEncoder().encode(JSON.stringify(job)).byteLength;
+  if (bytes > TRANSLATOR_MAX_STATE_BYTES) throw httpError(413, "Translation task state would exceed 20 MiB.");
+}
+
+function translatorJobKey(id) {
+  return TRANSLATOR_JOB_PREFIX + id;
+}
+
+async function getTranslatorJob(kv, id) {
+  return kv.get(translatorJobKey(id), "json");
+}
+
+async function saveTranslatorJob(kv, job) {
+  await kv.put(translatorJobKey(job.id), JSON.stringify(job), { expirationTtl: TRANSLATOR_JOB_TTL_SECONDS });
+}
+
+async function clearTranslatorActive(kv, id) {
+  if ((await kv.get(TRANSLATOR_ACTIVE_KEY)) === id) await kv.delete(TRANSLATOR_ACTIVE_KEY);
+}
+
+async function markTranslatorFailure(kv, id, revision, error) {
+  const job = await getTranslatorJob(kv, id);
+  if (!job || job.status !== "running" || job.updated_at !== revision) return;
+  job.failed_attempts = Number(job.failed_attempts || 0) + 1;
+  job.last_error = String(error?.message || error || "Translation batch failed").slice(0, 1000);
+  job.updated_at = hkNowIso();
+  try { await saveTranslatorJob(kv, job); } catch {}
 }
 
 async function adminConfigResponse(url, app) {
@@ -4289,13 +4625,13 @@ function parseJsonEnvArray(value, name) {
   }
 }
 
-async function readRequestText(request) {
+async function readRequestText(request, maxChars = MAX_REQUEST_BODY_CHARS, maxBytes = maxChars) {
   const declaredLength = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_CHARS) {
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw httpError(413, "Request body is too large.");
   }
   const text = await request.text();
-  if (text.length > MAX_REQUEST_BODY_CHARS) throw httpError(413, "Request body is too large.");
+  if (text.length > maxChars || new TextEncoder().encode(text).byteLength > maxBytes) throw httpError(413, "Request body is too large.");
   return text;
 }
 

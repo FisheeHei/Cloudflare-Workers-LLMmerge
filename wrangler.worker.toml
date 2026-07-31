@@ -1,0 +1,11 @@
+name = "llm-merge-worker"
+main = "_worker.js"
+compatibility_date = "2026-07-30"
+
+# Bind the same KV namespace used by the gateway before deploying this Worker.
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "<YOUR_KV_NAMESPACE_ID>"
+
+[triggers]
+crons = ["* * * * *"]
