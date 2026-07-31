@@ -10,6 +10,7 @@ globalThis.fetch = async (url, init = {}) => {
   if (target.includes("stdtime.gov.hk")) return new Response(null, { status: 200, headers: { date: "Fri, 31 Jul 2026 04:00:00 GMT" } });
   if (target.includes("translate.example")) {
     const request = JSON.parse(init.body);
+    assert.equal(request.reasoning_effort, "low");
     const items = JSON.parse(request.messages[1].content).items;
     const isReview = request.messages[0].content.includes("Review Japanese or English game translations");
     if (!isReview && request.messages[0].content.includes("Additional translation requirement")) assert.match(request.messages[0].content, /Keep honorifics/);
@@ -43,6 +44,15 @@ const env = {
 };
 const ctx = { waitUntil() {} };
 const admin = (path, init) => worker.default.fetch(new Request(`https://gw.test/admin/api${path}`, init), env, ctx);
+
+const aliasesResponse = await admin("/translator/models", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ client_ids: ["translator-client", "translator-client-2"] }),
+});
+assert.equal(aliasesResponse.status, 200);
+const aliases = await aliasesResponse.json();
+assert.equal(aliases.models.length, 1);
 
 const create = await admin("/translator/jobs", {
   method: "POST",

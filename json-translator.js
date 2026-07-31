@@ -88,7 +88,7 @@ export function buildBatches(items, size = TRANSLATOR_BATCH_SIZE, maxChars = TRA
   return batches;
 }
 
-export function translationRequestBody(model, batch, extraPrompt = "") {
+export function translationRequestBody(model, batch, extraPrompt = "", reasoningEffort = "low") {
   const systemPrompt = extraPrompt
     ? TRANSLATOR_SYSTEM_PROMPT + "\n\nAdditional translation requirement:\n" + String(extraPrompt).trim()
     : TRANSLATOR_SYSTEM_PROMPT;
@@ -96,6 +96,7 @@ export function translationRequestBody(model, batch, extraPrompt = "") {
     model,
     stream: false,
     temperature: 0.2,
+    reasoning_effort: reasoningEffort,
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: systemPrompt },
@@ -104,11 +105,12 @@ export function translationRequestBody(model, batch, extraPrompt = "") {
   };
 }
 
-export function reviewRequestBody(model, batch, translated) {
+export function reviewRequestBody(model, batch, translated, reasoningEffort = "low") {
   return {
     model,
     stream: false,
     temperature: 0.1,
+    reasoning_effort: reasoningEffort,
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: TRANSLATOR_REVIEW_PROMPT },

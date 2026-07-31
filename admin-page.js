@@ -2221,6 +2221,8 @@ function renderAdminScript(version) {
     byId("model-picker-title").textContent = "\u9009\u62e9\u6a21\u578b - " + picker.title;
     byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
     byId("picker-same-preset-wrap").hidden = !picker.sourceCard;
+    byId("picker-select-visible").hidden = Boolean(picker.single);
+    byId("picker-clear-visible").hidden = Boolean(picker.single);
     byId("model-tag-filter").innerHTML =
       '<button type="button" class="small secondary' + (!picker.tags.size ? ' active' : '') + '" data-tag="__all__">' + (!picker.tags.size ? '\u2705 ' : '') + '\u5168\u90e8\u6807\u7b7e</button>' +
       MODEL_TAGS.map(function(tag) {
@@ -2241,7 +2243,7 @@ function renderAdminScript(version) {
 
     byId("model-picker-list").innerHTML = picker.visible.length
       ? picker.visible.map(function(model) {
-          return '<label class="model-row" title="' + esc(model) + '"><input type="checkbox" class="model-pick" value="' + esc(model) + '"' + (picker.selected.has(model) ? ' checked' : '') + '><span class="mono">' + esc(modelDisplayName(model)) + '</span>' + renderModelTags(model) + '</label>';
+          return '<label class="model-row" title="' + esc(model) + '"><input type="' + (picker.single ? 'radio' : 'checkbox') + '" class="model-pick" value="' + esc(model) + '"' + (picker.selected.has(model) ? ' checked' : '') + '><span class="mono">' + esc(modelDisplayName(model)) + '</span>' + renderModelTags(model) + '</label>';
         }).join("")
       : '<div class="note" style="padding:12px">\u6ca1\u6709\u5339\u914d\u7684\u6a21\u578b</div>';
 
@@ -2266,6 +2268,7 @@ function renderAdminScript(version) {
     });
     byId("model-picker-list").querySelectorAll(".model-pick").forEach(function(cb) {
       cb.addEventListener("change", function() {
+        if (picker.single && cb.checked) picker.selected.clear();
         if (cb.checked) picker.selected.add(cb.value);
         else picker.selected.delete(cb.value);
         byId("picker-count").textContent = "\u5df2\u9009 " + picker.selected.size + " / " + picker.models.length;
@@ -2574,6 +2577,33 @@ function renderAdminScript(version) {
     return [...byId("translator-client-scope").querySelectorAll('input:checked')].map((input) => input.value);
   }
 
+  function ensureTranslatorReasoningControl() {
+    const modelField = byId("translator-model").closest(".field");
+    const label = modelField?.querySelector("label");
+    if (label) label.textContent = "网关模型别名";
+    byId("translator-model").placeholder = "先选择客户端 Key";
+    if (!modelField?.querySelector(".translator-model-alias-note")) modelField?.insertAdjacentHTML("beforeend", '<span class="translator-pool-note translator-model-alias-note">只显示所选 Key 共同可调用的网关别名。</span>');
+    if (byId("translator-reasoning-effort")) return;
+    byId("translator-extra-prompt").insertAdjacentHTML("afterend", '<div class="field"><label>推理强度</label><select id="translator-reasoning-effort"><option value="none">关闭</option><option value="low" selected>低</option><option value="medium">中</option><option value="high">高</option></select></div>');
+  }
+
+  async function openTranslatorAliasPicker() {
+    const clientIds = selectedTranslatorClients();
+    if (!clientIds.length) throw new Error("Select a client key first.");
+    const response = await fetch(API_BASE + "/translator/models", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_ids: clientIds }),
+    });
+    const payload = await parseApiResponse(response);
+    if (!response.ok) throw new Error(payload?.error?.message || "Unable to load gateway model aliases.");
+    const models = Array.isArray(payload.models) ? payload.models : [];
+    if (!models.length) throw new Error("The selected keys have no shared gateway model alias.");
+    showModelPicker("Translator model alias", models, byId("translator-model"));
+    state.modelPicker.single = true;
+    renderModelPicker();
+  }
+
   function openTranslatorModelPicker() {
     const models = (collectConfig().upstreams || []).flatMap((upstream) => upstream.enabled === false ? [] : (upstream.models || []))
       .filter((model) => model && model !== "*");
@@ -2623,13 +2653,14 @@ function renderAdminScript(version) {
     const clientIds = selectedTranslatorClients();
     const model = byId("translator-model").value.trim();
     const extraPrompt = byId("translator-extra-prompt").value.trim();
+    const reasoningEffort = byId("translator-reasoning-effort")?.value || "low";
     if (!file) throw new Error("请选择 JSON 文件");
     if (!clientIds.length || !model) throw new Error("至少选择一个客户端 Key 并填写模型");
     const source = JSON.parse(await file.text());
     const resp = await fetch(API_BASE + "/translator/jobs", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ source, client_ids: clientIds, model, extra_prompt: extraPrompt }),
+      body: JSON.stringify({ source, client_ids: clientIds, model, extra_prompt: extraPrompt, reasoning_effort: reasoningEffort }),
     });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "创建翻译任务失败");
@@ -2741,6 +2772,7 @@ function renderAdminScript(version) {
   /* ---- Boot ---- */
   async function boot() {
     try {
+      ensureTranslatorReasoningControl();
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
       byId("speed-picker-modal").addEventListener("click", (e) => { if (e.target === byId("speed-picker-modal")) closeSpeedPicker(); });
@@ -2819,7 +2851,7 @@ function renderAdminScript(version) {
       byId("picker-clear-visible").addEventListener("click", () => selectVisibleModels(false));
       byId("model-picker-search").addEventListener("input", renderModelPicker);
       byId("translator-model-picker").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "打开中...", openTranslatorModelPicker).catch(showError)
+        withButtonBusy(e.currentTarget, "打开中...", openTranslatorAliasPicker).catch(showError)
       );
       byId("vendor-account-id").addEventListener("input", applyVendorPreset);
       byId("vendor-fetch-models").addEventListener("click", (e) =>

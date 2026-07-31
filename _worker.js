@@ -77,9 +77,10 @@ const TRANSLATOR_JOB_PREFIX = "translator:job:";
 const TRANSLATOR_JOB_TTL_SECONDS = 8 * 24 * 3600;
 const TRANSLATOR_MAX_CLIENTS = 3;
 const TRANSLATOR_EXTRA_PROMPT_MAX_CHARS = 4000;
+const TRANSLATOR_REASONING_EFFORTS = new Set(["none", "low", "medium", "high"]);
 const TRANSLATOR_SECOND_LANE_DELAY_MS = 30000;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-31-json-translator-preview";
+const VERSION = "v26-07-31-json-translator-reasoning";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1133,6 +1134,9 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   const apiPath = pathname.slice(adminBasePath.length);
 
   const translatorJobMatch = apiPath.match(/^\/api\/translator\/jobs\/([^/]+)(?:\/(stop|download|review))?$/);
+  if (apiPath === "/api/translator/models" && request.method === "POST") {
+    return translatorModels(request, app);
+  }
   if (apiPath === "/api/translator/jobs" && request.method === "POST") {
     return createTranslatorJob(request, app);
   }
@@ -1302,9 +1306,11 @@ async function createTranslatorJob(request, app) {
   );
   const requestedModel = String(payload?.model || request.headers.get("x-translator-model") || "").trim();
   const extraPrompt = String(payload?.extra_prompt || "").trim();
+  const reasoningEffort = String(payload?.reasoning_effort || "low").trim().toLowerCase();
   if (!clientIds.length || !requestedModel) throw httpError(400, "At least one client_id and model are required.");
   if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
   if (extraPrompt.length > TRANSLATOR_EXTRA_PROMPT_MAX_CHARS) throw httpError(400, `Translation extra prompt must be at most ${TRANSLATOR_EXTRA_PROMPT_MAX_CHARS} characters.`);
+  if (!TRANSLATOR_REASONING_EFFORTS.has(reasoningEffort)) throw httpError(400, "Translation reasoning effort must be none, low, medium, or high.");
   try {
     validateSource(source);
   } catch (error) {
@@ -1350,6 +1356,7 @@ async function createTranslatorJob(request, app) {
     requested_model: requestedModel,
     model,
     extra_prompt: extraPrompt,
+    reasoning_effort: reasoningEffort,
     previews: [],
     current_batch: 0,
     total_batches: batches.length,
@@ -1364,6 +1371,24 @@ async function createTranslatorJob(request, app) {
   await saveTranslatorJob(app.kv, job);
   if (job.status === "running") await app.kv.put(TRANSLATOR_ACTIVE_KEY, job.id, { expirationTtl: TRANSLATOR_JOB_TTL_SECONDS });
   return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 201));
+}
+
+async function translatorModels(request, app) {
+  const payload = parseJsonBody(await readRequestText(request, 65536, 65536));
+  const clientIds = uniqueTranslatorClientIds(payload?.client_ids);
+  if (!clientIds.length) throw httpError(400, "Select at least one client key first.");
+  if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
+  const clients = await Promise.all(clientIds.map((id) => loadTranslatorClient(app, id)));
+  if (clients.some((client) => !client)) throw httpError(404, "One or more client keys were not found.");
+  const runtime = await loadRuntimeConfig(app);
+  const modelMaps = clients.map((client) => new Map(
+    modelRegistryRows(runtime)
+      .filter((row) => clientAllowsUpstream(client, row.upstream.name))
+      .filter((row) => clientAllowsModelSelection(client, row.alias, row.model))
+      .map((row) => [row.alias, row.model]),
+  ));
+  const models = [...modelMaps[0]].filter(([alias, model]) => modelMaps.every((map) => map.get(alias) === model)).map(([id]) => id).sort();
+  return withCorsResponse(json({ ok: true, models }, 200));
 }
 
 async function translatorJobStatus(app, id) {
@@ -1428,6 +1453,7 @@ function publicTranslatorJob(job) {
     client_names: Array.isArray(job.client_names) ? job.client_names : [job.client_name].filter(Boolean),
     model: job.requested_model || job.model,
     extra_prompt: job.extra_prompt || "",
+    reasoning_effort: job.reasoning_effort || "low",
     total_items: job.total_items,
     total_batches: job.total_batches,
     completed_batches: Math.min(job.current_batch || 0, job.total_batches || 0),
@@ -1463,8 +1489,8 @@ async function runTranslatorCron(app, ctx, lane = 0) {
   const revision = job.updated_at;
   try {
     const payload = job.phase === "review"
-      ? reviewRequestBody(job.model, batch, Object.fromEntries(batch.map((item) => [item.id, job.result[item.key] || item.source])))
-      : translationRequestBody(job.model, batch, job.extra_prompt);
+      ? reviewRequestBody(job.model, batch, Object.fromEntries(batch.map((item) => [item.id, job.result[item.key] || item.source])), job.reasoning_effort || "low")
+      : translationRequestBody(job.model, batch, job.extra_prompt, job.reasoning_effort || "low");
     const responsePayload = await runTranslatorModelRequest(app, job, payload, ctx, lane);
     const current = await getTranslatorJob(app.kv, id);
     if (!current || current.status !== "running" || current.updated_at !== revision || current.current_batch !== job.current_batch) {
