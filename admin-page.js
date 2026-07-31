@@ -2547,13 +2547,21 @@ function renderAdminScript(version) {
     renderTranslatorJob(payload.job);
   }
 
-  function downloadTranslatorJob() {
+  async function downloadTranslatorJob() {
     const id = state.translatorJob?.id;
     if (!id) return;
+    const response = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/download");
+    if (!response.ok) {
+      const payload = await parseApiResponse(response);
+      throw new Error(payload?.error?.message || "下载翻译结果失败");
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/download";
+    a.href = objectUrl;
     a.download = "translation-" + id + ".json";
     document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
 
   async function reviewTranslatorJob() {
@@ -2808,7 +2816,9 @@ function renderAdminScript(version) {
       byId("translator-stop").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "停止中...", stopTranslatorJob).catch(showError)
       );
-      byId("translator-download").addEventListener("click", downloadTranslatorJob);
+      byId("translator-download").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "下载中...", downloadTranslatorJob).catch(showError)
+      );
       byId("translator-review").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "启动中...", reviewTranslatorJob).catch(showError)
       );
