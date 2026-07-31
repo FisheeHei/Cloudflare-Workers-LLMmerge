@@ -107,7 +107,31 @@ function renderAdminStyle() {
     .url-card button { margin-right: 6px; }
     .panel { padding: 20px; min-width: 0; scroll-margin-top: 88px; }
     .panel h2 { margin: 0 0 14px; font-size: 19px; line-height: 1.2; }
-    .translator-card { border-top: 3px solid var(--accent-2); }
+    .translator-hero { border-top: 3px solid var(--accent-2); }
+    .translator-hero-copy { max-width: 720px; }
+    .translator-hero-copy p { margin: 0; color: var(--muted); }
+    .translator-hero-status {
+      display: grid; gap: 6px; min-width: 190px; padding: 12px 14px;
+      border: 1px solid var(--line); border-radius: 8px; background: var(--bg-raised);
+    }
+    .translator-hero-status strong { font-size: 13px; }
+    .translator-hero-status span { color: var(--muted); font-size: 12px; }
+    .translator-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .translator-section-head h2 { margin: 0; }
+    .translator-status-grid { display: grid; gap: 8px; }
+    .translator-status-row {
+      display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center;
+      min-height: 42px; padding: 10px 0; border-bottom: 1px solid var(--line);
+    }
+    .translator-status-row:last-child { border-bottom: 0; }
+    .translator-status-label { color: var(--muted); font-size: 12px; }
+    .translator-status-value { max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; text-align: right; }
+    .translator-status-value[data-state="running"] { color: var(--accent-2); }
+    .translator-status-value[data-state="completed"] { color: #166534; }
+    .translator-status-value[data-state="stopped"] { color: #9a3412; }
+    .translator-error { margin: 14px 0 0; color: #9a3412; font-size: 12px; overflow-wrap: anywhere; }
+    .translator-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .translator-actions button { flex: 0 0 auto; }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -333,6 +357,9 @@ function renderAdminStyle() {
       .url-card { max-width: none; }
       #view-overview #stats-panel { grid-column: 1 / span 7; }
       #view-overview #client-panel { grid-column: 8 / -1; }
+      #view-translator .translator-hero { grid-column: 1 / -1; }
+      #view-translator .translator-form-panel { grid-column: 1 / span 8; }
+      #view-translator .translator-progress-panel { grid-column: 9 / -1; }
       #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
       #view-upstreams #upstream-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
@@ -414,7 +441,7 @@ function renderAdminStyle() {
     @media (max-width: 700px) {
       .wrap { width: min(100%, calc(100vw - 12px)); padding: 8px 0 28px; }
       .hero, .panel { margin-bottom: 10px; }
-      .hero, .panel, .translator-card, .modal-card { padding: 14px; }
+      .hero, .panel, .modal-card { padding: 14px; }
       .hero h1 { font-size: 24px; }
       html, body { height: auto; overflow: auto; }
       .app-shell { display: block; height: auto; overflow: visible; }
@@ -430,6 +457,8 @@ function renderAdminStyle() {
       .topbar-badge { display: none; }
       .wrap { width: min(100%, calc(100vw - 12px)); }
       .hero { align-items: stretch; flex-direction: column; gap: 16px; }
+      .translator-hero-status { min-width: 0; }
+      .translator-actions button { flex: 1 1 140px; }
       .gateway-urls { flex: none; }
       .url-card { max-width: 100%; }
       .toolbar { align-items: stretch; }
@@ -585,21 +614,42 @@ function renderAdminMarkup(origin, version) {
 
   </section>
   <section class="page-view" id="view-translator" data-view="translator" hidden>
-  <div class="panel translator-card" id="translator-panel">
-    <div class="toolbar"><h2>在线 JSON 翻译</h2><span class="note">每分钟推进一个分片，关闭页面后仍会继续。</span></div>
+  <div class="hero translator-hero">
+    <div class="hero-copy translator-hero-copy">
+      <span class="hero-kicker">Background queue</span>
+      <h1>JSON Translation</h1>
+      <p>使用现有网关模型处理日文、英文或混合文本，并将任务进度保留在 Cloudflare KV 中。</p>
+    </div>
+    <div class="translator-hero-status">
+      <strong>Cloudflare Cron</strong>
+      <span>每分钟推进一个分片</span>
+    </div>
+  </div>
+  <div class="panel translator-form-panel" id="translator-panel">
+    <div class="translator-section-head"><h2>任务配置</h2><span class="note">顶层 JSON 对象，所有 value 必须是字符串</span></div>
     <div class="row">
       <div class="field span-4"><label>客户端 Key</label><select id="translator-client"></select></div>
       <div class="field span-4"><label>模型</label><input id="translator-model" class="mono" placeholder="例如 nvidia-nim/qwen..."></div>
-      <div class="field span-4"><label>JSON 文件（顶层对象，value 必须是字符串）</label><input id="translator-file" type="file" accept=".json,application/json"></div>
+      <div class="field span-4"><label>JSON 文件</label><input id="translator-file" type="file" accept=".json,application/json"></div>
     </div>
-    <div class="toolbar">
+    <div class="translator-actions">
       <button class="good" id="translator-start">创建翻译任务</button>
+    </div>
+  </div>
+  <aside class="panel translator-progress-panel">
+    <div class="translator-section-head"><h2>任务状态</h2><span class="note">自动轮询</span></div>
+    <div class="translator-status-grid">
+      <div class="translator-status-row"><span class="translator-status-label">当前状态</span><strong class="translator-status-value" id="translator-status" data-state="idle">尚未创建任务</strong></div>
+      <div class="translator-status-row"><span class="translator-status-label">进度</span><strong class="translator-status-value" id="translator-progress">-</strong></div>
+      <div class="translator-status-row"><span class="translator-status-label">模型</span><strong class="translator-status-value mono" id="translator-current-model">-</strong></div>
+    </div>
+    <p class="translator-error" id="translator-error" hidden></p>
+    <div class="translator-actions">
       <button class="secondary" id="translator-stop" disabled>停止</button>
       <button class="secondary" id="translator-download" disabled>下载当前结果</button>
       <button class="secondary" id="translator-review" disabled>启动复核</button>
     </div>
-    <div class="note" id="translator-status">尚未创建任务</div>
-  </div>
+  </aside>
   </section>
   <section class="page-view" id="view-activity" data-view="logs" hidden>
   <div class="panel" id="log-panel">
@@ -2502,8 +2552,16 @@ function renderAdminScript(version) {
     state.translatorJob = job;
     const status = byId("translator-status");
     if (!job) return;
+    const stateLabel = { running: "进行中", completed: "已完成", stopped: "已停止" }[job.status] || job.status;
+    const phaseLabel = job.phase === "review" ? "复核" : "翻译";
     const progress = job.total_batches ? job.completed_batches + "/" + job.total_batches + " 分片" : "无可翻译分片";
-    status.textContent = job.status + " / " + job.phase + " / " + progress + (job.last_error ? " / " + job.last_error : "");
+    status.textContent = stateLabel + " · " + phaseLabel;
+    status.dataset.state = job.status || "idle";
+    byId("translator-progress").textContent = progress;
+    byId("translator-current-model").textContent = job.model || "-";
+    const error = byId("translator-error");
+    error.hidden = !job.last_error;
+    error.textContent = job.last_error || "";
     byId("translator-stop").disabled = job.status !== "running";
     byId("translator-download").disabled = !job.id;
     byId("translator-review").disabled = job.status !== "completed" || job.phase === "review";
