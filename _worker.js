@@ -76,7 +76,7 @@ const TRANSLATOR_ACTIVE_KEY = "translator:active";
 const TRANSLATOR_JOB_PREFIX = "translator:job:";
 const TRANSLATOR_JOB_TTL_SECONDS = 8 * 24 * 3600;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-31-json-translator";
+const VERSION = "v26-07-31-json-translator-bilingual";
 
 export default {
   async fetch(request, env, ctx) {
