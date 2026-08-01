@@ -1,23 +1,6 @@
 import { renderAdminPage } from "./admin-page.js";
 import { PRESET_TEMPLATES, inferPresetId, presetById } from "./presets.js";
 import { isGlmModel, isMiniMaxM3Model, isNvidiaNimUpstream, sanitizeProxyBody } from "./provider-bridges.js";
-import {
-  TRANSLATOR_MAX_INPUT_BYTES,
-  TRANSLATOR_MAX_STATE_BYTES,
-  TRANSLATOR_BATCH_MAX_CHARS,
-  TRANSLATOR_REVIEW_PROMPT,
-  TRANSLATOR_SYSTEM_PROMPT,
-  buildBatches,
-  buildTranslationItems,
-  estimateTranslationTokens,
-  parseReviewResponse,
-  parseTranslationResponse,
-  reviewIssues,
-  reviewRequestBody,
-  sourceToResult,
-  translationRequestBody,
-  validateSource,
-} from "./json-translator.js";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -76,15 +59,16 @@ const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const ACTIVE_UPSTREAM_ABORT_REASON = "admin released active upstreams";
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
-const TRANSLATOR_ACTIVE_KEY = "translator:active";
-const TRANSLATOR_JOB_PREFIX = "translator:job:";
-const TRANSLATOR_JOB_TTL_SECONDS = 8 * 24 * 3600;
-const TRANSLATOR_MAX_CLIENTS = 3;
-const TRANSLATOR_EXTRA_PROMPT_MAX_CHARS = 4000;
-const TRANSLATOR_REASONING_EFFORTS = new Set(["none", "low", "medium", "high"]);
-const TRANSLATOR_SECOND_LANE_DELAY_MS = 30000;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
-const VERSION = "v26-07-31-json-translator-route-probe";
+const KV_USAGE_CACHE_MS = 60000;
+const KV_FREE_QUOTAS = {
+  reads: 100000,
+  writes: 1000,
+  deletes: 1000,
+  lists: 1000,
+  storage_bytes: 1024 * 1024 * 1024,
+};
+const VERSION = "v26-08-01-kv-meter-timezone-cleanup";
 
 export default {
   async fetch(request, env, ctx) {
@@ -284,23 +268,6 @@ export default {
       );
     }
   },
-  async scheduled(controller, env, ctx) {
-    if (_translatorCronRunning) return;
-    _translatorCronRunning = true;
-    try {
-      const app = createApp(env);
-      scheduleStdTimeSync(app, ctx);
-      const first = await runTranslatorCron(app, ctx, 0);
-      if (first.running && first.client_count > 1) {
-        await sleep(TRANSLATOR_SECOND_LANE_DELAY_MS);
-        await runTranslatorCron(app, ctx, 1);
-      }
-    } catch (error) {
-      console.error("translator cron failed", error);
-    } finally {
-      _translatorCronRunning = false;
-    }
-  },
 };
 
 // ponytail: cache createApp result per-isolate since env is stable across requests
@@ -329,11 +296,10 @@ var _stdTimeOffsetMs = 0;
 var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
 var _analyticsQueryCache = {};
+var _kvUsageCache = null;
 // ponytail: model state is isolate-local; Goal turns must not create KV reads/writes.
 var _sessionModelLocks = {};
 var _sessionCurrentModels = {};
-// ponytail: isolate-local cycle guard; use Durable Objects only if cross-instance exactly-once is required.
-var _translatorCronRunning = false;
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -767,6 +733,88 @@ ORDER BY hour ASC
   return buckets;
 }
 
+async function kvUsageResponse(app) {
+  if (!app.analyticsAccountId || !app.analyticsApiToken) {
+    return withCorsResponse(json({ ok: true, available: false, message: "ANALYTICS_ACCOUNT_ID / ANALYTICS_API_TOKEN is not configured." }, 200));
+  }
+  const now = Date.now();
+  if (_kvUsageCache && now - _kvUsageCache.ts < KV_USAGE_CACHE_MS) {
+    return withCorsResponse(json(_kvUsageCache.payload, 200));
+  }
+  try {
+    const payload = await fetchKvUsage(app);
+    _kvUsageCache = { ts: now, payload };
+    return withCorsResponse(json(payload, 200));
+  } catch (error) {
+    return withCorsResponse(json({ ok: true, available: false, message: String(error?.message || error || "Unable to read KV analytics.") }, 200));
+  }
+}
+
+async function fetchKvUsage(app) {
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(start.getTime() + 24 * 3600 * 1000);
+  const query = `query KvUsage($accountTag: string!, $start: Date!, $end: Date!) {
+    viewer {
+      accounts(filter: {accountTag: $accountTag}) {
+        kvOperationsAdaptiveGroups(limit: 1000, filter: {date_geq: $start, date_lt: $end}) {
+          dimensions { actionType }
+          sum { requests }
+        }
+        kvStorageAdaptiveGroups(limit: 1000, filter: {date_geq: $start, date_lt: $end}) {
+          max { keyCount byteCount }
+        }
+      }
+    }
+  }`;
+  const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${app.analyticsApiToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      query,
+      variables: {
+        accountTag: app.analyticsAccountId,
+        start: start.toISOString().slice(0, 10),
+        end: end.toISOString().slice(0, 10),
+      },
+    }),
+  });
+  const body = await resp.json().catch(() => null);
+  if (!resp.ok || !body || body.errors) throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${resp.status}`);
+  const account = body?.data?.viewer?.accounts?.[0];
+  if (!account) throw new Error("Cloudflare account analytics is not available.");
+  const operations = { reads: 0, writes: 0, deletes: 0, lists: 0 };
+  for (const row of account.kvOperationsAdaptiveGroups || []) {
+    const bucket = kvActionBucket(row?.dimensions?.actionType);
+    if (bucket) operations[bucket] += Number(row?.sum?.requests || 0);
+  }
+  const storage = (account.kvStorageAdaptiveGroups || []).reduce((acc, row) => ({
+    keys: Math.max(acc.keys, Number(row?.max?.keyCount || 0)),
+    bytes: Math.max(acc.bytes, Number(row?.max?.byteCount || 0)),
+  }), { keys: 0, bytes: 0 });
+  return {
+    ok: true,
+    available: true,
+    updated_at: hkNowIso(),
+    period: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), timezone: "UTC" },
+    quotas: KV_FREE_QUOTAS,
+    operations,
+    storage,
+  };
+}
+
+function kvActionBucket(actionType) {
+  const action = String(actionType || "").toLowerCase();
+  if (action.includes("read")) return "reads";
+  if (action.includes("write")) return "writes";
+  if (action.includes("delete")) return "deletes";
+  if (action.includes("list")) return "lists";
+  return "";
+}
+
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, responseModel = model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
   const toolsCount = requestToolsCount(requestPayload);
@@ -1137,28 +1185,6 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   const apiPath = pathname.slice(adminBasePath.length);
 
-  const translatorJobMatch = apiPath.match(/^\/api\/translator\/jobs\/([^/]+)(?:\/(stop|download|review))?$/);
-  if (apiPath === "/api/translator/jobs/active" && request.method === "GET") {
-    return translatorActiveJob(app);
-  }
-  if (apiPath === "/api/translator/models" && request.method === "POST") {
-    return translatorModels(request, app);
-  }
-  if (apiPath === "/api/translator/probe" && request.method === "POST") {
-    return translatorProbe(request, app);
-  }
-  if (apiPath === "/api/translator/jobs" && request.method === "POST") {
-    return createTranslatorJob(request, app);
-  }
-  if (translatorJobMatch) {
-    const jobId = decodeURIComponent(translatorJobMatch[1]);
-    const action = translatorJobMatch[2] || "status";
-    if (action === "status" && request.method === "GET") return translatorJobStatus(app, jobId);
-    if (action === "stop" && request.method === "POST") return stopTranslatorJob(app, jobId);
-    if (action === "download" && request.method === "GET") return downloadTranslatorJob(app, jobId);
-    if (action === "review" && request.method === "POST") return startTranslatorReview(app, jobId);
-  }
-
   if (apiPath === "/api/config" && request.method === "GET") {
     return adminConfigResponse(url, app);
   }
@@ -1265,6 +1291,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: hkNowIso(), time_zone: HK_TIME_ZONE_LABEL }, 200));
   }
 
+  if (apiPath === "/api/kv-usage" && request.method === "GET") {
+    return kvUsageResponse(app);
+  }
+
   if (apiPath === "/api/runtime" && request.method === "GET") {
     return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), active_upstream_clients: getActiveUpstreamClientSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
   }
@@ -1303,507 +1333,6 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   return withCorsResponse(json(openAiError("Admin route not found.", "not_found_error"), 404));
-}
-
-async function createTranslatorJob(request, app) {
-  const bodyText = await readRequestText(request, TRANSLATOR_MAX_INPUT_BYTES + 32768, TRANSLATOR_MAX_INPUT_BYTES + 32768);
-  const payload = parseJsonBody(bodyText);
-  const source = payload?.source && typeof payload.source === "object" && !Array.isArray(payload.source)
-    ? payload.source
-    : payload;
-  const clientIds = uniqueTranslatorClientIds(
-    Array.isArray(payload?.client_ids) ? payload.client_ids : [payload?.client_id || request.headers.get("x-translator-client-id")],
-  );
-  const requestedModel = String(payload?.model || request.headers.get("x-translator-model") || "").trim();
-  const extraPrompt = String(payload?.extra_prompt || "").trim();
-  const reasoningEffort = String(payload?.reasoning_effort || "low").trim().toLowerCase();
-  if (!clientIds.length || !requestedModel) throw httpError(400, "At least one client_id and model are required.");
-  if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
-  if (extraPrompt.length > TRANSLATOR_EXTRA_PROMPT_MAX_CHARS) throw httpError(400, `Translation extra prompt must be at most ${TRANSLATOR_EXTRA_PROMPT_MAX_CHARS} characters.`);
-  if (!TRANSLATOR_REASONING_EFFORTS.has(reasoningEffort)) throw httpError(400, "Translation reasoning effort must be none, low, medium, or high.");
-  try {
-    validateSource(source);
-  } catch (error) {
-    throw httpError(400, error.message || "Source must be a JSON object of string values.");
-  }
-  const sourceBytes = new TextEncoder().encode(JSON.stringify(source)).byteLength;
-  if (sourceBytes > TRANSLATOR_MAX_INPUT_BYTES) throw httpError(413, "Translation input is larger than 8 MiB.");
-
-  if (await getActiveTranslatorJob(app.kv)) throw httpError(409, "Another translation task is already running.");
-
-  const clients = await Promise.all(clientIds.map((id) => loadTranslatorClient(app, id)));
-  if (clients.some((client) => !client)) throw httpError(404, "One or more client keys were not found.");
-  const runtime = await loadRuntimeConfig(app);
-  const models = await Promise.all(clients.map((client) => resolveAuthorizedClientModel(
-    client,
-    runtime,
-    requestedModel,
-    new Request("https://translator.internal/v1/chat/completions", { headers: { "x-translator": "1" } }),
-    { model: requestedModel },
-  )));
-  const model = models[0];
-  if (models.some((candidate) => candidate !== model)) {
-    throw httpError(400, "Selected client keys resolve the requested model differently.");
-  }
-  const items = buildTranslationItems(source);
-  const batchPlan = translatorBatchPlan(runtime, clients, model, extraPrompt, reasoningEffort);
-  const batches = buildBatches(items, undefined, undefined, batchPlan.translation_tokens);
-  const now = hkNowIso();
-  const job = {
-    id: crypto.randomUUID(),
-    status: batches.length ? "running" : "completed",
-    phase: "translate",
-    source,
-    result: sourceToResult(source, items),
-    client_id: clients[0].id,
-    client_name: clients[0].name,
-    client_ids: clients.map((client) => client.id),
-    client_names: clients.map((client) => client.name),
-    requested_model: requestedModel,
-    model,
-    extra_prompt: extraPrompt,
-    reasoning_effort: reasoningEffort,
-    context_window_tokens: batchPlan.context_tokens,
-    batch_token_limit: batchPlan.translation_tokens,
-    review_batch_token_limit: batchPlan.review_tokens,
-    previews: [],
-    current_batch: 0,
-    total_batches: batches.length,
-    total_items: items.length,
-    failed_attempts: 0,
-    last_error: "",
-    review_issues: [],
-    created_at: now,
-    updated_at: now,
-  };
-  ensureTranslatorStateSize(job);
-  await saveTranslatorJob(app.kv, job);
-  if (job.status === "running") await app.kv.put(TRANSLATOR_ACTIVE_KEY, job.id, { expirationTtl: TRANSLATOR_JOB_TTL_SECONDS });
-  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 201));
-}
-
-async function translatorModels(request, app) {
-  const payload = parseJsonBody(await readRequestText(request, 65536, 65536));
-  const clientIds = uniqueTranslatorClientIds(payload?.client_ids);
-  if (!clientIds.length) throw httpError(400, "Select at least one client key first.");
-  if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
-  const clients = await Promise.all(clientIds.map((id) => loadTranslatorClient(app, id)));
-  if (clients.some((client) => !client)) throw httpError(404, "One or more client keys were not found.");
-  const runtime = await loadRuntimeConfig(app);
-  const modelMaps = clients.map((client) => new Map(
-    modelRegistryRows(runtime)
-      .filter((row) => clientAllowsUpstream(client, row.upstream.name))
-      .filter((row) => clientAllowsModelSelection(client, row.alias, row.model))
-      .map((row) => [row.alias, row.model]),
-  ));
-  const models = [...modelMaps[0]].filter(([alias, model]) => modelMaps.every((map) => map.get(alias) === model)).map(([id]) => id).sort();
-  return withCorsResponse(json({ ok: true, models }, 200));
-}
-
-async function translatorProbe(request, app) {
-  const payload = parseJsonBody(await readRequestText(request, 65536, 65536));
-  const clientIds = uniqueTranslatorClientIds(payload?.client_ids);
-  const requestedModel = String(payload?.model || "").trim();
-  const reasoningEffort = String(payload?.reasoning_effort || "low").trim().toLowerCase();
-  if (!clientIds.length || !requestedModel) throw httpError(400, "Select at least one client key and model first.");
-  if (clientIds.length > TRANSLATOR_MAX_CLIENTS) throw httpError(400, `A translation task may use at most ${TRANSLATOR_MAX_CLIENTS} client keys.`);
-  if (!TRANSLATOR_REASONING_EFFORTS.has(reasoningEffort)) throw httpError(400, "Translation reasoning effort must be none, low, medium, or high.");
-  const clients = await Promise.all(clientIds.map((id) => loadTranslatorClient(app, id)));
-  if (clients.some((client) => !client)) throw httpError(404, "One or more client keys were not found.");
-  const runtime = await loadRuntimeConfig(app);
-  const models = await Promise.all(clients.map((client) => resolveAuthorizedClientModel(
-    client,
-    runtime,
-    requestedModel,
-    new Request("https://translator.internal/v1/chat/completions", { headers: { "x-translator": "1" } }),
-    { model: requestedModel },
-  )));
-  if (models.some((model) => model !== models[0])) throw httpError(400, "Selected client keys resolve the requested model differently.");
-  const results = await Promise.all(clients.map((client) => translatorProbeClient(runtime, client, requestedModel, models[0], reasoningEffort)));
-  return withCorsResponse(json({ ok: true, model: requestedModel, results }, 200));
-}
-
-async function translatorProbeClient(runtime, client, requestedModel, model, reasoningEffort) {
-  const started = Date.now();
-  const bodyText = JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false, temperature: 0, reasoning_effort: reasoningEffort });
-  const request = new Request("https://translator.internal" + CHAT_PATH, {
-    method: "POST",
-    headers: { authorization: `Bearer ${client.key}`, "content-type": "application/json" },
-    body: bodyText,
-  });
-  try {
-    const result = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: "" });
-    const responseText = await result.response.text();
-    return {
-      client_id: client.id,
-      client_name: client.name || client.id,
-      gateway: "ok",
-      model: requestedModel,
-      upstream: result.upstream?.name || "unknown",
-      status: result.response.status,
-      ok: result.response.ok,
-      latency_ms: Date.now() - started,
-      error: result.response.ok ? "" : (safeJson(responseText)?.error?.message || responseText.slice(0, 240)),
-    };
-  } catch (error) {
-    return {
-      client_id: client.id,
-      client_name: client.name || client.id,
-      gateway: "failed",
-      model: requestedModel,
-      upstream: error?.upstreamName || "none",
-      status: error?.statusCode || 502,
-      ok: false,
-      latency_ms: Date.now() - started,
-      error: String(error?.message || error || "Route probe failed").slice(0, 240),
-    };
-  }
-}
-
-async function translatorJobStatus(app, id) {
-  const job = await getTranslatorJob(app.kv, id);
-  if (!job) throw httpError(404, "Translation task not found.");
-  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 200));
-}
-
-async function translatorActiveJob(app) {
-  const job = await getActiveTranslatorJob(app.kv);
-  return withCorsResponse(json({ ok: true, job: job ? publicTranslatorJob(job) : null }, 200));
-}
-
-async function stopTranslatorJob(app, id) {
-  const job = await getTranslatorJob(app.kv, id);
-  if (!job) throw httpError(404, "Translation task not found.");
-  if (job.status === "running") {
-    job.status = "stopped";
-    job.updated_at = hkNowIso();
-    await saveTranslatorJob(app.kv, job);
-    await clearTranslatorActive(app.kv, id);
-  }
-  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 200));
-}
-
-async function downloadTranslatorJob(app, id) {
-  const job = await getTranslatorJob(app.kv, id);
-  if (!job) throw httpError(404, "Translation task not found.");
-  const headers = new Headers(JSON_HEADERS);
-  headers.set("content-disposition", `attachment; filename="translation-${id}.json"`);
-  headers.set("cache-control", "private, no-store");
-  return withCorsResponse(new Response(JSON.stringify(job.result, null, 2), { status: 200, headers }));
-}
-
-async function startTranslatorReview(app, id) {
-  const job = await getTranslatorJob(app.kv, id);
-  if (!job) throw httpError(404, "Translation task not found.");
-  if (job.status === "running") throw httpError(409, "The translation task is still running.");
-  if (job.phase === "review") throw httpError(409, "This task has already been reviewed.");
-  if (job.status !== "completed") throw httpError(409, "Only completed translations can be reviewed.");
-  if (await getActiveTranslatorJob(app.kv)) throw httpError(409, "Another translation task is already running.");
-  job.phase = "review";
-  job.total_batches = translatorBatches(job, "review").length;
-  job.status = job.total_batches ? "running" : "completed";
-  job.current_batch = 0;
-  job.failed_attempts = 0;
-  job.last_error = "";
-  job.review_issues = [];
-  job.updated_at = hkNowIso();
-  ensureTranslatorStateSize(job);
-  await saveTranslatorJob(app.kv, job);
-  if (job.status === "running") await app.kv.put(TRANSLATOR_ACTIVE_KEY, job.id, { expirationTtl: TRANSLATOR_JOB_TTL_SECONDS });
-  return withCorsResponse(json({ ok: true, job: publicTranslatorJob(job) }, 202));
-}
-
-function publicTranslatorJob(job) {
-  return {
-    id: job.id,
-    status: job.status,
-    phase: job.phase,
-    client_id: job.client_id,
-    client_name: job.client_name,
-    client_ids: translatorJobClientIds(job),
-    client_names: Array.isArray(job.client_names) ? job.client_names : [job.client_name].filter(Boolean),
-    model: job.requested_model || job.model,
-    extra_prompt: job.extra_prompt || "",
-    reasoning_effort: job.reasoning_effort || "low",
-    context_window_tokens: job.context_window_tokens || null,
-    batch_token_limit: job.batch_token_limit || null,
-    total_items: job.total_items,
-    total_batches: job.total_batches,
-    completed_batches: Math.min(job.current_batch || 0, job.total_batches || 0),
-    failed_attempts: job.failed_attempts || 0,
-    last_error: job.last_error || "",
-    review_issues: job.review_issues || [],
-    previews: Array.isArray(job.previews) ? job.previews.slice(-4) : [],
-    created_at: job.created_at,
-    updated_at: job.updated_at,
-  };
-}
-
-async function runTranslatorCron(app, ctx, lane = 0) {
-  if (!app.kv) return { running: false, client_count: 0 };
-  const id = await app.kv.get(TRANSLATOR_ACTIVE_KEY);
-  if (!id) return { running: false, client_count: 0 };
-  const job = await getTranslatorJob(app.kv, id);
-  if (!job || job.status !== "running") {
-    await clearTranslatorActive(app.kv, id);
-    return { running: false, client_count: 0 };
-  }
-  const clientCount = translatorJobClientIds(job).length;
-  const batches = translatorBatches(job, job.phase);
-  const batch = batches[job.current_batch];
-  if (!batch) {
-    job.status = "completed";
-    job.updated_at = hkNowIso();
-    await saveTranslatorJob(app.kv, job);
-    await clearTranslatorActive(app.kv, id);
-    return { running: false, client_count: clientCount };
-  }
-  const revision = job.updated_at;
-  try {
-    const payload = job.phase === "review"
-      ? reviewRequestBody(job.model, batch, Object.fromEntries(batch.map((item) => [item.id, job.result[item.key] || item.source])), job.reasoning_effort || "low")
-      : translationRequestBody(job.model, batch, job.extra_prompt, job.reasoning_effort || "low");
-    const responsePayload = await runTranslatorModelRequest(app, job, payload, ctx, lane);
-    const current = await getTranslatorJob(app.kv, id);
-    if (!current || current.status !== "running" || current.updated_at !== revision || current.current_batch !== job.current_batch) {
-      return { running: Boolean(current?.status === "running"), client_count: clientCount };
-    }
-    if (job.phase === "review") {
-      const reviews = parseReviewResponse(responsePayload, batch);
-      applyTranslatorReview(current, batch, reviews);
-      current.review_issues = [...(current.review_issues || []), ...reviewIssues(reviews)];
-    } else {
-      const translations = parseTranslationResponse(responsePayload, batch);
-      applyTranslatorTranslations(current, batch, translations);
-      appendTranslatorPreview(current, batch, translations);
-    }
-    current.current_batch += 1;
-    current.last_error = "";
-    current.updated_at = hkNowIso();
-    if (current.current_batch >= batches.length) {
-      current.status = "completed";
-      if (current.phase === "review") current.review_issues = current.review_issues || [];
-    }
-    ensureTranslatorStateSize(current);
-    await saveTranslatorJob(app.kv, current);
-    if (current.status === "completed") await clearTranslatorActive(app.kv, id);
-    return { running: current.status === "running", client_count: clientCount };
-  } catch (error) {
-    await markTranslatorFailure(app.kv, id, revision, error);
-    return { running: true, client_count: clientCount };
-  }
-}
-
-async function runTranslatorModelRequest(app, job, payload, ctx, lane) {
-  let lastError = null;
-  for (const clientId of translatorClientAttemptIds(job, lane)) {
-    const client = await loadTranslatorClient(app, clientId);
-    if (!client) {
-      lastError = httpError(404, "A translation client key no longer exists.");
-      continue;
-    }
-    try {
-      return await runTranslatorClientRequest(app, job, payload, ctx, lane, client);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError || httpError(502, "No translation client key is available.");
-}
-
-async function runTranslatorClientRequest(app, job, payload, ctx, lane, client) {
-  const bodyText = JSON.stringify(payload);
-  const request = new Request("https://translator.internal" + CHAT_PATH, {
-    method: "POST",
-    headers: { authorization: `Bearer ${client.key}`, "content-type": "application/json" },
-    body: bodyText,
-  });
-  const runtime = await loadRuntimeConfig(app);
-  const started = Date.now();
-  let proxyResponse;
-  let logged = false;
-  try {
-    proxyResponse = await proxyRequest({ client, model: job.model, pathname: CHAT_PATH, request, bodyText, runtime, search: "" });
-    const traceId = `translator-${job.id}-${job.current_batch}-${lane}-${client.id}`;
-    const headers = proxyResponseHeaders(proxyResponse.response, proxyResponse, client, traceId);
-    const response = await buildLoggedProxyResponse({
-      app,
-      bodyText,
-      client,
-      ctx,
-      headers,
-      model: job.model,
-      responseModel: job.model,
-      pathname: CHAT_PATH,
-      requestPayload: payload,
-      proxyResponse,
-      started,
-      traceId,
-      upstreamResp: proxyResponse.response,
-    });
-    logged = true;
-    const textBody = await response.text();
-    const parsed = safeJson(textBody);
-    if (!response.ok) throw httpError(response.status, parsed?.error?.message || textBody.slice(0, 300) || "Translator model request failed.");
-    if (!parsed) throw new Error("Translator model returned invalid JSON.");
-    const content = parsed?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" && !Array.isArray(content)) throw new Error("Translator model returned no message content.");
-    return parsed;
-  } catch (error) {
-    if (!logged) {
-      recordRequestLog(app, makeRequestLogEntry({
-        client,
-        upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
-        model: job.model,
-        path: CHAT_PATH,
-        status: error.statusCode || 502,
-        started,
-        promptTokens: Math.max(1, Math.round(bodyText.length / 4)),
-        completionTokens: 0,
-        extra: { translator_job: job.id, translator_phase: job.phase, translator_lane: lane },
-      }), ctx);
-    }
-    throw error;
-  }
-}
-
-function uniqueTranslatorClientIds(values) {
-  return [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || "").trim()).filter(Boolean))];
-}
-
-function translatorJobClientIds(job) {
-  const ids = uniqueTranslatorClientIds(job?.client_ids);
-  return ids.length ? ids : uniqueTranslatorClientIds([job?.client_id]);
-}
-
-function translatorClientAttemptIds(job, lane) {
-  const ids = translatorJobClientIds(job);
-  if (ids.length <= 1) return ids;
-  const primary = ids[Math.min(Math.max(0, lane), 1)] || ids[0];
-  return uniqueTranslatorClientIds([primary, ...ids.slice(2), ...ids.slice(0, 2)]);
-}
-
-function translatorBatchPlan(runtime, clients, model, extraPrompt, reasoningEffort) {
-  const upstreams = [...new Map(clients.flatMap((client) => proxyCandidates(runtime, client, model, CHAT_PATH)).map((upstream) => [upstream.name, upstream])).values()];
-  const contextTokens = Math.min(...upstreams.map((upstream) => translatorContextTokens(upstream, model)));
-  const injectedTokens = Math.max(0, ...clients.map((client) => translatorInjectedTokens(runtime.settings, client, model)));
-  const reasoningTokens = ({ none: 0, low: 256, medium: 768, high: 1536 })[reasoningEffort] || 256;
-  const translationFixed = estimateTranslationTokens(TRANSLATOR_SYSTEM_PROMPT + "\n" + extraPrompt) + injectedTokens + reasoningTokens + 96;
-  const reviewFixed = estimateTranslationTokens(TRANSLATOR_REVIEW_PROMPT) + injectedTokens + reasoningTokens + 96;
-  const translationTokens = Math.floor((contextTokens - translationFixed) / 1.9);
-  const reviewTokens = Math.floor((contextTokens - reviewFixed) / 2.8);
-  if (translationTokens < 128 || reviewTokens < 128) throw httpError(400, "Configured model context is too small after prompts, context, and reasoning reserve.");
-  return { context_tokens: contextTokens, translation_tokens: translationTokens, review_tokens: reviewTokens };
-}
-
-function translatorContextTokens(upstream, model) {
-  const value = String(upstream?.model_contexts?.[model] || "1m").trim().toLowerCase();
-  const match = value.match(/^(\d+(?:\.\d+)?)\s*([km])?$/);
-  if (!match) return 1000000;
-  const multiplier = match[2] === "k" ? 1000 : match[2] === "m" ? 1000000 : 1;
-  return Math.max(256, Math.floor(Number(match[1]) * multiplier));
-}
-
-function translatorInjectedTokens(settings, client, model) {
-  const clientIds = clientIdentitySet(client);
-  let chars = 0;
-  if (promptAppliesToClient(settings?.system_prompt_clients, client, clientIds)) chars += String(settings?.system_prompt || "").length;
-  if (normalizeStringArray(settings?.subagent_prompt_clients).length && promptAppliesToClient(settings?.subagent_prompt_clients, client, clientIds)) chars += SUBAGENT_PROMPT.length;
-  if (promptAppliesToClient(settings?.global_context_clients, client, clientIds)) chars += String(settings?.global_context || "").length;
-  if (settings?.context_on_demand === true && (settings?.context_items || []).some((item) => item?.enabled !== false && contextScopeMatches(item.clients, client, clientIds) && contextModelMatches(item.models, model))) {
-    chars += Number(settings.context_max_chars || 4000);
-  }
-  return Math.max(0, Math.ceil(chars / 2));
-}
-
-function translatorBatches(job, phase) {
-  const review = phase === "review";
-  const tokenLimit = Number(review ? job.review_batch_token_limit : job.batch_token_limit);
-  return buildBatches(
-    buildTranslationItems(job.source),
-    undefined,
-    review ? Math.floor(TRANSLATOR_BATCH_MAX_CHARS / 2) : undefined,
-    Number.isFinite(tokenLimit) && tokenLimit > 0 ? tokenLimit : Infinity,
-    review ? 2 : 1,
-  );
-}
-
-async function loadTranslatorClient(app, id) {
-  const stored = await app.kv.get(clientIdKey(id), "json").catch(() => null);
-  if (stored?.key) return normalizeClient(stored);
-  const envClient = app.envClients.find((client) => String(client.id || client.name || client.key) === String(id));
-  return envClient?.key ? normalizeClient(envClient) : null;
-}
-
-function applyTranslatorTranslations(job, batch, translations) {
-  for (const item of batch) setTranslatorResult(job.result, item.key, translations[item.id] || item.source);
-}
-
-function appendTranslatorPreview(job, batch, translations) {
-  const sample = batch[0];
-  if (!sample) return;
-  const previews = Array.isArray(job.previews) ? job.previews : [];
-  previews.push({
-    batch: Number(job.current_batch || 0) + 1,
-    source: translatorPreviewText(sample.source),
-    translation: translatorPreviewText(translations[sample.id] || sample.source),
-  });
-  job.previews = previews.slice(-4);
-}
-
-function translatorPreviewText(value) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  return text.length > 700 ? text.slice(0, 697) + "..." : text;
-}
-
-function applyTranslatorReview(job, batch, reviews) {
-  for (const item of batch) {
-    const review = reviews[item.id];
-    if (review?.ok !== true && typeof review?.translation === "string") setTranslatorResult(job.result, item.key, review.translation);
-  }
-}
-
-function setTranslatorResult(result, key, value) {
-  Object.defineProperty(result, key, { value, enumerable: true, configurable: true, writable: true });
-}
-
-function ensureTranslatorStateSize(job) {
-  const bytes = new TextEncoder().encode(JSON.stringify(job)).byteLength;
-  if (bytes > TRANSLATOR_MAX_STATE_BYTES) throw httpError(413, "Translation task state would exceed 20 MiB.");
-}
-
-function translatorJobKey(id) {
-  return TRANSLATOR_JOB_PREFIX + id;
-}
-
-async function getTranslatorJob(kv, id) {
-  return kv.get(translatorJobKey(id), "json");
-}
-
-async function getActiveTranslatorJob(kv) {
-  const id = await kv.get(TRANSLATOR_ACTIVE_KEY);
-  if (!id) return null;
-  const job = await getTranslatorJob(kv, id);
-  if (job?.status === "running") return job;
-  await kv.delete(TRANSLATOR_ACTIVE_KEY);
-  return null;
-}
-
-async function saveTranslatorJob(kv, job) {
-  await kv.put(translatorJobKey(job.id), JSON.stringify(job), { expirationTtl: TRANSLATOR_JOB_TTL_SECONDS });
-}
-
-async function clearTranslatorActive(kv, id) {
-  if ((await kv.get(TRANSLATOR_ACTIVE_KEY)) === id) await kv.delete(TRANSLATOR_ACTIVE_KEY);
-}
-
-async function markTranslatorFailure(kv, id, revision, error) {
-  const job = await getTranslatorJob(kv, id);
-  if (!job || job.status !== "running" || job.updated_at !== revision) return;
-  job.failed_attempts = Number(job.failed_attempts || 0) + 1;
-  job.last_error = String(error?.message || error || "Translation batch failed").slice(0, 1000);
-  job.updated_at = hkNowIso();
-  try { await saveTranslatorJob(kv, job); } catch {}
 }
 
 async function adminConfigResponse(url, app) {
@@ -1978,6 +1507,8 @@ function normalizeGatewaySettings(settings = {}, app) {
     context_item_limit: Math.max(1, Math.min(5, parsePositiveInt(settings.context_item_limit, 3))),
     context_max_chars: Math.max(500, Math.min(20000, parsePositiveInt(settings.context_max_chars, 4000))),
     context_items: normalizeContextItems(settings.context_items),
+    time_zone_offset_minutes: normalizeTimeZoneOffset(settings.time_zone_offset_minutes),
+    time_zone_label: String(settings.time_zone_label || "UTC+8 北京/香港/上海/乌鲁木齐").trim(),
     upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
   };
 }
@@ -4943,6 +4474,12 @@ function parsePositiveInt(value, fallback) {
     return fallback;
   }
   return Math.floor(parsed);
+}
+
+function normalizeTimeZoneOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 480;
+  return Math.max(-720, Math.min(840, Math.floor(parsed)));
 }
 
 function parsePriority(value, fallback) {

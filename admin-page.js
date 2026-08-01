@@ -107,45 +107,11 @@ function renderAdminStyle() {
     .url-card button { margin-right: 6px; }
     .panel { padding: 20px; min-width: 0; scroll-margin-top: 88px; }
     .panel h2 { margin: 0 0 14px; font-size: 19px; line-height: 1.2; }
-    .translator-hero { border-top: 3px solid var(--accent-2); }
-    .translator-hero-copy { max-width: 720px; }
-    .translator-hero-copy p { margin: 0; color: var(--muted); }
-    .translator-hero-status {
-      display: grid; gap: 6px; min-width: 190px; padding: 12px 14px;
-      border: 1px solid var(--line); border-radius: 8px; background: var(--bg-raised);
-    }
-    .translator-hero-status strong { font-size: 13px; }
-    .translator-hero-status span { color: var(--muted); font-size: 12px; }
-    .translator-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
-    .translator-section-head h2 { margin: 0; }
-    .translator-status-grid { display: grid; gap: 8px; }
-    .translator-status-row {
-      display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center;
-      min-height: 42px; padding: 10px 0; border-bottom: 1px solid var(--line);
-    }
-    .translator-status-row:last-child { border-bottom: 0; }
-    .translator-status-label { color: var(--muted); font-size: 12px; }
-    .translator-status-value { max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; text-align: right; }
-    .translator-status-value[data-state="running"] { color: var(--accent-2); }
-    .translator-status-value[data-state="completed"] { color: #166534; }
-    .translator-status-value[data-state="stopped"] { color: #9a3412; }
-    .translator-error { margin: 14px 0 0; color: #9a3412; font-size: 12px; overflow-wrap: anywhere; }
-    .translator-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-    .translator-actions button { flex: 0 0 auto; }
-    .translator-client-pool { min-height: 118px; padding: 5px; }
-    .translator-pool-note { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
-    .translator-client-scope { min-height: 70px; }
-    .translator-model-control { display: flex; gap: 8px; }
-    .translator-model-control input { min-width: 0; flex: 1; }
-    .translator-preview { margin-top: 14px; display: grid; gap: 8px; max-height: 280px; overflow: auto; }
-    .translator-preview-row { border-top: 1px solid var(--line); padding-top: 8px; }
-    .translator-preview-row:first-child { border-top: 0; padding-top: 0; }
-    .translator-preview-label { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-    .translator-preview-value { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 12px; line-height: 1.45; }
-    .translator-route-results { margin-top: 10px; display: grid; gap: 6px; font-size: 12px; }
-    .translator-route-result { border-top: 1px solid var(--line); padding-top: 6px; overflow-wrap: anywhere; }
-    .translator-route-result.ok { color: #166534; }
-    .translator-route-result.fail { color: #9a3412; }
+    .kv-meter { display: grid; gap: 7px; margin-top: 8px; }
+    .kv-row { display: grid; grid-template-columns: 72px 1fr auto; align-items: center; gap: 8px; font-size: 12px; }
+    .kv-bar { height: 7px; overflow: hidden; border-radius: 999px; background: #e5edf7; }
+    .kv-bar span { display: block; height: 100%; width: 0; background: var(--accent); }
+    .client-summary { margin-left: auto; font-size: 12px; color: var(--muted); }
 
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
     .toolbar h2 { margin: 0; }
@@ -371,9 +337,6 @@ function renderAdminStyle() {
       .url-card { max-width: none; }
       #view-overview #stats-panel { grid-column: 1 / span 7; }
       #view-overview #client-panel { grid-column: 8 / -1; }
-      #view-translator .translator-hero { grid-column: 1 / -1; }
-      #view-translator .translator-form-panel { grid-column: 1 / span 8; }
-      #view-translator .translator-progress-panel { grid-column: 9 / -1; }
       #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
       #view-upstreams #upstream-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
@@ -471,8 +434,6 @@ function renderAdminStyle() {
       .topbar-badge { display: none; }
       .wrap { width: min(100%, calc(100vw - 12px)); }
       .hero { align-items: stretch; flex-direction: column; gap: 16px; }
-      .translator-hero-status { min-width: 0; }
-      .translator-actions button { flex: 1 1 140px; }
       .gateway-urls { flex: none; }
       .url-card { max-width: 100%; }
       .toolbar { align-items: stretch; }
@@ -520,7 +481,6 @@ function renderAdminMarkup(origin, version) {
       <a class="nav-item" href="#upstreams" data-view-target="upstreams"><span class="nav-icon">⇄</span><span>上游配置</span></a>
       <a class="nav-item" href="#logs" data-view-target="logs"><span class="nav-icon">≡</span><span>调用日志</span></a>
       <a class="nav-item" href="#settings" data-view-target="settings"><span class="nav-icon">⚙</span><span>高级设置</span></a>
-      <a class="nav-item" href="#translator" data-view-target="translator"><span class="nav-icon">文</span><span>JSON 翻译</span></a>
     </nav>
     <div class="sidebar-footer">
       <span class="sidebar-version">${version}</span>
@@ -554,6 +514,10 @@ function renderAdminMarkup(origin, version) {
           <div class="note mono upstream-live-summary-list" id="live-upstream-list">暂无活跃请求</div>
         </div>
       </div>
+      <div class="url-card">
+        <div class="url-card-head">KV Usage <span class="note" id="kv-usage-updated">checking...</span></div>
+        <div class="kv-meter" id="kv-usage-meter"><div class="note">Loading KV quota...</div></div>
+      </div>
     </div>
   </div>
 
@@ -583,8 +547,9 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
-  <div class="panel" id="client-panel">
-    <h2>\u5ba2\u6237\u7aef Keys</h2>
+  <details class="panel settings-panel" id="client-panel" open>
+    <summary><h2>\u5ba2\u6237\u7aef Keys</h2><span class="client-summary" id="client-summary">0 keys</span></summary>
+    <div class="settings-body">
     <div id="client-list"></div>
     <div class="client-create">
       <input id="client-name" placeholder="\u540d\u79f0 (\u53ef\u9009)">
@@ -598,7 +563,8 @@ function renderAdminMarkup(origin, version) {
         <button class="small secondary" id="copy-client-json">\u590d\u5236 JSON</button>
       </div>
     </div>
-  </div>
+    </div>
+  </details>
 
   </section>
   <section class="page-view" id="view-upstreams" data-view="upstreams" hidden>
@@ -626,47 +592,6 @@ function renderAdminMarkup(origin, version) {
     <input type="file" id="import-upstreams-file" accept=".json,application/json" hidden>
   </div>
 
-  </section>
-  <section class="page-view" id="view-translator" data-view="translator" hidden>
-  <div class="hero translator-hero">
-    <div class="hero-copy translator-hero-copy">
-      <span class="hero-kicker">Background queue</span>
-      <h1>JSON Translation</h1>
-      <p>使用现有网关模型处理日文、英文或混合文本，并将任务进度保留在 Cloudflare KV 中。</p>
-    </div>
-    <div class="translator-hero-status">
-      <strong>Cloudflare Cron</strong>
-      <span>双 Key 时分片之间至少间隔 30 秒</span>
-    </div>
-  </div>
-  <div class="panel translator-form-panel" id="translator-panel">
-    <div class="translator-section-head"><h2>任务配置</h2><span class="note">顶层 JSON 对象，所有 value 必须是字符串</span></div>
-    <div class="row">
-      <div class="field span-4"><label>客户端 Key 池</label><div class="prompt-client-scope translator-client-scope" id="translator-client-scope"></div><span class="translator-pool-note">最多 3 个；前 2 个轮换，第三个仅用于回退。</span></div>
-      <div class="field span-4"><label>模型</label><div class="translator-model-control"><input id="translator-model" class="mono" readonly placeholder="选择一个模型"><button type="button" class="secondary small" id="translator-model-picker">选择</button></div></div>
-      <div class="field span-4"><label>JSON 文件</label><input id="translator-file" type="file" accept=".json,application/json"></div>
-    </div>
-    <div class="field"><label>额外翻译要求</label><textarea id="translator-extra-prompt" rows="3" maxlength="4000" placeholder="可选；仅附加到本任务的翻译提示词"></textarea></div>
-    <div class="translator-actions">
-      <button class="good" id="translator-start">创建翻译任务</button>
-    </div>
-  </div>
-  <aside class="panel translator-progress-panel">
-    <div class="translator-section-head"><h2>任务状态</h2><span class="note">自动轮询</span></div>
-    <div class="translator-status-grid">
-      <div class="translator-status-row"><span class="translator-status-label">当前状态</span><strong class="translator-status-value" id="translator-status" data-state="idle">尚未创建任务</strong></div>
-      <div class="translator-status-row"><span class="translator-status-label">进度</span><strong class="translator-status-value" id="translator-progress">-</strong></div>
-      <div class="translator-status-row"><span class="translator-status-label">模型</span><strong class="translator-status-value mono" id="translator-current-model">-</strong></div>
-      <div class="translator-status-row"><span class="translator-status-label">Key 池</span><strong class="translator-status-value" id="translator-current-clients">-</strong></div>
-    </div>
-    <p class="translator-error" id="translator-error" hidden></p>
-    <div class="translator-preview" id="translator-preview"><div class="note">等待首个分片完成</div></div>
-    <div class="translator-actions">
-      <button class="secondary" id="translator-stop" disabled>停止</button>
-      <button class="secondary" id="translator-download" disabled>下载当前结果</button>
-      <button class="secondary" id="translator-review" disabled>启动复核</button>
-    </div>
-  </aside>
   </section>
   <section class="page-view" id="view-activity" data-view="logs" hidden>
   <div class="panel" id="log-panel">
@@ -713,6 +638,8 @@ function renderAdminMarkup(origin, version) {
       </div>
       <div class="row">
         <div class="field span-3"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
+        <div class="field span-5"><label>\u663e\u793a\u65f6\u533a</label><select id="time-zone-preset"><option value="480" data-label="UTC+8 北京/香港/上海/乌鲁木齐">UTC+8 北京 / 香港 / 上海 / 乌鲁木齐</option><option value="0" data-label="UTC">UTC</option><option value="custom" data-label="Custom">Custom</option></select></div>
+        <div class="field span-4"><label>UTC \u504f\u79fb (\u5206\u949f)</label><input id="time-zone-offset" type="number" min="-720" max="840" placeholder="480"></div>
       </div>
       <div class="row">
         <div class="field span-12"><label>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u63d0\u793a\u8bcd\u4e0e\u4e0a\u4e0b\u6587</button><span class="note" id="system-prompt-status"></span></div>
@@ -872,7 +799,7 @@ function renderAdminMarkup(origin, version) {
 function renderAdminScript(version) {
   return `<script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all" };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all", kvUsage: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
   let liveRefreshRunning = false;
@@ -899,6 +826,13 @@ function renderAdminScript(version) {
 
   function splitList(value) { return text(value).split(/[,\\n]/).map((s) => s.trim()).filter(Boolean); }
   function esc(value) { return text(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  function displayOffsetMinutes() { return Number(state.config?.settings?.time_zone_offset_minutes ?? byId("time-zone-offset")?.value ?? 480) || 480; }
+  function formatGatewayTime(value) {
+    const ms = typeof value === "number" ? value : Date.parse(text(value).replace(/^(\d{4}-\d{2}-\d{2}):(\d{2})$/, "$1T$2:00:00+08:00"));
+    if (!Number.isFinite(ms)) return text(value || "-");
+    const d = new Date(ms + displayOffsetMinutes() * 60000);
+    return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0") + " " + String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0") + ":" + String(d.getUTCSeconds()).padStart(2, "0");
+  }
   function presetById(id) { return state.presets.find((p) => p.id === id) || state.presets.find((p) => p.id === "custom") || state.presets[0]; }
   function baseUrlLocked(presetId) { const p = presetById(presetId); return !!p && p.requires_base_url === false; }
   function presetNeedsAccountId(presetId) { const p = presetById(presetId); return !!p && p.requires_account_id; }
@@ -1372,6 +1306,8 @@ function renderAdminScript(version) {
         context_item_limit: Number(byId("context-item-limit").value || 3),
         context_max_chars: Number(byId("context-max-chars").value || 4000),
         context_items: collectContextItems(),
+        time_zone_offset_minutes: Number(byId("time-zone-offset").value || 480),
+        time_zone_label: selectedTimeZoneLabel(),
       },
       routing: {
         load_balance: byId("routing-load-balance").checked,
@@ -1401,6 +1337,8 @@ function renderAdminScript(version) {
     byId("context-on-demand").checked = s.context_on_demand === true;
     byId("context-item-limit").value = s.context_item_limit || 3;
     byId("context-max-chars").value = s.context_max_chars || 4000;
+    byId("time-zone-offset").value = s.time_zone_offset_minutes ?? 480;
+    setTimeZonePreset(s.time_zone_offset_minutes ?? 480, s.time_zone_label || "");
     renderContextItems(s.context_items || []);
     renderPromptClientScopes();
     renderPromptContextStatus();
@@ -1410,6 +1348,19 @@ function renderAdminScript(version) {
     byId("routing-fast").checked = r.fast_routing === true;
     byId("routing-hedge-max").value = r.hedge_max || 2;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
+  }
+
+  function selectedTimeZoneLabel() {
+    const select = byId("time-zone-preset");
+    const option = select?.selectedOptions?.[0];
+    return option?.dataset?.label || "UTC" + (Number(byId("time-zone-offset").value || 480) / 60);
+  }
+
+  function setTimeZonePreset(offset, label) {
+    const select = byId("time-zone-preset");
+    const value = String(offset);
+    const option = [...select.options].find((item) => item.value === value);
+    select.value = option ? value : "custom";
   }
 
   async function loadConfig() {
@@ -1910,6 +1861,45 @@ function renderAdminScript(version) {
     }
   }
 
+  async function loadKvUsage() {
+    const meter = byId("kv-usage-meter");
+    const stamp = byId("kv-usage-updated");
+    if (!meter) return;
+    const resp = await fetch(API_BASE + "/kv-usage");
+    const payload = await parseApiResponse(resp);
+    state.kvUsage = payload;
+    if (!resp.ok || payload.available === false) {
+      meter.innerHTML = '<div class="note">' + esc(payload?.message || "KV usage unavailable") + '</div>';
+      if (stamp) stamp.textContent = "unavailable";
+      return;
+    }
+    const quotas = payload.quotas || {};
+    const ops = payload.operations || {};
+    const rows = [
+      ["Reads", ops.reads || 0, quotas.reads || 0],
+      ["Writes", ops.writes || 0, quotas.writes || 0],
+      ["Deletes", ops.deletes || 0, quotas.deletes || 0],
+      ["Lists", ops.lists || 0, quotas.lists || 0],
+      ["Storage", payload.storage?.bytes || 0, quotas.storage_bytes || 0, true],
+    ];
+    meter.innerHTML = rows.map(function(row) {
+      const used = Number(row[1] || 0);
+      const quota = Number(row[2] || 0);
+      const pct = quota > 0 ? Math.min(100, used / quota * 100) : 0;
+      const value = row[3] ? formatBytes(used) + " / " + formatBytes(quota) : used.toLocaleString() + " / " + quota.toLocaleString();
+      return '<div class="kv-row"><span>' + esc(row[0]) + '</span><div class="kv-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div><span class="mono">' + esc(value) + '</span></div>';
+    }).join("");
+    if (stamp) stamp.textContent = formatGatewayTime(payload.updated_at);
+  }
+
+  function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GiB";
+    if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MiB";
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + " KiB";
+    return bytes + " B";
+  }
+
   function activeClientText(clients) {
     const labels = Object.entries(clients || {}).filter(function(entry) { return Number(entry[1] || 0) > 0; }).map(function(entry) {
       return entry[0] + (Number(entry[1]) > 1 ? " x" + entry[1] : "");
@@ -2036,7 +2026,7 @@ function renderAdminScript(version) {
   }
 
   function statTipHtml(bucket, kind) {
-    const hour = esc(bucket.hour || "");
+    const hour = esc(formatGatewayTime(bucket.hour));
     if (kind === "tokens") {
       return '<div class="stat-tip-title">时间段 ' + hour + '</div>' +
         '<div class="stat-tip-row"><span>总 Input</span><span class="stat-tip-value">' + esc((bucket.prompt_tokens || 0).toLocaleString()) + '</span></div>' +
@@ -2439,7 +2429,8 @@ function renderAdminScript(version) {
         seg = '<div style="height:' + okH + 'px;background:var(--accent);border-radius:2px 2px 0 0"></div>';
         if (failH > 0) seg += '<div style="height:' + failH + 'px;background:#8d2f23"></div>';
       }
-      return '<div class="bar-hit" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="requests" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.success + ' success / ' + b.fail + ' fail') + '"><div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end">' + seg + '</div></div>';
+      const hourLabel = formatGatewayTime(b.hour).slice(11, 16);
+      return '<div class="bar-hit" data-h="' + esc(hourLabel) + '" data-stat-kind="requests" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc(formatGatewayTime(b.hour) + ': ' + b.success + ' success / ' + b.fail + ' fail') + '"><div class="bar' + (b.fail > 0 && b.success === 0 ? ' fail' : '') + '" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end">' + seg + '</div></div>';
     }).join("");
 
     // Chart 2: Tokens (indigo=input, violet=output)
@@ -2455,11 +2446,12 @@ function renderAdminScript(version) {
         seg = '<div style="height:' + inH + 'px;background:#6366f1;border-radius:2px 2px 0 0"></div>';
         if (outH > 0) seg += '<div style="height:' + outH + 'px;background:#a78bfa"></div>';
       }
-      return '<div class="bar-hit" data-h="' + esc((b.hour || "").slice(-2)) + '" data-stat-kind="tokens" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc((b.hour || "") + ': ' + b.prompt_tokens + ' input / ' + b.completion_tokens + ' output tokens') + '"><div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end">' + seg + '</div></div>';
+      const hourLabel = formatGatewayTime(b.hour).slice(11, 16);
+      return '<div class="bar-hit" data-h="' + esc(hourLabel) + '" data-stat-kind="tokens" data-stat-index="' + i + '" tabindex="0" aria-label="' + esc(formatGatewayTime(b.hour) + ': ' + b.prompt_tokens + ' input / ' + b.completion_tokens + ' output tokens') + '"><div class="bar" style="height:' + barH + 'px;flex-direction:column;display:flex;justify-content:flex-end">' + seg + '</div></div>';
     }).join("");
     bindStatBars(skeleton);
 
-    byId("stat-updated").textContent = (payload.now || "").slice(11, 19) + " HKT";
+    byId("stat-updated").textContent = formatGatewayTime(payload.now);
     if (!silent) showToast("统计已加载");
   }
 
@@ -2474,6 +2466,7 @@ function renderAdminScript(version) {
             '<span class="log-badge ' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</span>' +
             '<strong>' + esc(l.upstream) + '</strong>' +
             '<span class="note">' + esc(l.model) + '</span>' +
+            '<span class="note">' + esc(formatGatewayTime(l.ts).slice(11, 19)) + '</span>' +
             '<span class="note">' + esc(l.latency_ms + "ms") + '</span>' +
             '<span class="note">' + esc((l.prompt_tokens || 0) + (l.completion_tokens || 0) + " tk") + '</span>' +
             '</div>'
@@ -2526,7 +2519,7 @@ function renderAdminScript(version) {
       '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tools</th><th>Tokens</th>' +
     '</tr></thead><tbody>' +
     visibleLogs.map((l) => '<tr>' +
-      '<td>' + esc((l.ts || "").slice(11, 19)) + '</td>' +
+      '<td>' + esc(formatGatewayTime(l.ts)) + '</td>' +
       '<td>' + esc(l.client || "") + '</td>' +
       '<td>' + esc(l.upstream || "") + '</td>' +
       '<td class="mono">' + esc(l.model || "") + '</td>' +
@@ -2556,206 +2549,13 @@ function renderAdminScript(version) {
     if (!resp.ok) throw new Error(payload?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u5931\u8d25");
     state.clients = payload;
     renderClients();
-    renderTranslatorClients();
     renderPromptClientScopes();
-  }
-
-  function renderTranslatorClients() {
-    const host = byId("translator-client-scope");
-    if (!host) return;
-    const previous = new Set([...host.querySelectorAll('input:checked')].map((input) => input.value));
-    host.innerHTML = (state.clients || []).map(function(client) {
-      return clientScopeChip(client.id, client.name || client.id, previous.has(client.id));
-    }).join("") || '<div class="note">暂无客户端 Key</div>';
-    host.querySelectorAll('input').forEach(function(input) {
-      input.addEventListener("change", function() {
-        const checked = [...host.querySelectorAll('input:checked')];
-        if (checked.length > 3) input.checked = false;
-        syncClientScopeChips(host);
-      });
-    });
-    syncClientScopeChips(host);
-  }
-
-  function selectedTranslatorClients() {
-    return [...byId("translator-client-scope").querySelectorAll('input:checked')].map((input) => input.value);
-  }
-
-  function ensureTranslatorReasoningControl() {
-    const modelField = byId("translator-model").closest(".field");
-    const label = modelField?.querySelector("label");
-    if (label) label.textContent = "网关模型别名";
-    byId("translator-model").placeholder = "先选择客户端 Key";
-    if (!modelField?.querySelector(".translator-model-alias-note")) modelField?.insertAdjacentHTML("beforeend", '<span class="translator-pool-note translator-model-alias-note">只显示所选 Key 共同可调用的网关别名。</span>');
-    const stop = byId("translator-stop");
-    if (stop) {
-      stop.textContent = "强制中断";
-      stop.title = "停止任务并丢弃当前分片结果";
-    }
-    if (byId("translator-reasoning-effort")) return;
-    byId("translator-extra-prompt").insertAdjacentHTML("afterend", '<div class="field"><label>推理强度</label><select id="translator-reasoning-effort"><option value="none">关闭</option><option value="low" selected>低</option><option value="medium">中</option><option value="high">高</option></select></div>');
-    byId("translator-start").insertAdjacentHTML("afterend", '<button type="button" class="secondary" id="translator-route-probe">测试所选路由</button>');
-    byId("translator-error").insertAdjacentHTML("afterend", '<div class="translator-route-results" id="translator-route-results"></div>');
-  }
-
-  async function openTranslatorAliasPicker() {
-    const clientIds = selectedTranslatorClients();
-    if (!clientIds.length) throw new Error("Select a client key first.");
-    const response = await fetch(API_BASE + "/translator/models", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client_ids: clientIds }),
-    });
-    const payload = await parseApiResponse(response);
-    if (!response.ok) throw new Error(payload?.error?.message || "Unable to load gateway model aliases.");
-    const models = Array.isArray(payload.models) ? payload.models : [];
-    if (!models.length) throw new Error("The selected keys have no shared gateway model alias.");
-    showModelPicker("Translator model alias", models, byId("translator-model"));
-    state.modelPicker.single = true;
-    renderModelPicker();
-  }
-
-  function openTranslatorModelPicker() {
-    const models = (collectConfig().upstreams || []).flatMap((upstream) => upstream.enabled === false ? [] : (upstream.models || []))
-      .filter((model) => model && model !== "*");
-    if (!models.length) throw new Error("没有可选择的上游模型");
-    showModelPicker("翻译模型", models, byId("translator-model"));
-    state.modelPicker.single = true;
-  }
-
-  let translatorPollTimer = null;
-  function renderTranslatorJob(job) {
-    state.translatorJob = job;
-    const status = byId("translator-status");
-    if (!job) return;
-    const stateLabel = { running: "进行中", completed: "已完成", stopped: "已停止" }[job.status] || job.status;
-    const phaseLabel = job.phase === "review" ? "复核" : "翻译";
-    const progress = job.total_batches ? job.completed_batches + "/" + job.total_batches + " 分片" : "无可翻译分片";
-    status.textContent = stateLabel + " · " + phaseLabel;
-    status.dataset.state = job.status || "idle";
-    byId("translator-progress").textContent = progress;
-    byId("translator-current-model").textContent = job.model || "-";
-    byId("translator-current-clients").textContent = (job.client_names || []).join(", ") || "-";
-    const previews = Array.isArray(job.previews) ? job.previews : [];
-    byId("translator-preview").innerHTML = previews.length
-      ? previews.map((preview) => '<div class="translator-preview-row"><span class="translator-preview-label">分片 ' + esc(preview.batch) + ' 原文</span><p class="translator-preview-value">' + esc(preview.source) + '</p><span class="translator-preview-label" style="margin-top:7px">译文</span><p class="translator-preview-value">' + esc(preview.translation) + '</p></div>').join("")
-      : '<div class="note">等待首个分片完成</div>';
-    const error = byId("translator-error");
-    error.hidden = !job.last_error;
-    error.textContent = job.last_error || "";
-    byId("translator-stop").disabled = job.status !== "running";
-    byId("translator-download").disabled = !job.id;
-    byId("translator-review").disabled = job.status !== "completed" || job.phase === "review";
-    if (job.status === "running") {
-      clearTimeout(translatorPollTimer);
-      translatorPollTimer = setTimeout(() => pollTranslatorJob(job.id), 5000);
-    }
-  }
-
-  async function pollTranslatorJob(id) {
-    const resp = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id));
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "读取翻译任务失败");
-    renderTranslatorJob(payload.job);
-  }
-
-  async function loadActiveTranslatorJob() {
-    const resp = await fetch(API_BASE + "/translator/jobs/active");
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "Unable to load active translation task.");
-    if (payload.job) renderTranslatorJob(payload.job);
-    return payload.job;
-  }
-
-  function renderTranslatorProbe(results) {
-    const host = byId("translator-route-results");
-    if (!host) return;
-    host.innerHTML = (results || []).map(function(result) {
-      const status = result.ok ? "ok" : "fail";
-      const detail = result.ok ? "Gateway OK -> " + result.upstream + " | " + result.status + " | " + result.latency_ms + "ms" : "Gateway failed -> " + result.upstream + " | " + result.status + " | " + result.error;
-      return '<div class="translator-route-result ' + status + '"><strong>' + esc(result.client_name || result.client_id) + '</strong> · ' + esc(result.model) + '<br>' + esc(detail) + '</div>';
-    }).join("") || '<div class="note">暂无路由测试结果</div>';
-  }
-
-  async function probeTranslatorRoute() {
-    const clientIds = selectedTranslatorClients();
-    const model = byId("translator-model").value.trim();
-    const reasoningEffort = byId("translator-reasoning-effort")?.value || "low";
-    if (!clientIds.length || !model) throw new Error("请先选择客户端 Key 和模型");
-    const resp = await fetch(API_BASE + "/translator/probe", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client_ids: clientIds, model, reasoning_effort: reasoningEffort }),
-    });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "路由测试失败");
-    renderTranslatorProbe(payload.results);
-  }
-
-  async function createTranslatorJob() {
-    const file = byId("translator-file").files[0];
-    const clientIds = selectedTranslatorClients();
-    const model = byId("translator-model").value.trim();
-    const extraPrompt = byId("translator-extra-prompt").value.trim();
-    const reasoningEffort = byId("translator-reasoning-effort")?.value || "low";
-    if (!file) throw new Error("请选择 JSON 文件");
-    if (!clientIds.length || !model) throw new Error("至少选择一个客户端 Key 并填写模型");
-    const source = JSON.parse(await file.text());
-    const resp = await fetch(API_BASE + "/translator/jobs", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ source, client_ids: clientIds, model, extra_prompt: extraPrompt, reasoning_effort: reasoningEffort }),
-    });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) {
-      if (resp.status === 409) {
-        const active = await loadActiveTranslatorJob();
-        if (active) throw new Error("An existing translation task has been loaded.");
-      }
-      throw new Error(payload?.error?.message || "创建翻译任务失败");
-    }
-    renderTranslatorJob(payload.job);
-    showToast("翻译任务已创建");
-  }
-
-  async function stopTranslatorJob() {
-    const id = state.translatorJob?.id;
-    if (!id) return;
-    if (!confirm("强制中断当前翻译任务？当前分片即使随后返回也会被丢弃。")) return;
-    const resp = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/stop", { method: "POST" });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "停止任务失败");
-    renderTranslatorJob(payload.job);
-  }
-
-  async function downloadTranslatorJob() {
-    const id = state.translatorJob?.id;
-    if (!id) return;
-    const response = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/download");
-    if (!response.ok) {
-      const payload = await parseApiResponse(response);
-      throw new Error(payload?.error?.message || "下载翻译结果失败");
-    }
-    const blob = await response.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = objectUrl;
-    a.download = "translation-" + id + ".json";
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-  }
-
-  async function reviewTranslatorJob() {
-    const id = state.translatorJob?.id;
-    if (!id) return;
-    const resp = await fetch(API_BASE + "/translator/jobs/" + encodeURIComponent(id) + "/review", { method: "POST" });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "启动复核失败");
-    renderTranslatorJob(payload.job);
   }
 
   function renderClients() {
     const host = byId("client-list");
+    const summary = byId("client-summary");
+    if (summary) summary.textContent = state.clients.length + " keys";
     if (!state.clients.length) {
       host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u5ba2\u6237\u7aef Key\uff0c\u70b9\u201c\u751f\u6210 Key\u201d\u521b\u5efa\u3002</div>';
       return;
@@ -2823,7 +2623,6 @@ function renderAdminScript(version) {
   /* ---- Boot ---- */
   async function boot() {
     try {
-      ensureTranslatorReasoningControl();
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
       byId("speed-picker-modal").addEventListener("click", (e) => { if (e.target === byId("speed-picker-modal")) closeSpeedPicker(); });
@@ -2901,12 +2700,6 @@ function renderAdminScript(version) {
       byId("picker-select-visible").addEventListener("click", () => selectVisibleModels(true));
       byId("picker-clear-visible").addEventListener("click", () => selectVisibleModels(false));
       byId("model-picker-search").addEventListener("input", renderModelPicker);
-      byId("translator-model-picker").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "打开中...", openTranslatorAliasPicker).catch(showError)
-      );
-      byId("translator-route-probe").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "测试中...", probeTranslatorRoute).catch(showError)
-      );
       byId("vendor-account-id").addEventListener("input", applyVendorPreset);
       byId("vendor-fetch-models").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5bfc\u5165\u4e2d...", async () => {
@@ -2929,6 +2722,10 @@ function renderAdminScript(version) {
       byId("save-settings").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u4fdd\u5b58\u4e2d...", saveSettings).catch(showError)
       );
+      byId("time-zone-preset").addEventListener("change", () => {
+        const value = byId("time-zone-preset").value;
+        if (value !== "custom") byId("time-zone-offset").value = value;
+      });
       byId("export-upstreams").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5bfc\u51fa\u4e2d...", async () => {
           const payload = await exportUpstreams();
@@ -2997,30 +2794,18 @@ function renderAdminScript(version) {
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", loadLogs).catch(showError)
       );
 
-      // ponytail: parallel boot — config + clients fetch together
-      byId("translator-start").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "创建中...", createTranslatorJob).catch(showError)
-      );
-      byId("translator-stop").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "停止中...", stopTranslatorJob).catch(showError)
-      );
-      byId("translator-download").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "下载中...", downloadTranslatorJob).catch(showError)
-      );
-      byId("translator-review").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "启动中...", reviewTranslatorJob).catch(showError)
-      );
-
+      // ponytail: parallel boot — config + clients + quota fetch together
       var hero = document.querySelector('.hero');
       var bootSpan = document.createElement('span');
       bootSpan.className = 'note';
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
-      await Promise.all([loadConfig(), loadClients(), loadActiveTranslatorJob()]);
+      await Promise.all([loadConfig(), loadClients(), loadKvUsage()]);
       if (bootSpan.parentNode) bootSpan.remove();
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
-      setInterval(refreshLivePanels, 2000);
+      setInterval(refreshLivePanels, 5000);
+      setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000);
       // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
       setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000);
 
@@ -3048,4 +2833,3 @@ function renderAdminScript(version) {
   boot();
 </script>`;
 }
-
