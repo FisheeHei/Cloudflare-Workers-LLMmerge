@@ -567,6 +567,14 @@ assert.equal(unconfiguredHealth.status, 200);
 assert.equal((await unconfiguredHealth.json()).admin_configured, false);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/favicon.ico"), unconfiguredEnv)).status, 200);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", { method: "OPTIONS" }), unconfiguredEnv)).status, 204);
+const workersUsageNoTokenResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/workers-usage"), {
+  ...env,
+  ANALYTICS_ACCOUNT_ID: "",
+  ANALYTICS_API_TOKEN: "",
+});
+const workersUsageNoToken = await workersUsageNoTokenResp.json();
+assert.equal(workersUsageNoToken.available, false);
+assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), true);
 
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
@@ -578,8 +586,10 @@ assert.equal(adminPage.includes("translator-progress-panel"), false);
 assert.equal(adminPage.includes("translator-status-grid"), false);
 assert.equal(adminPage.includes("translator-client-pool"), false);
 assert.equal(adminPage.includes("kv-usage-meter"), true);
-assert.equal(adminPage.includes("worker-request-panel"), true);
+assert.equal(adminPage.includes("worker-request-panel"), false);
 assert.equal(adminPage.includes("worker-usage-meter"), true);
+assert.equal(adminPage.includes("Deletes"), false);
+assert.equal(adminPage.includes("Lists"), false);
 assert.equal(adminPage.includes("time-zone-preset"), true);
 assert.equal(adminPage.includes("client-summary"), true);
 assert.equal(adminPage.includes("document.visibilityState"), true);

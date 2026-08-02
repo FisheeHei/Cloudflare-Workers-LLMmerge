@@ -66,11 +66,8 @@ const WORKERS_FREE_DAILY_REQUEST_QUOTA = 100000;
 const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
-  deletes: 1000,
-  lists: 1000,
-  storage_bytes: 1024 * 1024 * 1024,
 };
-const VERSION = "v26-08-02-workers-quota-dashboard";
+const VERSION = "v26-08-02-usage-dashboard";
 
 export default {
   async fetch(request, env, ctx) {
@@ -766,9 +763,6 @@ async function fetchKvUsage(app) {
           dimensions { actionType }
           sum { requests }
         }
-        kvStorageAdaptiveGroups(limit: 1000, filter: {date_geq: $start, date_lt: $end}) {
-          max { keyCount byteCount }
-        }
       }
     }
   }`;
@@ -791,15 +785,11 @@ async function fetchKvUsage(app) {
   if (!resp.ok || !body || body.errors) throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${resp.status}`);
   const account = body?.data?.viewer?.accounts?.[0];
   if (!account) throw new Error("Cloudflare account analytics is not available.");
-  const operations = { reads: 0, writes: 0, deletes: 0, lists: 0 };
+  const operations = { reads: 0, writes: 0 };
   for (const row of account.kvOperationsAdaptiveGroups || []) {
     const bucket = kvActionBucket(row?.dimensions?.actionType);
     if (bucket) operations[bucket] += Number(row?.sum?.requests || 0);
   }
-  const storage = (account.kvStorageAdaptiveGroups || []).reduce((acc, row) => ({
-    keys: Math.max(acc.keys, Number(row?.max?.keyCount || 0)),
-    bytes: Math.max(acc.bytes, Number(row?.max?.byteCount || 0)),
-  }), { keys: 0, bytes: 0 });
   return {
     ok: true,
     available: true,
@@ -807,13 +797,12 @@ async function fetchKvUsage(app) {
     period: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), timezone: "UTC" },
     quotas: KV_FREE_QUOTAS,
     operations,
-    storage,
   };
 }
 
 async function workersUsageResponse(app) {
   if (!app.analyticsAccountId || !app.analyticsApiToken) {
-    return withCorsResponse(json({ ok: true, available: false, message: "ANALYTICS_ACCOUNT_ID / ANALYTICS_API_TOKEN is not configured." }, 200));
+    return withCorsResponse(json({ ok: true, available: false, message: "Workers Requests requires ANALYTICS_API_TOKEN with Account Analytics > Read." }, 200));
   }
   const now = Date.now();
   if (_workersUsageCache && now - _workersUsageCache.ts < WORKERS_USAGE_CACHE_MS) {
@@ -824,7 +813,7 @@ async function workersUsageResponse(app) {
     _workersUsageCache = { ts: now, payload };
     return withCorsResponse(json(payload, 200));
   } catch (error) {
-    return withCorsResponse(json({ ok: true, available: false, message: String(error?.message || error || "Unable to read Workers usage.") }, 200));
+    return withCorsResponse(json({ ok: true, available: false, message: "Workers Requests requires Account Analytics > Read: " + String(error?.message || error || "unavailable") }, 200));
   }
 }
 
@@ -883,8 +872,6 @@ function kvActionBucket(actionType) {
   const action = String(actionType || "").toLowerCase();
   if (action.includes("read")) return "reads";
   if (action.includes("write")) return "writes";
-  if (action.includes("delete")) return "deletes";
-  if (action.includes("list")) return "lists";
   return "";
 }
 
