@@ -45,7 +45,7 @@ const STDTIME_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 // Keep the SSE connection visibly active through an additional proxy layer.
-const SSE_KEEPALIVE_MS = 5000;
+const SSE_KEEPALIVE_MS = 3000;
 const SSE_FINISH_GRACE_MS = 1000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
@@ -68,7 +68,7 @@ const KV_FREE_QUOTAS = {
   lists: 1000,
   storage_bytes: 1024 * 1024 * 1024,
 };
-const VERSION = "v26-08-01-kv-meter-timezone-cleanup";
+const VERSION = "v26-08-02-speed-stability";
 
 export default {
   async fetch(request, env, ctx) {
@@ -282,6 +282,8 @@ var _activeUpstreams = {};
 var _activeUpstreamClients = {};
 var _activeUpstreamEpoch = 0;
 var _activeUpstreamControllers = new Set();
+// ponytail: isolate-local soft reservations; DO only if cross-edge fairness ever matters
+var _upstreamReservations = {};
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -3483,7 +3485,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     : Math.min(attempts.length, runtime.routing.hedge_max || 2);
   if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
     const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
-    return hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, client, model, pathname, request, runtime, search });
+    const used = new Set(hedgedAttempts.map(upstreamKey));
+    const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
+    return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search });
   }
   let lastError = null;
 
@@ -3582,7 +3586,7 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
     const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
     const init = {
       method: request.method,
-      headers: buildUpstreamHeaders(request, upstream),
+      headers: buildUpstreamHeaders(request, upstream, sanitizedBody),
       body: sanitizedBody,
     };
     init.signal = controller.signal;
@@ -3785,7 +3789,7 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname, request, runtime, search }) {
+async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
@@ -3795,6 +3799,7 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
     ? index * fastDelayMs
     : index * hedgeDelayMs;
   let done = false;
+  const releaseReservation = reserveUpstreams(attempts);
 
   function launchLater(index) {
     const upstream = attempts[index];
@@ -3823,38 +3828,83 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
     });
   }
 
-  const pending = attempts.map((_, index) => ({ index, promise: launchLater(index) }));
-  let lastResult = null;
-  while (pending.length) {
-    const raced = await Promise.race(pending.map((entry) => entry.promise.then((result) => ({ entry, result }))));
-    pending.splice(pending.indexOf(raced.entry), 1);
-    const result = raced.result;
-    if (result.cancelled) continue;
-    lastResult = result;
-    if (result.error?.statusCode === 499) {
-      done = true;
-      stopHedgeLosers(pending, controllers, -1);
-      throw result.error;
+  try {
+    const pending = attempts.map((_, index) => ({ index, promise: launchLater(index) }));
+    let lastResult = null;
+    while (pending.length) {
+      const raced = await Promise.race(pending.map((entry) => entry.promise.then((result) => ({ entry, result }))));
+      pending.splice(pending.indexOf(raced.entry), 1);
+      const result = raced.result;
+      if (result.cancelled) continue;
+      lastResult = result;
+      if (result.error?.statusCode === 499) {
+        done = true;
+        stopHedgeLosers(pending, controllers, -1);
+        throw result.error;
+      }
+      if (result.limited) continue;
+      const retryable = Boolean(result.streamError) || (result.response && await isRetryableUpstreamResponse(result.response));
+      if (result.response && !retryable) {
+        done = true;
+        stopHedgeLosers(pending, controllers, result.index);
+        clearUpstreamFailure(result.upstream, model);
+        rememberUpstreamLatency(result.upstream, model, result.latency);
+        rememberSuccessfulUpstream(result.upstream, model);
+        return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
+      }
+      if (result.response) {
+        await discardUpstreamResponse(result, "retryable hedged response");
+      }
+      markUpstreamFailure(runtime, result.upstream, model);
     }
-    if (result.limited) continue;
-    const retryable = Boolean(result.streamError) || (result.response && await isRetryableUpstreamResponse(result.response));
-    if (result.response && !retryable) {
-      done = true;
-      stopHedgeLosers(pending, controllers, result.index);
-      clearUpstreamFailure(result.upstream, model);
-      rememberUpstreamLatency(result.upstream, model, result.latency);
-      rememberSuccessfulUpstream(result.upstream, model);
-      return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
-    }
-    if (result.response) {
-      await discardUpstreamResponse(result, "retryable hedged response");
-    }
-    markUpstreamFailure(runtime, result.upstream, model);
-  }
 
-  const err = httpError(502, lastResult?.error?.message || "All hedged upstreams failed.");
-  err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
-  throw err;
+    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest });
+    if (fallbackResult) return { ...fallbackResult, attempts: attempts.length + 1 };
+
+    const err = httpError(502, lastResult?.error?.message || "All hedged upstreams failed.");
+    err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
+    throw err;
+  } finally {
+    done = true;
+    releaseReservation();
+  }
+}
+
+async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest }) {
+  const upstream = attempts?.[0];
+  if (!upstream || runtime.routing.failover === false) return null;
+  let result = null;
+  const releaseReservation = reserveUpstreams([upstream]);
+  try {
+    if (!takeNimMinuteSlot(upstream)) return null;
+    result = await fetchProxyUpstream({
+      bodyText, client, pathname, request, runtime, search, upstream,
+      firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+    });
+    if (result.response.ok && streamRequest) {
+      const primed = await primeSseResponse(result.response);
+      result.response = primed.response;
+      result.streamError = primed.error;
+      result.latency = Date.now() - result.startedAt;
+    }
+    const retryable = Boolean(result.streamError) || await isRetryableUpstreamResponse(result.response);
+    if (retryable) {
+      await discardUpstreamResponse(result, "retryable hedged fallback response");
+      markUpstreamFailure(runtime, upstream, model);
+      return null;
+    }
+    clearUpstreamFailure(upstream, model);
+    rememberUpstreamLatency(upstream, model, result.latency);
+    rememberSuccessfulUpstream(upstream, model);
+    return { response: result.response, upstream };
+  } catch (error) {
+    await discardUpstreamResponse(result, "hedged fallback failed");
+    if (error.statusCode === 499) throw error;
+    markUpstreamFailure(runtime, upstream, model);
+    return null;
+  } finally {
+    releaseReservation();
+  }
 }
 
 function sleep(ms) {
@@ -3984,12 +4034,12 @@ function orderUpstreams(runtime, candidates, model) {
   });
 
   const orderedHealthy = runtime.routing.load_balance === false
-    ? activeSort(latencySort(prioritySort(healthy), model))
-    : activeSort(latencySort(weightedShuffle(healthy), model));
+    ? pressureSort(latencySort(prioritySort(healthy), model), model)
+    : pressureSort(latencySort(weightedShuffle(healthy), model), model);
 
   const orderedCooling = runtime.routing.load_balance === false
-    ? activeSort(latencySort(prioritySort(cooling), model))
-    : activeSort(latencySort(weightedShuffle(cooling), model));
+    ? pressureSort(latencySort(prioritySort(cooling), model), model)
+    : pressureSort(latencySort(weightedShuffle(cooling), model), model);
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
   if (runtime.routing.failover === false) {
@@ -4008,12 +4058,39 @@ function latencySort(items, model) {
   return [...items].sort((a, b) => upstreamLatencyScore(a, model) - upstreamLatencyScore(b, model));
 }
 
-function activeSort(items) {
-  return [...items].sort((a, b) => activeUpstreamCount(a) - activeUpstreamCount(b));
+function pressureSort(items) {
+  return [...items].sort((a, b) => upstreamPressure(a) - upstreamPressure(b));
 }
 
 function activeUpstreamCount(upstream) {
-  return Number(_activeUpstreams[String(upstream?.name || "").trim()] || 0) || 0;
+  return Number(_activeUpstreams[upstreamKey(upstream)] || 0) || 0;
+}
+
+function upstreamReservationCount(upstream) {
+  return Number(_upstreamReservations[upstreamKey(upstream)] || 0) || 0;
+}
+
+function upstreamPressure(upstream) {
+  return activeUpstreamCount(upstream) + upstreamReservationCount(upstream);
+}
+
+function reserveUpstreams(upstreams) {
+  const names = (upstreams || []).map(upstreamKey).filter(Boolean);
+  names.forEach((name) => { _upstreamReservations[name] = Number(_upstreamReservations[name] || 0) + 1; });
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    names.forEach((name) => {
+      const next = Math.max(0, Number(_upstreamReservations[name] || 0) - 1);
+      if (next) _upstreamReservations[name] = next;
+      else delete _upstreamReservations[name];
+    });
+  };
+}
+
+function upstreamKey(upstream) {
+  return String(upstream?.name || "").trim();
 }
 
 function upstreamLatencyScore(upstream, model) {
@@ -4091,6 +4168,7 @@ function clearActiveUpstreamState() {
   _activeUpstreamControllers.clear();
   _activeUpstreams = {};
   _activeUpstreamClients = {};
+  _upstreamReservations = {};
   return released;
 }
 
@@ -4140,14 +4218,14 @@ function buildUpstreamUrl(baseUrl, pathname, search) {
   return `${base}${path}${search}`;
 }
 
-function buildUpstreamHeaders(request, upstream) {
+function buildUpstreamHeaders(request, upstream, bodyText = "") {
   const headers = new Headers();
   headers.set("authorization", `Bearer ${upstream.api_key}`);
   headers.set(
     "content-type",
     request?.headers.get("content-type") || "application/json; charset=utf-8",
   );
-  headers.set("accept", request?.headers.get("accept") || "application/json");
+  headers.set("accept", requestBodyStreams(bodyText) ? "text/event-stream" : "application/json");
   headers.set("user-agent", "cf-llm-gateway/0.3");
 
   if (upstream.headers && typeof upstream.headers === "object") {

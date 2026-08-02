@@ -32,6 +32,8 @@ const hedgeHits = [];
 const hedgeStreamHits = [];
 const hedgeStreamAborts = [];
 const hedgeCancels = [];
+const hedgeReserveHits = [];
+const hedgeFallbackHits = [];
 const bodyIsolationHits = [];
 const softFastHits = [];
 const attemptBudgetHits = [];
@@ -50,6 +52,7 @@ const missingFunctionHits = [];
 const disabledHits = [];
 const longStreamHits = [];
 const usageHits = [];
+const acceptHits = [];
 const wrappedHits = [];
 const toolStreamHits = [];
 const appErrorHits = [];
@@ -116,6 +119,7 @@ globalThis.fetch = async (url, init) => {
     });
   }
   if (String(url).includes("usage-stream.example")) {
+    acceptHits.push(init.headers.get("accept"));
     usageHits.push("stream");
     return new Response([
       'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n',
@@ -124,6 +128,7 @@ globalThis.fetch = async (url, init) => {
     ].join(""), { status: 200, headers: { "content-type": "text/event-stream", "content-length": "999", "content-encoding": "gzip" } });
   }
   if (String(url).includes("usage.example")) {
+    acceptHits.push(init.headers.get("accept"));
     usageHits.push("json");
     return new Response(JSON.stringify({
       id: "usage",
@@ -341,6 +346,33 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("hedge-fast.example")) {
     hedgeHits.push("fast");
     return new Response(JSON.stringify({ id: "hedge-fast", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-reserve-")) {
+    const name = String(url).match(/hedge-reserve-[a-d]/)?.[0] || "hedge-reserve";
+    hedgeReserveHits.push(name);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    return new Response(JSON.stringify({ id: name, choices: [{ message: { content: name } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-fallback-a.example") || String(url).includes("hedge-fallback-b.example")) {
+    hedgeFallbackHits.push(String(url).includes("-a.") ? "a" : "b");
+    return new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("hedge-fallback-c.example")) {
+    hedgeFallbackHits.push("c");
+    return new Response(JSON.stringify({ id: "hedge-fallback-c", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("hedge-fallback-d.example")) {
+    hedgeFallbackHits.push("d");
+    return new Response(JSON.stringify({ id: "hedge-fallback-d", choices: [{ message: { content: "unused" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -1715,6 +1747,70 @@ const hedgeResp2 = await worker.default.fetch(new Request("https://gw.test/v1/ch
 assert.equal(hedgeResp2.headers.get("x-llm-gateway-upstream"), "hedge-fast");
 assert.equal(hedgeHits[hedgeSecondStart], "slow");
 
+const hedgeReserveStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 500, upstream_cooldown_ttl: 60 },
+  upstreams: ["a", "b", "c", "d"].map((id, index) => ({
+    name: "hedge-reserve-" + id,
+    base_url: "https://hedge-reserve-" + id + ".example/v1",
+    api_key_encrypted: id,
+    models: ["hedge-reserve-model"],
+    paths: ["/v1/chat/completions"],
+    priority: index + 1,
+    weight: 1,
+    enabled: true,
+  })),
+})]]);
+const hedgeReserveEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = hedgeReserveStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { hedgeReserveStore.set(key, value); },
+    async delete(key) { hedgeReserveStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify(["one", "two"].map((id) => ({ name: "reserve-" + id, key: "sk-reserve-" + id, models: ["*"], upstreams: ["hedge-reserve-a", "hedge-reserve-b", "hedge-reserve-c", "hedge-reserve-d"] }))),
+};
+const hedgeReserveStart = hedgeReserveHits.length;
+const reserveResponses = await Promise.all(["one", "two"].map((id) => worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-reserve-" + id, "content-type": "application/json" },
+  body: JSON.stringify({ model: "hedge-reserve-model", messages: [] }),
+}), hedgeReserveEnv)));
+assert.deepEqual(reserveResponses.map((response) => response.headers.get("x-llm-gateway-upstream")).sort(), ["hedge-reserve-a", "hedge-reserve-c"]);
+assert.deepEqual(hedgeReserveHits.slice(hedgeReserveStart).sort(), ["hedge-reserve-a", "hedge-reserve-c"]);
+
+const hedgeFallbackStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 500, upstream_cooldown_ttl: 60 },
+  upstreams: ["a", "b", "c", "d"].map((id, index) => ({
+    name: "hedge-fallback-" + id,
+    base_url: "https://hedge-fallback-" + id + ".example/v1",
+    api_key_encrypted: id,
+    models: ["hedge-fallback-model"],
+    paths: ["/v1/chat/completions"],
+    priority: index + 1,
+    weight: 1,
+    enabled: true,
+  })),
+})]]);
+const hedgeFallbackEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = hedgeFallbackStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { hedgeFallbackStore.set(key, value); },
+    async delete(key) { hedgeFallbackStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "fallback-client", key: "sk-hedge-fallback", models: ["*"], upstreams: ["hedge-fallback-a", "hedge-fallback-b", "hedge-fallback-c", "hedge-fallback-d"] }]),
+};
+const hedgeFallbackStart = hedgeFallbackHits.length;
+const hedgeFallbackResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-hedge-fallback", "content-type": "application/json" },
+  body: JSON.stringify({ model: "hedge-fallback-model", messages: [] }),
+}), hedgeFallbackEnv);
+assert.equal(hedgeFallbackResp.headers.get("x-llm-gateway-upstream"), "hedge-fallback-c");
+assert.deepEqual(hedgeFallbackHits.slice(hedgeFallbackStart), ["a", "b", "c"]);
+
 const hedgeStreamStore = new Map();
 hedgeStreamStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
@@ -2514,6 +2610,8 @@ assert.equal(usageStreamResp.headers.get("content-encoding"), null);
 assert.equal(usageStreamResp.headers.get("cache-control"), "no-cache, no-transform");
 assert.equal(usageStreamResp.headers.get("x-accel-buffering"), "no");
 await usageStreamResp.text();
+assert.equal(acceptHits.includes("application/json"), true);
+assert.equal(acceptHits.includes("text/event-stream"), true);
 const usageLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), usageEnv);
 const usageLogs = await usageLogsResp.json();
 assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-json" && entry.prompt_tokens === 11 && entry.completion_tokens === 22), true);
