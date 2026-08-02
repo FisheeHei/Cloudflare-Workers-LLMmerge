@@ -97,7 +97,7 @@ function renderAdminStyle() {
       background: #eff6ff; padding: 4px 10px; border-radius: 6px;
       font-size: 14px; word-break: break-all;
     }
-    .gateway-urls { flex: 0 1 560px; margin-top: 0; }
+    .gateway-urls { flex: 0 1 620px; margin-top: 0; display: grid; gap: 12px; }
     .url-card {
       border: 1px solid var(--line);
       background: var(--bg-raised); border-radius: 8px; padding: 14px; overflow: hidden;
@@ -108,6 +108,7 @@ function renderAdminStyle() {
     .panel { padding: 20px; min-width: 0; scroll-margin-top: 88px; }
     .panel h2 { margin: 0 0 14px; font-size: 19px; line-height: 1.2; }
     .kv-meter { display: grid; gap: 7px; margin-top: 8px; }
+    .kv-panel .toolbar { margin-bottom: 8px; }
     .kv-row { display: grid; grid-template-columns: 72px 1fr auto; align-items: center; gap: 8px; font-size: 12px; }
     .kv-bar { height: 7px; overflow: hidden; border-radius: 999px; background: #e5edf7; }
     .kv-bar span { display: block; height: 100%; width: 0; background: var(--accent); }
@@ -335,8 +336,9 @@ function renderAdminStyle() {
       .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
       .url-card { max-width: none; }
-      #view-overview #stats-panel { grid-column: 1 / span 7; }
-      #view-overview #client-panel { grid-column: 8 / -1; }
+      #view-overview #stats-panel { grid-column: 1 / span 7; grid-row: 2 / span 2; }
+      #view-overview #kv-panel { grid-column: 8 / -1; grid-row: 2; }
+      #view-overview #client-panel { grid-column: 8 / -1; grid-row: 3; }
       #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
       #view-upstreams #upstream-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
@@ -514,11 +516,15 @@ function renderAdminMarkup(origin, version) {
           <div class="note mono upstream-live-summary-list" id="live-upstream-list">暂无活跃请求</div>
         </div>
       </div>
-      <div class="url-card">
-        <div class="url-card-head">KV Usage <span class="note" id="kv-usage-updated">checking...</span></div>
-        <div class="kv-meter" id="kv-usage-meter"><div class="note">Loading KV quota...</div></div>
-      </div>
     </div>
+  </div>
+
+  <div class="panel kv-panel" id="kv-panel">
+    <div class="toolbar">
+      <h2>KV Usage</h2>
+      <span class="note" id="kv-usage-updated">checking...</span>
+    </div>
+    <div class="kv-meter" id="kv-usage-meter"><div class="note">Loading KV quota...</div></div>
   </div>
 
   <div class="panel" id="stats-panel">

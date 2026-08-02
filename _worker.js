@@ -68,7 +68,7 @@ const KV_FREE_QUOTAS = {
   lists: 1000,
   storage_bytes: 1024 * 1024 * 1024,
 };
-const VERSION = "v26-08-02-speed-stability";
+const VERSION = "v26-08-02-overview-cards";
 
 export default {
   async fetch(request, env, ctx) {
