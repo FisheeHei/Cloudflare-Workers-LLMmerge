@@ -119,6 +119,7 @@ globalThis.fetch = async (url, init) => {
           viewer: {
             accounts: [{
               workersInvocationsAdaptive: [{ sum: { requests: 1234, errors: 7, subrequests: 18 } }],
+              pagesFunctionsInvocationsAdaptiveGroups: [{ sum: { requests: 4321, errors: 3, subrequests: 9 } }],
             }],
           },
         },
@@ -1551,8 +1552,10 @@ const workersUsageResp = await worker.default.fetch(new Request("https://gw.test
 const workersUsage = await workersUsageResp.json();
 assert.equal(workersUsageResp.status, 200);
 assert.equal(workersUsage.available, true);
-assert.equal(workersUsage.usage.requests, 1234);
-assert.equal(workersUsage.usage.errors, 7);
+assert.equal(workersUsage.usage.requests, 5555);
+assert.equal(workersUsage.usage.errors, 10);
+assert.equal(workersUsage.sources.workers.requests, 1234);
+assert.equal(workersUsage.sources.pages.requests, 4321);
 assert.equal(workersUsage.quota, 100000);
 
 const cachedConfigHits = speedHits.length;

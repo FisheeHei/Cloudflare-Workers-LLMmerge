@@ -1923,7 +1923,9 @@ function renderAdminScript(version) {
     const pct = quota > 0 ? Math.min(100, used / quota * 100) : 0;
     meter.innerHTML =
       '<div class="kv-row"><span>Daily requests</span><div class="kv-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div><span class="mono">' + used.toLocaleString() + ' / ' + quota.toLocaleString() + '</span></div>' +
-      '<div class="note">Resets at 00:00 UTC · Errors ' + Number(payload.usage?.errors || 0).toLocaleString() + '</div>';
+      '<div class="note">Resets at 00:00 UTC · Errors ' + Number(payload.usage?.errors || 0).toLocaleString() +
+      ' · Workers ' + Number(payload.sources?.workers?.requests || 0).toLocaleString() +
+      ' · Pages ' + Number(payload.sources?.pages?.requests || 0).toLocaleString() + '</div>';
     if (stamp) stamp.textContent = formatGatewayTime(payload.updated_at);
   }
 

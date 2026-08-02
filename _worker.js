@@ -67,7 +67,7 @@ const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
 };
-const VERSION = "v26-08-02-usage-dashboard";
+const VERSION = "v26-08-02-workers-pages-usage";
 
 export default {
   async fetch(request, env, ctx) {
@@ -830,6 +830,12 @@ async function fetchWorkersUsage(app) {
         ) {
           sum { requests errors subrequests }
         }
+        pagesFunctionsInvocationsAdaptiveGroups(
+          limit: 10000
+          filter: {datetime_geq: "${start.toISOString()}", datetime_leq: "${now.toISOString()}"}
+        ) {
+          sum { requests errors subrequests }
+        }
       }
     }
   }`;
@@ -848,11 +854,13 @@ async function fetchWorkersUsage(app) {
   if (!resp.ok || !body || body.errors) throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${resp.status}`);
   const account = body?.data?.viewer?.accounts?.[0];
   if (!account) throw new Error("Cloudflare account analytics is not available.");
-  const usage = (account.workersInvocationsAdaptive || []).reduce((acc, row) => ({
-    requests: acc.requests + Number(row?.sum?.requests || 0),
-    errors: acc.errors + Number(row?.sum?.errors || 0),
-    subrequests: acc.subrequests + Number(row?.sum?.subrequests || 0),
-  }), { requests: 0, errors: 0, subrequests: 0 });
+  const workers = sumInvocationRows(account.workersInvocationsAdaptive);
+  const pages = sumInvocationRows(account.pagesFunctionsInvocationsAdaptiveGroups);
+  const usage = {
+    requests: workers.requests + pages.requests,
+    errors: workers.errors + pages.errors,
+    subrequests: workers.subrequests + pages.subrequests,
+  };
   return {
     ok: true,
     available: true,
@@ -865,7 +873,16 @@ async function fetchWorkersUsage(app) {
     },
     quota: WORKERS_FREE_DAILY_REQUEST_QUOTA,
     usage,
+    sources: { workers, pages },
   };
+}
+
+function sumInvocationRows(rows) {
+  return (rows || []).reduce((acc, row) => ({
+    requests: acc.requests + Number(row?.sum?.requests || 0),
+    errors: acc.errors + Number(row?.sum?.errors || 0),
+    subrequests: acc.subrequests + Number(row?.sum?.subrequests || 0),
+  }), { requests: 0, errors: 0, subrequests: 0 });
 }
 
 function kvActionBucket(actionType) {
