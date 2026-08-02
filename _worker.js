@@ -61,6 +61,8 @@ const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
 const KV_USAGE_CACHE_MS = 60000;
+const WORKERS_USAGE_CACHE_MS = 60000;
+const WORKERS_FREE_DAILY_REQUEST_QUOTA = 100000;
 const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
@@ -68,7 +70,7 @@ const KV_FREE_QUOTAS = {
   lists: 1000,
   storage_bytes: 1024 * 1024 * 1024,
 };
-const VERSION = "v26-08-02-overview-cards";
+const VERSION = "v26-08-02-workers-quota-dashboard";
 
 export default {
   async fetch(request, env, ctx) {
@@ -299,6 +301,7 @@ var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
 var _analyticsQueryCache = {};
 var _kvUsageCache = null;
+var _workersUsageCache = null;
 // ponytail: model state is isolate-local; Goal turns must not create KV reads/writes.
 var _sessionModelLocks = {};
 var _sessionCurrentModels = {};
@@ -808,6 +811,74 @@ async function fetchKvUsage(app) {
   };
 }
 
+async function workersUsageResponse(app) {
+  if (!app.analyticsAccountId || !app.analyticsApiToken) {
+    return withCorsResponse(json({ ok: true, available: false, message: "ANALYTICS_ACCOUNT_ID / ANALYTICS_API_TOKEN is not configured." }, 200));
+  }
+  const now = Date.now();
+  if (_workersUsageCache && now - _workersUsageCache.ts < WORKERS_USAGE_CACHE_MS) {
+    return withCorsResponse(json(_workersUsageCache.payload, 200));
+  }
+  try {
+    const payload = await fetchWorkersUsage(app);
+    _workersUsageCache = { ts: now, payload };
+    return withCorsResponse(json(payload, 200));
+  } catch (error) {
+    return withCorsResponse(json({ ok: true, available: false, message: String(error?.message || error || "Unable to read Workers usage.") }, 200));
+  }
+}
+
+async function fetchWorkersUsage(app) {
+  const now = new Date();
+  const start = new Date(now);
+  start.setUTCHours(0, 0, 0, 0);
+  const query = `query WorkersUsage($accountTag: string!) {
+    viewer {
+      accounts(filter: {accountTag: $accountTag}) {
+        workersInvocationsAdaptive(
+          limit: 10000
+          filter: {datetime_geq: "${start.toISOString()}", datetime_leq: "${now.toISOString()}"}
+        ) {
+          sum { requests errors subrequests }
+        }
+      }
+    }
+  }`;
+  const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${app.analyticsApiToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      query,
+      variables: { accountTag: app.analyticsAccountId },
+    }),
+  });
+  const body = await resp.json().catch(() => null);
+  if (!resp.ok || !body || body.errors) throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${resp.status}`);
+  const account = body?.data?.viewer?.accounts?.[0];
+  if (!account) throw new Error("Cloudflare account analytics is not available.");
+  const usage = (account.workersInvocationsAdaptive || []).reduce((acc, row) => ({
+    requests: acc.requests + Number(row?.sum?.requests || 0),
+    errors: acc.errors + Number(row?.sum?.errors || 0),
+    subrequests: acc.subrequests + Number(row?.sum?.subrequests || 0),
+  }), { requests: 0, errors: 0, subrequests: 0 });
+  return {
+    ok: true,
+    available: true,
+    updated_at: hkNowIso(),
+    period: {
+      start: start.toISOString(),
+      end: now.toISOString(),
+      timezone: "UTC",
+      reset: "00:00 UTC",
+    },
+    quota: WORKERS_FREE_DAILY_REQUEST_QUOTA,
+    usage,
+  };
+}
+
 function kvActionBucket(actionType) {
   const action = String(actionType || "").toLowerCase();
   if (action.includes("read")) return "reads";
@@ -1295,6 +1366,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   if (apiPath === "/api/kv-usage" && request.method === "GET") {
     return kvUsageResponse(app);
+  }
+
+  if (apiPath === "/api/workers-usage" && request.method === "GET") {
+    return workersUsageResponse(app);
   }
 
   if (apiPath === "/api/runtime" && request.method === "GET") {

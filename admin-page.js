@@ -336,9 +336,10 @@ function renderAdminStyle() {
       .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
       .url-card { max-width: none; }
-      #view-overview #stats-panel { grid-column: 1 / span 7; grid-row: 2 / span 2; }
+      #view-overview #stats-panel { grid-column: 1 / span 7; grid-row: 2 / span 3; }
       #view-overview #kv-panel { grid-column: 8 / -1; grid-row: 2; }
-      #view-overview #client-panel { grid-column: 8 / -1; grid-row: 3; }
+      #view-overview #worker-request-panel { grid-column: 8 / -1; grid-row: 3; }
+      #view-overview #client-panel { grid-column: 8 / -1; grid-row: 4; }
       #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
       #view-upstreams #upstream-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
@@ -525,6 +526,14 @@ function renderAdminMarkup(origin, version) {
       <span class="note" id="kv-usage-updated">checking...</span>
     </div>
     <div class="kv-meter" id="kv-usage-meter"><div class="note">Loading KV quota...</div></div>
+  </div>
+
+  <div class="panel worker-request-panel" id="worker-request-panel">
+    <div class="toolbar">
+      <h2>Workers Requests</h2>
+      <span class="note" id="worker-usage-updated">checking...</span>
+    </div>
+    <div class="kv-meter" id="worker-usage-meter"><div class="note">Loading daily request quota...</div></div>
   </div>
 
   <div class="panel" id="stats-panel">
@@ -1898,6 +1907,26 @@ function renderAdminScript(version) {
     if (stamp) stamp.textContent = formatGatewayTime(payload.updated_at);
   }
 
+  async function loadWorkersUsage() {
+    const meter = byId("worker-usage-meter");
+    const stamp = byId("worker-usage-updated");
+    if (!meter) return;
+    const resp = await fetch(API_BASE + "/workers-usage");
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok || payload.available === false) {
+      meter.innerHTML = '<div class="note">' + esc(payload?.message || "Workers usage unavailable") + '</div>';
+      if (stamp) stamp.textContent = "unavailable";
+      return;
+    }
+    const used = Number(payload.usage?.requests || 0);
+    const quota = Number(payload.quota || 0);
+    const pct = quota > 0 ? Math.min(100, used / quota * 100) : 0;
+    meter.innerHTML =
+      '<div class="kv-row"><span>Daily requests</span><div class="kv-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div><span class="mono">' + used.toLocaleString() + ' / ' + quota.toLocaleString() + '</span></div>' +
+      '<div class="note">Resets at 00:00 UTC · Errors ' + Number(payload.usage?.errors || 0).toLocaleString() + '</div>';
+    if (stamp) stamp.textContent = formatGatewayTime(payload.updated_at);
+  }
+
   function formatBytes(value) {
     const bytes = Number(value || 0);
     if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GiB";
@@ -2806,12 +2835,13 @@ function renderAdminScript(version) {
       bootSpan.className = 'note';
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
-      await Promise.all([loadConfig(), loadClients(), loadKvUsage()]);
+      await Promise.all([loadConfig(), loadClients(), loadKvUsage(), loadWorkersUsage()]);
       if (bootSpan.parentNode) bootSpan.remove();
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
       setInterval(refreshLivePanels, 5000);
       setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000);
+      setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000);
       // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
       setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000);
 

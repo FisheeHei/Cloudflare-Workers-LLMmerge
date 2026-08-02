@@ -111,6 +111,30 @@ globalThis.fetch = async (url, init) => {
       }];
     return new Response(JSON.stringify({ data }), { status: 200, headers: { "content-type": "application/json" } });
   }
+  if (String(url).includes("/graphql")) {
+    const query = String(JSON.parse(init.body || "{}").query || "");
+    if (query.includes("workersInvocationsAdaptive")) {
+      return new Response(JSON.stringify({
+        data: {
+          viewer: {
+            accounts: [{
+              workersInvocationsAdaptive: [{ sum: { requests: 1234, errors: 7, subrequests: 18 } }],
+            }],
+          },
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          accounts: [{
+            kvOperationsAdaptiveGroups: [],
+            kvStorageAdaptiveGroups: [],
+          }],
+        },
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).includes("disabled.example")) {
     disabledHits.push(String(url));
     return new Response(JSON.stringify({ data: [{ id: "disabled-model" }] }), {
@@ -554,6 +578,8 @@ assert.equal(adminPage.includes("translator-progress-panel"), false);
 assert.equal(adminPage.includes("translator-status-grid"), false);
 assert.equal(adminPage.includes("translator-client-pool"), false);
 assert.equal(adminPage.includes("kv-usage-meter"), true);
+assert.equal(adminPage.includes("worker-request-panel"), true);
+assert.equal(adminPage.includes("worker-usage-meter"), true);
 assert.equal(adminPage.includes("time-zone-preset"), true);
 assert.equal(adminPage.includes("client-summary"), true);
 assert.equal(adminPage.includes("document.visibilityState"), true);
@@ -1511,6 +1537,13 @@ const analyticsLogsResp = await worker.default.fetch(new Request("https://gw.tes
 const analyticsLogs = await analyticsLogsResp.json();
 assert.equal(analyticsLogs.logs.some((entry) => entry.model === "qwen3"), true);
 assert.equal(analyticsSqlQueries.length >= 2, true);
+const workersUsageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/workers-usage"), analyticsQueryEnv);
+const workersUsage = await workersUsageResp.json();
+assert.equal(workersUsageResp.status, 200);
+assert.equal(workersUsage.available, true);
+assert.equal(workersUsage.usage.requests, 1234);
+assert.equal(workersUsage.usage.errors, 7);
+assert.equal(workersUsage.quota, 100000);
 
 const cachedConfigHits = speedHits.length;
 const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
