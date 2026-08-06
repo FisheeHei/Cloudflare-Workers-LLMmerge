@@ -67,7 +67,7 @@ const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
 };
-const VERSION = "v26-08-06-context-injection-tuning";
+const VERSION = "v26-08-06-compact-fallback";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2910,6 +2910,27 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   }
 }
 
+// ponytail: Codex's internal compaction models (gpt-5.6-terra etc.) aren't in
+//  any upstream catalog; compaction just needs *a* model, so fall back to the
+//  session model or the first client-allowed model with upstream candidates.
+async function resolveCompactionModel(client, runtime, requestedModel, request, payload) {
+  const sessionModel = await currentSessionModel(client, runtime, request, payload);
+  if (sessionModel && clientAllowsModelSelection(client, sessionModel, sessionModel) && proxyCandidates(runtime, client, sessionModel, CHAT_PATH).length) return sessionModel;
+  try {
+    const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+    if (proxyCandidates(runtime, client, model, CHAT_PATH).length) return model;
+  } catch (err) {
+    if (err?.statusCode !== 403) throw err;
+  }
+  const rows = modelRegistryRows(runtime)
+    .filter((row) => clientAllowsUpstream(client, row.upstream.name))
+    .filter((row) => clientAllowsModelSelection(client, row.alias, row.model));
+  for (const row of rows) {
+    if (proxyCandidates(runtime, client, row.model, CHAT_PATH).length) return row.model;
+  }
+  throw httpError(403, `No compaction-capable model available for client: ${client.id}`);
+}
+
 async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   const started = Date.now();
   const runtime = await loadRuntimeConfig(app);
@@ -2918,11 +2939,7 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   const requestedModel = String(payload?.model || "").trim();
   if (!requestedModel) throw httpError(400, "`model` is required.");
 
-  const sessionModel = await currentSessionModel(client, runtime, request, payload);
-  const model = sessionModel || await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
-  if (sessionModel && !clientAllowsModelSelection(client, sessionModel, sessionModel)) {
-    throw httpError(403, `Model is not allowed for this client key: ${sessionModel}`);
-  }
+  const model = await resolveCompactionModel(client, runtime, requestedModel, request, payload);
   const transcript = compactTranscript(payload.input, payload.instructions);
   if (!transcript) throw httpError(400, "`input` is required.");
 

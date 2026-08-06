@@ -2100,6 +2100,26 @@ assert.equal(responsesLog.finish_reason, "tool_calls");
 assert.equal(responsesLogs.logs.some((entry) => entry.path === "/v1/responses/compact" && entry.model === "resp-model"), true);
 assert.equal(responsesLog.tool_calls_count, 1);
 
+// ponytail: Codex sends internal compaction models (gpt-5.6-terra etc.); gateway must fall back
+const compactFallbackStart = responseHits.length;
+const compactFallbackResp = await worker.default.fetch(new Request("https://gw.test/v1/responses/compact", {
+  method: "POST",
+  headers: {
+    authorization: "Bearer sk-resp",
+    "content-type": "application/json",
+    "session-id": "compact-fallback-session",
+    "x-codex-turn-metadata": JSON.stringify({ session_id: "compact-fallback-session", turn_id: "compact-fallback-turn" }),
+  },
+  body: JSON.stringify({
+    model: "gpt-5.6-terra",
+    input: [{ role: "user", content: [{ type: "input_text", text: "Long-running task history." }] }],
+  }),
+}), responsesEnv);
+const compactFallbackPayload = await compactFallbackResp.json();
+assert.equal(compactFallbackResp.status, 200);
+assert.equal(responseHits.length, compactFallbackStart + 1);
+assert.equal(responseHits.at(-1).model, "resp-model");
+assert.equal(compactFallbackPayload.output[0].content[0].text, "Conversation summary:\nhello");
 const responsesStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
