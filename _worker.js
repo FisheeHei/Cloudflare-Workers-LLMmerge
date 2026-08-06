@@ -67,7 +67,7 @@ const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
 };
-const VERSION = "v26-08-02-workers-pages-usage";
+const VERSION = "v26-08-06-context-injection-tuning";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1585,8 +1585,9 @@ function normalizeGatewaySettings(settings = {}, app) {
     global_context_clients: normalizeStringArray(settings.global_context_clients),
     context_always_clients: normalizeStringArray(settings.context_always_clients),
     context_on_demand: settings.context_on_demand === true,
-    context_item_limit: Math.max(1, Math.min(5, parsePositiveInt(settings.context_item_limit, 3))),
-    context_max_chars: Math.max(500, Math.min(20000, parsePositiveInt(settings.context_max_chars, 4000))),
+    context_item_limit: Math.max(1, Math.min(3, parsePositiveInt(settings.context_item_limit, 1))),
+    context_max_chars: Math.max(500, Math.min(20000, parsePositiveInt(settings.context_max_chars, 800))),
+    context_role: ["system", "developer", "user"].includes(String(settings?.context_role || "").toLowerCase()) ? String(settings.context_role).toLowerCase() : "system",
     context_items: normalizeContextItems(settings.context_items),
     time_zone_offset_minutes: normalizeTimeZoneOffset(settings.time_zone_offset_minutes),
     time_zone_label: String(settings.time_zone_label || "UTC+8 北京/香港/上海/乌鲁木齐").trim(),
@@ -3729,7 +3730,7 @@ function applyGatewayPromptContext(bodyText, settings, client) {
   }
   if (contextText) {
     const contextMessage = {
-      role: "user",
+      role: settings?.context_role || "system",
       content: "Global reference context. Use it when relevant, but do not mention it unless the user asks.\n\n" + contextText,
     };
     const systemEnd = payload.messages.findIndex((msg) => !["system", "developer"].includes(String(msg?.role || "")));
@@ -3756,10 +3757,10 @@ function selectGatewayContext(payload, settings, client, clientIds) {
   const forceAll = alwaysClients.length && promptAppliesToClient(alwaysClients, client, clientIds);
   const picked = forceAll
     ? candidates
-    : candidates.filter((hit) => hit.score > 0).slice(0, Math.max(1, Math.min(5, Number(settings.context_item_limit || 3))));
+    : candidates.filter((hit) => hit.score > 0).slice(0, Math.max(1, Math.min(3, Number(settings.context_item_limit || 1))));
   if (!picked.length) return base;
 
-  let remaining = Math.max(500, Number(settings.context_max_chars || 4000));
+  let remaining = Math.max(500, Number(settings.context_max_chars || 800));
   const parts = [];
   for (const { item } of picked) {
     if (remaining <= 0) break;

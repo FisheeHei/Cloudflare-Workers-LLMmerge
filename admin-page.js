@@ -1321,8 +1321,8 @@ function renderAdminScript(version) {
         global_context_clients: selectedPromptClients("global-context-client-scope"),
         context_always_clients: selectedPromptClients("context-always-client-scope"),
         context_on_demand: byId("context-on-demand").checked,
-        context_item_limit: Number(byId("context-item-limit").value || 3),
-        context_max_chars: Number(byId("context-max-chars").value || 4000),
+        context_item_limit: Number(byId("context-item-limit").value || 1),
+        context_max_chars: Number(byId("context-max-chars").value || 800),
         context_items: collectContextItems(),
         time_zone_offset_minutes: Number(byId("time-zone-offset").value || 480),
         time_zone_label: selectedTimeZoneLabel(),
@@ -1353,8 +1353,8 @@ function renderAdminScript(version) {
     byId("system-prompt-input").value = s.system_prompt || "";
     byId("global-context-input").value = s.global_context || "";
     byId("context-on-demand").checked = s.context_on_demand === true;
-    byId("context-item-limit").value = s.context_item_limit || 3;
-    byId("context-max-chars").value = s.context_max_chars || 4000;
+    byId("context-item-limit").value = s.context_item_limit || 1;
+    byId("context-max-chars").value = s.context_max_chars || 800;
     byId("time-zone-offset").value = s.time_zone_offset_minutes ?? 480;
     setTimeZonePreset(s.time_zone_offset_minutes ?? 480, s.time_zone_label || "");
     renderContextItems(s.context_items || []);
@@ -1448,8 +1448,8 @@ function renderAdminScript(version) {
       global_context_clients: selectedPromptClients("global-context-client-scope"),
       context_always_clients: selectedPromptClients("context-always-client-scope"),
       context_on_demand: byId("context-on-demand").checked,
-      context_item_limit: Number(byId("context-item-limit").value || 3),
-      context_max_chars: Number(byId("context-max-chars").value || 4000),
+      context_item_limit: Number(byId("context-item-limit").value || 1),
+      context_max_chars: Number(byId("context-max-chars").value || 800),
       context_items: collectContextItems(),
     };
   }
@@ -1484,8 +1484,8 @@ function renderAdminScript(version) {
       global_context_clients: normalizeImportList(source.global_context_clients),
       context_always_clients: normalizeImportList(source.context_always_clients),
       context_on_demand: source.context_on_demand === true || items.length > 0,
-      context_item_limit: Number(source.context_item_limit || 3),
-      context_max_chars: Number(source.context_max_chars || 4000),
+      context_item_limit: Number(source.context_item_limit || 1),
+      context_max_chars: Number(source.context_max_chars || 800),
       context_items: items.map(function(item) {
         return {
           id: text(item && item.id).trim() || crypto.randomUUID(),

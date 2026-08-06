@@ -1631,7 +1631,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), env);
 assert.equal(speedHits[cachedConfigHits], "fast");
 assert.deepEqual(speedBodies.at(-1).messages[0], { role: "system", content: "Always obey the gateway rule." });
-assert.equal(speedBodies.at(-1).messages[1].role, "user");
+assert.equal(speedBodies.at(-1).messages[1].role, "system");
 assert.equal(speedBodies.at(-1).messages[1].content.includes("Use tests and minimal patches."), true);
 assert.equal(speedBodies.at(-1).messages[1].content.includes("Project context should guide details."), false);
 assert.equal(speedBodies.at(-1).messages[1].content.includes("travel note"), false);
