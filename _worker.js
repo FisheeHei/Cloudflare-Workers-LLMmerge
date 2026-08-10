@@ -70,7 +70,7 @@ const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
 };
-const VERSION = "v26-08-11-kv-state-usage";
+const VERSION = "v26-08-11-refined";
 
 export default {
   async fetch(request, env, ctx) {
@@ -828,25 +828,11 @@ async function fetchKvUsage(app) {
       }
     }
   }`;
-  const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${app.analyticsApiToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      query,
-      variables: {
-        accountTag: app.analyticsAccountId,
-        start: start.toISOString().slice(0, 10),
-        end: end.toISOString().slice(0, 10),
-      },
-    }),
+  const account = await queryCloudflareGraphql(app, query, {
+    accountTag: app.analyticsAccountId,
+    start: start.toISOString().slice(0, 10),
+    end: end.toISOString().slice(0, 10),
   });
-  const body = await resp.json().catch(() => null);
-  if (!resp.ok || !body || body.errors) throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${resp.status}`);
-  const account = body?.data?.viewer?.accounts?.[0];
-  if (!account) throw new Error("Cloudflare account analytics is not available.");
   const operations = { reads: 0, writes: 0 };
   for (const row of account.kvOperationsAdaptiveGroups || []) {
     const bucket = kvActionBucket(row?.dimensions?.actionType);
@@ -901,21 +887,7 @@ async function fetchWorkersUsage(app) {
       }
     }
   }`;
-  const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${app.analyticsApiToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      query,
-      variables: { accountTag: app.analyticsAccountId },
-    }),
-  });
-  const body = await resp.json().catch(() => null);
-  if (!resp.ok || !body || body.errors) throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${resp.status}`);
-  const account = body?.data?.viewer?.accounts?.[0];
-  if (!account) throw new Error("Cloudflare account analytics is not available.");
+  const account = await queryCloudflareGraphql(app, query, { accountTag: app.analyticsAccountId });
   const workers = sumInvocationRows(account.workersInvocationsAdaptive);
   const pages = sumInvocationRows(account.pagesFunctionsInvocationsAdaptiveGroups);
   const usage = {
@@ -2139,6 +2111,24 @@ async function enforceSessionModelLock(client, runtime, request, payload, model)
   if (lockKeys.length > 500) delete _sessionModelLocks[lockKeys[0]];
 }
 
+async function queryCloudflareGraphql(app, query, variables) {
+  const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${app.analyticsApiToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body || body.errors) {
+    throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${response.status}`);
+  }
+  const account = body?.data?.viewer?.accounts?.[0];
+  if (!account) throw new Error("Cloudflare account analytics is not available.");
+  return account;
+}
+
 function sessionCurrentModelKey(client, request, payload) {
   const scopeId = requestModelLockScope(request, payload);
   const sessionScope = scopeId.split("\nturn:")[0];
@@ -2283,10 +2273,6 @@ function configuredUpstreamModels(upstream) {
 
 function isQwenModel(model) {
   return String(model || "").toLowerCase().includes("qwen");
-}
-
-function isKimiModel(model) {
-  return /(^|[\/_.-])kimi([\/_.-]|$)/i.test(String(model || ""));
 }
 
 function isLooseAliasModel(model) {

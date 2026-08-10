@@ -1,6 +1,20 @@
 export function isNvidiaNimUpstream(upstream) {
-  return String(upstream?.preset || "") === "nvidia-nim" || String(upstream?.base_url || "").toLowerCase().includes("integrate.api.nvidia.com");
+  return upstreamMatches(upstream, ["nvidia-nim"], ["integrate.api.nvidia.com"]);
 }
+
+const MODEL_FAMILY_PATTERNS = {
+  glm: /(^|[\/_.-])glm([\/_.-]|$)/i,
+  "minimax-m3": /(^|[\/_.-])minimax[\/_.-]*m3([\/_.-]|$)/i,
+  kimi: /(^|[\/_.-])kimi([\/_.-]|$)/i,
+  deepseek: /(^|[\/_.-])deepseek([\/_.-]|$)/i,
+  qwen: /qwen/i,
+  "nemotron-3": /(^|[\/_.-])nemotron[\/_.-]*3([\/_.-]|$)/i,
+  nemotron: /(^|[\/_.-])nemotron([\/_.-]|$)/i,
+  mistral: /(^|[\/_.-])(mistral|mixtral|codestral|magistral)([\/_.-]|$)/i,
+  step: /(^|[\/_.-])(step|stepfun|step-ai)([\/_.-]|$)/i,
+  "gpt-oss": /(^|[\/_.-])gpt[\/_.-]*oss([\/_.-]|$)/i,
+  sarvam: /(^|[\/_.-])sarvam([\/_.-]|$)/i,
+};
 
 export function sanitizeProxyBody(bodyText, upstream) {
   if (!bodyText) return bodyText;
@@ -47,31 +61,12 @@ function providerModelBridge(upstream, modelName) {
 }
 
 function modelFamily(modelName) {
-  if (isGlmModel(modelName)) return "glm";
-  if (isMiniMaxM3Model(modelName)) return "minimax-m3";
-  if (isKimiModel(modelName)) return "kimi";
-  if (isDeepSeekModel(modelName)) return "deepseek";
-  if (String(modelName).includes("qwen")) return "qwen";
-  if (isNemotron3Model(modelName)) return "nemotron-3";
-  if (isNemotronModel(modelName)) return "nemotron";
-  if (isMistralModel(modelName)) return "mistral";
-  if (isStepModel(modelName)) return "step";
-  if (isGptOssModel(modelName)) return "gpt-oss";
-  if (isSarvamModel(modelName)) return "sarvam";
-  return "generic";
+  const value = String(modelName || "");
+  return Object.entries(MODEL_FAMILY_PATTERNS).find(([, pattern]) => pattern.test(value))?.[0] || "generic";
 }
 
 function glmThinkingRequested(payload) {
-  return Boolean(
-    payload?.reasoning ||
-    payload?.reasoning_effort ||
-    payload?.reasoningEffort ||
-    payload?.reasoning_summary ||
-    payload?.reasoningSummary ||
-    payload?.thinking ||
-    payload?.enable_thinking === true ||
-    payload?.chat_template_kwargs?.enable_thinking === true
-  );
+  return hasReasoningInput(payload, { includeSummary: true });
 }
 
 function bodyNeedsSanitizing(bodyText, bodyLower) {
@@ -196,126 +191,68 @@ function applyKimiPreservedThinking(payload, enabled) {
 }
 
 export function isGlmModel(modelName) {
-  return /(^|[\/_.-])glm([\/_.-]|$)/i.test(String(modelName || ""));
+  return MODEL_FAMILY_PATTERNS.glm.test(String(modelName || ""));
 }
 
 export function isMiniMaxM3Model(modelName) {
-  return /(^|[\/_.-])minimax[\/_.-]*m3([\/_.-]|$)/i.test(String(modelName || ""));
+  return MODEL_FAMILY_PATTERNS["minimax-m3"].test(String(modelName || ""));
 }
 
 function isKimiModel(model) {
-  return /(^|[\/_.-])kimi([\/_.-]|$)/i.test(String(model || ""));
-}
-
-function isDeepSeekModel(modelName) {
-  return /(^|[\/_.-])deepseek([\/_.-]|$)/i.test(String(modelName || ""));
+  return MODEL_FAMILY_PATTERNS.kimi.test(String(model || ""));
 }
 
 function isDeepSeekUpstream(upstream) {
-  return String(upstream?.preset || "") === "deepseek" || String(upstream?.base_url || "").toLowerCase().includes("api.deepseek.com");
+  return upstreamMatches(upstream, ["deepseek"], ["api.deepseek.com"]);
 }
 
 function isMoonshotUpstream(upstream) {
-  const baseUrl = String(upstream?.base_url || "").toLowerCase();
-  return String(upstream?.preset || "") === "moonshot" || baseUrl.includes("api.moonshot.ai") || baseUrl.includes("api.kimi.com");
+  return upstreamMatches(upstream, ["moonshot"], ["api.moonshot.ai", "api.kimi.com"]);
 }
 
 function isMiniMaxUpstream(upstream) {
-  const baseUrl = String(upstream?.base_url || "").toLowerCase();
-  return String(upstream?.preset || "") === "minimax" || baseUrl.includes("api.minimax.io") || baseUrl.includes("api.minimaxi.com");
+  return upstreamMatches(upstream, ["minimax"], ["api.minimax.io", "api.minimaxi.com"]);
 }
 
 function isOpenRouterUpstream(upstream) {
-  const baseUrl = String(upstream?.base_url || "").toLowerCase();
-  return String(upstream?.preset || "") === "openrouter" || baseUrl.includes("openrouter.ai");
+  return upstreamMatches(upstream, ["openrouter"], ["openrouter.ai"]);
 }
 
 function isZhipuUpstream(upstream) {
-  const preset = String(upstream?.preset || "");
-  const baseUrl = String(upstream?.base_url || "").toLowerCase();
-  return preset === "zhipu" || preset === "zhipu-coding" || baseUrl.includes("open.bigmodel.cn");
+  return upstreamMatches(upstream, ["zhipu", "zhipu-coding"], ["open.bigmodel.cn"]);
 }
 
 function isWorkersAiUpstream(upstream) {
   const baseUrl = String(upstream?.base_url || "").toLowerCase();
-  return String(upstream?.preset || "") === "workers-ai" || (baseUrl.includes("api.cloudflare.com/client/v4/accounts/") && baseUrl.includes("/ai/v1"));
+  return upstreamMatches(upstream, ["workers-ai"]) || (baseUrl.includes("api.cloudflare.com/client/v4/accounts/") && baseUrl.includes("/ai/v1"));
 }
 
 function isGenericOpenAiUpstream(upstream) {
-  const preset = String(upstream?.preset || "");
-  const baseUrl = String(upstream?.base_url || "").toLowerCase();
-  return ["deepinfra", "together", "workers-ai", "custom"].includes(preset) ||
-    baseUrl.includes("deepinfra.com") ||
-    baseUrl.includes("together.xyz") ||
+  return upstreamMatches(upstream, ["deepinfra", "together", "workers-ai", "custom"], ["deepinfra.com", "together.xyz"]) ||
     isWorkersAiUpstream(upstream);
 }
 
-function isStepModel(modelName) {
-  return /(^|[\/_.-])(step|stepfun|step-ai)([\/_.-]|$)/i.test(String(modelName || ""));
-}
-
-function isNemotronModel(modelName) {
-  return /(^|[\/_.-])nemotron([\/_.-]|$)/i.test(String(modelName || ""));
-}
-
-function isNemotron3Model(modelName) {
-  return /(^|[\/_.-])nemotron[\/_.-]*3([\/_.-]|$)/i.test(String(modelName || ""));
-}
-
-function isMistralModel(modelName) {
-  return /(^|[\/_.-])(mistral|mixtral|codestral|magistral)([\/_.-]|$)/i.test(String(modelName || ""));
-}
-
-function isGptOssModel(modelName) {
-  return /(^|[\/_.-])gpt[\/_.-]*oss([\/_.-]|$)/i.test(String(modelName || ""));
-}
-
-function isSarvamModel(modelName) {
-  return /(^|[\/_.-])sarvam([\/_.-]|$)/i.test(String(modelName || ""));
+function upstreamMatches(upstream, presets, hosts = []) {
+  const preset = String(upstream?.preset || "");
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return presets.includes(preset) || hosts.some((host) => baseUrl.includes(host));
 }
 
 function applyDeepSeekBridge(payload) {
   let changed = false;
-  if (deepSeekReasoningRequested(payload)) {
-    const disabled = deepSeekReasoningDisabled(payload);
+  if (hasReasoningInput(payload, { includeSummary: true, explicitOptions: true })) {
+    const disabled = nimReasoningDisabled(payload);
     payload.thinking = { type: disabled ? "disabled" : "enabled" };
     changed = true;
     if (disabled) {
       if ("reasoning_effort" in payload) { delete payload.reasoning_effort; changed = true; }
     } else {
-      const effort = mapDeepSeekEffort(deepSeekEffortInput(payload));
+      const effort = mapDeepSeekEffort(reasoningEffortInput(payload));
       if (effort) { payload.reasoning_effort = effort; changed = true; }
       else if ("reasoning_effort" in payload) { delete payload.reasoning_effort; changed = true; }
     }
   }
-  for (const key of ["reasoning", "reasoning_budget", "reasoningBudget", "reasoning_split", "enable_thinking", "chat_template_kwargs"]) {
-    if (key in payload) { delete payload[key]; changed = true; }
-  }
-  return changed;
-}
-
-function deepSeekReasoningRequested(payload) {
-  return Boolean(
-    payload?.reasoning ||
-    payload?.reasoning_effort ||
-    payload?.reasoningEffort ||
-    payload?.reasoning_summary ||
-    payload?.reasoningSummary ||
-    payload?.thinking != null ||
-    payload?.enable_thinking != null ||
-    payload?.chat_template_kwargs?.enable_thinking != null
-  );
-}
-
-function deepSeekReasoningDisabled(payload) {
-  const effort = String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || "").toLowerCase();
-  const thinkingType = String(payload?.thinking?.type || "").toLowerCase();
-  return payload?.enable_thinking === false || thinkingType === "disabled" || effort === "none" || effort === "disabled" || effort === "off";
-}
-
-function deepSeekEffortInput(payload) {
-  if (deepSeekReasoningDisabled(payload)) return "none";
-  return String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || payload?.reasoning?.enabled || payload?.enable_thinking || "").toLowerCase();
+  return deleteKeys(payload, ["reasoning", "reasoning_budget", "reasoningBudget", "reasoning_split", "enable_thinking", "chat_template_kwargs"]) || changed;
 }
 
 function mapDeepSeekEffort(raw) {
@@ -425,7 +362,7 @@ function mapOpenAiReasoningEffort(raw) {
 }
 
 function bridgeReasoningEffortInput(payload) {
-  const effort = nimReasoningEffortInput(payload);
+  const effort = reasoningEffortInput(payload);
   if (effort) return effort;
   return String(payload?.thinking?.type || "").toLowerCase() === "enabled" ? "high" : "";
 }
@@ -513,7 +450,7 @@ function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
   }
 
   if (isNemotron3 && nimReasoningRequested(payload)) {
-    const raw = nimReasoningEffortInput(payload);
+    const raw = reasoningEffortInput(payload);
     const disabled = nimReasoningDisabled(payload);
     setChatTemplateKwargs(payload, {
       enable_thinking: !disabled,
@@ -553,28 +490,13 @@ function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
 }
 
 function removeNimReasoningPayloadFields(payload, options = {}) {
-  let changed = false;
-  if ("reasoning" in payload) {
-    delete payload.reasoning;
-    changed = true;
-  }
-  if (!options.keepReasoningEffort && "reasoning_effort" in payload) {
-    delete payload.reasoning_effort;
-    changed = true;
-  }
-  if (!options.keepReasoningBudget && "reasoning_budget" in payload) {
-    delete payload.reasoning_budget;
-    changed = true;
-  }
-  if ("reasoningBudget" in payload) {
-    delete payload.reasoningBudget;
-    changed = true;
-  }
-  if (!options.keepThinking && "thinking" in payload) {
-    delete payload.thinking;
-    changed = true;
-  }
-  return changed;
+  return deleteKeys(payload, [
+    "reasoning",
+    "reasoningBudget",
+    ...(options.keepReasoningEffort ? [] : ["reasoning_effort"]),
+    ...(options.keepReasoningBudget ? [] : ["reasoning_budget"]),
+    ...(options.keepThinking ? [] : ["thinking"]),
+  ]);
 }
 
 function setChatTemplateKwargs(payload, values) {
@@ -586,16 +508,13 @@ function setChatTemplateKwargs(payload, values) {
 
 function nimFamilyReasoningEffort(family, payload) {
   if (!nimReasoningRequested(payload)) return "";
-  const raw = nimReasoningEffortInput(payload);
+  const raw = reasoningEffortInput(payload);
   if (family === "deepseek") return mapNimReasoningEffort(raw, ["none", "high", "max"], "high");
-  if (["step", "nemotron", "gpt-oss", "sarvam"].includes(family)) {
-    return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
-  }
-  if (family === "mistral") return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
+  if (["step", "nemotron", "gpt-oss", "sarvam", "mistral"].includes(family)) return mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
   return "";
 }
 
-function nimReasoningEffortInput(payload) {
+function reasoningEffortInput(payload) {
   if (nimReasoningDisabled(payload)) return "none";
   return String(payload?.reasoning_effort || payload?.reasoning?.effort || payload?.reasoningEffort || payload?.reasoning?.enabled || payload?.enable_thinking || "").toLowerCase();
 }
@@ -626,7 +545,19 @@ function nimThinkingMode(payload) {
 }
 
 function nimReasoningRequested(payload) {
-  return Boolean(payload?.reasoning || payload?.reasoning_effort || payload?.reasoningEffort || payload?.thinking != null || payload?.enable_thinking != null || payload?.chat_template_kwargs?.enable_thinking != null);
+  return hasReasoningInput(payload, { explicitOptions: true });
+}
+
+function hasReasoningInput(payload, { includeSummary = false, explicitOptions = false } = {}) {
+  return Boolean(
+    payload?.reasoning ||
+    payload?.reasoning_effort ||
+    payload?.reasoningEffort ||
+    (includeSummary && (payload?.reasoning_summary || payload?.reasoningSummary)) ||
+    (explicitOptions ? payload?.thinking != null : payload?.thinking) ||
+    (explicitOptions ? payload?.enable_thinking != null : payload?.enable_thinking === true) ||
+    (explicitOptions ? payload?.chat_template_kwargs?.enable_thinking != null : payload?.chat_template_kwargs?.enable_thinking === true)
+  );
 }
 
 function nimReasoningDisabled(payload) {
