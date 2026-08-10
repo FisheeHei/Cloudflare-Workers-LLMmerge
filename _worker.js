@@ -69,7 +69,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-11-utc-time";
+const VERSION = "v26-08-11-admin-ui";
 
 export default {
   async fetch(request, env, ctx) {

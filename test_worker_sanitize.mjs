@@ -659,7 +659,12 @@ assert.equal(adminPage.includes("\u6df1\u5ea6\u601d\u8003"), false);
 assert.equal(adminPage.includes("Agentic"), true);
 assert.equal(adminPage.includes("\u5de5\u5177\u8c03\u7528"), true);
 assert.equal(adminPage.includes("\u2705"), true);
-assert.equal(adminPage.includes(".model-tag-filter button.active { background: #1f8f61; color: white; }"), true);
+assert.equal(adminPage.includes(".model-tag-filter button.active { background: var(--success); color: white; }"), true);
+assert.equal(adminPage.includes("--surface-muted: #f8fafc"), true);
+assert.equal(adminPage.includes("button:focus-visible"), true);
+assert.equal(adminPage.includes("endpoint-block"), true);
+assert.equal(adminPage.includes("topbar-view-title"), true);
+assert.equal(adminScript.includes("aria-current"), true);
 
 const privateModelsResp = await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: "Bearer sk-test" },
