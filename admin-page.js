@@ -844,9 +844,16 @@ function renderAdminScript(version) {
 
   function splitList(value) { return text(value).split(/[,\\n]/).map((s) => s.trim()).filter(Boolean); }
   function esc(value) { return text(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
-  function displayOffsetMinutes() { return Number(state.config?.settings?.time_zone_offset_minutes ?? byId("time-zone-offset")?.value ?? 480) || 480; }
+  function timeZoneOffsetMinutes(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(-720, Math.min(840, Math.trunc(parsed))) : 480;
+  }
+  function displayOffsetMinutes() { return timeZoneOffsetMinutes(state.config?.settings?.time_zone_offset_minutes ?? byId("time-zone-offset")?.value ?? 480); }
   function formatGatewayTime(value) {
-    const ms = typeof value === "number" ? value : Date.parse(text(value).replace(/^(\d{4}-\d{2}-\d{2}):(\d{2})$/, "$1T$2:00:00+08:00"));
+    const raw = text(value).trim();
+    const legacyHour = raw.match(/^(\d{4}-\d{2}-\d{2}):(\d{2})$/);
+    const naiveTime = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/);
+    const ms = typeof value === "number" ? value : Date.parse(legacyHour ? legacyHour[1] + "T" + legacyHour[2] + ":00:00+08:00" : (naiveTime ? naiveTime[1] + "T" + naiveTime[2] + "Z" : raw));
     if (!Number.isFinite(ms)) return text(value || "-");
     const d = new Date(ms + displayOffsetMinutes() * 60000);
     return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0") + " " + String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0") + ":" + String(d.getUTCSeconds()).padStart(2, "0");
@@ -1324,7 +1331,7 @@ function renderAdminScript(version) {
         context_item_limit: Number(byId("context-item-limit").value || 1),
         context_max_chars: Number(byId("context-max-chars").value || 800),
         context_items: collectContextItems(),
-        time_zone_offset_minutes: Number(byId("time-zone-offset").value || 480),
+        time_zone_offset_minutes: timeZoneOffsetMinutes(byId("time-zone-offset").value),
         time_zone_label: selectedTimeZoneLabel(),
       },
       routing: {
@@ -1371,7 +1378,7 @@ function renderAdminScript(version) {
   function selectedTimeZoneLabel() {
     const select = byId("time-zone-preset");
     const option = select?.selectedOptions?.[0];
-    return option?.dataset?.label || "UTC" + (Number(byId("time-zone-offset").value || 480) / 60);
+    return option?.dataset?.label || "UTC" + (timeZoneOffsetMinutes(byId("time-zone-offset").value) / 60);
   }
 
   function setTimeZonePreset(offset, label) {

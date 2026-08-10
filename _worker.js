@@ -38,9 +38,8 @@ const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
 const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
-const HK_TIME_ZONE = "Asia/Hong_Kong";
-const HK_TIME_ZONE_LABEL = "Hong Kong Standard Time (UTC+8)";
-const HK_UTC_OFFSET_MS = 8 * 3600 * 1000;
+const API_TIME_ZONE_LABEL = "UTC";
+const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 const STDTIME_URL = "https://stdtime.gov.hk/";
 const STDTIME_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const NVIDIA_NIM_RPM_LIMIT = 40;
@@ -70,7 +69,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-11-resource-budget";
+const VERSION = "v26-08-11-utc-time";
 
 export default {
   async fetch(request, env, ctx) {
@@ -94,8 +93,8 @@ export default {
               mode: "openai-compatible-gateway",
               has_kv: Boolean(env.KV),
               admin_configured: Boolean(pickAdminToken(env)),
-              now: hkNowIso(),
-              time_zone: HK_TIME_ZONE_LABEL,
+              now: utcNowIso(),
+              time_zone: API_TIME_ZONE_LABEL,
             },
             200,
           ),
@@ -377,33 +376,50 @@ async function syncStdTime(app) {
   _stdTimeSyncedAt = Date.now();
 }
 
-function hkNowMs() {
+function utcNowMs() {
   return Date.now() + _stdTimeOffsetMs;
 }
 
-function hkNowIso(ms = hkNowMs()) {
-  const d = new Date(ms + HK_UTC_OFFSET_MS);
-  return d.getUTCFullYear() + "-" +
-    String(d.getUTCMonth() + 1).padStart(2, "0") + "-" +
-    String(d.getUTCDate()).padStart(2, "0") + "T" +
-    String(d.getUTCHours()).padStart(2, "0") + ":" +
-    String(d.getUTCMinutes()).padStart(2, "0") + ":" +
-    String(d.getUTCSeconds()).padStart(2, "0") + "." +
-    String(d.getUTCMilliseconds()).padStart(3, "0") + "+08:00";
+function utcNowIso(ms = utcNowMs()) {
+  return new Date(ms).toISOString();
 }
 
-function hkHourKey(value) {
-  const ms = typeof value === "number" ? value : Date.parse(value || hkNowIso());
-  const d = new Date((Number.isFinite(ms) ? ms : hkNowMs()) + HK_UTC_OFFSET_MS);
+function parseGatewayTime(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  const raw = String(value || "").trim();
+  if (!raw) return NaN;
+  const legacyHour = raw.match(/^(\d{4}-\d{2}-\d{2}):(\d{2})$/);
+  const normalized = legacyHour
+    ? legacyHour[1] + "T" + legacyHour[2] + ":00:00+08:00"
+    : (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw) ? raw.replace(" ", "T") + "Z" : raw);
+  const ms = Date.parse(normalized);
+  return ms;
+}
+
+function timestampMs(value) {
+  const ms = parseGatewayTime(value);
+  return Number.isFinite(ms) ? ms : utcNowMs();
+}
+
+function utcTimestamp(value) {
+  const ms = parseGatewayTime(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : String(value || "");
+}
+
+function utcHourKey(value) {
+  return new Date(timestampMs(value)).toISOString().slice(0, 13) + ":00:00.000Z";
+}
+
+function legacyStatsHourKey(value) {
+  const d = new Date(timestampMs(value) + LEGACY_STATS_UTC_OFFSET_MS);
   return d.getUTCFullYear() + "-" +
     String(d.getUTCMonth() + 1).padStart(2, "0") + "-" +
     String(d.getUTCDate()).padStart(2, "0") + ":" +
     String(d.getUTCHours()).padStart(2, "0");
 }
 
-function hkDayKey(value) {
-  const ms = typeof value === "number" ? value : Date.parse(value || hkNowIso());
-  const d = new Date((Number.isFinite(ms) ? ms : hkNowMs()) + HK_UTC_OFFSET_MS);
+function legacyStatsDayKey(value) {
+  const d = new Date(timestampMs(value) + LEGACY_STATS_UTC_OFFSET_MS);
   return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
 }
 
@@ -426,7 +442,7 @@ function appendLog(app, entry) {
 }
 
 function recordStats(app, entry) {
-  var hour = hkHourKey(entry.ts);
+  var hour = legacyStatsHourKey(entry.ts);
   if (!_pendingStats[hour]) {
     _pendingStats[hour] = emptyStatsBucket();
   }
@@ -478,7 +494,7 @@ function recordAnalyticsPoint(app, entry, ctx) {
 
 function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path, promptTokens, started, status, upstream }) {
   return {
-    ts: hkNowIso(),
+    ts: utcNowIso(),
     client: client?.name || client?.id || "client",
     client_id: client?.id || client?.name || "client",
     upstream: upstream || "unknown",
@@ -499,7 +515,7 @@ function recordClientDailyUsage(app, entry, ctx) {
 }
 
 async function updateClientDailyUsage(kv, entry) {
-  const day = hkDayKey(entry.ts);
+  const day = legacyStatsDayKey(entry.ts);
   const key = await clientDailyUsageStorageKey(entry.client_id, day);
   // ponytail: read-merge-write is adequate for personal traffic; use a Durable Object if concurrent writes lose increments.
   const existing = await kv.get(key, "json");
@@ -527,7 +543,7 @@ function mergeClientDailyUsage(existing, entry, day) {
   else usage.fail += 1;
   usage.prompt_tokens += Number(entry.prompt_tokens || 0);
   usage.completion_tokens += Number(entry.completion_tokens || 0);
-  usage.updated_at = entry.ts || hkNowIso();
+  usage.updated_at = entry.ts || utcNowIso();
   return usage;
 }
 
@@ -640,7 +656,7 @@ function mergeStatsBucket(base, delta) {
 
 async function getMergedLogs(app) {
   const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
-  return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse();
+  return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse().map(publicRequestLogEntry);
 }
 
 async function getBestLogs(app) {
@@ -651,27 +667,32 @@ async function getBestLogs(app) {
 
 function recentPendingLogs(maxAgeMs = ANALYTICS_LIVE_PENDING_MS) {
   const cutoff = Date.now() - maxAgeMs;
-  return _pendingLogs.filter((entry) => Date.parse(entry.ts || "") >= cutoff).slice(-50).reverse();
+  return _pendingLogs.filter((entry) => parseGatewayTime(entry.ts) >= cutoff).slice(-50).reverse();
 }
 
 function mergeRecentLogs(persisted, recent) {
   const seen = new Set();
   return [...(recent || []), ...(persisted || [])]
-    .sort((a, b) => Date.parse(b.ts || 0) - Date.parse(a.ts || 0))
+    .sort((a, b) => parseGatewayTime(b.ts) - parseGatewayTime(a.ts))
     .filter((entry) => {
       const key = entry.trace_id || [entry.ts, entry.client, entry.upstream, entry.model, entry.status].join("|");
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     })
-    .slice(0, 50);
+    .slice(0, 50)
+    .map(publicRequestLogEntry);
+}
+
+function publicRequestLogEntry(entry) {
+  return { ...entry, ts: utcTimestamp(entry?.ts) };
 }
 
 function recentPendingStats(maxAgeMs = ANALYTICS_LIVE_PENDING_MS) {
   const buckets = {};
   for (const entry of _pendingLogs) {
-    if (Date.parse(entry.ts || "") < Date.now() - maxAgeMs) continue;
-    const hour = hkHourKey(entry.ts);
+    if (parseGatewayTime(entry.ts) < Date.now() - maxAgeMs) continue;
+    const hour = legacyStatsHourKey(entry.ts);
     if (!buckets[hour]) buckets[hour] = emptyStatsBucket();
     addStatsEntry(buckets[hour], entry);
   }
@@ -843,7 +864,7 @@ async function fetchKvUsage(app) {
   return {
     ok: true,
     available: true,
-    updated_at: hkNowIso(),
+    updated_at: utcNowIso(),
     period: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), timezone: "UTC" },
     quotas: app.kvDailyBudget,
     operations,
@@ -900,7 +921,7 @@ async function fetchWorkersUsage(app) {
   return {
     ok: true,
     available: true,
-    updated_at: hkNowIso(),
+    updated_at: utcNowIso(),
     period: {
       start: start.toISOString(),
       end: now.toISOString(),
@@ -1394,10 +1415,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   // ponytail: parallel KV reads for 24h stats instead of sequential loop
   if (apiPath === "/api/stats" && request.method === "GET") {
-    const now = hkNowMs();
+    const now = utcNowMs();
     const hourKeys = [];
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
-      hourKeys.push(hkHourKey(now - h * 3600000));
+      hourKeys.push(legacyStatsHourKey(now - h * 3600000));
     }
     const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
     const useAnalyticsForStats = analyticsBuckets !== null;
@@ -1405,11 +1426,11 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     // Keep all isolate-local stats when AE is write-only; the two-minute merge window is only for readable AE data.
     const liveStats = analyticsBuckets ? recentPendingStats() : _pendingStats;
     const logs = await getBestLogs(app);
-    const buckets = hourKeys.map((hour, i) => {
-      const raw = analyticsBuckets ? analyticsBuckets[hour] : raws?.[i];
-      return { hour, ...mergeStatsBucket(raw, liveStats[hour]) };
+    const buckets = hourKeys.map((storageHour, i) => {
+      const raw = analyticsBuckets ? analyticsBuckets[storageHour] : raws?.[i];
+      return { hour: utcHourKey(now - (STATS_WINDOW_HOURS - 1 - i) * 3600000), ...mergeStatsBucket(raw, liveStats[storageHour]) };
     });
-    return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: hkNowIso(), time_zone: HK_TIME_ZONE_LABEL }, 200));
+    return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: utcNowIso(), time_zone: API_TIME_ZONE_LABEL }, 200));
   }
 
   if (apiPath === "/api/kv-usage" && request.method === "GET") {
@@ -1834,7 +1855,7 @@ async function listConfigSnapshots(kv) {
 function publicConfigSnapshot(snapshot) {
   return {
     id: snapshot.id,
-    created_at: snapshot.created_at,
+    created_at: utcTimestamp(snapshot.created_at),
     upstream_count: snapshot.upstream_count || 0,
     client_note: snapshot.client_note || "",
   };
@@ -1845,7 +1866,7 @@ async function saveConfigSnapshot(kv, config, clientNote = "before-save") {
   const snapshots = await listConfigSnapshots(kv);
   snapshots.unshift({
     id: `cfg_${Date.now()}_${randomString(6).toLowerCase()}`,
-    created_at: hkNowIso(),
+    created_at: utcNowIso(),
     upstream_count: config.upstreams.length,
     client_note: clientNote,
     config,
@@ -1890,7 +1911,7 @@ async function exportUpstreamGroup(app) {
   );
 
   return {
-    exported_at: hkNowIso(),
+    exported_at: utcNowIso(),
     upstreams,
     version: editable.version || 1,
   };
@@ -2327,7 +2348,7 @@ async function getFreshModels(runtime, upstream) {
     await runtime.kv.put(
       modelsCacheKey(upstream.name),
       JSON.stringify({
-        fetched_at: hkNowIso(),
+        fetched_at: utcNowIso(),
         models,
       }),
       { expirationTtl: runtime.modelCacheTtl },
@@ -2686,7 +2707,7 @@ function translateAnthropicMessagesRequest(payload) {
     toolsCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
     seed: {
       id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
-      createdAt: Math.floor(hkNowMs() / 1000),
+      createdAt: Math.floor(utcNowMs() / 1000),
       model,
     },
   };
@@ -3151,7 +3172,7 @@ function translateResponsesRequest(payload) {
     model,
     stream: chat.stream,
     seed: {
-      createdAt: Math.floor(hkNowMs() / 1000),
+      createdAt: Math.floor(utcNowMs() / 1000),
       id: responseId,
       instructions: typeof payload.instructions === "string" ? payload.instructions : null,
       maxOutputTokens: maxTokens ?? null,
@@ -4504,8 +4525,8 @@ function normalizeClient(client) {
     name: client.name || client.id || "client",
     key: client.key,
     upstreams: normalizeStringArray(client.upstreams),
-    created_at: client.created_at || hkNowIso(),
-    updated_at: client.updated_at || hkNowIso(),
+    created_at: client.created_at || utcNowIso(),
+    updated_at: client.updated_at || utcNowIso(),
   };
 }
 
@@ -4522,7 +4543,7 @@ function buildClientRecord(payload) {
     throw httpError(400, "Client key is too long.");
   }
 
-  const now = hkNowIso();
+  const now = utcNowIso();
   return normalizeClient({
     id: payload.id || crypto.randomUUID(),
     key,
@@ -4541,7 +4562,7 @@ async function saveClientRecord(kv, record) {
   const stored = {
     ...record,
     created_at: createdAt,
-    updated_at: hkNowIso(),
+    updated_at: utcNowIso(),
   };
 
   await kv.put(clientIdKey(stored.id), JSON.stringify(stored));
@@ -4589,12 +4610,16 @@ async function listClientIndexWithUsage(kv) {
 }
 
 async function readClientDailyUsage(kv, record) {
-  const day = hkDayKey();
+  const day = legacyStatsDayKey();
   try {
-    return await kv.get(await clientDailyUsageStorageKey(record.id, day), "json") || emptyClientDailyUsage(day, record.name);
+    return publicClientDailyUsage(await kv.get(await clientDailyUsageStorageKey(record.id, day), "json") || emptyClientDailyUsage(day, record.name));
   } catch {
     return emptyClientDailyUsage(day, record.name);
   }
+}
+
+function publicClientDailyUsage(usage) {
+  return { ...usage, updated_at: utcTimestamp(usage?.updated_at) };
 }
 
 function publicClientRecord(record) {
@@ -4605,8 +4630,8 @@ function publicClientRecord(record) {
     models: record.models,
     upstreams: record.upstreams,
     metadata: record.metadata,
-    created_at: record.created_at,
-    updated_at: record.updated_at,
+    created_at: utcTimestamp(record.created_at),
+    updated_at: utcTimestamp(record.updated_at),
   };
 }
 

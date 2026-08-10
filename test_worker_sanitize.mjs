@@ -604,6 +604,8 @@ assert.equal(adminPage.includes("worker-usage-meter"), true);
 assert.equal(adminPage.includes("Deletes"), false);
 assert.equal(adminPage.includes("Lists"), false);
 assert.equal(adminPage.includes("time-zone-preset"), true);
+assert.equal(adminScript.includes("Number.isFinite(parsed)"), true);
+assert.equal(adminScript.includes(") || 480"), false);
 assert.equal(adminPage.includes("client-summary"), true);
 assert.equal(adminPage.includes("document.visibilityState"), true);
 assert.equal(adminPage.includes("Gateway Fast"), true);
@@ -693,6 +695,14 @@ assert.equal(adminPage.includes("toolDiag"), true);
 const configResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), env);
 const configPayload = await configResp.json();
 assert.equal(configPayload.config.settings.stream_idle_timeout_ms, 900000);
+const utcConfig = structuredClone(configPayload.config);
+utcConfig.settings.time_zone_offset_minutes = 0;
+utcConfig.settings.time_zone_label = "UTC";
+const utcConfigResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(utcConfig),
+}), env);
+assert.equal(utcConfigResp.status, 200);
+assert.equal((await utcConfigResp.json()).config.settings.time_zone_offset_minutes, 0);
 const invalidUpstreamConfig = structuredClone(configPayload.config);
 invalidUpstreamConfig.upstreams[0].preset = "custom";
 invalidUpstreamConfig.upstreams[0].base_url = "ftp://invalid.example/v1";
@@ -763,8 +773,8 @@ assert.equal("functions" in zhipuBodies.at(-1), false);
 
 const healthTimeResp = await worker.default.fetch(new Request("https://gw.test/health"), env);
 const healthTime = await healthTimeResp.json();
-assert.equal(healthTime.time_zone, "Hong Kong Standard Time (UTC+8)");
-assert.equal(healthTime.now.endsWith("+08:00"), true);
+assert.equal(healthTime.time_zone, "UTC");
+assert.equal(healthTime.now.endsWith("Z"), true);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -843,13 +853,15 @@ const statsResp = await worker.default.fetch(new Request("https://gw.test/admin-
 const stats = await statsResp.json();
 assert.equal(stats.buckets.some((b) => b.total >= 5), true);
 assert.equal(stats.last_model, "glm-4.6");
-assert.equal(stats.time_zone, "Hong Kong Standard Time (UTC+8)");
-assert.equal(stats.now.endsWith("+08:00"), true);
+assert.equal(stats.time_zone, "UTC");
+assert.equal(stats.now.endsWith("Z"), true);
+assert.equal(stats.buckets.every((bucket) => /Z$/.test(bucket.hour)), true);
 assert.equal(stats.buckets.some((b) => b.model_statuses?.["minimax-m3"]?.success >= 1), true);
 
 const logsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), env);
 const logs = await logsResp.json();
 assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
+assert.equal(logs.logs.every((entry) => /Z$/.test(entry.ts)), true);
 assert.equal(kvPuts.some((key) => key === "gateway:logs" || key.startsWith("gateway:stats:")), false);
 const developerRoleBodyStart = bodies.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
