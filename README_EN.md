@@ -89,6 +89,10 @@ If `ADMIN_TOKEN` is not set, the default admin path is `/llmmerge-admin`. Do not
 | `STREAM_IDLE_TIMEOUT_MS` | Optional | Defaults to `900000` |
 | `UPSTREAM_COOLDOWN_TTL` | Optional | Defaults to `60` seconds |
 | `MODEL_CACHE_TTL` | Optional | Defaults to `3600` seconds |
+| `KV_FLUSH_INTERVAL_MS` | Optional | KV mirror flush interval; defaults to `60000` |
+| `KV_DAILY_READ_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `2000000` |
+| `KV_DAILY_WRITE_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `1000000` |
+| `WORKERS_DAILY_REQUEST_BUDGET` | Optional | Admin Workers request-meter budget; defaults to `1000000` |
 | `STDTIME_URL` | Optional | Defaults to `https://stdtime.gov.hk/` |
 | `UPSTREAMS_JSON` | Optional | Initial upstream seed config |
 | `CLIENTS_JSON` | Optional | Initial client-key seed config |

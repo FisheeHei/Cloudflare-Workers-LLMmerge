@@ -65,12 +65,12 @@ const ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 3600;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
 const KV_USAGE_CACHE_MS = 60000;
 const WORKERS_USAGE_CACHE_MS = 60000;
-const WORKERS_FREE_DAILY_REQUEST_QUOTA = 100000;
-const KV_FREE_QUOTAS = {
-  reads: 100000,
-  writes: 1000,
+const DEFAULT_WORKERS_DAILY_REQUEST_BUDGET = 1_000_000;
+const DEFAULT_KV_DAILY_BUDGET = {
+  reads: 2_000_000,
+  writes: 1_000_000,
 };
-const VERSION = "v26-08-11-refined";
+const VERSION = "v26-08-11-resource-budget";
 
 export default {
   async fetch(request, env, ctx) {
@@ -334,6 +334,11 @@ function createApp(env) {
     analyticsApiToken: String(env.ANALYTICS_API_TOKEN || env.CLOUDFLARE_API_TOKEN || "").trim(),
     analyticsDataset: String(env.ANALYTICS_DATASET || "llmmerge_requests").trim(),
     defaultCooldownTtl: parsePositiveInt(env.UPSTREAM_COOLDOWN_TTL, DEFAULT_COOLDOWN_TTL),
+    kvDailyBudget: {
+      reads: parsePositiveInt(env.KV_DAILY_READ_BUDGET, DEFAULT_KV_DAILY_BUDGET.reads),
+      writes: parsePositiveInt(env.KV_DAILY_WRITE_BUDGET, DEFAULT_KV_DAILY_BUDGET.writes),
+    },
+    kvFlushIntervalMs: parsePositiveInt(env.KV_FLUSH_INTERVAL_MS, DEFAULT_KV_FLUSH_INTERVAL_MS),
     defaultModelCacheTtl: parsePositiveInt(env.MODEL_CACHE_TTL, DEFAULT_MODEL_CACHE_TTL),
     defaultStreamIdleTimeoutMs: parsePositiveInt(env.STREAM_IDLE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS),
     defaultTimeoutMs: parsePositiveInt(env.REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
@@ -343,6 +348,7 @@ function createApp(env) {
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
     kv: env.KV || null,
     stdTimeUrl: String(env.STDTIME_URL || STDTIME_URL),
+    workersDailyRequestBudget: parsePositiveInt(env.WORKERS_DAILY_REQUEST_BUDGET, DEFAULT_WORKERS_DAILY_REQUEST_BUDGET),
   };
   _cachedEnvRef = env;
   return _cachedApp;
@@ -405,11 +411,11 @@ async function clientDailyUsageStorageKey(clientId, day) {
   return "usage:client-day:" + await storageKeyHash(`${clientId}\n${day}`);
 }
 
-// ponytail: in-memory batch; KV fallback flushes every 15 minutes, AE writes per request.
+// KV mirrors request logs and hourly stats in one-minute batches; Analytics Engine remains the long-term store.
 var _pendingLogs = [];
 var _pendingStats = {}; // hourKey -> bucket
 var _lastFlush = Date.now();
-var FLUSH_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_KV_FLUSH_INTERVAL_MS = 60 * 1000;
 var FLUSH_PENDING_LIMIT = 200;
 var _flushPromise = null;
 
@@ -432,7 +438,7 @@ function recordRequestLog(app, entry, ctx) {
   recordStats(app, entry);
   recordClientDailyUsage(app, entry, ctx);
   recordAnalyticsPoint(app, entry, ctx);
-  if (!hasAnalyticsEngine(app)) scheduleLogFlush(app, ctx);
+  scheduleLogFlush(app, ctx);
 }
 
 function hasAnalyticsEngine(app) {
@@ -535,10 +541,8 @@ function scheduleLogFlush(app, ctx) {
 
 async function flushBatch(app, force = false) {
   if (!app.kv) return;
-  // ponytail: AE handles stats+log persistence, skip KV writes entirely
-  if (hasAnalyticsEngine(app)) return;
   var now = Date.now();
-  if (!force && now - _lastFlush < FLUSH_INTERVAL_MS && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
+  if (!force && now - _lastFlush < app.kvFlushIntervalMs && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
   if (_flushPromise) return _flushPromise;
   _lastFlush = now;
   _flushPromise = _doFlush(app).catch(() => {}).finally(() => { _flushPromise = null; });
@@ -642,8 +646,6 @@ async function getMergedLogs(app) {
 async function getBestLogs(app) {
   const analyticsLogs = await getAnalyticsLogs(app).catch(() => null);
   if (analyticsLogs) return mergeRecentLogs(analyticsLogs, recentPendingLogs());
-  // ponytail: AE is the log store; without its query token show only live logs, never burn KV reads.
-  if (hasAnalyticsEngine(app)) return recentPendingLogs();
   return await getMergedLogs(app);
 }
 
@@ -843,7 +845,7 @@ async function fetchKvUsage(app) {
     available: true,
     updated_at: hkNowIso(),
     period: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), timezone: "UTC" },
-    quotas: KV_FREE_QUOTAS,
+    quotas: app.kvDailyBudget,
     operations,
   };
 }
@@ -905,7 +907,7 @@ async function fetchWorkersUsage(app) {
       timezone: "UTC",
       reset: "00:00 UTC",
     },
-    quota: WORKERS_FREE_DAILY_REQUEST_QUOTA,
+    quota: app.workersDailyRequestBudget,
     usage,
     sources: { workers, pages },
   };
@@ -1398,7 +1400,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       hourKeys.push(hkHourKey(now - h * 3600000));
     }
     const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
-    const useAnalyticsForStats = analyticsBuckets !== null || hasAnalyticsEngine(app);
+    const useAnalyticsForStats = analyticsBuckets !== null;
     const raws = useAnalyticsForStats ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
     // Keep all isolate-local stats when AE is write-only; the two-minute merge window is only for readable AE data.
     const liveStats = analyticsBuckets ? recentPendingStats() : _pendingStats;

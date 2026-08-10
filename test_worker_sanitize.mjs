@@ -1602,6 +1602,14 @@ assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
 assert.equal(kvPuts.length > kvPutsBeforeAnalytics, true);
 const realDateNow = Date.now;
 Date.now = () => realDateNow() + 3 * 60 * 1000;
+const mirroredKvTasks = [];
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [] }),
+}), analyticsEnv, { waitUntil(task) { mirroredKvTasks.push(task); } });
+await Promise.all(mirroredKvTasks);
+assert.equal(kvPuts.some((key) => key === "gateway:logs" || key.startsWith("gateway:stats:")), true);
 const writeOnlyStats = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), analyticsEnv)).json();
 Date.now = realDateNow;
 assert.equal(writeOnlyStats.buckets.some((bucket) => bucket.models?.qwen3 >= 1), true);
@@ -1627,7 +1635,18 @@ assert.equal(workersUsage.usage.requests, 5555);
 assert.equal(workersUsage.usage.errors, 10);
 assert.equal(workersUsage.sources.workers.requests, 1234);
 assert.equal(workersUsage.sources.pages.requests, 4321);
-assert.equal(workersUsage.quota, 100000);
+assert.equal(workersUsage.quota, 1000000);
+const budgetWorker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?budget=${Date.now()}`);
+const budgetEnv = {
+  ...analyticsQueryEnv,
+  KV_DAILY_READ_BUDGET: "2000000",
+  KV_DAILY_WRITE_BUDGET: "20000",
+  WORKERS_DAILY_REQUEST_BUDGET: "3000000",
+};
+const budgetKvUsage = await (await budgetWorker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), budgetEnv)).json();
+const budgetWorkersUsage = await (await budgetWorker.default.fetch(new Request("https://gw.test/admin-test-token/api/workers-usage"), budgetEnv)).json();
+assert.deepEqual(budgetKvUsage.quotas, { reads: 2000000, writes: 20000 });
+assert.equal(budgetWorkersUsage.quota, 3000000);
 
 const cachedConfigHits = speedHits.length;
 const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
