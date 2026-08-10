@@ -69,7 +69,7 @@ const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
 };
-const VERSION = "v26-08-06-compact-fallback";
+const VERSION = "v26-08-11-multi-client-compat";
 
 export default {
   async fetch(request, env, ctx) {
