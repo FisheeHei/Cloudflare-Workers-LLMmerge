@@ -2594,6 +2594,7 @@ function renderAdminScript(version) {
         '<div class="client-meta">' +
           '<strong>' + esc(c.name) + '</strong>' +
           '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
+          '<span class="note">' + clientUsageText(c.today_usage) + '</span>' +
         '</div>' +
         '<button type="button" class="small secondary" data-copy-client-id="' + esc(c.id) + '">\u590d\u5236 Key</button>' +
         '<button type="button" class="small secondary" data-copy-client-setup="' + esc(c.id) + '">\u590d\u5236\u914d\u7f6e</button>' +
@@ -2639,6 +2640,13 @@ function renderAdminScript(version) {
     byId("refresh-client-key").hidden = false;
     showToast("\u5ba2\u6237\u7aef Key \u5df2\u751f\u6210");
     await loadClients();
+  }
+
+  function clientUsageText(usage) {
+    usage = usage || {};
+    const requests = Number(usage.requests || 0);
+    const tokens = Number(usage.prompt_tokens || 0) + Number(usage.completion_tokens || 0);
+    return requests + ' today / ' + tokens.toLocaleString() + ' tokens';
   }
 
   async function copyClientKey(id) {

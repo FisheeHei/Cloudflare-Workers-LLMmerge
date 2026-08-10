@@ -850,7 +850,7 @@ assert.equal(stats.buckets.some((b) => b.model_statuses?.["minimax-m3"]?.success
 const logsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), env);
 const logs = await logsResp.json();
 assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
-assert.equal(kvPuts.length, 0);
+assert.equal(kvPuts.some((key) => key === "gateway:logs" || key.startsWith("gateway:stats:")), false);
 const developerRoleBodyStart = bodies.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -875,6 +875,17 @@ assert.equal(copiedClientResp.headers.get("cache-control"), "private, no-store")
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 200);
+const createdClientUsageTasks = [];
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: `Bearer ${createdClient.api_key}`, "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [] }),
+}), env, { waitUntil(task) { createdClientUsageTasks.push(task); } });
+await Promise.all(createdClientUsageTasks);
+const usedClient = await (await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/clients/${createdClient.id}`), env)).json();
+assert.equal(usedClient.today_usage.requests >= 1, true);
+const listedClients = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients"), env)).json();
+assert.equal(listedClients.some((client) => client.id === createdClient.id && client.today_usage.requests >= 1), true);
 const updateClientResp = await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/clients/${createdClient.id}`, {
   method: "PUT",
   headers: { "content-type": "application/json" },
@@ -947,6 +958,30 @@ const deniedSessionSwitch = await worker.default.fetch(new Request("https://gw.t
 }), restrictedEnv);
 assert.equal(deniedSessionSwitch.status, 403);
 assert.equal((await deniedSessionSwitch.text()).includes("locked to model: z-ai/glm-5.2"), true);
+const sessionKvStore = new Map();
+const sessionKvEnv = {
+  ...restrictedEnv,
+  KV: {
+    async get(key, type) { const value = sessionKvStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { sessionKvStore.set(key, value); },
+    async delete(key) { sessionKvStore.delete(key); },
+  },
+};
+const persistedSessionHeaders = {
+  authorization: "Bearer sk-session-locked", "content-type": "application/json", "session-id": "persisted-session-lock",
+  "x-codex-turn-metadata": JSON.stringify({ session_id: "persisted-session-lock", turn_id: "persisted-turn" }),
+};
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST", headers: persistedSessionHeaders,
+  body: JSON.stringify({ model: "z-ai/glm-5.2", input: "hi" }),
+}), sessionKvEnv)).status, 200);
+const freshWorker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?sessionKv=${Date.now()}`);
+const persistedLockResp = await freshWorker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST", headers: persistedSessionHeaders,
+  body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "switch" }),
+}), sessionKvEnv);
+assert.equal(persistedLockResp.status, 403);
+assert.equal((await persistedLockResp.text()).includes("locked to model: z-ai/glm-5.2"), true);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST", headers: { ...sessionHeaders, "x-codex-turn-metadata": JSON.stringify({ session_id: "codex-session-mixed", turn_id: "turn-gpt" }) },
   body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "next turn" }),
@@ -1542,7 +1577,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), env, { waitUntil(task) { waitUntilTasks.push(task); } });
 assert.equal(waitUntilTasks.length > 0, true);
 await Promise.all(waitUntilTasks);
-assert.equal(kvPuts.length, kvPutsBeforeWaitUntil);
+assert.equal(kvPuts.length > kvPutsBeforeWaitUntil, true);
 
 const analyticsTasks = [];
 const kvPutsBeforeAnalytics = kvPuts.length;
@@ -1564,7 +1599,7 @@ await Promise.all(analyticsTasks);
 assert.equal(analyticsPoints.length > 0, true);
 assert.equal(analyticsPoints.at(-1).blobs[3], "qwen3");
 assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
-assert.equal(kvPuts.length, kvPutsBeforeAnalytics);
+assert.equal(kvPuts.length > kvPutsBeforeAnalytics, true);
 const realDateNow = Date.now;
 Date.now = () => realDateNow() + 3 * 60 * 1000;
 const writeOnlyStats = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), analyticsEnv)).json();
@@ -2001,6 +2036,15 @@ const attemptBudgetResp = await worker.default.fetch(new Request("https://gw.tes
 }), attemptBudgetEnv);
 assert.equal(attemptBudgetResp.status, 503);
 assert.deepEqual(attemptBudgetHits.slice(attemptBudgetStart), ["fail"]);
+const cooldownWorker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?cooldown=${Date.now()}`);
+const cooldownStart = attemptBudgetHits.length;
+const cooldownResp = await cooldownWorker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-attempt-budget", "content-type": "application/json" },
+  body: JSON.stringify({ model: "attempt-budget-model", messages: [] }),
+}), attemptBudgetEnv);
+assert.equal(cooldownResp.headers.get("x-llm-gateway-upstream"), "attempt-budget-ok");
+assert.deepEqual(attemptBudgetHits.slice(cooldownStart), ["ok"]);
 
 const nimStore = new Map();
 nimStore.set("gateway:config", JSON.stringify({

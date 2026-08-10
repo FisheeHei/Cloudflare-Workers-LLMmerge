@@ -31,6 +31,7 @@ const CONFIG_SNAPSHOT_LIMIT = 5;
 const LOG_KEY = "gateway:logs";
 const STATS_PREFIX = "gateway:stats:";
 const STATS_WINDOW_HOURS = 24;
+const CLIENT_DAILY_USAGE_TTL_SECONDS = 35 * 24 * 3600;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
 const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
@@ -69,7 +70,7 @@ const KV_FREE_QUOTAS = {
   reads: 100000,
   writes: 1000,
 };
-const VERSION = "v26-08-11-multi-client-compat";
+const VERSION = "v26-08-11-kv-state-usage";
 
 export default {
   async fetch(request, env, ctx) {
@@ -304,7 +305,7 @@ var _stdTimeSyncing = null;
 var _analyticsQueryCache = {};
 var _kvUsageCache = null;
 var _workersUsageCache = null;
-// ponytail: model state is isolate-local; Goal turns must not create KV reads/writes.
+// ponytail: local copies avoid repeated KV reads; KV is the cross-isolate session source of truth.
 var _sessionModelLocks = {};
 var _sessionCurrentModels = {};
 
@@ -394,6 +395,16 @@ function hkHourKey(value) {
     String(d.getUTCHours()).padStart(2, "0");
 }
 
+function hkDayKey(value) {
+  const ms = typeof value === "number" ? value : Date.parse(value || hkNowIso());
+  const d = new Date((Number.isFinite(ms) ? ms : hkNowMs()) + HK_UTC_OFFSET_MS);
+  return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
+}
+
+async function clientDailyUsageStorageKey(clientId, day) {
+  return "usage:client-day:" + await storageKeyHash(`${clientId}\n${day}`);
+}
+
 // ponytail: in-memory batch; KV fallback flushes every 15 minutes, AE writes per request.
 var _pendingLogs = [];
 var _pendingStats = {}; // hourKey -> bucket
@@ -419,6 +430,7 @@ function recordStats(app, entry) {
 function recordRequestLog(app, entry, ctx) {
   appendLog(app, entry);
   recordStats(app, entry);
+  recordClientDailyUsage(app, entry, ctx);
   recordAnalyticsPoint(app, entry, ctx);
   if (!hasAnalyticsEngine(app)) scheduleLogFlush(app, ctx);
 }
@@ -462,6 +474,7 @@ function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path
   return {
     ts: hkNowIso(),
     client: client?.name || client?.id || "client",
+    client_id: client?.id || client?.name || "client",
     upstream: upstream || "unknown",
     model,
     path,
@@ -471,6 +484,45 @@ function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path
     completion_tokens: completionTokens || 0,
     ...extra,
   };
+}
+
+function recordClientDailyUsage(app, entry, ctx) {
+  if (!app?.kv || !entry?.client_id) return;
+  const task = updateClientDailyUsage(app.kv, entry).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+}
+
+async function updateClientDailyUsage(kv, entry) {
+  const day = hkDayKey(entry.ts);
+  const key = await clientDailyUsageStorageKey(entry.client_id, day);
+  // ponytail: read-merge-write is adequate for personal traffic; use a Durable Object if concurrent writes lose increments.
+  const existing = await kv.get(key, "json");
+  const usage = mergeClientDailyUsage(existing, entry, day);
+  await kv.put(key, JSON.stringify(usage), { expirationTtl: CLIENT_DAILY_USAGE_TTL_SECONDS });
+}
+
+function emptyClientDailyUsage(day, client) {
+  return {
+    day,
+    client: client || "client",
+    requests: 0,
+    success: 0,
+    fail: 0,
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    updated_at: "",
+  };
+}
+
+function mergeClientDailyUsage(existing, entry, day) {
+  const usage = { ...emptyClientDailyUsage(day, entry.client), ...(existing || {}) };
+  usage.requests += 1;
+  if (entry.status >= 200 && entry.status < 400) usage.success += 1;
+  else usage.fail += 1;
+  usage.prompt_tokens += Number(entry.prompt_tokens || 0);
+  usage.completion_tokens += Number(entry.completion_tokens || 0);
+  usage.updated_at = entry.ts || hkNowIso();
+  return usage;
 }
 
 function scheduleLogFlush(app, ctx) {
@@ -1297,7 +1349,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/clients" && request.method === "GET") {
-    return withCorsResponse(json(await listClientIndex(app.kv), 200));
+    return withCorsResponse(json(await listClientIndexWithUsage(app.kv), 200));
   }
 
   if (apiPath === "/api/clients" && request.method === "POST") {
@@ -1331,6 +1383,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       ...publicClientRecord(existing),
       api_key: existing.key,
       base_url: baseUrl,
+      today_usage: await readClientDailyUsage(app.kv, existing),
       setup: clientSetupPayload(existing, baseUrl),
     }, 200));
     const headers = new Headers(response.headers);
@@ -2063,13 +2116,25 @@ async function enforceSessionModelLock(client, runtime, request, payload, model)
   const cacheKey = `${client.id}\n${scopeId}`;
   const now = Date.now();
   let lock = _sessionModelLocks[cacheKey];
+  if (!lock && runtime.kv) {
+    try {
+      const stored = await runtime.kv.get(await sessionModelLockStorageKey(cacheKey), "json");
+      if (stored?.model && Number(stored.expires) > now) lock = stored;
+    } catch {}
+  }
   if (lock?.expires > now) {
+    _sessionModelLocks[cacheKey] = lock;
     if (lock.model !== model) throw httpError(403, `This session is locked to model: ${lock.model}`);
     return;
   }
 
   lock = { model, expires: now + SESSION_MODEL_LOCK_TTL_SECONDS * 1000 };
   _sessionModelLocks[cacheKey] = lock;
+  if (runtime.kv) {
+    try {
+      await runtime.kv.put(await sessionModelLockStorageKey(cacheKey), JSON.stringify(lock), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS });
+    } catch {}
+  }
   const lockKeys = Object.keys(_sessionModelLocks);
   if (lockKeys.length > 500) delete _sessionModelLocks[lockKeys[0]];
 }
@@ -2123,8 +2188,16 @@ async function currentSessionModel(client, runtime, request, payload) {
 }
 
 async function sessionCurrentModelStorageKey(value) {
+  return "session:current-model:" + await storageKeyHash(value);
+}
+
+async function sessionModelLockStorageKey(value) {
+  return "session:model-lock:" + await storageKeyHash(value);
+}
+
+async function storageKeyHash(value) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return "session:current-model:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function requestModelLockScope(request, payload) {
@@ -3616,6 +3689,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     throw httpError(404, `No upstream available for model: ${model}`);
   }
 
+  await hydrateUpstreamCooldowns(runtime, candidates, model);
   const attempts = orderUpstreams(runtime, candidates, model);
   const maxAttempts = runtime.routing.failover === false
     ? 1
@@ -3653,9 +3727,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         }
         lastError = new Error(`HTTP ${response.status}`);
         lastError.upstreamName = upstream.name;
-        markUpstreamFailure(runtime, upstream, model);
+        await markUpstreamFailure(runtime, upstream, model);
       } else {
-        clearUpstreamFailure(upstream, model);
+        await clearUpstreamFailure(runtime, upstream, model);
         rememberUpstreamLatency(upstream, model, upstreamLatency);
         rememberSuccessfulUpstream(upstream, model);
       }
@@ -3672,7 +3746,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       if (error.statusCode === 499) throw error;
       lastError = error;
       lastError.upstreamName = upstream.name;
-      markUpstreamFailure(runtime, upstream, model);
+      await markUpstreamFailure(runtime, upstream, model);
       if (isLast) {
         break;
       }
@@ -3984,7 +4058,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       if (result.response && !retryable) {
         done = true;
         stopHedgeLosers(pending, controllers, result.index);
-        clearUpstreamFailure(result.upstream, model);
+        await clearUpstreamFailure(runtime, result.upstream, model);
         rememberUpstreamLatency(result.upstream, model, result.latency);
         rememberSuccessfulUpstream(result.upstream, model);
         return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
@@ -3992,7 +4066,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       if (result.response) {
         await discardUpstreamResponse(result, "retryable hedged response");
       }
-      markUpstreamFailure(runtime, result.upstream, model);
+      await markUpstreamFailure(runtime, result.upstream, model);
     }
 
     const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest });
@@ -4027,17 +4101,17 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     const retryable = Boolean(result.streamError) || await isRetryableUpstreamResponse(result.response);
     if (retryable) {
       await discardUpstreamResponse(result, "retryable hedged fallback response");
-      markUpstreamFailure(runtime, upstream, model);
+      await markUpstreamFailure(runtime, upstream, model);
       return null;
     }
-    clearUpstreamFailure(upstream, model);
+    await clearUpstreamFailure(runtime, upstream, model);
     rememberUpstreamLatency(upstream, model, result.latency);
     rememberSuccessfulUpstream(upstream, model);
     return { response: result.response, upstream };
   } catch (error) {
     await discardUpstreamResponse(result, "hedged fallback failed");
     if (error.statusCode === 499) throw error;
-    markUpstreamFailure(runtime, upstream, model);
+    await markUpstreamFailure(runtime, upstream, model);
     return null;
   } finally {
     releaseReservation();
@@ -4329,15 +4403,41 @@ function weightedShuffle(items) {
     .map((entry) => entry.item);
 }
 
-function markUpstreamFailure(runtime, upstream, model) {
-  if (runtime.routing.failover === false) return;
-  _upstreamCooldowns[upstreamModelKey(upstream, model)] = {
-    until: Date.now() + runtime.upstreamCooldownTtl * 1000,
-  };
+async function hydrateUpstreamCooldowns(runtime, upstreams, model) {
+  if (!runtime.kv || !upstreams?.length) return;
+  await Promise.all(upstreams.map(async (upstream) => {
+    const key = upstreamModelKey(upstream, model);
+    try {
+      const stored = await runtime.kv.get(await upstreamCooldownStorageKey(key), "json");
+      if (stored?.until && Number(stored.until) > Date.now()) _upstreamCooldowns[key] = stored;
+      else delete _upstreamCooldowns[key];
+    } catch {}
+  }));
 }
 
-function clearUpstreamFailure(upstream, model) {
-  delete _upstreamCooldowns[upstreamModelKey(upstream, model)];
+async function markUpstreamFailure(runtime, upstream, model) {
+  if (runtime.routing.failover === false) return;
+  const key = upstreamModelKey(upstream, model);
+  const status = { until: Date.now() + runtime.upstreamCooldownTtl * 1000 };
+  _upstreamCooldowns[key] = status;
+  if (runtime.kv) {
+    try {
+      await runtime.kv.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: Math.max(1, runtime.upstreamCooldownTtl) });
+    } catch {}
+  }
+}
+
+async function clearUpstreamFailure(runtime, upstream, model) {
+  const key = upstreamModelKey(upstream, model);
+  const hadCooldown = Boolean(_upstreamCooldowns[key]);
+  delete _upstreamCooldowns[key];
+  if (hadCooldown && runtime.kv) {
+    try { await runtime.kv.delete(await upstreamCooldownStorageKey(key)); } catch {}
+  }
+}
+
+async function upstreamCooldownStorageKey(value) {
+  return "state:cooldown:" + await storageKeyHash(value);
 }
 
 function upstreamModelKey(upstream, model) {
@@ -4490,6 +4590,23 @@ async function deleteClientRecord(kv, id) {
 
 async function listClientIndex(kv) {
   return (await kv.get(clientIndexKey(), "json")) || [];
+}
+
+async function listClientIndexWithUsage(kv) {
+  const rows = await listClientIndex(kv);
+  return Promise.all(rows.map(async (record) => ({
+    ...record,
+    today_usage: await readClientDailyUsage(kv, record),
+  })));
+}
+
+async function readClientDailyUsage(kv, record) {
+  const day = hkDayKey();
+  try {
+    return await kv.get(await clientDailyUsageStorageKey(record.id, day), "json") || emptyClientDailyUsage(day, record.name);
+  } catch {
+    return emptyClientDailyUsage(day, record.name);
+  }
 }
 
 function publicClientRecord(record) {
