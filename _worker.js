@@ -59,6 +59,8 @@ const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
 const ACTIVE_UPSTREAM_ABORT_REASON = "admin released active upstreams";
 const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
+const ADMIN_SESSION_COOKIE = "llmmerge_admin";
+const ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 3600;
 const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
 const KV_USAGE_CACHE_MS = 60000;
 const WORKERS_USAGE_CACHE_MS = 60000;
@@ -99,7 +101,7 @@ export default {
         );
       }
 
-      if (env.ASSETS && request.method === "GET" && pathname !== "/" && pathname !== MODEL_PATH) {
+      if (env.ASSETS && request.method === "GET" && pathname !== "/" && pathname !== MODEL_PATH && !looksLikeAdminPath(pathnameLower, env)) {
         const assetResponse = await env.ASSETS.fetch(request);
         if (assetResponse.status !== 404) return assetResponse;
       }
@@ -107,21 +109,24 @@ export default {
       const app = createApp(env);
       scheduleStdTimeSync(app, ctx);
       const adminRoute = matchAdminRoute(pathnameLower, app);
+      const adminAuth = adminRoute && authorizeAdminRequest(request, url, app, adminRoute);
 
       if (request.method === "GET" && adminRoute?.kind === "page") {
+        if (!adminAuth?.ok) return adminUnauthorizedResponse(false);
         // ponytail: ETag-based conditional request �?CDN caches, revalidates with 304
-        var inm = request.headers.get("if-none-match") || ""; if (inm.includes(VERSION)) {
-          return new Response(null, { status: 304, headers: { etag: '"'+VERSION+'"', "cache-control": "public, max-age=0, must-revalidate" } });
-        }
         const pageBody = renderAdminPage(url.origin, VERSION);
         const pageHdrs = new Headers(HTML_HEADERS);
-        pageHdrs.set("cache-control", "public, max-age=0, must-revalidate");
-        pageHdrs.set("etag", '"'+VERSION+'"');
+        pageHdrs.set("cache-control", "private, no-store");
+        pageHdrs.set("x-frame-options", "DENY");
+        pageHdrs.set("referrer-policy", "no-referrer");
+        if (adminAuth.setCookie) pageHdrs.set("set-cookie", adminAuth.setCookie);
         return new Response(pageBody, { status: 200, headers: pageHdrs });
       }
 
       if (adminRoute?.kind === "api") {
-        return await handleAdminApi(request, url, pathnameLower, app, adminRoute.basePath);
+        if (!adminAuth?.ok) return adminUnauthorizedResponse(true);
+        const response = await handleAdminApi(request, url, pathnameLower, app, adminRoute.basePath);
+        return privateAdminResponse(response, adminAuth.setCookie);
       }
 
       if (pathname === MODEL_PATH && request.method === "GET") {
@@ -314,9 +319,14 @@ function createApp(env) {
     throw badConfig("ADMIN_TOKEN may only contain URL-safe characters.");
   }
 
+  const adminPath = normalizeAdminPath(env.ADMIN_PATH || "/llmmerge-admin");
+
   _cachedApp = {
-    adminPath: "/" + adminToken,
-    adminPaths: buildAdminPathAliases(adminToken),
+    adminPath,
+    adminPaths: [
+      adminPath,
+      ...buildAdminPathAliases(adminToken),
+    ].filter((value, index, values) => values.indexOf(value) === index),
     adminToken,
     analytics: env.ANALYTICS || env.LLM_ANALYTICS || env.LLM_GATEWAY_ANALYTICS || null,
     analyticsAccountId: String(env.ANALYTICS_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID || "").trim(),
@@ -1303,6 +1313,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
             ...publicClientRecord(record),
             api_key: record.key,
             base_url: `${url.origin}/v1`,
+            setup: clientSetupPayload(record, `${url.origin}/v1`),
           },
         },
         201,
@@ -1315,7 +1326,13 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     const id = decodeURIComponent(clientMatch[1]);
     const existing = await app.kv.get(clientIdKey(id), "json");
     if (!existing?.key) throw httpError(404, "Client not found.");
-    const response = withCorsResponse(json({ ...publicClientRecord(existing), api_key: existing.key }, 200));
+    const baseUrl = `${url.origin}/v1`;
+    const response = withCorsResponse(json({
+      ...publicClientRecord(existing),
+      api_key: existing.key,
+      base_url: baseUrl,
+      setup: clientSetupPayload(existing, baseUrl),
+    }, 200));
     const headers = new Headers(response.headers);
     headers.set("cache-control", "private, no-store");
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
@@ -1882,6 +1899,7 @@ async function buildRuntimeConfig(app) {
         api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
       }))
   );
+  const modelCache = await loadCachedModelMap(app.kv, decrypted);
 
   const runtime = {
     clients: app.envClients.map(normalizeClient),
@@ -1893,6 +1911,7 @@ async function buildRuntimeConfig(app) {
     settings: editable.settings,
     upstreamCooldownTtl: editable.settings.upstream_cooldown_ttl,
     upstreams: decrypted,
+    modelCache,
   };
   runtime.routeIndex = buildRouteIndex(decrypted);
   _runtimeCache = { app, runtime };
@@ -2126,11 +2145,15 @@ function requestModelLockScope(request, payload) {
 function routeModelRows(runtime) {
   if (runtime._routeModelRows) return runtime._routeModelRows;
   runtime._routeModelRows = runtime.upstreams.flatMap((upstream) =>
-    configuredUpstreamModels(upstream)
-      .filter((model) => model && model !== "*")
+    registryModelsForUpstream(runtime, upstream)
       .map((model) => ({ model, upstream }))
   );
   return runtime._routeModelRows;
+}
+
+function registryModelsForUpstream(runtime, upstream) {
+  const configured = configuredUpstreamModels(upstream).filter((model) => model && model !== "*");
+  return configured.length ? configured : normalizeStringArray(runtime.modelCache?.[upstream.name]);
 }
 
 function modelRegistryRows(runtime) {
@@ -2208,6 +2231,19 @@ function modelsMatch(left, right) {
   return lowerA === lowerB || modelSuffix(a).toLowerCase() === modelSuffix(b).toLowerCase();
 }
 
+async function loadCachedModelMap(kv, upstreams) {
+  if (!kv) return {};
+  const entries = await Promise.all((upstreams || []).map(async (upstream) => {
+    try {
+      const cached = await kv.get(modelsCacheKey(upstream.name), "json");
+      return [upstream.name, normalizeStringArray(cached?.models)];
+    } catch {
+      return [upstream.name, []];
+    }
+  }));
+  return Object.fromEntries(entries);
+}
+
 // ponytail: parallel model refresh
 async function refreshModelCache(runtime) {
   const results = await Promise.all(
@@ -2235,6 +2271,10 @@ async function getFreshModels(runtime, upstream) {
       }),
       { expirationTtl: runtime.modelCacheTtl },
     );
+    runtime.modelCache ||= {};
+    runtime.modelCache[upstream.name] = models;
+    delete runtime._routeModelRows;
+    delete runtime._modelRegistryRows;
 
     return models;
   } catch {
@@ -4465,6 +4505,38 @@ function publicClientRecord(record) {
   };
 }
 
+function clientSetupPayload(record, baseUrl) {
+  const model = firstClientModel(record);
+  const apiKey = record.key;
+  return {
+    base_url: baseUrl,
+    api_key: apiKey,
+    model,
+    opencode: {
+      provider: "llm-merge",
+      npm: "@ai-sdk/openai-compatible",
+      options: { baseURL: baseUrl, apiKey },
+      models: { [model]: {} },
+    },
+    openclaw: {
+      providers: {
+        "llm-merge": {
+          api: "openai-completions",
+          baseUrl,
+          apiKey,
+          models: { [model]: {} },
+        },
+      },
+    },
+    rikkahub: { baseUrl, apiKey, model },
+    cherry_studio: { provider: "Custom OpenAI Compatible", apiAddress: baseUrl, apiKey, model },
+  };
+}
+
+function firstClientModel(record) {
+  return normalizeStringArray(record?.models).find((model) => model !== "*") || "your-model-id";
+}
+
 async function ensureEncryptedValue(value, secret) {
   if (!secret) {
     throw badConfig("Missing API_KEY_CRYPT_SECRET or ADMIN_TOKEN for encryption.");
@@ -4592,6 +4664,11 @@ function normalizePathname(pathname) {
   return value.replace(/\/+$/, "") || "/";
 }
 
+function normalizeAdminPath(pathname) {
+  const normalized = normalizePathname(pathname);
+  return (normalized.startsWith("/") ? normalized : `/${normalized}`).toLowerCase();
+}
+
 function pickAdminToken(env) {
   const candidates = [
     env.ADMIN_TOKEN,
@@ -4628,7 +4705,14 @@ function buildAdminPathAliases(adminToken) {
     variants.add(`/${normalized.replace(/_/g, "")}`);
   }
 
-  return [...variants].map((value) => normalizePathname(value));
+  return [...variants].map((value) => normalizeAdminPath(value));
+}
+
+function looksLikeAdminPath(pathnameLower, env) {
+  const token = pickAdminToken(env);
+  const paths = [normalizeAdminPath(env.ADMIN_PATH || "/llmmerge-admin")];
+  if (token) paths.push(...buildAdminPathAliases(token));
+  return paths.some((basePath) => pathnameLower === basePath || pathnameLower.startsWith(`${basePath}/api/`));
 }
 
 function matchAdminRoute(pathnameLower, app) {
@@ -4641,6 +4725,58 @@ function matchAdminRoute(pathnameLower, app) {
     }
   }
   return null;
+}
+
+function authorizeAdminRequest(request, url, app, adminRoute) {
+  const legacyPath = adminRoute.basePath !== app.adminPath;
+  const token = adminRequestToken(request, url);
+  if (!legacyPath && token !== app.adminToken) return { ok: false };
+  return {
+    ok: true,
+    setCookie: token === app.adminToken ? adminSessionCookie(app, url) : "",
+  };
+}
+
+function adminRequestToken(request, url) {
+  const authorization = String(request.headers.get("authorization") || "");
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
+  return String(
+    request.headers.get("x-admin-token") ||
+    bearer ||
+    url.searchParams.get("token") ||
+    readCookie(request, ADMIN_SESSION_COOKIE) ||
+    "",
+  ).trim();
+}
+
+function readCookie(request, name) {
+  const prefix = `${name}=`;
+  for (const item of String(request.headers.get("cookie") || "").split(";")) {
+    const value = item.trim();
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
+  }
+  return "";
+}
+
+function adminSessionCookie(app, url) {
+  return `${ADMIN_SESSION_COOKIE}=${app.adminToken}; Path=${app.adminPath}; Max-Age=${ADMIN_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax${url.protocol === "https:" ? "; Secure" : ""}`;
+}
+
+function adminUnauthorizedResponse(isApi) {
+  if (isApi) return withCorsResponse(json(openAiError("Admin authentication required.", "authentication_error"), 401));
+  const headers = new Headers(HTML_HEADERS);
+  headers.set("cache-control", "private, no-store");
+  headers.set("www-authenticate", "Bearer");
+  return new Response("Admin authentication required.", { status: 401, headers });
+}
+
+function privateAdminResponse(response, setCookie) {
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "private, no-store");
+  headers.set("x-frame-options", "DENY");
+  headers.set("referrer-policy", "no-referrer");
+  if (setCookie) headers.set("set-cookie", setCookie);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 function parsePositiveInt(value, fallback) {

@@ -20,6 +20,7 @@ export function sanitizeProxyBody(bodyText, upstream) {
   const bridge = providerModelBridge(upstream, modelName);
   const isGlm = isGlmModel(modelName);
   const wantsKimiPreservedThinking = (bridge.provider === "nim" || bridge.provider === "moonshot") && kimiPreservedThinkingRequested(payload, modelName);
+  changed = normalizeDeveloperMessages(payload, upstreamSupportsDeveloperRole(upstream)) || changed;
   changed = applyProviderReasoningOptions(payload) || changed;
   changed = normalizeReasoningFields(payload, isGlm && bridge.provider !== "zhipu", wantsKimiPreservedThinking || bridge.provider !== "none") || changed;
   changed = applyKimiPreservedThinking(payload, wantsKimiPreservedThinking) || changed;
@@ -85,12 +86,34 @@ function bodyNeedsSanitizing(bodyText, bodyLower) {
     bodyText.includes('"reasoning_split"') ||
     bodyText.includes('"enable_thinking"') ||
     bodyText.includes('"chat_template_kwargs"') ||
+    bodyText.includes('"developer"') ||
     bodyLower.includes("kimi-k2") ||
     bodyText.includes('"functions"') ||
     bodyText.includes('"function_call"') ||
     bodyText.includes('"tool_choice"') ||
     bodyText.includes('"temperature"') ||
     bodyLower.includes("minimax-m3");
+}
+
+function upstreamSupportsDeveloperRole(upstream) {
+  const preset = String(upstream?.preset || "");
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return upstream?.capability?.developer_role === true ||
+    upstream?.supports_developer_role === true ||
+    preset === "openai" ||
+    baseUrl.includes("api.openai.com");
+}
+
+function normalizeDeveloperMessages(payload, keepDeveloperRole) {
+  if (keepDeveloperRole || !Array.isArray(payload?.messages)) return false;
+  let changed = false;
+  for (const message of payload.messages) {
+    if (String(message?.role || "") === "developer") {
+      message.role = "system";
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function applyProviderReasoningOptions(payload) {

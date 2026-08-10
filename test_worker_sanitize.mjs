@@ -579,6 +579,18 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
+assert.equal(adminPageResp.headers.get("cache-control"), "private, no-store");
+assert.equal(adminPageResp.headers.get("x-frame-options"), "DENY");
+assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-admin"), env)).status, 401);
+const canonicalAdminResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin?token=admin-test-token"), env);
+assert.equal(canonicalAdminResp.status, 200);
+const adminCookie = canonicalAdminResp.headers.get("set-cookie").split(";")[0];
+assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {
+  headers: { cookie: adminCookie },
+}), env)).status, 200);
+assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-admin/api/config", {
+  headers: { "x-admin-token": "admin-test-token" },
+}), env)).status, 200);
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
 assert.equal(adminPage.includes("routing-fast"), true);
@@ -651,6 +663,21 @@ const privateModelsResp = await worker.default.fetch(new Request("https://gw.tes
   headers: { authorization: "Bearer sk-test" },
 }), env);
 assert.equal(privateModelsResp.headers.get("cache-control"), "private, max-age=30");
+const modelCacheStore = new Map([["cache:models:cached-upstream", JSON.stringify({ models: ["vendor/cached-model"] })]]);
+const modelCacheEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  KV: {
+    async get(key, type) { const value = modelCacheStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { modelCacheStore.set(key, value); },
+    async delete(key) { modelCacheStore.delete(key); },
+  },
+  UPSTREAMS_JSON: JSON.stringify([{ name: "cached-upstream", base_url: "https://cached.example/v1", api_key: "x", models: ["*"], paths: ["/v1/chat/completions"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "cached-client", key: "sk-cached", models: ["*"], upstreams: ["cached-upstream"] }]),
+};
+const cachedModels = await (await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-cached" },
+}), modelCacheEnv)).json();
+assert.equal(cachedModels.data.some((model) => model.id === "custom/cached-model"), true);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
@@ -824,6 +851,13 @@ const logsResp = await worker.default.fetch(new Request("https://gw.test/admin-t
 const logs = await logsResp.json();
 assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
 assert.equal(kvPuts.length, 0);
+const developerRoleBodyStart = bodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
+  body: JSON.stringify({ model: "qwen3", messages: [{ role: "developer", content: "follow repo rules" }] }),
+}), env);
+assert.equal(bodies[developerRoleBodyStart].messages[0].role, "system");
 
 const createdClientResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients", {
   method: "POST",
@@ -835,6 +869,8 @@ const copiedClientResp = await worker.default.fetch(new Request(`https://gw.test
 const copiedClient = await copiedClientResp.json();
 assert.equal(copiedClientResp.status, 200);
 assert.equal(copiedClient.api_key, createdClient.api_key);
+assert.equal(copiedClient.setup.openclaw.providers["llm-merge"].baseUrl, "https://gw.test/v1");
+assert.equal(copiedClient.setup.rikkahub.apiKey, createdClient.api_key);
 assert.equal(copiedClientResp.headers.get("cache-control"), "private, no-store");
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },

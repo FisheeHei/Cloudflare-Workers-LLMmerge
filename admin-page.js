@@ -2596,12 +2596,18 @@ function renderAdminScript(version) {
           '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
         '</div>' +
         '<button type="button" class="small secondary" data-copy-client-id="' + esc(c.id) + '">\u590d\u5236 Key</button>' +
+        '<button type="button" class="small secondary" data-copy-client-setup="' + esc(c.id) + '">\u590d\u5236\u914d\u7f6e</button>' +
         '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '">\u5220\u9664</button>' +
       '</div>'
     ).join("");
     host.querySelectorAll("button[data-copy-client-id]").forEach((btn) => {
       btn.addEventListener("click", () =>
         withButtonBusy(btn, "\u590d\u5236\u4e2d...", () => copyClientKey(btn.dataset.copyClientId)).catch(showError)
+      );
+    });
+    host.querySelectorAll("button[data-copy-client-setup]").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        withButtonBusy(btn, "\u590d\u5236\u4e2d...", () => copyClientSetup(btn.dataset.copyClientSetup)).catch(showError)
       );
     });
     host.querySelectorAll("button[data-client-id]").forEach((btn) => {
@@ -2640,6 +2646,13 @@ function renderAdminScript(version) {
     const client = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(client?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef Key \u5931\u8d25");
     await copyText(client.api_key, "API Key \u5df2\u590d\u5236");
+  }
+
+  async function copyClientSetup(id) {
+    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(id));
+    const client = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(client?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u914d\u7f6e\u5931\u8d25");
+    await copyText(JSON.stringify(client.setup, null, 2), "\u5ba2\u6237\u7aef\u914d\u7f6e\u5df2\u590d\u5236");
   }
 
   async function deleteClient(id) {
