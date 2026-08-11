@@ -2537,7 +2537,7 @@ function renderAdminScript(version) {
 
   function filterLogs(logs) {
     if (state.logFilter === "stream") return logs.filter((l) => l.time_to_first_byte_ms != null);
-    if (state.logFilter === "error") return logs.filter((l) => Number(l.status || 0) >= 400 || l.close_reason === "error");
+    if (state.logFilter === "error") return logs.filter((l) => Number(l.status || 0) >= 400 || ["error", "eof", "finish_grace"].includes(l.close_reason));
     if (state.logFilter === "slow") return logs.filter((l) => Number(l.max_stream_gap_ms || 0) >= 30000);
     return logs;
   }

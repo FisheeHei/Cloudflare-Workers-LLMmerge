@@ -20,7 +20,8 @@ const cancelledText = await new Response(worker.withSseKeepAlive(new ReadableStr
   },
 }), 50)).text();
 assert.equal(cancelledText.includes('"content":"hi"'), true);
-assert.equal(cancelledText.endsWith("data: [DONE]\n\n"), true);
+assert.equal(cancelledText.includes('"message":"CANCEL"'), true);
+assert.equal(cancelledText.includes("data: [DONE]"), false);
 
 const bodies = [];
 const zhipuBodies = [];
@@ -151,6 +152,12 @@ globalThis.fetch = async (url, init) => {
       'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9,"total_tokens":16}}\n\n',
       'data: [DONE]\n\n',
     ].join(""), { status: 200, headers: { "content-type": "text/event-stream", "content-length": "999", "content-encoding": "gzip" } });
+  }
+  if (String(url).includes("eof-stream.example")) {
+    return new Response([
+      'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n',
+    ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("usage.example")) {
     acceptHits.push(init.headers.get("accept"));
@@ -2748,6 +2755,7 @@ usageStore.set("gateway:config", JSON.stringify({
   upstreams: [
     { name: "usage-json", base_url: "https://usage.example/v1", api_key_encrypted: "u", models: ["usage-json"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "usage-stream", base_url: "https://usage-stream.example/v1", api_key_encrypted: "s", models: ["usage-stream"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "eof-stream", base_url: "https://eof-stream.example/v1", api_key_encrypted: "e", models: ["eof-stream"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const usageEnv = {
@@ -2761,7 +2769,7 @@ const usageEnv = {
     async put(key, value) { usageStore.set(key, value); },
     async delete(key) { usageStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "usage-client", key: "sk-usage", models: ["*"], upstreams: ["usage-json", "usage-stream"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "usage-client", key: "sk-usage", models: ["*"], upstreams: ["usage-json", "usage-stream", "eof-stream"] }]),
 };
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -2803,6 +2811,20 @@ assert.equal(usageStreamLog.close_reason, "done");
 assert.equal(Number.isFinite(usageStreamLog.time_to_first_byte_ms), true);
 assert.equal(Number.isFinite(usageStreamLog.time_to_first_token_ms), true);
 assert.equal(Number.isFinite(usageStreamLog.max_stream_gap_ms), true);
+const eofStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-usage", "content-type": "application/json" },
+  body: JSON.stringify({ model: "eof-stream", messages: [], stream: true }),
+}), usageEnv);
+const eofStreamText = await eofStreamResp.text();
+assert.equal(eofStreamText.includes('"content":"partial"'), true);
+assert.equal(eofStreamText.includes('"message":"Upstream stream ended without [DONE]."'), true);
+assert.equal(eofStreamText.includes("data: [DONE]"), false);
+const eofLogs = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), usageEnv)).json();
+const eofStreamLog = eofLogs.logs.find((entry) => entry.model === "eof-stream");
+assert.equal(eofStreamLog.status, 502);
+assert.equal(eofStreamLog.close_reason, "eof");
+assert.equal(eofStreamLog.completion_tokens, 4);
 
 const toolLogStore = new Map();
 toolLogStore.set("gateway:config", JSON.stringify({

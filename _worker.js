@@ -46,7 +46,7 @@ const NVIDIA_NIM_RPM_LIMIT = 40;
 const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 // Keep the SSE connection visibly active through an additional proxy layer.
 const SSE_KEEPALIVE_MS = 3000;
-const SSE_FINISH_GRACE_MS = 1000;
+const SSE_FINISH_GRACE_MS = 5000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
@@ -69,7 +69,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-11-admin-ui";
+const VERSION = "v26-08-11-stream-fix";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1008,6 +1008,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const doneChunk = encoder.encode("data: [DONE]\n\n");
+  const errorChunk = (message) => encoder.encode("data: " + JSON.stringify(openAiError(message, "server_error")) + "\n\n");
   let buffer = "";
   let usage = null;
   let outputText = "";
@@ -1086,10 +1087,16 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
           if (rewriteModel) emitRewritten(controller);
           else consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk), () => { sawDone = true; });
         }
+        if (!sawDone && closeReason === "done") {
+          closeReason = "eof";
+          failureStatus = failureStatus || 502;
+          controller.enqueue(errorChunk("Upstream stream ended without [DONE]."));
+        }
         finish();
         controller.close();
       } catch (error) {
         closeReason = "error";
+        failureStatus = failureStatus || 502;
         finish();
         controller.error(error);
       }
@@ -1101,7 +1108,7 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
   if (!body) return body;
   const encoder = new TextEncoder();
   const ping = encoder.encode(": keepalive\n\n");
-  const done = encoder.encode(": stream closed\n\ndata: [DONE]\n\n");
+  const errorChunk = (error) => encoder.encode("data: " + JSON.stringify(openAiError(error?.message || "Stream error.", "server_error")) + "\n\n");
   const interval = Math.max(1, Number(intervalMs) || SSE_KEEPALIVE_MS);
   let reader = null;
   let timer = null;
@@ -1145,7 +1152,7 @@ export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
         }
       } catch (error) {
         if (!closed) {
-          if (safeEnqueue(controller, done)) safeClose(controller);
+          if (safeEnqueue(controller, errorChunk(error))) safeClose(controller);
         }
       }
     },
