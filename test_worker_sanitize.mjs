@@ -359,6 +359,13 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("hedge-stream-slow.example")) {
     hedgeStreamHits.push("slow");
+    const body = JSON.parse(init.body || "{}");
+    if (String(body.model || "").includes("deepseek")) {
+      return new Response([
+        'data: {"choices":[{"delta":{"reasoning_content":"hidden thought"}}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
     return new Response(new ReadableStream({
       start(controller) {
         init.signal?.addEventListener("abort", () => {
@@ -378,7 +385,9 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("hedge-stream-fast.example")) {
     hedgeStreamHits.push("fast");
-    return new Response('data: {"choices":[{"delta":{"content":"fast"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+    const body = JSON.parse(init.body || "{}");
+    const text = String(body.model || "").includes("deepseek") ? "visible" : "fast";
+    return new Response('data: {"choices":[{"delta":{"content":"' + text + '"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("hedge-fast.example")) {
     hedgeHits.push("fast");
@@ -2086,6 +2095,36 @@ assert.equal((await hedgeStreamResp.text()).includes('"content":"fast"'), true);
 assert.deepEqual(hedgeStreamHits.slice(hedgeStreamStart), ["slow", "fast"]);
 await new Promise((resolve) => setTimeout(resolve, 100));
 assert.equal(hedgeStreamAborts.includes("slow"), true);
+
+const deepSeekHedgeStreamStore = new Map();
+deepSeekHedgeStreamStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 600, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "deepseek-hedge-slow", base_url: "https://hedge-stream-slow.example/v1", api_key_encrypted: "s", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "deepseek-hedge-fast", base_url: "https://hedge-stream-fast.example/v1", api_key_encrypted: "f", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+}));
+const deepSeekHedgeStreamEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = deepSeekHedgeStreamStore.get(key); return (type === "json" || type?.type === "json") && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { deepSeekHedgeStreamStore.set(key, value); },
+    async delete(key) { deepSeekHedgeStreamStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "deepseek-hedge-client", key: "sk-deepseek-hedge", models: ["*"], upstreams: ["deepseek-hedge-slow", "deepseek-hedge-fast"] }]),
+};
+const deepSeekHedgeStart = hedgeStreamHits.length;
+const deepSeekHedgeResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-deepseek-hedge", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", messages: [], stream: true }),
+}), deepSeekHedgeStreamEnv);
+const deepSeekHedgeText = await deepSeekHedgeResp.text();
+assertNoDeepSeekLeak(deepSeekHedgeText);
+assert.equal(deepSeekHedgeText.includes('"content":"visible"'), true);
+assert.deepEqual(hedgeStreamHits.slice(deepSeekHedgeStart), ["slow", "fast"]);
 
 const softFastStore = new Map();
 softFastStore.set("gateway:config", JSON.stringify({

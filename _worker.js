@@ -2607,7 +2607,7 @@ async function speedTestUpstream(runtime, upstream, model) {
 
     const streaming = (resp.headers.get("content-type") || "").includes("text/event-stream");
     if (streaming) {
-      const primed = await primeSseResponse(resp);
+      const primed = await primeSseResponse(resp, shouldHideDeepSeekReasoning(model, model, upstream));
       resp = primed.response;
       const latency = Date.now() - started;
       if (primed.error) return { name: upstream.name, ok: false, status: 502, error: primed.error, latency_ms: latency };
@@ -4173,7 +4173,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
           firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
         });
         if (result.response.ok && streamRequest) {
-          const primed = await primeSseResponse(result.response);
+          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
           result.response = primed.response;
           result.streamError = primed.error;
           result.latency = Date.now() - result.startedAt;
@@ -4240,7 +4240,7 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
       firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
     });
     if (result.response.ok && streamRequest) {
-      const primed = await primeSseResponse(result.response);
+      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
       result.response = primed.response;
       result.streamError = primed.error;
       result.latency = Date.now() - result.startedAt;
@@ -4273,7 +4273,7 @@ function requestBodyStreams(bodyText) {
   try { return JSON.parse(bodyText || "{}").stream === true; } catch { return false; }
 }
 
-async function primeSseResponse(response) {
+async function primeSseResponse(response, hideReasoning = false) {
   if (!response.body || !(response.headers.get("content-type") || "").includes("text/event-stream")) {
     return { response, error: "" };
   }
@@ -4283,6 +4283,7 @@ async function primeSseResponse(response) {
   let text = "";
   let error = "";
   let bufferedBytes = 0;
+  const stripText = hideReasoning ? createThinkTagStripper() : null;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -4304,7 +4305,7 @@ async function primeSseResponse(response) {
       if (!data || data === "[DONE]") continue;
       const payload = safeJson(data);
       error = streamEventErrorMessage(payload) || upstreamApplicationErrorMessage(data);
-      if (error || ssePayloadHasOutput(payload)) {
+      if (error || ssePayloadHasOutput(payload, hideReasoning, stripText)) {
         return { response: prependResponseChunks(response, reader, chunks), error };
       }
     }
@@ -4312,11 +4313,13 @@ async function primeSseResponse(response) {
   return { response: prependResponseChunks(response, reader, chunks), error: error || "Upstream stream ended before producing output." };
 }
 
-function ssePayloadHasOutput(payload) {
+function ssePayloadHasOutput(payload, hideReasoning = false, stripText = null) {
   if (!payload || typeof payload !== "object") return false;
-  if (String(payload.type || "").includes("delta")) return true;
+  if (String(payload.type || "").includes("delta")) return !hideReasoning || !String(payload.type || "").includes("reasoning");
   const delta = payload.choices?.[0]?.delta || {};
-  return Boolean(chatContentToText(delta.content || "") || delta.reasoning_content || delta.reasoning || delta.thinking || delta.tool_calls?.length);
+  const text = chatContentToText(delta.content || "");
+  const visible = hideReasoning && stripText ? stripText(text) : text;
+  return Boolean(visible || (!hideReasoning && (delta.reasoning_content || delta.reasoning || delta.thinking)) || delta.tool_calls?.length);
 }
 
 function prependResponseChunks(response, reader, chunks) {
