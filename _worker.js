@@ -69,7 +69,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-11-stream-fix";
+const VERSION = "v26-08-14-deepseek-reasoning-filter";
 
 export default {
   async fetch(request, env, ctx) {
@@ -952,6 +952,7 @@ function kvActionBucket(actionType) {
 async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, responseModel = model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
   const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
   const toolsCount = requestToolsCount(requestPayload);
+  const hideReasoning = shouldHideDeepSeekReasoning(model, responseModel, proxyResponse.upstream);
   const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
     client,
     upstream: proxyResponse.upstream.name,
@@ -979,7 +980,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   }
   if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
     setSseHeaders(headers);
-    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : ""));
+    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : "", hideReasoning));
     return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -994,6 +995,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
       log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
       return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
     }
+    sanitizeOpenAiPayload(payload, hideReasoning);
     const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
     log(usage, 0, { finish_reason: responseFinishReason(payload), tool_calls_count: responseToolCallsCount(payload) });
     payload.model = responseModel;
@@ -1004,7 +1006,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
 }
 
-function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "") {
+function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "", hideReasoning = false) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const doneChunk = encoder.encode("data: [DONE]\n\n");
@@ -1019,12 +1021,14 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   let closeReason = "done";
   let finishReason = "";
   let sawDone = false;
-  const rewriteModel = Boolean(responseModel);
-  const emitRewritten = (controller, now = Date.now()) => {
+  const transformChunk = Boolean(responseModel || hideReasoning);
+  const stripChoiceText = createChoiceThinkTagStripper();
+  const emitTransformed = (controller, now = Date.now()) => {
     let output = "";
     buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
-      noteChunk(chunk, now);
-      output += `data: ${JSON.stringify({ ...chunk, model: responseModel })}\n\n`;
+      const out = sanitizeOpenAiStreamChunk(chunk, { responseModel, hideReasoning, stripChoiceText });
+      noteChunk(out, now);
+      output += "data: " + JSON.stringify(out) + "\n\n";
     }, () => {
       sawDone = true;
       output += "data: [DONE]\n\n";
@@ -1074,8 +1078,8 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
           const now = Date.now();
           noteStreamByte(diag, now);
           buffer += decoder.decode(value, { stream: true });
-          if (rewriteModel) {
-            emitRewritten(controller, now);
+          if (transformChunk) {
+            emitTransformed(controller, now);
           } else {
             buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk, now), () => { sawDone = true; });
             controller.enqueue(value);
@@ -1084,7 +1088,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
         }
         if (buffer) {
           buffer += "\n\n";
-          if (rewriteModel) emitRewritten(controller);
+          if (transformChunk) emitTransformed(controller);
           else consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk), () => { sawDone = true; });
         }
         if (!sawDone && closeReason === "done") {
@@ -1293,6 +1297,130 @@ function isIntegerString(value) {
 function requestToolsCount(payload) {
   if (!payload || typeof payload !== "object") return 0;
   return (Array.isArray(payload.tools) ? payload.tools.length : 0) + (Array.isArray(payload.functions) ? payload.functions.length : 0);
+}
+
+function shouldHideDeepSeekReasoning(model, responseModel = "", upstream = null) {
+  const preset = String(upstream?.preset || "").trim();
+  return isDeepSeekModelName(model) || isDeepSeekModelName(responseModel) ||
+    preset === "deepseek" || inferPresetId(upstream?.base_url) === "deepseek";
+}
+
+function isDeepSeekModelName(value) {
+  return /(^|[\/_.-])deepseek([\/_.-]|$)/i.test(String(value || ""));
+}
+
+function stripThinkTags(value) {
+  return String(value || "")
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
+    .replace(/^[\s\S]*?<\/think>/i, "")
+    .replace(/<think\b[^>]*>[\s\S]*$/i, "");
+}
+
+function trailingThinkMarker(text) {
+  const lower = String(text || "").toLowerCase();
+  const tags = ["<think", "</think>"];
+  for (let length = Math.min(7, lower.length); length > 0; length -= 1) {
+    const suffix = lower.slice(-length);
+    if (tags.some((tag) => tag.startsWith(suffix))) return length;
+  }
+  return 0;
+}
+
+function createThinkTagStripper() {
+  let inThink = false;
+  let pending = "";
+  return (value) => {
+    let text = pending + String(value || "");
+    pending = "";
+    const pendingLength = trailingThinkMarker(text);
+    if (pendingLength) {
+      pending = text.slice(-pendingLength);
+      text = text.slice(0, -pendingLength);
+    }
+    let out = "";
+    for (;;) {
+      const lower = text.toLowerCase();
+      if (inThink) {
+        const close = lower.indexOf("</think>");
+        if (close < 0) return out;
+        text = text.slice(close + 8);
+        inThink = false;
+        continue;
+      }
+      const open = lower.indexOf("<think");
+      const close = lower.indexOf("</think>");
+      if (close >= 0 && (open < 0 || close < open)) {
+        text = text.slice(close + 8);
+        continue;
+      }
+      if (open < 0) return out + text;
+      out += text.slice(0, open);
+      const end = text.indexOf(">", open);
+      if (end < 0) {
+        pending = text.slice(open);
+        return out;
+      }
+      text = text.slice(end + 1);
+      inThink = true;
+    }
+  };
+}
+
+function createChoiceThinkTagStripper() {
+  const strippers = new Map();
+  return (key, value) => {
+    const id = String(key ?? 0);
+    if (!strippers.has(id)) strippers.set(id, createThinkTagStripper());
+    return strippers.get(id)(value);
+  };
+}
+
+function sanitizeTextContent(content, stripText = stripThinkTags) {
+  if (typeof content === "string") return stripText(content);
+  if (!Array.isArray(content)) return content;
+  return content.map((part) => {
+    if (typeof part === "string") return stripText(part);
+    if (!part || typeof part !== "object") return part;
+    const out = { ...part };
+    if (typeof out.text === "string") out.text = stripText(out.text);
+    if (typeof out.content === "string") out.content = stripText(out.content);
+    return out;
+  });
+}
+
+function sanitizeOpenAiMessage(message, stripText = stripThinkTags) {
+  if (!message || typeof message !== "object") return message;
+  delete message.reasoning_content;
+  delete message.reasoning;
+  delete message.thinking;
+  if ("content" in message) message.content = sanitizeTextContent(message.content, stripText);
+  return message;
+}
+
+function sanitizeOpenAiPayload(payload, hideReasoning) {
+  if (!hideReasoning || !payload || typeof payload !== "object") return payload;
+  for (const choice of payload.choices || []) {
+    sanitizeOpenAiMessage(choice?.message);
+    sanitizeOpenAiMessage(choice?.delta);
+    if (typeof choice?.text === "string") choice.text = stripThinkTags(choice.text);
+  }
+  return payload;
+}
+
+function sanitizeOpenAiStreamChunk(chunk, { responseModel = "", hideReasoning = false, stripChoiceText = null } = {}) {
+  const out = responseModel ? { ...chunk, model: responseModel } : { ...chunk };
+  if (!hideReasoning) return out;
+  if (!Array.isArray(chunk.choices)) return out;
+  out.choices = chunk.choices.map((choice, index) => {
+    const key = choice?.index ?? index;
+    const stripText = stripChoiceText ? (text) => stripChoiceText(key, text) : stripThinkTags;
+    const next = { ...choice };
+    if (choice?.message) next.message = sanitizeOpenAiMessage({ ...choice.message }, stripText);
+    if (choice?.delta) next.delta = sanitizeOpenAiMessage({ ...choice.delta }, stripText);
+    if (typeof choice?.text === "string") next.text = stripText(choice.text);
+    return next;
+  });
+  return out;
 }
 
 function responseToolCallsCount(payload) {
@@ -2604,7 +2732,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
           throw error;
         }
         const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, extra);
-        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started);
+        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
       } catch (error) {
         if (!logged) {
           recordRequestLog(app, makeRequestLogEntry({
@@ -2651,7 +2779,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
       return anthropicErrorResponse(upstreamApplicationErrorMessage(openaiPayload) || "Upstream returned an invalid response.", 502, headers);
     }
 
-    const responsePayload = openAiChatToAnthropicMessage(openaiPayload, translated.seed);
+    const responsePayload = openAiChatToAnthropicMessage(openaiPayload, translated.seed, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
     headers.set("content-type", "application/json; charset=utf-8");
     recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated, responsePayload.usage, ctx, traceId, {
       finish_reason: responseFinishReason(openaiPayload),
@@ -2834,10 +2962,10 @@ function anthropicToolChoiceToOpenAi(choice) {
   return null;
 }
 
-function openAiChatToAnthropicMessage(openaiPayload, seed) {
+function openAiChatToAnthropicMessage(openaiPayload, seed, hideReasoning = false) {
   const choice = (openaiPayload?.choices || [])[0] || {};
   const message = choice.message || {};
-  const content = openAiMessageToAnthropicContent(message);
+  const content = openAiMessageToAnthropicContent(message, hideReasoning);
   return {
     id: seed.id,
     type: "message",
@@ -2850,11 +2978,11 @@ function openAiChatToAnthropicMessage(openaiPayload, seed) {
   };
 }
 
-function openAiMessageToAnthropicContent(message) {
+function openAiMessageToAnthropicContent(message, hideReasoning = false) {
   const content = [];
   const thinking = reasoningText(message?.reasoning_content ?? message?.reasoning ?? message?.thinking);
-  if (thinking) content.push({ type: "thinking", thinking });
-  const text = chatContentToText(message?.content || "");
+  if (thinking && !hideReasoning) content.push({ type: "thinking", thinking });
+  const text = hideReasoning ? stripThinkTags(chatContentToText(message?.content || "")) : chatContentToText(message?.content || "");
   if (text) content.push({ type: "text", text });
   for (const call of (message?.tool_calls || [])) {
     content.push({
@@ -2967,7 +3095,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
         const onDone = (usage, extra) => recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
-        return streamResponsesFromChat(upstreamResp, translated.seed, onDone, started);
+        return streamResponsesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
       } catch (error) {
         recordRequestLog(app, makeRequestLogEntry({
           client,
@@ -3014,8 +3142,9 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     }
     const choice = (openaiPayload.choices || [])[0] || {};
     const message = choice.message || {};
-    const text = chatContentToText(message.content || "");
-    const reasoning = reasoningText(message.reasoning_content ?? message.reasoning ?? message.thinking);
+    const hideReasoning = shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream);
+    const text = hideReasoning ? stripThinkTags(chatContentToText(message.content || "")) : chatContentToText(message.content || "");
+    const reasoning = hideReasoning ? "" : reasoningText(message.reasoning_content ?? message.reasoning ?? message.thinking);
     const responsePayload = makeResponsesPayload(translated.seed, { text, usage: openaiPayload.usage, toolCalls: message.tool_calls || [], reasoning });
     headers.set("content-type", "application/json; charset=utf-8");
     recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId, {
@@ -3394,7 +3523,7 @@ function recordResponsesLog(app, client, upstreamName, model, started, status, b
   }), ctx);
 }
 
-function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now()) {
+function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -3413,6 +3542,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
     let nextIndex = 0;
     const toolBlocks = new Map();
     const diag = createStreamDiag(started);
+    const stripText = createThinkTagStripper();
     const closeText = async () => {
       if (textIndex == null) return;
       await write("content_block_stop", { type: "content_block_stop", index: textIndex });
@@ -3478,14 +3608,14 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       const choice = (chunk.choices || [])[0] || {};
       finishReason = choice.finish_reason || finishReason;
       const delta = choice.delta || {};
-      const thinking = reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
+      const thinking = hideReasoning ? "" : reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
       if (thinking) {
         outputText += thinking;
         const index = await ensureThinking();
         noteStreamToken(diag, now);
         await write("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } });
       }
-      const text = chatContentToText(delta.content || "");
+      const text = hideReasoning ? stripText(chatContentToText(delta.content || "")) : chatContentToText(delta.content || "");
       if (text) {
         outputText += text;
         const index = await ensureText();
@@ -3569,7 +3699,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
   return readable;
 }
 
-function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now()) {
+function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -3591,6 +3721,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     const diag = createStreamDiag(started);
     let closeReason = "done";
     const writes = [];
+    const stripText = createThinkTagStripper();
     const ensureReasoning = () => {
       if (reasoningOutputIndex != null) return;
       reasoningOutputIndex = nextOutputIndex++;
@@ -3602,7 +3733,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       usage = chunk.usage || usage;
       finishReason = responseFinishReason(chunk) || finishReason;
       const delta = (chunk.choices || [])[0]?.delta || {};
-      const reasoningDelta = reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
+      const reasoningDelta = hideReasoning ? "" : reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
       if (reasoningDelta) {
         ensureReasoning();
         noteStreamToken(diag, now);
@@ -3610,7 +3741,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         outputChars += reasoningDelta.length;
         writes.push(write({ type: "response.reasoning_summary_text.delta", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, delta: reasoningDelta }));
       }
-      const content = chatContentToText(delta.content || "");
+      const content = hideReasoning ? stripText(chatContentToText(delta.content || "")) : chatContentToText(delta.content || "");
       if (content) {
         noteStreamToken(diag, now);
         textParts.push(content);

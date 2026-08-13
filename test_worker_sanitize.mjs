@@ -62,6 +62,11 @@ const analyticsPoints = [];
 const analyticsSqlQueries = [];
 const kvPuts = [];
 const kvStore = new Map();
+function assertNoDeepSeekLeak(text) {
+  for (const part of ["reasoning_content", "hidden thought", "hidden object", "hidden reasoning", "secret plan", "<think", "</think>"]) {
+    assert.equal(String(text).includes(part), false, part + " leaked in " + text);
+  }
+}
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
   if (String(url).includes("stdtime.gov.hk")) {
@@ -522,6 +527,27 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("open.bigmodel.cn")) {
     zhipuBodies.push(JSON.parse(init.body));
     return new Response(JSON.stringify({ id: "glm", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("api.deepseek.com") && init?.body) {
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    if (body.stream) {
+      return new Response([
+        'data: {"model":"deepseek-v4-pro","choices":[{"delta":{"reasoning_content":"hidden thought"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"<thi"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"nk>secret plan</think>visible"}}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify({
+      id: "deepseek-leak",
+      model: body.model,
+      choices: [{ message: { reasoning_content: "hidden thought", reasoning: "hidden reasoning", thinking: "hidden object", content: "<think>secret plan</think>visible" } }],
+      usage: { prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 },
+    }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -1137,6 +1163,65 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 assert.deepEqual(bodies[deepSeekOfficialStart + 1].thinking, { type: "disabled" });
 assert.equal("reasoning_effort" in bodies[deepSeekOfficialStart + 1], false);
 assert.equal("chat_template_kwargs" in bodies[deepSeekOfficialStart + 1], false);
+
+const deepSeekLeakResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", messages: [] }),
+}), deepSeekOfficialEnv);
+const deepSeekLeakText = await deepSeekLeakResp.text();
+assertNoDeepSeekLeak(deepSeekLeakText);
+assert.equal(deepSeekLeakText.includes('"content":"visible"'), true);
+
+const deepSeekLeakStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", messages: [], stream: true }),
+}), deepSeekOfficialEnv);
+const deepSeekLeakStreamText = await deepSeekLeakStreamResp.text();
+assertNoDeepSeekLeak(deepSeekLeakStreamText);
+assert.equal(deepSeekLeakStreamText.includes('"content":"visible"'), true);
+assert.equal(deepSeekLeakStreamText.includes("data: [DONE]"), true);
+
+const deepSeekLeakResponsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", input: "hi" }),
+}), deepSeekOfficialEnv);
+const deepSeekLeakResponsesText = await deepSeekLeakResponsesResp.text();
+assertNoDeepSeekLeak(deepSeekLeakResponsesText);
+assert.equal(deepSeekLeakResponsesText.includes('"output_text":"visible"'), true);
+assert.equal(deepSeekLeakResponsesText.includes('"type":"reasoning"'), false);
+
+const deepSeekLeakResponsesStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", input: "hi", stream: true }),
+}), deepSeekOfficialEnv);
+const deepSeekLeakResponsesStreamText = await deepSeekLeakResponsesStreamResp.text();
+assertNoDeepSeekLeak(deepSeekLeakResponsesStreamText);
+assert.equal(deepSeekLeakResponsesStreamText.includes('"delta":"visible"'), true);
+assert.equal(deepSeekLeakResponsesStreamText.includes('"type":"response.reasoning_summary_text.delta"'), false);
+
+const deepSeekLeakMessagesResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-deepseek", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }),
+}), deepSeekOfficialEnv);
+const deepSeekLeakMessagesText = await deepSeekLeakMessagesResp.text();
+assertNoDeepSeekLeak(deepSeekLeakMessagesText);
+assert.equal(deepSeekLeakMessagesText.includes('"type":"thinking"'), false);
+assert.equal(deepSeekLeakMessagesText.includes('"text":"visible"'), true);
+
+const deepSeekLeakMessagesStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-deepseek", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", max_tokens: 8, messages: [{ role: "user", content: "hi" }], stream: true }),
+}), deepSeekOfficialEnv);
+const deepSeekLeakMessagesStreamText = await deepSeekLeakMessagesStreamResp.text();
+assertNoDeepSeekLeak(deepSeekLeakMessagesStreamText);
+assert.equal(deepSeekLeakMessagesStreamText.includes('"type":"thinking_delta"'), false);
+assert.equal(deepSeekLeakMessagesStreamText.includes('"text":"visible"'), true);
 
 const moonshotEnv = {
   ADMIN_TOKEN: "admin-test-token",
