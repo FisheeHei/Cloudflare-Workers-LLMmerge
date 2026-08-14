@@ -660,8 +660,9 @@ function renderAdminMarkup(origin, version) {
       </div>
       <div class="row">
         <div class="field span-3"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
-        <div class="field span-5"><label>\u663e\u793a\u65f6\u533a</label><select id="time-zone-preset"><option value="480" data-label="UTC+8 北京/香港/上海/乌鲁木齐">UTC+8 北京 / 香港 / 上海 / 乌鲁木齐</option><option value="0" data-label="UTC">UTC</option><option value="custom" data-label="Custom">Custom</option></select></div>
-        <div class="field span-4"><label>UTC \u504f\u79fb (\u5206\u949f)</label><input id="time-zone-offset" type="number" min="-720" max="840" placeholder="480"></div>
+        <div class="field span-3"><label>\u4e0a\u6e38\u534f\u8c03\u5f3a\u5ea6 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"><span class="note">\u8d8a\u9ad8\u8d8a\u5206\u6563\u6d3b\u8dc3\u8bf7\u6c42</span></div>
+        <div class="field span-3"><label>\u663e\u793a\u65f6\u533a</label><select id="time-zone-preset"><option value="480" data-label="UTC+8 北京/香港/上海/乌鲁木齐">UTC+8 北京 / 香港 / 上海 / 乌鲁木齐</option><option value="0" data-label="UTC">UTC</option><option value="custom" data-label="Custom">Custom</option></select></div>
+        <div class="field span-3"><label>UTC \u504f\u79fb (\u5206\u949f)</label><input id="time-zone-offset" type="number" min="-720" max="840" placeholder="480"></div>
       </div>
       <div class="row">
         <div class="field span-12"><label>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u63d0\u793a\u8bcd\u4e0e\u4e0a\u4e0b\u6587</button><span class="note" id="system-prompt-status"></span></div>
@@ -1353,6 +1354,7 @@ function renderAdminScript(version) {
         hedge_enabled: byId("routing-hedge").checked,
         fast_routing: byId("routing-fast").checked,
         hedge_max: Number(byId("routing-hedge-max").value || 2),
+        coordination_level: Number(byId("routing-coordination-level").value || 3),
       },
       upstreams,
     };
@@ -1385,6 +1387,7 @@ function renderAdminScript(version) {
     byId("routing-hedge").checked = r.hedge_enabled === true;
     byId("routing-fast").checked = r.fast_routing === true;
     byId("routing-hedge-max").value = r.hedge_max || 2;
+    byId("routing-coordination-level").value = r.coordination_level ?? 3;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
   }
 

@@ -202,6 +202,7 @@ In short: memory is for live display, Analytics Engine is for history, and KV is
 
 - `failover`: try another upstream after failure
 - `load_balance`: distribute by weight
+- `coordination_level` (0-5, default 3): higher values spread concurrent requests away from active or reserved upstreams, with weight treated as relative capacity
 - `Hedged Request`: race multiple upstreams for the same model
 - `Gateway Fast mode`: speed up the first two candidates for faster first byte
 - Fast + Hedged together: Hedged decides candidate count, Fast speeds up the first two

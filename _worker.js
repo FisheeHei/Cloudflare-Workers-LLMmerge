@@ -69,7 +69,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-14-deepseek-reasoning-filter";
+const VERSION = "v26-08-14-upstream-coordination";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1764,7 +1764,12 @@ function unwrapGatewayConfig(value) {
 }
 
 function normalizeGatewayRouting(routing = {}) {
+  const rawCoordination = routing.coordination_level;
+  const coordination = rawCoordination === undefined || rawCoordination === null || rawCoordination === ""
+    ? 3
+    : Number(rawCoordination);
   return {
+    coordination_level: Number.isFinite(coordination) ? Math.max(0, Math.min(5, Math.floor(coordination))) : 3,
     failover: routing.failover !== false,
     fast_routing: routing.fast_routing === true,
     hedge_enabled: routing.hedge_enabled === true,
@@ -4394,13 +4399,8 @@ function orderUpstreams(runtime, candidates, model) {
     healthy.push(upstream);
   });
 
-  const orderedHealthy = runtime.routing.load_balance === false
-    ? pressureSort(latencySort(prioritySort(healthy), model), model)
-    : pressureSort(latencySort(weightedShuffle(healthy), model), model);
-
-  const orderedCooling = runtime.routing.load_balance === false
-    ? pressureSort(latencySort(prioritySort(cooling), model), model)
-    : pressureSort(latencySort(weightedShuffle(cooling), model), model);
+  const orderedHealthy = coordinationSort(runtime, healthy, model);
+  const orderedCooling = coordinationSort(runtime, cooling, model);
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
   if (runtime.routing.failover === false) {
@@ -4415,12 +4415,12 @@ function prioritySort(items) {
   return [...items].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
 }
 
-function latencySort(items, model) {
-  return [...items].sort((a, b) => upstreamLatencyScore(a, model) - upstreamLatencyScore(b, model));
-}
-
-function pressureSort(items) {
-  return [...items].sort((a, b) => upstreamPressure(a) - upstreamPressure(b));
+function coordinationSort(runtime, items, model) {
+  const base = runtime.routing.load_balance === false ? prioritySort(items) : weightedShuffle(items);
+  return base
+    .map((item, index) => ({ item, index, pressure: upstreamCoordinationPressure(runtime, item), latency: upstreamLatencySortScore(item, model) }))
+    .sort((a, b) => a.pressure - b.pressure || a.latency - b.latency || a.index - b.index)
+    .map((entry) => entry.item);
 }
 
 function activeUpstreamCount(upstream) {
@@ -4431,8 +4431,21 @@ function upstreamReservationCount(upstream) {
   return Number(_upstreamReservations[upstreamKey(upstream)] || 0) || 0;
 }
 
-function upstreamPressure(upstream) {
-  return activeUpstreamCount(upstream) + upstreamReservationCount(upstream);
+function upstreamCoordinationPressure(runtime, upstream) {
+  const level = upstreamCoordinationPressureMs(runtime);
+  if (level <= 0) return 0;
+  const capacity = Math.max(1, Number(upstream?.weight) || 1);
+  return ((activeUpstreamCount(upstream) + upstreamReservationCount(upstream) * 1.5) / capacity) * level;
+}
+
+function upstreamLatencySortScore(upstream, model) {
+  const latency = upstreamLatencyScore(upstream, model);
+  return Number.isFinite(latency) ? latency : Number.MAX_SAFE_INTEGER;
+}
+
+function upstreamCoordinationPressureMs(runtime) {
+  const level = Number(runtime?.routing?.coordination_level ?? 3);
+  return Math.max(0, Math.min(5, Number.isFinite(level) ? Math.floor(level) : 3)) * 500;
 }
 
 function reserveUpstreams(upstreams) {

@@ -636,6 +636,7 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-a
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
 assert.equal(adminPage.includes("routing-fast"), true);
+assert.equal(adminPage.includes("routing-coordination-level"), true);
 assert.equal(adminPage.includes("translator-hero"), false);
 assert.equal(adminPage.includes("translator-progress-panel"), false);
 assert.equal(adminPage.includes("translator-status-grid"), false);
@@ -2839,7 +2840,7 @@ assert.equal(longStreamHits.length, 1);
 
 const spreadStore = new Map();
 spreadStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, load_balance: false },
+  routing: { failover: true, load_balance: false, coordination_level: 3 },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "busy", base_url: "https://long-stream.example/v1", api_key_encrypted: "b", models: ["spread-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
@@ -2871,6 +2872,83 @@ const spreadResp = await worker.default.fetch(new Request("https://gw.test/v1/ch
 }), spreadEnv);
 assert.equal(spreadResp.headers.get("x-llm-gateway-upstream"), "idle");
 await spreadBusyResp.text();
+await spreadResp.text();
+const spreadZeroStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false, coordination_level: 0 },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "busy", base_url: "https://long-stream.example/v1", api_key_encrypted: "b", models: ["spread-zero-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "idle", base_url: "https://speed-fast.example/v1", api_key_encrypted: "i", models: ["spread-zero-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+})]]);
+const spreadZeroEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = spreadZeroStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { spreadZeroStore.set(key, value); },
+    async delete(key) { spreadZeroStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "spread-zero-client", key: "sk-spread-zero", models: ["*"], upstreams: ["busy", "idle"] }]),
+};
+const spreadZeroBusyResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-spread-zero", "content-type": "application/json" },
+  body: JSON.stringify({ model: "spread-zero-model", messages: [] }),
+}), spreadZeroEnv);
+const spreadZeroResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-spread-zero", "content-type": "application/json" },
+  body: JSON.stringify({ model: "spread-zero-model", messages: [] }),
+}), spreadZeroEnv);
+assert.equal(spreadZeroResp.headers.get("x-llm-gateway-upstream"), "busy");
+await Promise.all([spreadZeroBusyResp.text(), spreadZeroResp.text()]);
+
+const spreadWeightedStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false, coordination_level: 3 },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "busy-weighted", base_url: "https://long-stream.example/v1", api_key_encrypted: "b", models: ["spread-weighted-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 8, enabled: true },
+    { name: "busy-light", base_url: "https://long-stream.example/v1", api_key_encrypted: "i", models: ["spread-weighted-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+})]]);
+const spreadWeightedEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = spreadWeightedStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { spreadWeightedStore.set(key, value); },
+    async delete(key) { spreadWeightedStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([
+    { name: "spread-weighted-high", key: "sk-spread-weighted-high", models: ["*"], upstreams: ["busy-weighted"] },
+    { name: "spread-weighted-low", key: "sk-spread-weighted-low", models: ["*"], upstreams: ["busy-light"] },
+    { name: "spread-weighted-client", key: "sk-spread-weighted", models: ["*"], upstreams: ["busy-weighted", "busy-light"] },
+  ]),
+};
+const spreadWeightedHighResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-spread-weighted-high", "content-type": "application/json" },
+  body: JSON.stringify({ model: "spread-weighted-model", messages: [] }),
+}), spreadWeightedEnv);
+const spreadWeightedLowResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-spread-weighted-low", "content-type": "application/json" },
+  body: JSON.stringify({ model: "spread-weighted-model", messages: [] }),
+}), spreadWeightedEnv);
+const spreadWeightedResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-spread-weighted", "content-type": "application/json" },
+  body: JSON.stringify({ model: "spread-weighted-model", messages: [] }),
+}), spreadWeightedEnv);
+assert.equal(spreadWeightedResp.headers.get("x-llm-gateway-upstream"), "busy-weighted");
+await Promise.all([spreadWeightedHighResp.text(), spreadWeightedLowResp.text(), spreadWeightedResp.text()]);
 
 const usageStore = new Map();
 usageStore.set("gateway:config", JSON.stringify({

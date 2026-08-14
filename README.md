@@ -198,6 +198,7 @@ const res = await client.chat.completions.create({
 
 - `failover`：上游失败后尝试下一个
 - `load_balance`：按权重分配
+- `coordination_level`（0-5，默认 3）：按活跃/预留请求分散到负载较低的上游，并按权重折算承载能力
 - `Hedged Request`：同一模型多个上游竞速
 - `Gateway Fast 模式`：加速前两个候选上游抢首包
 - Fast 与 Hedged 同开时：Hedged 决定候选数量，Fast 加速前两个
