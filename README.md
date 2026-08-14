@@ -37,7 +37,7 @@ KV 变量名必须是：
 KV
 ```
 
-KV 空间名称可以任意。KV 用于保存配置、客户端 Key、上游、Prompt、Context、模型缓存和 cooldown。
+KV 空间名称可以任意。KV 用于保存配置、客户端 Key、上游、Prompt、Context、模型缓存、cooldown 和 6 小时上游延迟评分。
 
 ### 3. 绑定 Analytics Engine
 
@@ -190,15 +190,16 @@ const res = await client.chat.completions.create({
 
 - 内存：最近请求实时显示，包含请求数、Token、日志和活跃上游
 - Analytics Engine：长期统计与日志查询
-- KV fallback：未绑定 Analytics Engine 时批量写入统计
+- KV mirror：后台实时日志和近两小时统计镜像，Analytics Engine 查询延迟或不可用时仍能显示当前状态
 
-也就是说：内存负责快，Analytics Engine 负责存，KV 负责配置。
+也就是说：内存负责快，Analytics Engine 负责长期历史，KV 负责配置、当前遥测镜像和跨 isolate 路由状态。
 
 ## 路由机制
 
 - `failover`：上游失败后尝试下一个
 - `load_balance`：按权重分配
 - `coordination_level`（0-5，默认 3）：按活跃/预留请求分散到负载较低的上游，并按权重折算承载能力
+- 成功请求和后台测速会把 6 小时延迟 EWMA 写入 KV，新 isolate 也能优先选择近期更快的上游
 - `Hedged Request`：同一模型多个上游竞速
 - `Gateway Fast 模式`：加速前两个候选上游抢首包
 - Fast 与 Hedged 同开时：Hedged 决定候选数量，Fast 加速前两个

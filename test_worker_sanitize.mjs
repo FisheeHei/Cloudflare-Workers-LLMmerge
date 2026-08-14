@@ -62,6 +62,7 @@ const analyticsPoints = [];
 const analyticsSqlQueries = [];
 const kvPuts = [];
 const kvStore = new Map();
+let analyticsStale = false;
 function assertNoDeepSeekLeak(text) {
   for (const part of ["reasoning_content", "hidden thought", "hidden object", "hidden reasoning", "secret plan", "<think", "</think>"]) {
     assert.equal(String(text).includes(part), false, part + " leaked in " + text);
@@ -94,7 +95,7 @@ globalThis.fetch = async (url, init) => {
     const sql = String(init.body || "");
     analyticsSqlQueries.push(sql);
     const data = sql.includes("GROUP BY hour")
-      ? [{
+      ? (analyticsStale ? [] : [{
         hour: "2026-07-04:12",
         upstream: "nim",
         model: "qwen3",
@@ -103,7 +104,7 @@ globalThis.fetch = async (url, init) => {
         fail: 1,
         prompt_tokens: 30,
         completion_tokens: 40,
-      }]
+      }])
       : [{
         timestamp: "2026-07-04 12:00:00",
         client: "c",
@@ -1697,6 +1698,7 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 assert.equal(waitUntilTasks.length > 0, true);
 await Promise.all(waitUntilTasks);
 assert.equal(kvPuts.length > kvPutsBeforeWaitUntil, true);
+assert.equal(kvPuts.some((key) => key.startsWith("state:latency:")), true);
 
 const analyticsTasks = [];
 const kvPutsBeforeAnalytics = kvPuts.length;
@@ -1720,7 +1722,8 @@ assert.equal(analyticsPoints.at(-1).blobs[3], "qwen3");
 assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
 assert.equal(kvPuts.length > kvPutsBeforeAnalytics, true);
 const realDateNow = Date.now;
-Date.now = () => realDateNow() + 3 * 60 * 1000;
+const mirroredNow = realDateNow() + 3 * 60 * 1000;
+Date.now = () => mirroredNow;
 const mirroredKvTasks = [];
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -1742,6 +1745,15 @@ const analyticsQueryEnv = {
 const analyticsStatsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), analyticsQueryEnv);
 const analyticsStats = await analyticsStatsResp.json();
 assert.equal(analyticsStats.buckets.some((bucket) => bucket.models?.qwen3 >= 2), true);
+analyticsStale = true;
+Date.now = () => mirroredNow;
+const staleAnalyticsStats = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), {
+  ...analyticsQueryEnv,
+  ANALYTICS_ACCOUNT_ID: "acct-stale",
+})).json();
+Date.now = realDateNow;
+analyticsStale = false;
+assert.equal(staleAnalyticsStats.buckets.at(-1).models?.qwen3 >= 1, true);
 const analyticsLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), analyticsQueryEnv);
 const analyticsLogs = await analyticsLogsResp.json();
 assert.equal(analyticsLogs.logs.some((entry) => entry.model === "qwen3"), true);
@@ -1939,6 +1951,16 @@ assert.equal(manualSpeed.results.filter((r) => r.ok).length, 3);
 assert.equal(manualSpeed.results.find((r) => r.name === "stream").metric, "first_output");
 assert.equal(speedStreamHits.includes("cancel"), true);
 assert.equal(speedBodies.at(-1).stream, true);
+assert.equal([...speedStore.keys()].some((key) => key.startsWith("state:latency:")), true);
+const latencyWorker = await import(pathToFileURL(process.cwd() + "/_worker.js").href + "?latency-state");
+const latencyChoiceStart = speedHits.length;
+const latencyChoiceResp = await latencyWorker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-both", "content-type": "application/json" },
+  body: JSON.stringify({ model: "speed-model", messages: [] }),
+}), speedEnv);
+assert.equal(latencyChoiceResp.headers.get("x-llm-gateway-upstream"), "fast");
+assert.equal(speedHits[latencyChoiceStart], "fast");
 const selectedSpeedStart = speedHits.length;
 const selectedSpeedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/speed-test", {
   method: "POST",

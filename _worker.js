@@ -38,6 +38,7 @@ const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
 const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
+const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 const STDTIME_URL = "https://stdtime.gov.hk/";
@@ -69,7 +70,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-14-upstream-coordination";
+const VERSION = "v26-08-14-stateful-routing";
 
 export default {
   async fetch(request, env, ctx) {
@@ -166,7 +167,7 @@ export default {
             let proxyResponse;
             let logged = false;
             try {
-              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: proxyBodyText, runtime, search: url.search });
+              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: proxyBodyText, runtime, search: url.search, ctx });
               const upstreamResp = proxyResponse.response;
               const responseHeaders = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
               const response = await buildLoggedProxyResponse({ app, bodyText: proxyBodyText, client, ctx, headers: responseHeaders, model, responseModel: publicModel, pathname, requestPayload: payload, proxyResponse, started, traceId, upstreamResp });
@@ -205,6 +206,7 @@ export default {
             bodyText: proxyBodyText,
             runtime,
             search: url.search,
+            ctx,
           });
         } catch (error) {
           recordRequestLog(app, makeRequestLogEntry({
@@ -277,8 +279,9 @@ export default {
 // ponytail: cache createApp result per-isolate since env is stable across requests
 var _cachedApp = null;
 var _cachedEnvRef = null;
-// ponytail: per-isolate EWMA, KV-backed global scores only if cross-edge routing matters
+// ponytail: per-isolate EWMA, KV mirror shares route scores across fresh isolates.
 var _upstreamLatency = {};
+var _upstreamLatencyUpdatedAt = {};
 var _upstreamCooldowns = {};
 // ponytail: per-isolate and per-model; DO if strict global rotation ever matters
 var _lastSuccessfulUpstreamName = {};
@@ -660,14 +663,11 @@ async function getMergedLogs(app) {
 }
 
 async function getBestLogs(app) {
-  const analyticsLogs = await getAnalyticsLogs(app).catch(() => null);
-  if (analyticsLogs) return mergeRecentLogs(analyticsLogs, recentPendingLogs());
-  return await getMergedLogs(app);
-}
-
-function recentPendingLogs(maxAgeMs = ANALYTICS_LIVE_PENDING_MS) {
-  const cutoff = Date.now() - maxAgeMs;
-  return _pendingLogs.filter((entry) => parseGatewayTime(entry.ts) >= cutoff).slice(-50).reverse();
+  const [analyticsLogs, kvLogs] = await Promise.all([
+    getAnalyticsLogs(app).catch(() => null),
+    getMergedLogs(app),
+  ]);
+  return analyticsLogs ? mergeRecentLogs(analyticsLogs, kvLogs) : kvLogs;
 }
 
 function mergeRecentLogs(persisted, recent) {
@@ -1548,22 +1548,25 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, logs }, 200));
   }
 
-  // ponytail: parallel KV reads for 24h stats instead of sequential loop
+  // Keep the current two hours on the KV mirror while Analytics Engine catches up.
   if (apiPath === "/api/stats" && request.method === "GET") {
     const now = utcNowMs();
     const hourKeys = [];
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
       hourKeys.push(legacyStatsHourKey(now - h * 3600000));
     }
-    const analyticsBuckets = await getAnalyticsStats(app, hourKeys).catch(() => null);
-    const useAnalyticsForStats = analyticsBuckets !== null;
-    const raws = useAnalyticsForStats ? null : (app.kv ? await Promise.all(hourKeys.map((k) => app.kv.get(STATS_PREFIX + k, "json"))) : hourKeys.map(() => null));
-    // Keep all isolate-local stats when AE is write-only; the two-minute merge window is only for readable AE data.
-    const liveStats = analyticsBuckets ? recentPendingStats() : _pendingStats;
-    const logs = await getBestLogs(app);
+    const [analyticsBuckets, raws, logs] = await Promise.all([
+      getAnalyticsStats(app, hourKeys).catch(() => null),
+      app.kv ? Promise.all(hourKeys.map((key) => app.kv.get(STATS_PREFIX + key, "json"))) : Promise.resolve(hourKeys.map(() => null)),
+      getBestLogs(app),
+    ]);
+    const analyticsPending = analyticsBuckets ? recentPendingStats() : {};
+    const recentKvStart = Math.max(0, hourKeys.length - 2);
     const buckets = hourKeys.map((storageHour, i) => {
-      const raw = analyticsBuckets ? analyticsBuckets[storageHour] : raws?.[i];
-      return { hour: utcHourKey(now - (STATS_WINDOW_HOURS - 1 - i) * 3600000), ...mergeStatsBucket(raw, liveStats[storageHour]) };
+      const useKv = i >= recentKvStart && raws?.[i];
+      const raw = useKv ? raws[i] : (analyticsBuckets?.[storageHour] || raws?.[i]);
+      const live = useKv || !analyticsBuckets ? _pendingStats : analyticsPending;
+      return { hour: utcHourKey(now - (STATS_WINDOW_HOURS - 1 - i) * 3600000), ...mergeStatsBucket(raw, live[storageHour]) };
     });
     return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: utcNowIso(), time_zone: API_TIME_ZONE_LABEL }, 200));
   }
@@ -2616,7 +2619,7 @@ async function speedTestUpstream(runtime, upstream, model) {
       resp = primed.response;
       const latency = Date.now() - started;
       if (primed.error) return { name: upstream.name, ok: false, status: 502, error: primed.error, latency_ms: latency };
-      rememberUpstreamLatency(upstream, model, latency);
+      await rememberUpstreamLatency(runtime, upstream, model, latency);
       return { name: upstream.name, ok: true, status: 200, latency_ms: latency, metric: "first_output" };
     }
 
@@ -2626,7 +2629,7 @@ async function speedTestUpstream(runtime, upstream, model) {
     const valid = payload && Array.isArray(payload.choices) && payload.choices.length > 0 && !looksLikeHtmlDocument(text) && !error;
     const latency = Date.now() - started;
     if (!valid) return { name: upstream.name, ok: false, status: 502, error: error || "Upstream returned no valid model output.", latency_ms: latency };
-    rememberUpstreamLatency(upstream, model, latency);
+    await rememberUpstreamLatency(runtime, upstream, model, latency);
     return { name: upstream.name, ok: true, status: 200, latency_ms: latency, metric: "complete" };
   } catch (err) {
     return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
@@ -2724,6 +2727,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
           bodyText: translated.bodyText,
           runtime,
           search: url.search,
+          ctx,
         });
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) {
@@ -2767,6 +2771,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
       bodyText: translated.bodyText,
       runtime,
       search: url.search,
+      ctx,
     });
 
     const upstreamResp = proxyResponse.response;
@@ -3096,7 +3101,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const body = streamPendingOpenAiResponse(async () => {
       let proxyResponse;
       try {
-        proxyResponse = await proxyRequest({ client, model: translated.model, pathname: CHAT_PATH, request, bodyText: translated.bodyText, runtime, search: url.search });
+        proxyResponse = await proxyRequest({ client, model: translated.model, pathname: CHAT_PATH, request, bodyText: translated.bodyText, runtime, search: url.search, ctx });
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
         const onDone = (usage, extra) => recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
@@ -3128,6 +3133,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
       bodyText: translated.bodyText,
       runtime,
       search: url.search,
+      ctx,
     });
 
     const upstreamResp = proxyResponse.response;
@@ -3232,7 +3238,7 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   }), ctx);
 
   try {
-    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search });
+    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search, ctx });
     upstreamName = proxyResponse.upstream.name;
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
@@ -3830,7 +3836,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
   return readable;
 }
 
-async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search }) {
+async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx }) {
   if (pathname === CHAT_PATH) {
     bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
@@ -3841,7 +3847,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     throw httpError(404, `No upstream available for model: ${model}`);
   }
 
-  await hydrateUpstreamCooldowns(runtime, candidates, model);
+  await hydrateUpstreamState(runtime, candidates, model);
   const attempts = orderUpstreams(runtime, candidates, model);
   const maxAttempts = runtime.routing.failover === false
     ? 1
@@ -3850,7 +3856,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
     const used = new Set(hedgedAttempts.map(upstreamKey));
     const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-    return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search });
+    return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx });
   }
   let lastError = null;
 
@@ -3882,7 +3888,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         await markUpstreamFailure(runtime, upstream, model);
       } else {
         await clearUpstreamFailure(runtime, upstream, model);
-        rememberUpstreamLatency(upstream, model, upstreamLatency);
+        rememberUpstreamLatency(runtime, upstream, model, upstreamLatency, ctx);
         rememberSuccessfulUpstream(upstream, model);
       }
 
@@ -4152,7 +4158,7 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search }) {
+async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
@@ -4211,7 +4217,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
         done = true;
         stopHedgeLosers(pending, controllers, result.index);
         await clearUpstreamFailure(runtime, result.upstream, model);
-        rememberUpstreamLatency(result.upstream, model, result.latency);
+        rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
         rememberSuccessfulUpstream(result.upstream, model);
         return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
       }
@@ -4221,7 +4227,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       await markUpstreamFailure(runtime, result.upstream, model);
     }
 
-    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest });
+    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx });
     if (fallbackResult) return { ...fallbackResult, attempts: attempts.length + 1 };
 
     const err = httpError(502, lastResult?.error?.message || "All hedged upstreams failed.");
@@ -4233,7 +4239,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
   }
 }
 
-async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest }) {
+async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx }) {
   const upstream = attempts?.[0];
   if (!upstream || runtime.routing.failover === false) return null;
   let result = null;
@@ -4257,7 +4263,7 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
       return null;
     }
     await clearUpstreamFailure(runtime, upstream, model);
-    rememberUpstreamLatency(upstream, model, result.latency);
+    rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
     rememberSuccessfulUpstream(upstream, model);
     return { response: result.response, upstream };
   } catch (error) {
@@ -4546,14 +4552,21 @@ function clearActiveUpstreamState() {
   return released;
 }
 
-function rememberUpstreamLatency(upstream, model, latencyMs) {
+function rememberUpstreamLatency(runtime, upstream, model, latencyMs, ctx) {
   const name = upstreamModelKey(upstream, model);
   const latency = Number(latencyMs);
-  if (!name || !Number.isFinite(latency) || latency < 0) return;
+  if (!name || !Number.isFinite(latency) || latency < 0) return Promise.resolve();
   const previous = Number(_upstreamLatency[name]);
-  _upstreamLatency[name] = Number.isFinite(previous)
+  const score = Number.isFinite(previous)
     ? Math.round(previous * 0.7 + latency * 0.3)
     : Math.max(1, Math.round(latency));
+  const updatedAt = Date.now();
+  _upstreamLatency[name] = score;
+  _upstreamLatencyUpdatedAt[name] = updatedAt;
+  if (!runtime?.kv) return Promise.resolve();
+  const task = persistUpstreamLatency(runtime, name, score, updatedAt);
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+  return task;
 }
 
 function weightedShuffle(items) {
@@ -4566,16 +4579,40 @@ function weightedShuffle(items) {
     .map((entry) => entry.item);
 }
 
-async function hydrateUpstreamCooldowns(runtime, upstreams, model) {
-  if (!runtime.kv || !upstreams?.length) return;
+async function hydrateUpstreamState(runtime, upstreams, model) {
+  if (!runtime?.kv || !upstreams?.length) return;
   await Promise.all(upstreams.map(async (upstream) => {
     const key = upstreamModelKey(upstream, model);
     try {
-      const stored = await runtime.kv.get(await upstreamCooldownStorageKey(key), "json");
-      if (stored?.until && Number(stored.until) > Date.now()) _upstreamCooldowns[key] = stored;
+      const [cooldownKey, latencyKey] = await Promise.all([
+        upstreamCooldownStorageKey(key),
+        upstreamLatencyStorageKey(key),
+      ]);
+      const [cooldown, latency] = await Promise.all([
+        runtime.kv.get(cooldownKey, "json"),
+        runtime.kv.get(latencyKey, "json"),
+      ]);
+      if (cooldown?.until && Number(cooldown.until) > Date.now()) _upstreamCooldowns[key] = cooldown;
       else delete _upstreamCooldowns[key];
+      const score = Number(latency?.latency_ms);
+      const updatedAt = Number(latency?.updated_at);
+      const localUpdatedAt = Number(_upstreamLatencyUpdatedAt[key] || 0);
+      if (Number.isFinite(score) && score > 0 && Number.isFinite(updatedAt) && updatedAt >= localUpdatedAt && Date.now() - updatedAt <= UPSTREAM_LATENCY_TTL_SECONDS * 1000) {
+        _upstreamLatency[key] = score;
+        _upstreamLatencyUpdatedAt[key] = updatedAt;
+      }
     } catch {}
   }));
+}
+
+async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
+  try {
+    await runtime.kv.put(
+      await upstreamLatencyStorageKey(key),
+      JSON.stringify({ latency_ms: latency, updated_at: updatedAt }),
+      { expirationTtl: UPSTREAM_LATENCY_TTL_SECONDS },
+    );
+  } catch {}
 }
 
 async function markUpstreamFailure(runtime, upstream, model) {
@@ -4601,6 +4638,10 @@ async function clearUpstreamFailure(runtime, upstream, model) {
 
 async function upstreamCooldownStorageKey(value) {
   return "state:cooldown:" + await storageKeyHash(value);
+}
+
+async function upstreamLatencyStorageKey(value) {
+  return "state:latency:" + await storageKeyHash(value);
 }
 
 function upstreamModelKey(upstream, model) {

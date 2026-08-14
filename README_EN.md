@@ -37,7 +37,7 @@ The KV binding name must be:
 KV
 ```
 
-The KV namespace name can be anything. KV stores gateway config, client keys, upstreams, Prompt, Context, model cache, and cooldown state.
+The KV namespace name can be anything. KV stores gateway config, client keys, upstreams, Prompt, Context, model cache, cooldown state, and six-hour upstream latency scores shared by fresh isolates.
 
 ### 3. Bind Analytics Engine
 
@@ -194,15 +194,16 @@ Main endpoints:
 
 - Memory: live recent requests, tokens, logs, and active upstreams
 - Analytics Engine: historical logs and statistics
-- KV fallback: batch stats when Analytics Engine is not bound
+- KV mirror: current logs and recent hourly stats while Analytics Engine queries catch up or are unavailable
 
-In short: memory is for live display, Analytics Engine is for history, and KV is for configuration.
+In short: memory is for live display, Analytics Engine is for long-term history, and KV is for configuration, current telemetry, and shared routing state.
 
 ## Routing
 
 - `failover`: try another upstream after failure
 - `load_balance`: distribute by weight
 - `coordination_level` (0-5, default 3): higher values spread concurrent requests away from active or reserved upstreams, with weight treated as relative capacity
+- Successful requests and speed tests write a six-hour latency EWMA to KV so fresh isolates can prefer recently faster upstreams
 - `Hedged Request`: race multiple upstreams for the same model
 - `Gateway Fast mode`: speed up the first two candidates for faster first byte
 - Fast + Hedged together: Hedged decides candidate count, Fast speeds up the first two
