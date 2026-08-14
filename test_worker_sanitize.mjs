@@ -58,6 +58,9 @@ const wrappedHits = [];
 const toolStreamHits = [];
 const appErrorHits = [];
 const htmlHits = [];
+const emptyStreamHits = [];
+const retryAfterHits = [];
+const healthProbeHits = [];
 const analyticsPoints = [];
 const analyticsSqlQueries = [];
 const kvPuts = [];
@@ -145,6 +148,12 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("disabled.example")) {
     disabledHits.push(String(url));
+    if (init?.body) {
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     return new Response(JSON.stringify({ data: [{ id: "disabled-model" }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -248,6 +257,34 @@ globalThis.fetch = async (url, init) => {
     return new Response("<!DOCTYPE html><html><body>bad gateway</body></html>", {
       status: 200,
       headers: { "content-type": "text/html" },
+    });
+  }
+  if (String(url).includes("empty-stream.example")) {
+    emptyStreamHits.push("empty");
+    return new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("stream-rescue.example")) {
+    emptyStreamHits.push("rescue");
+    return new Response('data: {"choices":[{"delta":{"content":"rescued"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("retry-after.example")) {
+    retryAfterHits.push("429");
+    return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+      status: 429,
+      headers: { "content-type": "application/json", "retry-after": "120" },
+    });
+  }
+  if (String(url).includes("health-probe.example")) {
+    healthProbeHits.push(init?.body ? "chat" : "models");
+    if (init?.body) {
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ data: [{ id: "probe-model" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
     });
   }
   if (String(url).includes("responses-stream.example")) {
@@ -1658,7 +1695,8 @@ const disabledHealthResp = await worker.default.fetch(new Request("https://gw.te
 }), disabledEnv);
 const disabledHealth = await disabledHealthResp.json();
 assert.equal(disabledHealth.results.some((item) => item.name === "disabled" && item.ok), true);
-assert.equal(disabledHits.length, disabledHitStart + 1);
+assert.equal(disabledHealth.results.find((item) => item.name === "disabled").capabilities.chat, true);
+assert.equal(disabledHits.length, disabledHitStart + 2);
 
 const authHealthStore = new Map([["gateway:config", JSON.stringify({
   routing: {},
@@ -1679,6 +1717,29 @@ const authHealthEnv = {
 const authHealth = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", { method: "POST" }), authHealthEnv)).json();
 assert.equal(authHealth.results[0].ok, false);
 assert.equal(authHealth.results[0].status, 401);
+
+const probeHealthStore = new Map([["gateway:config", JSON.stringify({
+  routing: {},
+  settings: {},
+  upstreams: [
+    { name: "probe", base_url: "https://health-probe.example/v1", api_key_encrypted: "p", models: ["probe-model"], paths: ["/v1/chat/completions"], enabled: true },
+  ],
+})]]);
+const probeHealthEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = probeHealthStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { probeHealthStore.set(key, value); },
+    async delete(key) { probeHealthStore.delete(key); },
+  },
+};
+const probeHealthStart = healthProbeHits.length;
+const probeHealth = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", { method: "POST" }), probeHealthEnv)).json();
+assert.deepEqual(healthProbeHits.slice(probeHealthStart), ["models", "chat"]);
+assert.equal(probeHealth.results[0].capabilities.models, true);
+assert.equal(probeHealth.results[0].capabilities.chat, true);
+assert.equal([...probeHealthStore.keys()].some((key) => key.startsWith("state:health:")), true);
 
 const exportResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/upstreams/export"), env);
 const exported = await exportResp.json();
@@ -2535,6 +2596,59 @@ const cloudflare529Resp = await worker.default.fetch(new Request("https://gw.tes
 }), cloudflare524Env);
 assert.equal(cloudflare529Resp.status, 200);
 assert.equal(cloudflare529Resp.headers.get("x-llm-gateway-upstream"), "cloudflare-524-fallback");
+
+const streamRescueStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "empty-stream", base_url: "https://empty-stream.example/v1", api_key_encrypted: "e", models: ["stream-rescue-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "stream-rescue", base_url: "https://stream-rescue.example/v1", api_key_encrypted: "r", models: ["stream-rescue-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+})]]);
+const streamRescueEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = streamRescueStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { streamRescueStore.set(key, value); },
+    async delete(key) { streamRescueStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "stream-rescue-client", key: "sk-stream-rescue", models: ["*"], upstreams: ["empty-stream", "stream-rescue"] }]),
+};
+const streamRescueStart = emptyStreamHits.length;
+const streamRescueResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-stream-rescue", "content-type": "application/json" },
+  body: JSON.stringify({ model: "stream-rescue-model", messages: [], stream: true }),
+}), streamRescueEnv);
+const streamRescueText = await streamRescueResp.text();
+assert.deepEqual(emptyStreamHits.slice(streamRescueStart), ["empty", "rescue"]);
+assert.equal(streamRescueText.includes('\"content\":\"rescued\"'), true);
+
+const retryAfterStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "retry-after", base_url: "https://retry-after.example/v1", api_key_encrypted: "r", models: ["retry-after-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "retry-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "f", models: ["retry-after-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+})]]);
+const retryAfterEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = retryAfterStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { retryAfterStore.set(key, value); },
+    async delete(key) { retryAfterStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "retry-after-client", key: "sk-retry-after", models: ["*"], upstreams: ["retry-after", "retry-fallback"] }]),
+};
+const retryAfterStarted = Date.now();
+const retryAfterResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-retry-after", "content-type": "application/json" },
+  body: JSON.stringify({ model: "retry-after-model", messages: [] }),
+}), retryAfterEnv);
+assert.equal(retryAfterResp.headers.get("x-llm-gateway-upstream"), "retry-fallback");
+assert.equal(Date.now() - retryAfterStarted < 1500, true);
+const retryAfterCooldown = JSON.parse([...retryAfterStore.entries()].find(([key]) => key.startsWith("state:cooldown:"))[1]);
+assert.equal(Number(retryAfterCooldown.until) - retryAfterStarted >= 110000, true);
 const anthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
   headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },

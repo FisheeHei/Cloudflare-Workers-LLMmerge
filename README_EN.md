@@ -204,6 +204,9 @@ In short: memory is for live display, Analytics Engine is for long-term history,
 - `load_balance`: distribute by weight
 - `coordination_level` (0-5, default 3): higher values spread concurrent requests away from active or reserved upstreams, with weight treated as relative capacity
 - Successful requests and speed tests write a six-hour latency EWMA to KV so fresh isolates can prefer recently faster upstreams
+- Streaming failover only happens before the first visible output; once bytes are visible to the client, the gateway never replays the request, avoiding duplicate Agent text or tool calls
+- An upstream `Retry-After` response becomes an upstream/model cooldown state; a healthy fallback is attempted immediately instead of waiting on the failed provider
+- Health checks cache `/models` and minimal Chat capability probes in KV; probes never include user Prompt, Context, or session data
 - `Hedged Request`: race multiple upstreams for the same model
 - `Gateway Fast mode`: speed up the first two candidates for faster first byte
 - Fast + Hedged together: Hedged decides candidate count, Fast speeds up the first two
@@ -216,4 +219,5 @@ In short: memory is for live display, Analytics Engine is for long-term history,
 - Upstream export files contain plaintext API keys. Store them carefully.
 - Analytics Engine SQL queries require `Account > Account Analytics > Read`.
 - In-memory live stats may be lost if the Worker isolate is recycled. Use Analytics Engine as the historical source of truth.
+- KV routing state is a short-lived hint, not a strict global lock. Use Durable Objects if strongly consistent scheduling is ever required.
 - Long-reasoning models may have slow first bytes. Use suitable timeouts, Hedged Request, or Gateway Fast mode.

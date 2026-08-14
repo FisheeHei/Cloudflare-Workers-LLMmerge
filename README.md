@@ -200,6 +200,9 @@ const res = await client.chat.completions.create({
 - `load_balance`：按权重分配
 - `coordination_level`（0-5，默认 3）：按活跃/预留请求分散到负载较低的上游，并按权重折算承载能力
 - 成功请求和后台测速会把 6 小时延迟 EWMA 写入 KV，新 isolate 也能优先选择近期更快的上游
+- 流式请求只会在首个可见输出前故障转移；已经向客户端输出后不会重放，避免 Agent 内容或工具调用重复
+- 上游返回 `Retry-After` 时会写入对应上游/模型冷却状态，备用上游会立即尝试，不等待失败上游恢复
+- 健康检查会缓存 `/models` 和最小 Chat 探针能力到 KV；探针不包含用户 Prompt、Context 或会话内容
 - `Hedged Request`：同一模型多个上游竞速
 - `Gateway Fast 模式`：加速前两个候选上游抢首包
 - Fast 与 Hedged 同开时：Hedged 决定候选数量，Fast 加速前两个
@@ -212,4 +215,5 @@ const res = await client.chat.completions.create({
 - 上游导出文件会包含明文 API Key，请妥善保存
 - Analytics Engine 查询需要 `Account > Account Analytics > Read`
 - Worker 内存实时统计可能因 isolate 回收而丢失，历史统计以 Analytics Engine 为准
+- KV 路由状态是短期提示，不是严格全局锁；若需要强一致调度，应改用 Durable Objects
 - 长推理模型首包可能很慢，建议开启合适的超时、Hedged Request 或 Gateway Fast 模式

@@ -39,6 +39,8 @@ const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
+const UPSTREAM_HEALTH_TTL_SECONDS = 10 * 60;
+const UPSTREAM_HEALTH_REFRESH_INTERVAL_MS = 60 * 1000;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 const STDTIME_URL = "https://stdtime.gov.hk/";
@@ -70,7 +72,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-14-stateful-routing";
+const VERSION = "v26-08-14-agent-reliability";
 
 export default {
   async fetch(request, env, ctx) {
@@ -109,6 +111,7 @@ export default {
 
       const app = createApp(env);
       scheduleStdTimeSync(app, ctx);
+      scheduleUpstreamHealthRefresh(app, ctx);
       const adminRoute = matchAdminRoute(pathnameLower, app);
       const adminAuth = adminRoute && authorizeAdminRequest(request, url, app, adminRoute);
 
@@ -304,6 +307,8 @@ var _aesKeyPromise = null;
 var _stdTimeOffsetMs = 0;
 var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
+var _upstreamHealthRefreshAt = 0;
+var _upstreamHealthRefreshing = null;
 var _analyticsQueryCache = {};
 var _kvUsageCache = null;
 var _workersUsageCache = null;
@@ -361,6 +366,25 @@ function scheduleStdTimeSync(app, ctx) {
   if (_stdTimeSyncing || Date.now() - _stdTimeSyncedAt < STDTIME_SYNC_INTERVAL_MS) return;
   _stdTimeSyncing = syncStdTime(app).finally(() => { _stdTimeSyncing = null; });
   ctx.waitUntil(_stdTimeSyncing);
+}
+
+function scheduleUpstreamHealthRefresh(app, ctx) {
+  if (!app.kv || !ctx || typeof ctx.waitUntil !== "function") return;
+  if (_upstreamHealthRefreshing || Date.now() < _upstreamHealthRefreshAt) return;
+  _upstreamHealthRefreshAt = Date.now() + UPSTREAM_HEALTH_REFRESH_INTERVAL_MS;
+  _upstreamHealthRefreshing = refreshStaleUpstreamHealth(app).finally(() => { _upstreamHealthRefreshing = null; });
+  ctx.waitUntil(_upstreamHealthRefreshing);
+}
+
+async function refreshStaleUpstreamHealth(app) {
+  const runtime = await loadRuntimeConfig(app);
+  const states = await Promise.all(runtime.upstreams.map(async (upstream) => {
+    try { return await app.kv.get(await upstreamHealthStorageKey(upstream), "json"); } catch { return null; }
+  }));
+  const stale = runtime.upstreams.filter((_, index) =>
+    Date.now() - Number(states[index]?.updated_at || 0) >= UPSTREAM_HEALTH_TTL_SECONDS * 1000
+  );
+  await Promise.all(stale.map((upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000)));
 }
 
 async function syncStdTime(app) {
@@ -1601,7 +1625,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   if (apiPath === "/api/health" && request.method === "POST") {
     const upstreams = await loadHealthUpstreams(app);
     const results = await Promise.all(
-      upstreams.map((upstream) => checkUpstreamHealth(upstream, 10000))
+      upstreams.map((upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000))
     );
     return withCorsResponse(json({ ok: true, results }, 200));
   }
@@ -2558,22 +2582,24 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
       const payload = await fetchWorkersAiModelPage(upstream, timeoutMs, 1, CLOUDFLARE_MODEL_SEARCH_PER_PAGE);
       const rows = Array.isArray(payload?.result) ? payload.result : [];
       const total = Number(payload?.result_info?.total_count || payload?.result_info?.count || rows.length);
-      return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: total };
+      return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: total, capabilities: { models: true, chat: null } };
     }
 
-    let resp = await fetchWithTimeout(
+    const model = configuredUpstreamModels(upstream).find((item) => item && item !== "*");
+    let modelsResp = await fetchWithTimeout(
       buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
       { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
       timeoutMs,
     );
-    const model = configuredUpstreamModels(upstream).find((item) => item && item !== "*");
-    if (!resp.ok && model && ![401, 403, 429].includes(resp.status)) {
-      try { await resp.body?.cancel("falling back to model probe"); } catch {}
+    const modelsOk = modelsResp.ok;
+    let chatResp = null;
+    if (model && upstreamSupportsPath(upstream, CHAT_PATH) && (modelsOk || ![401, 403, 429].includes(modelsResp.status))) {
+      try { await modelsResp.body?.cancel("health model list complete"); } catch {}
       if (!takeNimMinuteSlot(upstream)) {
-        return { name: upstream.name, ok: false, status: 429, error: "NVIDIA NIM RPM limit reached", latency_ms: Date.now() - started };
+        return { name: upstream.name, ok: false, status: 429, error: "NVIDIA NIM RPM limit reached", latency_ms: Date.now() - started, capabilities: { models: modelsOk, chat: false } };
       }
       const body = sanitizeProxyBody(JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false }), upstream);
-      resp = await fetchWithTimeout(
+      chatResp = await fetchWithTimeout(
         buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
         {
           method: "POST",
@@ -2583,12 +2609,52 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
         timeoutMs,
       );
     }
-    const error = resp.ok ? "" : await responseErrorMessage(resp);
-    try { await resp.body?.cancel("health check complete"); } catch {}
-    return { name: upstream.name, ok: resp.ok, status: resp.status, ...(error ? { error } : {}), latency_ms: Date.now() - started };
+    const chatOk = chatResp ? await validHealthChatResponse(chatResp) : (model && upstreamSupportsPath(upstream, CHAT_PATH) ? false : null);
+    const response = chatResp || modelsResp;
+    const ok = chatOk === null ? modelsOk : chatOk === true;
+    const error = ok ? "" : await responseErrorMessage(response);
+    try { await modelsResp.body?.cancel("health check complete"); } catch {}
+    try { await chatResp?.body?.cancel("health check complete"); } catch {}
+    return { name: upstream.name, ok, status: response.status, ...(error ? { error } : {}), latency_ms: Date.now() - started, capabilities: { models: modelsOk, chat: chatOk } };
   } catch (err) {
-    return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
+    return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started, capabilities: { models: false, chat: false } };
   }
+}
+
+async function validHealthChatResponse(response) {
+  if (!response?.ok) return false;
+  try {
+    const text = await response.clone().text();
+    const payload = safeJson(text);
+    return Boolean(payload && Array.isArray(payload.choices) && payload.choices.length > 0 &&
+      !upstreamApplicationErrorMessage(payload) && !looksLikeHtmlDocument(text));
+  } catch {
+    return false;
+  }
+}
+
+async function checkAndPersistUpstreamHealth(app, upstream, timeoutMs) {
+  const result = await checkUpstreamHealth(upstream, timeoutMs);
+  const cooldownMs = result.ok ? 0 : healthCooldownMs(result.status);
+  const state = {
+    ok: Boolean(result.ok),
+    status: Number(result.status) || 0,
+    latency_ms: Number(result.latency_ms) || 0,
+    capabilities: result.capabilities || { models: false, chat: false },
+    updated_at: Date.now(),
+    ...(cooldownMs ? { route_cooldown_until: Date.now() + cooldownMs } : {}),
+  };
+  try {
+    await app.kv.put(await upstreamHealthStorageKey(upstream), JSON.stringify(state), { expirationTtl: UPSTREAM_HEALTH_TTL_SECONDS });
+  } catch {}
+  return result;
+}
+
+function healthCooldownMs(status) {
+  if ([401, 403].includes(Number(status))) return 15 * 60 * 1000;
+  if (Number(status) === 429) return 60 * 1000;
+  if (Number(status) >= 500 || Number(status) === 0) return 30 * 1000;
+  return 0;
 }
 
 async function speedTestUpstream(runtime, upstream, model) {
@@ -3098,7 +3164,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
 
   if (translated.stream) {
     const headers = pendingSseHeaders(client, traceId);
-    const body = streamPendingOpenAiResponse(async () => {
+    const body = streamPendingResponsesResponse(async () => {
       let proxyResponse;
       try {
         proxyResponse = await proxyRequest({ client, model: translated.model, pathname: CHAT_PATH, request, bodyText: translated.bodyText, runtime, search: url.search, ctx });
@@ -3120,7 +3186,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
         }), ctx);
         throw error;
       }
-    });
+    }, translated.seed);
     return new Response(body, { status: 200, headers });
   }
 
@@ -3876,23 +3942,31 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         firstByteTimeoutMs: requestBodyStreams(bodyText) ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
       });
       let response = upstreamResult.response;
-      const upstreamLatency = upstreamResult.latency;
 
-      const shouldRetry = runtime.routing.failover !== false && await isRetryableUpstreamResponse(response);
+      if (response.ok && requestBodyStreams(bodyText)) {
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream));
+        response = primed.response;
+        upstreamResult.response = response;
+        upstreamResult.streamError = primed.error;
+        upstreamResult.streamErrorKind = primed.errorKind || "";
+        upstreamResult.latency = Date.now() - upstreamResult.startedAt;
+      }
+
+      const shouldRetry = runtime.routing.failover !== false && (Boolean(upstreamResult.streamError) || await isRetryableUpstreamResponse(response));
       if (shouldRetry) {
         if (!isLast) {
           await discardUpstreamResponse(upstreamResult, "retryable upstream response");
         }
-        lastError = new Error(`HTTP ${response.status}`);
+        lastError = new Error(upstreamResult.streamError || `HTTP ${response.status}`);
         lastError.upstreamName = upstream.name;
-        await markUpstreamFailure(runtime, upstream, model);
+        await markUpstreamFailure(runtime, upstream, model, response);
       } else {
         await clearUpstreamFailure(runtime, upstream, model);
-        rememberUpstreamLatency(runtime, upstream, model, upstreamLatency, ctx);
+        rememberUpstreamLatency(runtime, upstream, model, upstreamResult.latency, ctx);
         rememberSuccessfulUpstream(upstream, model);
       }
 
-      if (!shouldRetry || isLast) {
+      if (!shouldRetry || (isLast && (!upstreamResult.streamError || upstreamResult.streamErrorKind === "event"))) {
         return {
           attempts: index + 1,
           response,
@@ -4104,6 +4178,20 @@ async function isRetryableUpstreamResponse(response) {
   }
 }
 
+function retryAfterCooldownSeconds(response, fallbackSeconds) {
+  const ms = retryAfterMs(response?.headers?.get("retry-after"));
+  return Math.max(1, Math.min(UPSTREAM_HEALTH_TTL_SECONDS, Math.ceil((ms || fallbackSeconds * 1000) / 1000)));
+}
+
+function retryAfterMs(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(raw);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : 0;
+}
+
 function upstreamApplicationErrorMessage(value) {
   if (!value) return "";
   if (typeof value === "string") {
@@ -4187,6 +4275,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
           const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
           result.response = primed.response;
           result.streamError = primed.error;
+          result.streamErrorKind = primed.errorKind || "";
           result.latency = Date.now() - result.startedAt;
         }
         return { ...result, upstream, index };
@@ -4224,7 +4313,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       if (result.response) {
         await discardUpstreamResponse(result, "retryable hedged response");
       }
-      await markUpstreamFailure(runtime, result.upstream, model);
+      await markUpstreamFailure(runtime, result.upstream, model, result.response);
     }
 
     const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx });
@@ -4254,12 +4343,13 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
       const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
       result.response = primed.response;
       result.streamError = primed.error;
+      result.streamErrorKind = primed.errorKind || "";
       result.latency = Date.now() - result.startedAt;
     }
     const retryable = Boolean(result.streamError) || await isRetryableUpstreamResponse(result.response);
     if (retryable) {
       await discardUpstreamResponse(result, "retryable hedged fallback response");
-      await markUpstreamFailure(runtime, upstream, model);
+      await markUpstreamFailure(runtime, upstream, model, result.response);
       return null;
     }
     await clearUpstreamFailure(runtime, upstream, model);
@@ -4317,11 +4407,11 @@ async function primeSseResponse(response, hideReasoning = false) {
       const payload = safeJson(data);
       error = streamEventErrorMessage(payload) || upstreamApplicationErrorMessage(data);
       if (error || ssePayloadHasOutput(payload, hideReasoning, stripText)) {
-        return { response: prependResponseChunks(response, reader, chunks), error };
+        return { response: prependResponseChunks(response, reader, chunks), error, errorKind: error ? "event" : "" };
       }
     }
   }
-  return { response: prependResponseChunks(response, reader, chunks), error: error || "Upstream stream ended before producing output." };
+  return { response: prependResponseChunks(response, reader, chunks), error: error || "Upstream stream ended before producing output.", errorKind: "empty" };
 }
 
 function ssePayloadHasOutput(payload, hideReasoning = false, stripText = null) {
@@ -4519,6 +4609,21 @@ function streamPendingOpenAiResponse(open) {
   );
 }
 
+function streamPendingResponsesResponse(open, seed) {
+  return streamPendingSseResponse(
+    open,
+    `: ${" ".repeat(2048)}\n\n`,
+    ": keepalive\n\n",
+    (error) => {
+      const status = error.statusCode || 502;
+      const message = error.message || "Upstream request failed.";
+      const type = mapErrorType(status);
+      const failed = { ...makeResponsesPayload(seed, { status: "failed" }), error: { message, type } };
+      return `data: ${JSON.stringify({ type: "response.failed", response: failed })}\n\ndata: ${JSON.stringify({ type: "error", error: { message, type } })}\n\n`;
+    },
+  );
+}
+
 function trackActiveUpstream(upstream, client, controller) {
   const epoch = _activeUpstreamEpoch;
   if (controller) _activeUpstreamControllers.add(controller);
@@ -4584,16 +4689,22 @@ async function hydrateUpstreamState(runtime, upstreams, model) {
   await Promise.all(upstreams.map(async (upstream) => {
     const key = upstreamModelKey(upstream, model);
     try {
-      const [cooldownKey, latencyKey] = await Promise.all([
+      const [cooldownKey, latencyKey, healthKey] = await Promise.all([
         upstreamCooldownStorageKey(key),
         upstreamLatencyStorageKey(key),
+        upstreamHealthStorageKey(upstream),
       ]);
-      const [cooldown, latency] = await Promise.all([
+      const [cooldown, latency, health] = await Promise.all([
         runtime.kv.get(cooldownKey, "json"),
         runtime.kv.get(latencyKey, "json"),
+        runtime.kv.get(healthKey, "json"),
       ]);
       if (cooldown?.until && Number(cooldown.until) > Date.now()) _upstreamCooldowns[key] = cooldown;
       else delete _upstreamCooldowns[key];
+      const healthCooldown = Number(health?.route_cooldown_until);
+      if (healthCooldown > Date.now() && healthCooldown > Number(_upstreamCooldowns[key]?.until || 0)) {
+        _upstreamCooldowns[key] = { until: healthCooldown };
+      }
       const score = Number(latency?.latency_ms);
       const updatedAt = Number(latency?.updated_at);
       const localUpdatedAt = Number(_upstreamLatencyUpdatedAt[key] || 0);
@@ -4615,14 +4726,15 @@ async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
   } catch {}
 }
 
-async function markUpstreamFailure(runtime, upstream, model) {
+async function markUpstreamFailure(runtime, upstream, model, response = null) {
   if (runtime.routing.failover === false) return;
   const key = upstreamModelKey(upstream, model);
-  const status = { until: Date.now() + runtime.upstreamCooldownTtl * 1000 };
+  const ttl = retryAfterCooldownSeconds(response, runtime.upstreamCooldownTtl);
+  const status = { until: Date.now() + ttl * 1000 };
   _upstreamCooldowns[key] = status;
   if (runtime.kv) {
     try {
-      await runtime.kv.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: Math.max(1, runtime.upstreamCooldownTtl) });
+      await runtime.kv.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: ttl });
     } catch {}
   }
 }
@@ -4642,6 +4754,10 @@ async function upstreamCooldownStorageKey(value) {
 
 async function upstreamLatencyStorageKey(value) {
   return "state:latency:" + await storageKeyHash(value);
+}
+
+async function upstreamHealthStorageKey(upstream) {
+  return "state:health:" + await storageKeyHash(`${String(upstream?.name || "").trim()}\n${String(upstream?.base_url || "").trim()}`);
 }
 
 function upstreamModelKey(upstream, model) {
