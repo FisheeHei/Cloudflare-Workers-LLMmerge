@@ -203,6 +203,7 @@ const res = await client.chat.completions.create({
 - 流式请求只会在首个可见输出前故障转移；已经向客户端输出后不会重放，避免 Agent 内容或工具调用重复
 - 上游返回 `Retry-After` 时会写入对应上游/模型冷却状态，备用上游会立即尝试，不等待失败上游恢复
 - 健康检查会缓存 `/models` 和最小 Chat 探针能力到 KV；探针不包含用户 Prompt、Context 或会话内容
+- 健康探针、模型刷新和测速使用有限并发，避免上游数量增加时瞬时耗尽 Workers Request
 - `Hedged Request`：同一模型多个上游竞速
 - `Gateway Fast 模式`：加速前两个候选上游抢首包
 - Fast 与 Hedged 同开时：Hedged 决定候选数量，Fast 加速前两个

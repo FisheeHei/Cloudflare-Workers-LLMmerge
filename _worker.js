@@ -41,6 +41,7 @@ const DEFAULT_COOLDOWN_TTL = 60;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const UPSTREAM_HEALTH_TTL_SECONDS = 10 * 60;
 const UPSTREAM_HEALTH_REFRESH_INTERVAL_MS = 60 * 1000;
+const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 const STDTIME_URL = "https://stdtime.gov.hk/";
@@ -72,7 +73,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 2_000_000,
   writes: 1_000_000,
 };
-const VERSION = "v26-08-14-agent-reliability";
+const VERSION = "v26-08-14-chain-hardening";
 
 export default {
   async fetch(request, env, ctx) {
@@ -384,7 +385,7 @@ async function refreshStaleUpstreamHealth(app) {
   const stale = runtime.upstreams.filter((_, index) =>
     Date.now() - Number(states[index]?.updated_at || 0) >= UPSTREAM_HEALTH_TTL_SECONDS * 1000
   );
-  await Promise.all(stale.map((upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000)));
+  await mapConcurrent(stale, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000));
 }
 
 async function syncStdTime(app) {
@@ -1034,10 +1035,12 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const doneChunk = encoder.encode("data: [DONE]\n\n");
-  const errorChunk = (message) => encoder.encode("data: " + JSON.stringify(openAiError(message, "server_error")) + "\n\n");
+  const errorEvent = (message) => "data: " + JSON.stringify(openAiError(message, "server_error")) + "\n\n";
+  const errorChunk = (message) => encoder.encode(errorEvent(message));
   let buffer = "";
   let usage = null;
   let outputText = "";
+  let streamError = "";
   let logged = false;
   let failureStatus = 0;
   const toolCallKeys = new Set();
@@ -1051,8 +1054,14 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
     let output = "";
     buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
       const out = sanitizeOpenAiStreamChunk(chunk, { responseModel, hideReasoning, stripChoiceText });
-      noteChunk(out, now);
-      output += "data: " + JSON.stringify(out) + "\n\n";
+      const error = noteChunk(out, now);
+      if (error) {
+        streamError = streamError || error;
+        sawDone = true;
+        output += errorEvent(error);
+      } else {
+        output += "data: " + JSON.stringify(out) + "\n\n";
+      }
     }, () => {
       sawDone = true;
       output += "data: [DONE]\n\n";
@@ -1060,13 +1069,15 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
     if (output) controller.enqueue(encoder.encode(output));
   };
   const noteChunk = (chunk, now = Date.now()) => {
-    if (upstreamApplicationErrorMessage(chunk)) failureStatus = 502;
+    const error = streamEventErrorMessage(chunk) || upstreamApplicationErrorMessage(chunk);
+    if (error) failureStatus = 502;
     usage = chunk.usage || usage;
     finishReason = responseFinishReason(chunk) || finishReason;
     noteStreamToolCalls(chunk, toolCallKeys);
     const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
     if (delta) noteStreamToken(diag, now);
     outputText += delta;
+    return error;
   };
   const finish = () => {
     if (logged) return;
@@ -1105,15 +1116,34 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
           if (transformChunk) {
             emitTransformed(controller, now);
           } else {
-            buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk, now), () => { sawDone = true; });
-            controller.enqueue(value);
+            let parsedOutput = "";
+            buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
+              const error = noteChunk(chunk, now);
+              if (error) {
+                streamError = streamError || error;
+                parsedOutput += errorEvent(error);
+              } else {
+                parsedOutput += "data: " + JSON.stringify(chunk) + "\n\n";
+              }
+            }, () => {
+              sawDone = true;
+              parsedOutput += "data: [DONE]\n\n";
+            });
+            controller.enqueue(streamError ? encoder.encode(parsedOutput) : value);
+            if (streamError) sawDone = true;
           }
           if (sawDone) break;
         }
         if (buffer) {
           buffer += "\n\n";
           if (transformChunk) emitTransformed(controller);
-          else consumeOpenAiStreamBuffer(buffer, (chunk) => noteChunk(chunk), () => { sawDone = true; });
+          else {
+            consumeOpenAiStreamBuffer(buffer, (chunk) => { streamError = streamError || noteChunk(chunk); }, () => { sawDone = true; });
+            if (streamError && !sawDone) {
+              controller.enqueue(errorChunk(streamError));
+              sawDone = true;
+            }
+          }
         }
         if (!sawDone && closeReason === "done") {
           closeReason = "eof";
@@ -1624,9 +1654,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 // ponytail: parallel health checks instead of sequential loop
   if (apiPath === "/api/health" && request.method === "POST") {
     const upstreams = await loadHealthUpstreams(app);
-    const results = await Promise.all(
-      upstreams.map((upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000))
-    );
+    const results = await mapConcurrent(upstreams, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000));
     return withCorsResponse(json({ ok: true, results }, 200));
   }
 
@@ -1733,7 +1761,7 @@ async function speedTestAdminUpstreams(request, app) {
   if (!targets.length) {
     return withCorsResponse(json(openAiError("No enabled upstream provides this model.", "not_found_error"), 404));
   }
-  const results = await Promise.all(targets.map((upstream) => speedTestUpstream(runtime, upstream, model)));
+  const results = await mapConcurrent(targets, UPSTREAM_PROBE_CONCURRENCY, (upstream) => speedTestUpstream(runtime, upstream, model));
   return withCorsResponse(json({ ok: true, results }, 200));
 }
 
@@ -2493,15 +2521,11 @@ async function loadCachedModelMap(kv, upstreams) {
   return Object.fromEntries(entries);
 }
 
-// ponytail: parallel model refresh
 async function refreshModelCache(runtime) {
-  const results = await Promise.all(
-    runtime.upstreams.map(async (upstream) => {
-      const models = await getFreshModels(runtime, upstream);
-      return { model_count: models.length, name: upstream.name };
-    })
-  );
-  return results;
+  return mapConcurrent(runtime.upstreams, UPSTREAM_PROBE_CONCURRENCY, async (upstream) => {
+    const models = await getFreshModels(runtime, upstream);
+    return { model_count: models.length, name: upstream.name };
+  });
 }
 
 async function getFreshModels(runtime, upstream) {
@@ -3906,6 +3930,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   if (pathname === CHAT_PATH) {
     bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
+  const streamRequest = requestBodyStreams(bodyText);
 
   const candidates = proxyCandidates(runtime, client, model, pathname);
 
@@ -3939,11 +3964,11 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
       upstreamResult = await fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, upstream,
-        firstByteTimeoutMs: requestBodyStreams(bodyText) ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
+        firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
       });
       let response = upstreamResult.response;
 
-      if (response.ok && requestBodyStreams(bodyText)) {
+      if (response.ok && streamRequest) {
         const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream));
         response = primed.response;
         upstreamResult.response = response;
@@ -4368,6 +4393,21 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function mapConcurrent(items, limit, fn) {
+  const list = Array.from(items || []);
+  const results = new Array(list.length);
+  let index = 0;
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit || 1), list.length) }, async () => {
+    for (;;) {
+      const current = index;
+      index += 1;
+      if (current >= list.length) return;
+      results[current] = await fn(list[current], current);
+    }
+  }));
+  return results;
 }
 
 function requestBodyStreams(bodyText) {

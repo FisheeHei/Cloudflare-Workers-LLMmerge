@@ -207,6 +207,7 @@ In short: memory is for live display, Analytics Engine is for long-term history,
 - Streaming failover only happens before the first visible output; once bytes are visible to the client, the gateway never replays the request, avoiding duplicate Agent text or tool calls
 - An upstream `Retry-After` response becomes an upstream/model cooldown state; a healthy fallback is attempted immediately instead of waiting on the failed provider
 - Health checks cache `/models` and minimal Chat capability probes in KV; probes never include user Prompt, Context, or session data
+- Health probes, model refreshes, and speed tests use bounded concurrency so a large upstream pool does not burst through the Workers Request budget
 - `Hedged Request`: race multiple upstreams for the same model
 - `Gateway Fast mode`: speed up the first two candidates for faster first byte
 - Fast + Hedged together: Hedged decides candidate count, Fast speeds up the first two

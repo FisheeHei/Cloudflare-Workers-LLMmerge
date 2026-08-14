@@ -59,6 +59,7 @@ const toolStreamHits = [];
 const appErrorHits = [];
 const htmlHits = [];
 const emptyStreamHits = [];
+const openAiStreamErrorHits = [];
 const retryAfterHits = [];
 const healthProbeHits = [];
 const analyticsPoints = [];
@@ -262,6 +263,10 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("empty-stream.example")) {
     emptyStreamHits.push("empty");
     return new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("openai-stream-error.example")) {
+    openAiStreamErrorHits.push("error");
+    return new Response('data: {"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("stream-rescue.example")) {
     emptyStreamHits.push("rescue");
@@ -2622,6 +2627,33 @@ const streamRescueResp = await worker.default.fetch(new Request("https://gw.test
 const streamRescueText = await streamRescueResp.text();
 assert.deepEqual(emptyStreamHits.slice(streamRescueStart), ["empty", "rescue"]);
 assert.equal(streamRescueText.includes('\"content\":\"rescued\"'), true);
+
+const openAiStreamErrorStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "openai-stream-error", base_url: "https://openai-stream-error.example/v1", api_key_encrypted: "e", models: ["chat-stream-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+})]]);
+const openAiStreamErrorEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = openAiStreamErrorStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { openAiStreamErrorStore.set(key, value); },
+    async delete(key) { openAiStreamErrorStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "openai-stream-error-client", key: "sk-openai-stream-error", models: ["*"], upstreams: ["openai-stream-error"] }]),
+};
+const openAiStreamErrorResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST", headers: { authorization: "Bearer sk-openai-stream-error", "content-type": "application/json" },
+  body: JSON.stringify({ model: "chat-stream-error-model", messages: [], stream: true }),
+}), openAiStreamErrorEnv);
+const openAiStreamErrorText = await openAiStreamErrorResp.text();
+assert.equal(openAiStreamErrorText.includes('\"message\":\"overloaded\"'), true);
+assert.equal(openAiStreamErrorText.includes('\"type\":\"overloaded_error\"'), false);
+const openAiStreamErrorLogs = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), openAiStreamErrorEnv)).json();
+const openAiStreamErrorLog = openAiStreamErrorLogs.logs.find((entry) => entry.model === "chat-stream-error-model");
+assert.equal(openAiStreamErrorLog.status, 502);
 
 const retryAfterStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
