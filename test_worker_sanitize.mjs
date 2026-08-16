@@ -3387,6 +3387,21 @@ function makeD1Mock() {
   return db;
 }
 
+function makeBrokenD1Mock() {
+  return {
+    prepare() {
+      return {
+        bind() {
+          return {
+            async first() { throw new Error("d1 down"); },
+            async run() { throw new Error("d1 down"); },
+          };
+        },
+        async run() { throw new Error("d1 down"); },
+      };
+    },
+  };
+}
 function makeDoNamespace(storage) {
   const ttls = [];
   const instance = new worker.LlmMergeStore({
@@ -3439,6 +3454,52 @@ assert.equal(d1Usage.has_kv, false);
 assert.equal(d1Usage.has_do, false);
 assert.equal(d1Usage.migration_source, null);
 
+const mirrorKv = new Map();
+const mirrorEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = mirrorKv.get(key); const wantJson = type === "json" || type?.type === "json"; return wantJson && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { mirrorKv.set(key, value); },
+    async delete(key) { mirrorKv.delete(key); },
+  },
+  llmerge: makeD1Mock(),
+};
+const mirrorSaveResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ settings: { time_zone_label: "mirror" } }),
+}), mirrorEnv);
+assert.equal(mirrorSaveResp.status, 200);
+assert.equal(mirrorKv.has("gateway:config"), true);
+const mirrorUsage = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), mirrorEnv)).json();
+assert.equal(mirrorUsage.storage, "d1");
+assert.equal(mirrorUsage.kv_mirror, true);
+assert.equal(mirrorUsage.degraded, false);
+
+const d1DownKv = new Map();
+d1DownKv.set("gateway:config", JSON.stringify({ routing: {}, settings: {}, upstreams: [] }));
+d1DownKv.set("client:index", JSON.stringify([]));
+d1DownKv.set("client:token:sk-fallback", JSON.stringify({ id: "fb", name: "fb", key: "sk-fallback", models: ["*"], upstreams: [], metadata: {}, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }));
+const d1DownEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = d1DownKv.get(key); const wantJson = type === "json" || type?.type === "json"; return wantJson && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { d1DownKv.set(key, value); },
+    async delete(key) { d1DownKv.delete(key); },
+  },
+  llmerge: makeBrokenD1Mock(),
+  CLIENTS_JSON: "[]",
+};
+const d1DownResp = await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-fallback" },
+}), d1DownEnv);
+assert.equal(d1DownResp.status, 200);
+const d1DownUsage = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), d1DownEnv)).json();
+assert.equal(d1DownUsage.storage, "d1");
+assert.equal(d1DownUsage.degraded, true);
+assert.equal(d1DownUsage.fallback, "KV");
 const migrationKv = new Map();
 const migratedClient = {
   id: "migrated-client",

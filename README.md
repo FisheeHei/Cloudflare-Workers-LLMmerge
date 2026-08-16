@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS llmmerge_store (
 
 仓库已提供 `d1_migrations/0001_create_store.sql`，也可以自动建表（首次读写时自动执行）。
 
-如果暂时只使用 KV，绑定名必须是 `KV`。D1/DO 启用后，KV 只作为一次性迁移源：原来存在 KV 里的网关配置、上游配置、客户端 Key 会在第一次读取时自动写入新存储，原有 Key 对接方式不变。
+如果暂时只使用 KV，绑定名必须是 `KV`。D1/DO 启用后，KV 同时承担两层角色：一次性迁移源，以及持久键（网关配置、配置快照、客户端 Key）的低频灾备快照。D1 暂时不可用时，网关会自动回退 KV 快照并标记降级状态，恢复后自动回写 D1；原有 Key 对接方式不变。
 
 Worker 部署的 Durable Object 示例见 `wrangler.worker.toml`。
 

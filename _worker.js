@@ -77,7 +77,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-16-storage-status";
+const VERSION = "v26-08-16-kv-snapshot";
 
 export default {
   async fetch(request, env, ctx) {
@@ -378,30 +378,58 @@ function ensureD1Schema(d1) {
 
 // ponytail: D1/DO are authoritative; KV is only a lazy migration source so an
 // existing KV deployment keeps its config and client keys on the first switch.
+// Durable keys are also mirrored to KV as a low-frequency snapshot; if D1 is
+// unavailable the gateway falls back to that snapshot and marks itself degraded.
 function createD1StateStore(d1, kv) {
   const store = {
     kind: "d1",
     binding: "llmerge",
+    degraded: false,
     async get(key, type) {
-      await ensureD1Schema(d1);
-      const row = await d1.prepare(`SELECT value FROM ${D1_STORE_TABLE} WHERE key = ?1 AND (expires_at IS NULL OR expires_at > ?2)`).bind(key, Date.now()).first();
-      const value = row?.value ?? null;
-      if (value !== null) return decodeStateValue(value, type);
-      if (!kv) return null;
-      const legacy = await kv.get(key, type).catch(() => null);
-      if (legacy === null || legacy === undefined) return null;
-      if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
-      return legacy;
+      try {
+        await ensureD1Schema(d1);
+        const row = await d1.prepare(`SELECT value FROM ${D1_STORE_TABLE} WHERE key = ?1 AND (expires_at IS NULL OR expires_at > ?2)`).bind(key, Date.now()).first();
+        store.degraded = false;
+        const value = row?.value ?? null;
+        if (value !== null) return decodeStateValue(value, type);
+        if (!kv) return null;
+        const legacy = await kv.get(key, type).catch(() => null);
+        if (legacy === null || legacy === undefined) return null;
+        if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
+        return legacy;
+      } catch (error) {
+        if (!kv || !isDurableStateKey(key)) throw error;
+        store.degraded = true;
+        const legacy = await kv.get(key, type).catch(() => null);
+        if (legacy === null || legacy === undefined) return null;
+        try { await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)); } catch {}
+        return legacy;
+      }
     },
     async put(key, value, options = {}) {
-      await ensureD1Schema(d1);
-      const expiresAt = Number(options?.expirationTtl) > 0 ? Math.round(Date.now() + Number(options.expirationTtl) * 1000) : null;
-      await d1.prepare(`INSERT INTO ${D1_STORE_TABLE} (key, value, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`).bind(key, String(value), expiresAt).run();
+      try {
+        await ensureD1Schema(d1);
+        const expiresAt = Number(options?.expirationTtl) > 0 ? Math.round(Date.now() + Number(options.expirationTtl) * 1000) : null;
+        await d1.prepare(`INSERT INTO ${D1_STORE_TABLE} (key, value, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`).bind(key, String(value), expiresAt).run();
+        store.degraded = false;
+        if (kv && isDurableStateKey(key)) await kv.put(key, String(value), options).catch(() => {});
+      } catch (error) {
+        if (!kv || !isDurableStateKey(key)) throw error;
+        store.degraded = true;
+        await kv.put(key, String(value), options).catch(() => {});
+      }
     },
     async delete(key) {
-      await ensureD1Schema(d1);
-      await d1.prepare(`DELETE FROM ${D1_STORE_TABLE} WHERE key = ?1`).bind(key).run();
-      if (kv) await kv.delete(key).catch(() => {});
+      try {
+        await ensureD1Schema(d1);
+        await d1.prepare(`DELETE FROM ${D1_STORE_TABLE} WHERE key = ?1`).bind(key).run();
+        store.degraded = false;
+        if (kv) await kv.delete(key).catch(() => {});
+      } catch (error) {
+        if (!kv || !isDurableStateKey(key)) throw error;
+        store.degraded = true;
+        throw error;
+      }
     },
   };
   return store;
@@ -1062,14 +1090,19 @@ ORDER BY hour ASC
 }
 
 function storageDiagnostics(app) {
-  const kind = app.state?.kind || "memory";
+  const state = app.state;
+  const kind = state?.kind || "memory";
+  const degraded = state?.degraded === true;
   return {
     storage: kind,
-    binding: app.state?.binding || "",
+    binding: state?.binding || "",
     has_kv: Boolean(app.kv),
     has_d1: kind === "d1",
     has_do: kind === "do",
     migration_source: app.kv && kind !== "kv" ? "KV" : null,
+    kv_mirror: Boolean(app.kv && kind === "d1"),
+    degraded,
+    fallback: degraded ? "KV" : null,
   };
 }
 async function kvUsageResponse(app) {
@@ -1079,7 +1112,9 @@ async function kvUsageResponse(app) {
       available: true,
       active: false,
       ...storageDiagnostics(app),
-      message: `KV is bypassed; state is stored in ${app.state.kind.toUpperCase()}.`,
+      message: app.state.degraded
+        ? "D1 unavailable; falling back to KV snapshot for durable keys."
+        : `KV is bypassed; state is stored in ${app.state.kind.toUpperCase()}.`,
       updated_at: utcNowIso(),
       operations: { reads: 0, writes: 0 },
       quotas: { reads: 0, writes: 0 },

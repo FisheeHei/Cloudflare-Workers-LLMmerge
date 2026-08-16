@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS llmmerge_store (
 
 The repo includes `d1_migrations/0001_create_store.sql`; the worker also auto-creates the table on first read/write.
 
-KV-only mode still works with the binding name `KV`. Once D1/DO is enabled, KV becomes a one-time lazy migration source: gateway config, upstreams, and client keys already in KV are copied into the new backend on first read, so existing client keys keep working without re-export.
+KV-only mode still works with the binding name `KV`. Once D1/DO is enabled, KV becomes both a one-time lazy migration source and a low-frequency disaster snapshot for durable keys (gateway config, config snapshots, client keys). If D1 becomes temporarily unavailable, the gateway falls back to the KV snapshot and marks itself degraded, then writes back to D1 once it recovers; existing client keys keep working without re-export.
 
 See `wrangler.worker.toml` for the Worker Durable Object example.
 

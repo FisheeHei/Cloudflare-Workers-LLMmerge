@@ -1920,12 +1920,15 @@ function renderAdminScript(version) {
     else if (storage === "do") label = "Durable Object \u5df2\u542f\u7528\uff08\u4e3b\u5b58\u50a8\uff09";
     else if (storage === "kv") label = "KV \u6a21\u5f0f\uff08\u4e3b\u5b58\u50a8\uff09";
     else if (storage === "memory") label = "\u5185\u5b58\u6a21\u5f0f\uff08\u65e0\u6301\u4e45\u7ed1\u5b9a\uff09";
+    else if (payload?.degraded === true) label = "D1 \u5f02\u5e38 \u00b7 KV \u5feb\u7167\u56de\u9000\u4e2d";
     else if (payload?.available === false) label = "\u72b6\u6001\u4e0d\u53ef\u7528";
     value.textContent = label;
     const bits = [];
     if (storage) bits.push("\u540e\u7aef: " + storage.toUpperCase());
     if (binding) bits.push("\u7ed1\u5b9a: " + binding);
     bits.push("KV \u7ed1\u5b9a: " + (hasKv ? "\u662f" : "\u5426"));
+    if (payload?.kv_mirror) bits.push("KV \u5feb\u7167: \u542f\u7528");
+    if (payload?.fallback) bits.push("\u56de\u9000: " + payload.fallback);
     if (payload?.migration_source) bits.push("\u8fc1\u79fb\u6e90: " + payload.migration_source);
     detail.textContent = bits.join(" \u00b7 ");
     if (payload?.message) detail.textContent += " \u00b7 " + payload.message;
