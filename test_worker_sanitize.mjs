@@ -3433,6 +3433,11 @@ assert.equal(d1.rows.has("client:index"), true);
 const d1Usage = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), d1Env)).json();
 assert.equal(d1Usage.active, false);
 assert.equal(d1Usage.storage, "d1");
+assert.equal(d1Usage.binding, "llmerge");
+assert.equal(d1Usage.has_d1, true);
+assert.equal(d1Usage.has_kv, false);
+assert.equal(d1Usage.has_do, false);
+assert.equal(d1Usage.migration_source, null);
 
 const migrationKv = new Map();
 const migratedClient = {
@@ -3477,6 +3482,10 @@ migrationKv.clear();
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: "Bearer sk-migrated" },
 }), migrationEnv)).status, 200);
+const migrationUsage = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), migrationEnv)).json();
+assert.equal(migrationUsage.storage, "d1");
+assert.equal(migrationUsage.has_kv, true);
+assert.equal(migrationUsage.migration_source, "KV");
 
 const doStorage = new Map();
 const doNamespace = makeDoNamespace(doStorage);

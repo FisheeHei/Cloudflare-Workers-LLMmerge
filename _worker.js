@@ -77,7 +77,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-16-d1-release";
+const VERSION = "v26-08-16-storage-status";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1061,13 +1061,24 @@ ORDER BY hour ASC
   return buckets;
 }
 
+function storageDiagnostics(app) {
+  const kind = app.state?.kind || "memory";
+  return {
+    storage: kind,
+    binding: app.state?.binding || "",
+    has_kv: Boolean(app.kv),
+    has_d1: kind === "d1",
+    has_do: kind === "do",
+    migration_source: app.kv && kind !== "kv" ? "KV" : null,
+  };
+}
 async function kvUsageResponse(app) {
   if (app.state && app.state.kind !== "kv") {
     return withCorsResponse(json({
       ok: true,
       available: true,
       active: false,
-      storage: app.state.kind,
+      ...storageDiagnostics(app),
       message: `KV is bypassed; state is stored in ${app.state.kind.toUpperCase()}.`,
       updated_at: utcNowIso(),
       operations: { reads: 0, writes: 0 },
@@ -1075,7 +1086,7 @@ async function kvUsageResponse(app) {
     }, 200));
   }
   if (!app.analyticsAccountId || !app.analyticsApiToken) {
-    return withCorsResponse(json({ ok: true, available: false, message: "ANALYTICS_ACCOUNT_ID / ANALYTICS_API_TOKEN is not configured." }, 200));
+    return withCorsResponse(json({ ok: true, available: false, ...storageDiagnostics(app), message: "ANALYTICS_ACCOUNT_ID / ANALYTICS_API_TOKEN is not configured." }, 200));
   }
   const now = Date.now();
   if (_kvUsageCache && now - _kvUsageCache.ts < KV_USAGE_CACHE_MS) {
@@ -1086,7 +1097,7 @@ async function kvUsageResponse(app) {
     _kvUsageCache = { ts: now, payload };
     return withCorsResponse(json(payload, 200));
   } catch (error) {
-    return withCorsResponse(json({ ok: true, available: false, message: String(error?.message || error || "Unable to read KV analytics.") }, 200));
+    return withCorsResponse(json({ ok: true, available: false, ...storageDiagnostics(app), message: String(error?.message || error || "Unable to read KV analytics.") }, 200));
   }
 }
 
@@ -1119,6 +1130,11 @@ async function fetchKvUsage(app) {
     available: true,
     active: true,
     storage: "kv",
+    binding: "KV",
+    has_kv: true,
+    has_d1: false,
+    has_do: false,
+    migration_source: null,
     updated_at: utcNowIso(),
     period: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), timezone: "UTC" },
     quotas: app.kvDailyBudget,

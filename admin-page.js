@@ -665,7 +665,13 @@ function renderAdminMarkup(origin, version) {
         <div class="field span-3"><label>UTC \u504f\u79fb (\u5206\u949f)</label><input id="time-zone-offset" type="number" min="-720" max="840" placeholder="480"></div>
       </div>
       <div class="row">
-        <div class="field span-12"><label>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u63d0\u793a\u8bcd\u4e0e\u4e0a\u4e0b\u6587</button><span class="note" id="system-prompt-status"></span></div>
+        <div class="field span-12">
+          <label>\u5b58\u50a8\u7ed1\u5b9a\u72b6\u6001</label>
+          <div class="context-controls"><strong id="storage-status-value">\u68c0\u67e5\u4e2d...</strong><button type="button" class="secondary small" id="refresh-storage-status">\u5237\u65b0</button></div>
+          <div class="note mono" id="storage-status-detail"></div>
+        </div>
+      </div>
+      <div class="row">        <div class="field span-12"><label>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u63d0\u793a\u8bcd\u4e0e\u4e0a\u4e0b\u6587</button><span class="note" id="system-prompt-status"></span></div>
       </div>
       <button class="good small" id="save-settings">\u4fdd\u5b58\u8bbe\u7f6e</button>
       <span class="note" id="settings-status"></span>
@@ -1902,13 +1908,36 @@ function renderAdminScript(version) {
     }
   }
 
-  async function loadKvUsage() {
+  function renderStorageStatusCard(payload) {
+    const value = byId("storage-status-value");
+    const detail = byId("storage-status-detail");
+    if (!value || !detail) return;
+    const storage = String(payload?.storage || "");
+    const binding = String(payload?.binding || "");
+    const hasKv = payload?.has_kv === true;
+    let label = "\u68c0\u67e5\u4e2d";
+    if (storage === "d1") label = "D1 \u5df2\u542f\u7528\uff08\u4e3b\u5b58\u50a8\uff09";
+    else if (storage === "do") label = "Durable Object \u5df2\u542f\u7528\uff08\u4e3b\u5b58\u50a8\uff09";
+    else if (storage === "kv") label = "KV \u6a21\u5f0f\uff08\u4e3b\u5b58\u50a8\uff09";
+    else if (storage === "memory") label = "\u5185\u5b58\u6a21\u5f0f\uff08\u65e0\u6301\u4e45\u7ed1\u5b9a\uff09";
+    else if (payload?.available === false) label = "\u72b6\u6001\u4e0d\u53ef\u7528";
+    value.textContent = label;
+    const bits = [];
+    if (storage) bits.push("\u540e\u7aef: " + storage.toUpperCase());
+    if (binding) bits.push("\u7ed1\u5b9a: " + binding);
+    bits.push("KV \u7ed1\u5b9a: " + (hasKv ? "\u662f" : "\u5426"));
+    if (payload?.migration_source) bits.push("\u8fc1\u79fb\u6e90: " + payload.migration_source);
+    detail.textContent = bits.join(" \u00b7 ");
+    if (payload?.message) detail.textContent += " \u00b7 " + payload.message;
+  }
+async function loadKvUsage() {
     const meter = byId("kv-usage-meter");
     const stamp = byId("kv-usage-updated");
     if (!meter) return;
     const resp = await fetch(API_BASE + "/kv-usage");
     const payload = await parseApiResponse(resp);
     state.kvUsage = payload;
+    renderStorageStatusCard(payload);
     if (!resp.ok || payload.available === false) {
       meter.innerHTML = '<div class="note">' + esc(payload?.message || "KV usage unavailable") + '</div>';
       if (stamp) stamp.textContent = "unavailable";
@@ -2880,6 +2909,10 @@ function renderAdminScript(version) {
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
       await Promise.all([loadConfig(), loadClients(), loadKvUsage(), loadWorkersUsage()]);
+      const refreshStorageBtn = byId("refresh-storage-status");
+      if (refreshStorageBtn) refreshStorageBtn.addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", loadKvUsage).catch(showError)
+      );
       if (bootSpan.parentNode) bootSpan.remove();
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
