@@ -14,7 +14,7 @@ LLM-merge is a single-file LLM aggregation gateway for Cloudflare Workers or Pag
 - Model picker with source grouping, tags, and context-length notes
 - NVIDIA NIM bridge for GLM, Qwen, MiniMax, Kimi, DeepSeek, Nemotron, Mistral, and related models
 - Prompt / Context injection scoped by client key, with keyword-based context fragments and import/export
-- Live in-memory stats + Analytics Engine history, with KV fallback
+- Live in-memory stats + Analytics Engine history, with D1/DO or KV mirror fallback
 - Upstream import/export, health checks, model speed tests, and active-upstream display
 
 ## Deployment
@@ -29,15 +29,31 @@ wrangler deploy
 
 For Pages, use Advanced Mode and keep `_worker.js` as the entry file. No build step is required.
 
-### 2. Bind KV
+### 2. Bind storage (KV / D1 / Durable Object)
 
-The KV binding name must be:
+Backends are auto-selected in this order: Durable Object `llmerge` > D1 `llmerge` > KV `KV`.
+
+D1 is recommended. The binding name must be:
 
 ```txt
-KV
+llmerge
 ```
 
-The KV namespace name can be anything. KV stores gateway config, client keys, upstreams, Prompt, Context, model cache, cooldown state, and six-hour upstream latency scores shared by fresh isolates.
+Create the table before first use (the binding name is `llmerge` for both D1 and the optional Durable Object):
+
+```sql
+CREATE TABLE IF NOT EXISTS llmmerge_store (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  expires_at INTEGER
+);
+```
+
+The repo includes `d1_migrations/0001_create_store.sql`; the worker also auto-creates the table on first read/write.
+
+KV-only mode still works with the binding name `KV`. Once D1/DO is enabled, KV becomes a one-time lazy migration source: gateway config, upstreams, and client keys already in KV are copied into the new backend on first read, so existing client keys keep working without re-export.
+
+See `wrangler.worker.toml` for the Worker Durable Object example.
 
 ### 3. Bind Analytics Engine
 
@@ -78,7 +94,8 @@ If `ADMIN_TOKEN` is not set, the default admin path is `/llmmerge-admin`. Do not
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `KV` | Yes | Cloudflare KV binding |
+| `KV` | Optional | Cloudflare KV binding; lightweight storage when D1/DO is absent |
+| `llmerge` | Optional | D1 or Durable Object binding; KV becomes a one-time migration fallback when present |
 | `ADMIN_TOKEN` | Recommended | Admin path token |
 | `API_KEY_CRYPT_SECRET` | Recommended | Secret used to encrypt upstream API keys; keep stable in production |
 | `ANALYTICS` | Optional | Analytics Engine binding for request stats |
@@ -89,9 +106,9 @@ If `ADMIN_TOKEN` is not set, the default admin path is `/llmmerge-admin`. Do not
 | `STREAM_IDLE_TIMEOUT_MS` | Optional | Defaults to `900000` |
 | `UPSTREAM_COOLDOWN_TTL` | Optional | Defaults to `60` seconds |
 | `MODEL_CACHE_TTL` | Optional | Defaults to `3600` seconds |
-| `KV_FLUSH_INTERVAL_MS` | Optional | KV mirror flush interval; defaults to `60000` |
-| `KV_DAILY_READ_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `2000000` |
-| `KV_DAILY_WRITE_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `1000000` |
+| `KV_FLUSH_INTERVAL_MS` | Optional | KV-only log/stats mirror flush interval; defaults to `120000` |
+| `KV_DAILY_READ_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `100000` (Free plan) |
+| `KV_DAILY_WRITE_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `1000` (Free plan) |
 | `WORKERS_DAILY_REQUEST_BUDGET` | Optional | Admin Workers request-meter budget; defaults to `1000000` |
 | `STDTIME_URL` | Optional | Defaults to `https://stdtime.gov.hk/` |
 | `UPSTREAMS_JSON` | Optional | Initial upstream seed config |
@@ -194,19 +211,19 @@ Main endpoints:
 
 - Memory: live recent requests, tokens, logs, and active upstreams
 - Analytics Engine: historical logs and statistics
-- KV mirror: current logs and recent hourly stats while Analytics Engine queries catch up or are unavailable
+- State mirror: current logs and recent hourly stats while Analytics Engine queries catch up or are unavailable
 
-In short: memory is for live display, Analytics Engine is for long-term history, and KV is for configuration, current telemetry, and shared routing state.
+In short: memory is for live display, Analytics Engine is for long-term history, and D1/DO/KV is for configuration, current telemetry, and shared routing state. With D1/DO enabled, KV reads and writes drop to near zero, which fits the small Free-plan KV quota.
 
 ## Routing
 
 - `failover`: try another upstream after failure
 - `load_balance`: distribute by weight
 - `coordination_level` (0-5, default 3): higher values spread concurrent requests away from active or reserved upstreams, with weight treated as relative capacity
-- Successful requests and speed tests write a six-hour latency EWMA to KV so fresh isolates can prefer recently faster upstreams
+- Successful requests and speed tests write a six-hour latency EWMA to state storage so fresh isolates can prefer recently faster upstreams
 - Streaming failover only happens before the first visible output; once bytes are visible to the client, the gateway never replays the request, avoiding duplicate Agent text or tool calls
 - An upstream `Retry-After` response becomes an upstream/model cooldown state; a healthy fallback is attempted immediately instead of waiting on the failed provider
-- Health checks cache `/models` and minimal Chat capability probes in KV; probes never include user Prompt, Context, or session data
+- Health checks cache `/models` and minimal Chat capability probes in state storage; probes never include user Prompt, Context, or session data
 - Health probes, model refreshes, and speed tests use bounded concurrency so a large upstream pool does not burst through the Workers Request budget
 - `Hedged Request`: race multiple upstreams for the same model
 - `Gateway Fast mode`: speed up the first two candidates for faster first byte
@@ -220,5 +237,5 @@ In short: memory is for live display, Analytics Engine is for long-term history,
 - Upstream export files contain plaintext API keys. Store them carefully.
 - Analytics Engine SQL queries require `Account > Account Analytics > Read`.
 - In-memory live stats may be lost if the Worker isolate is recycled. Use Analytics Engine as the historical source of truth.
-- KV routing state is a short-lived hint, not a strict global lock. Use Durable Objects if strongly consistent scheduling is ever required.
+- KV routing state is a short-lived hint, not a strict global lock. Use the Durable Object `llmerge` backend if strongly consistent scheduling is ever required.
 - Long-reasoning models may have slow first bytes. Use suitable timeouts, Hedged Request, or Gateway Fast mode.

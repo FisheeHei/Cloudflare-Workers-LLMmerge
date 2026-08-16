@@ -13,3 +13,10 @@ compatibility_date = "2026-06-29"
 # [[kv_namespaces]]
 # binding = "KV"
 # id = "<YOUR_KV_NAMESPACE_ID>"
+
+# Recommended: bind D1 as `llmerge` and apply d1_migrations/0001_create_store.sql.
+# [[d1_databases]]
+# binding = "llmerge"
+# database_name = "llmmerge"
+# database_id = "<YOUR_D1_DATABASE_ID>"
+# migrations_dir = "d1_migrations"

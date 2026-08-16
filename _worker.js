@@ -40,7 +40,10 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const UPSTREAM_HEALTH_TTL_SECONDS = 10 * 60;
-const UPSTREAM_HEALTH_REFRESH_INTERVAL_MS = 60 * 1000;
+const UPSTREAM_HEALTH_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
+const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 30 * 1000;
+const D1_STORE_TABLE = "llmmerge_store";
 const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
@@ -65,15 +68,16 @@ const MAX_CLIENT_KEY_LENGTH = 512;
 const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
 const ADMIN_SESSION_COOKIE = "llmmerge_admin";
 const ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 3600;
-const KV_HOT_READ_CACHE_TTL_SECONDS = 60;
+const KV_HOT_READ_CACHE_TTL_SECONDS = 300;
+const KV_HOT_JSON_READ = { type: "json", cacheTtl: KV_HOT_READ_CACHE_TTL_SECONDS };
 const KV_USAGE_CACHE_MS = 60000;
 const WORKERS_USAGE_CACHE_MS = 60000;
 const DEFAULT_WORKERS_DAILY_REQUEST_BUDGET = 1_000_000;
 const DEFAULT_KV_DAILY_BUDGET = {
-  reads: 2_000_000,
-  writes: 1_000_000,
+  reads: 100_000,
+  writes: 1_000,
 };
-const VERSION = "v26-08-14-chain-hardening";
+const VERSION = "v26-08-16-d1-release";
 
 export default {
   async fetch(request, env, ctx) {
@@ -90,12 +94,16 @@ export default {
       }
 
       if (pathname === "/health") {
+        const storage = pickStateBackend(env);
         return withCorsResponse(
           json(
             {
               ok: true,
               mode: "openai-compatible-gateway",
               has_kv: Boolean(env.KV),
+              has_d1: storage.kind === "d1",
+              has_do: storage.kind === "do",
+              storage: storage.kind,
               admin_configured: Boolean(pickAdminToken(env)),
               now: utcNowIso(),
               time_zone: API_TIME_ZONE_LABEL,
@@ -283,10 +291,12 @@ export default {
 // ponytail: cache createApp result per-isolate since env is stable across requests
 var _cachedApp = null;
 var _cachedEnvRef = null;
-// ponytail: per-isolate EWMA, KV mirror shares route scores across fresh isolates.
+// ponytail: per-isolate EWMA; state storage shares route scores across fresh isolates.
 var _upstreamLatency = {};
 var _upstreamLatencyUpdatedAt = {};
+var _upstreamLatencyPersistedAt = {};
 var _upstreamCooldowns = {};
+var _upstreamStateHydratedAt = {};
 // ponytail: per-isolate and per-model; DO if strict global rotation ever matters
 var _lastSuccessfulUpstreamName = {};
 var _activeUpstreams = {};
@@ -300,7 +310,7 @@ var _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
 var _runtimeCache = null;
 var _runtimeCacheTs = 0;
-var RUNTIME_CACHE_TTL_MS = 120000;
+var RUNTIME_CACHE_TTL_MS = 600000;
 var _runtimeLoading = null;
 // ponytail: encryption secret changes only on redeploy; reuse its imported CryptoKey per isolate.
 var _aesKeySecret = "";
@@ -308,14 +318,191 @@ var _aesKeyPromise = null;
 var _stdTimeOffsetMs = 0;
 var _stdTimeSyncedAt = 0;
 var _stdTimeSyncing = null;
+var _d1SchemaReady = null;
 var _upstreamHealthRefreshAt = 0;
 var _upstreamHealthRefreshing = null;
 var _analyticsQueryCache = {};
 var _kvUsageCache = null;
 var _workersUsageCache = null;
-// ponytail: local copies avoid repeated KV reads; KV is the cross-isolate session source of truth.
+// ponytail: local copies avoid repeated state reads; state is the cross-isolate session source of truth.
 var _sessionModelLocks = {};
 var _sessionCurrentModels = {};
+
+function pickStateBackend(env) {
+  const llmerge = env?.llmerge;
+  if (llmerge && typeof llmerge.idFromName === "function" && typeof llmerge.get === "function") {
+    return { kind: "do", backend: llmerge, binding: "llmerge" };
+  }
+  if (llmerge && typeof llmerge.prepare === "function") {
+    return { kind: "d1", backend: llmerge, binding: "llmerge" };
+  }
+  const d1 = env?.D1 || env?.DB;
+  if (d1 && typeof d1.prepare === "function") {
+    return { kind: "d1", backend: d1, binding: "D1/DB" };
+  }
+  if (env?.KV) return { kind: "kv", backend: env.KV, binding: "KV" };
+  return { kind: "memory", backend: null, binding: "" };
+}
+
+function decodeStateValue(value, type) {
+  const wantJson = type === "json" || type?.type === "json";
+  return wantJson ? safeJson(value) : value;
+}
+
+// ponytail: only durable records are written through during lazy KV migration;
+// ephemeral routing/telemetry keys rebuild themselves with their own TTLs.
+function isDurableStateKey(key) {
+  return key === GATEWAY_CONFIG_KEY ||
+    key === CONFIG_SNAPSHOTS_KEY ||
+    key === clientIndexKey() ||
+    key.startsWith("client:id:") ||
+    key.startsWith("client:token:");
+}
+
+function createStateStore(env) {
+  const backend = pickStateBackend(env);
+  if (backend.kind === "d1") return createD1StateStore(backend.backend, env?.KV || null);
+  if (backend.kind === "do") return createDoStateStore(backend.backend, env?.KV || null);
+  if (backend.kind === "kv") return createKvStateStore(backend.backend);
+  return createMemoryStateStore();
+}
+
+// ponytail: one generic key/value table keeps migration and admin code trivial.
+function ensureD1Schema(d1) {
+  _d1SchemaReady ||= d1.prepare(`CREATE TABLE IF NOT EXISTS ${D1_STORE_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)`).run().then(() => true).catch((error) => {
+    _d1SchemaReady = null;
+    throw error;
+  });
+  return _d1SchemaReady;
+}
+
+// ponytail: D1/DO are authoritative; KV is only a lazy migration source so an
+// existing KV deployment keeps its config and client keys on the first switch.
+function createD1StateStore(d1, kv) {
+  const store = {
+    kind: "d1",
+    binding: "llmerge",
+    async get(key, type) {
+      await ensureD1Schema(d1);
+      const row = await d1.prepare(`SELECT value FROM ${D1_STORE_TABLE} WHERE key = ?1 AND (expires_at IS NULL OR expires_at > ?2)`).bind(key, Date.now()).first();
+      const value = row?.value ?? null;
+      if (value !== null) return decodeStateValue(value, type);
+      if (!kv) return null;
+      const legacy = await kv.get(key, type).catch(() => null);
+      if (legacy === null || legacy === undefined) return null;
+      if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
+      return legacy;
+    },
+    async put(key, value, options = {}) {
+      await ensureD1Schema(d1);
+      const expiresAt = Number(options?.expirationTtl) > 0 ? Math.round(Date.now() + Number(options.expirationTtl) * 1000) : null;
+      await d1.prepare(`INSERT INTO ${D1_STORE_TABLE} (key, value, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`).bind(key, String(value), expiresAt).run();
+    },
+    async delete(key) {
+      await ensureD1Schema(d1);
+      await d1.prepare(`DELETE FROM ${D1_STORE_TABLE} WHERE key = ?1`).bind(key).run();
+      if (kv) await kv.delete(key).catch(() => {});
+    },
+  };
+  return store;
+}
+
+function createKvStateStore(kv) {
+  return {
+    kind: "kv",
+    binding: "KV",
+    get: (key, type) => kv.get(key, type),
+    put: (key, value, options = {}) => kv.put(key, value, options),
+    delete: (key) => kv.delete(key),
+  };
+}
+
+function createMemoryStateStore() {
+  const map = new Map();
+  return {
+    kind: "memory",
+    binding: "",
+    async get(key, type) {
+      const entry = map.get(key);
+      if (!entry) return null;
+      if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+        map.delete(key);
+        return null;
+      }
+      return decodeStateValue(entry.value, type);
+    },
+    async put(key, value, options = {}) {
+      const expiresAt = Number(options?.expirationTtl) > 0 ? Date.now() + Number(options.expirationTtl) * 1000 : null;
+      map.set(key, { value: String(value), expiresAt });
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+  };
+}
+
+// ponytail: optional Durable Object backend for Worker deployments; the same
+// `llmerge` binding name is shared by D1 and DO so only one needs to exist.
+function createDoStateStore(namespace, kv) {
+  const stub = namespace.get(namespace.idFromName("llmmerge-state"));
+  const store = {
+    kind: "do",
+    binding: "llmerge",
+    async get(key, type) {
+      const response = await stub.fetch(`https://llmmerge-state/state?key=${encodeURIComponent(key)}`);
+      const payload = response.ok ? await response.json() : null;
+      const value = payload?.value ?? null;
+      if (value !== null) return decodeStateValue(value, type);
+      if (!kv) return null;
+      const legacy = await kv.get(key, type).catch(() => null);
+      if (legacy === null || legacy === undefined) return null;
+      if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
+      return legacy;
+    },
+    async put(key, value, options = {}) {
+      const expirationTtl = Number(options?.expirationTtl) > 0 ? Math.max(30, Number(options.expirationTtl)) : null;
+      await stub.fetch(`https://llmmerge-state/state?key=${encodeURIComponent(key)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value: String(value), expirationTtl }),
+      });
+    },
+    async delete(key) {
+      await stub.fetch(`https://llmmerge-state/state?key=${encodeURIComponent(key)}`, { method: "DELETE" });
+      if (kv) await kv.delete(key).catch(() => {});
+    },
+  };
+  return store;
+}
+
+export class LlmMergeStore {
+  constructor(state, env) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const key = url.searchParams.get("key") || "";
+    if (!key) return new Response("missing key", { status: 400 });
+    if (request.method === "GET") {
+      const value = await this.state.storage.get(key);
+      return Response.json({ value: value === undefined ? null : value });
+    }
+    if (request.method === "PUT") {
+      const payload = await request.json();
+      const value = String(payload?.value ?? "");
+      const rawTtl = Number(payload?.expirationTtl);
+      const ttl = Number.isFinite(rawTtl) && rawTtl > 0 ? Math.max(30, rawTtl) : 0;
+      await this.state.storage.put(key, value, ttl > 0 ? { expirationTtl: ttl } : undefined);
+      return new Response("ok");
+    }
+    if (request.method === "DELETE") {
+      await this.state.storage.delete(key);
+      return new Response("ok");
+    }
+    return new Response("method not allowed", { status: 405 });
+  }
+}
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
@@ -329,6 +516,7 @@ function createApp(env) {
   }
 
   const adminPath = normalizeAdminPath(env.ADMIN_PATH || "/llmmerge-admin");
+  const appState = createStateStore(env);
 
   _cachedApp = {
     adminPath,
@@ -355,6 +543,8 @@ function createApp(env) {
     envClients: parseJsonEnvArray(env.CLIENTS_JSON, "CLIENTS_JSON"),
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
     kv: env.KV || null,
+    state: appState,
+    storage: appState.kind,
     stdTimeUrl: String(env.STDTIME_URL || STDTIME_URL),
     workersDailyRequestBudget: parsePositiveInt(env.WORKERS_DAILY_REQUEST_BUDGET, DEFAULT_WORKERS_DAILY_REQUEST_BUDGET),
   };
@@ -370,7 +560,7 @@ function scheduleStdTimeSync(app, ctx) {
 }
 
 function scheduleUpstreamHealthRefresh(app, ctx) {
-  if (!app.kv || !ctx || typeof ctx.waitUntil !== "function") return;
+  if (!app.state || !ctx || typeof ctx.waitUntil !== "function") return;
   if (_upstreamHealthRefreshing || Date.now() < _upstreamHealthRefreshAt) return;
   _upstreamHealthRefreshAt = Date.now() + UPSTREAM_HEALTH_REFRESH_INTERVAL_MS;
   _upstreamHealthRefreshing = refreshStaleUpstreamHealth(app).finally(() => { _upstreamHealthRefreshing = null; });
@@ -380,7 +570,7 @@ function scheduleUpstreamHealthRefresh(app, ctx) {
 async function refreshStaleUpstreamHealth(app) {
   const runtime = await loadRuntimeConfig(app);
   const states = await Promise.all(runtime.upstreams.map(async (upstream) => {
-    try { return await app.kv.get(await upstreamHealthStorageKey(upstream), "json"); } catch { return null; }
+    try { return await app.state.get(await upstreamHealthStorageKey(upstream), "json"); } catch { return null; }
   }));
   const stale = runtime.upstreams.filter((_, index) =>
     Date.now() - Number(states[index]?.updated_at || 0) >= UPSTREAM_HEALTH_TTL_SECONDS * 1000
@@ -455,11 +645,12 @@ async function clientDailyUsageStorageKey(clientId, day) {
   return "usage:client-day:" + await storageKeyHash(`${clientId}\n${day}`);
 }
 
-// KV mirrors request logs and hourly stats in one-minute batches; Analytics Engine remains the long-term store.
+// State storage mirrors request logs and hourly stats in batched writes; Analytics Engine remains the long-term store.
 var _pendingLogs = [];
 var _pendingStats = {}; // hourKey -> bucket
+var _pendingClientUsage = {}; // storageKey -> delta
 var _lastFlush = Date.now();
-const DEFAULT_KV_FLUSH_INTERVAL_MS = 60 * 1000;
+const DEFAULT_KV_FLUSH_INTERVAL_MS = 120 * 1000;
 var FLUSH_PENDING_LIMIT = 200;
 var _flushPromise = null;
 
@@ -537,18 +728,27 @@ function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path
 }
 
 function recordClientDailyUsage(app, entry, ctx) {
-  if (!app?.kv || !entry?.client_id) return;
-  const task = updateClientDailyUsage(app.kv, entry).catch(() => {});
+  if (!app?.state || !entry?.client_id) return;
+  const task = rememberPendingClientUsage(app.state, entry).catch(() => {});
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
 }
 
-async function updateClientDailyUsage(kv, entry) {
+async function rememberPendingClientUsage(store, entry) {
   const day = legacyStatsDayKey(entry.ts);
   const key = await clientDailyUsageStorageKey(entry.client_id, day);
-  // ponytail: read-merge-write is adequate for personal traffic; use a Durable Object if concurrent writes lose increments.
-  const existing = await kv.get(key, "json");
-  const usage = mergeClientDailyUsage(existing, entry, day);
-  await kv.put(key, JSON.stringify(usage), { expirationTtl: CLIENT_DAILY_USAGE_TTL_SECONDS });
+  _pendingClientUsage[key] = mergeClientDailyUsage(_pendingClientUsage[key], entry, day);
+}
+
+function mergeClientUsageSnapshot(existing, delta) {
+  if (!delta) return existing || null;
+  const usage = { ...emptyClientDailyUsage(delta.day, delta.client), ...(existing || {}) };
+  usage.requests += delta.requests || 0;
+  usage.success += delta.success || 0;
+  usage.fail += delta.fail || 0;
+  usage.prompt_tokens += delta.prompt_tokens || 0;
+  usage.completion_tokens += delta.completion_tokens || 0;
+  usage.updated_at = delta.updated_at || usage.updated_at;
+  return usage;
 }
 
 function emptyClientDailyUsage(day, client) {
@@ -584,7 +784,7 @@ function scheduleLogFlush(app, ctx) {
 }
 
 async function flushBatch(app, force = false) {
-  if (!app.kv) return;
+  if (!app.state) return;
   var now = Date.now();
   if (!force && now - _lastFlush < app.kvFlushIntervalMs && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
   if (_flushPromise) return _flushPromise;
@@ -600,11 +800,11 @@ async function _doFlush(app) {
     var logsToFlush = _pendingLogs.splice(0);
     logPromise = (async () => {
       try {
-        var raw = await app.kv.get(LOG_KEY, "json");
+        var raw = await app.state.get(LOG_KEY, "json");
         var existing = Array.isArray(raw) ? raw : [];
         existing.push(...logsToFlush);
         if (existing.length > 50) existing.splice(0, existing.length - 50);
-        await app.kv.put(LOG_KEY, JSON.stringify(existing));
+        await app.state.put(LOG_KEY, JSON.stringify(existing));
       } catch {
         _pendingLogs.unshift(...logsToFlush);
         _lastFlush = 0;
@@ -619,16 +819,32 @@ async function _doFlush(app) {
     statsPromise = Promise.all(keys.map(async function(hourKey) {
       var delta = deltas[hourKey];
       try {
-        var raw = await app.kv.get(STATS_PREFIX + hourKey, "json");
+        var raw = await app.state.get(STATS_PREFIX + hourKey, "json");
         var bucket = mergeStatsBucket(raw, delta);
-        await app.kv.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
+        await app.state.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
       } catch {
         _pendingStats[hourKey] = mergeStatsBucket(_pendingStats[hourKey], delta);
         _lastFlush = 0;
       }
     }));
   }
-  await Promise.all([logPromise, statsPromise]);
+  var usagePromise = Promise.resolve();
+  var usageKeys = Object.keys(_pendingClientUsage);
+  if (usageKeys.length > 0) {
+    var usageDeltas = {};
+    for (var usageKey of usageKeys) { usageDeltas[usageKey] = _pendingClientUsage[usageKey]; delete _pendingClientUsage[usageKey]; }
+    usagePromise = Promise.all(usageKeys.map(async function(storageKey) {
+      var delta = usageDeltas[storageKey];
+      try {
+        var existing = await app.state.get(storageKey, "json");
+        await app.state.put(storageKey, JSON.stringify(mergeClientUsageSnapshot(existing, delta)), { expirationTtl: CLIENT_DAILY_USAGE_TTL_SECONDS });
+      } catch {
+        _pendingClientUsage[storageKey] = mergeClientUsageSnapshot(_pendingClientUsage[storageKey], delta);
+        _lastFlush = 0;
+      }
+    }));
+  }
+  await Promise.all([logPromise, statsPromise, usagePromise]);
 }
 
 function emptyStatsBucket() {
@@ -683,7 +899,7 @@ function mergeStatsBucket(base, delta) {
 }
 
 async function getMergedLogs(app) {
-  const raw = app.kv ? await app.kv.get(LOG_KEY, "json") : [];
+  const raw = app.state ? await app.state.get(LOG_KEY, "json") : [];
   return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse().map(publicRequestLogEntry);
 }
 
@@ -846,6 +1062,18 @@ ORDER BY hour ASC
 }
 
 async function kvUsageResponse(app) {
+  if (app.state && app.state.kind !== "kv") {
+    return withCorsResponse(json({
+      ok: true,
+      available: true,
+      active: false,
+      storage: app.state.kind,
+      message: `KV is bypassed; state is stored in ${app.state.kind.toUpperCase()}.`,
+      updated_at: utcNowIso(),
+      operations: { reads: 0, writes: 0 },
+      quotas: { reads: 0, writes: 0 },
+    }, 200));
+  }
   if (!app.analyticsAccountId || !app.analyticsApiToken) {
     return withCorsResponse(json({ ok: true, available: false, message: "ANALYTICS_ACCOUNT_ID / ANALYTICS_API_TOKEN is not configured." }, 200));
   }
@@ -889,6 +1117,8 @@ async function fetchKvUsage(app) {
   return {
     ok: true,
     available: true,
+    active: true,
+    storage: "kv",
     updated_at: utcNowIso(),
     period: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), timezone: "UTC" },
     quotas: app.kvDailyBudget,
@@ -1502,8 +1732,8 @@ function noteStreamToolCalls(chunk, seen) {
 }
 
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
-  if (!app.kv) {
-    throw badConfig("A KV binding named `KV` is required for the admin page.");
+  if (!app.state || app.state.kind === "memory") {
+    throw badConfig("A KV (`KV`), D1 (`llmerge`) or Durable Object (`llmerge`) binding is required for the admin page.");
   }
 
   const apiPath = pathname.slice(adminBasePath.length);
@@ -1517,7 +1747,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/config/snapshots" && request.method === "GET") {
-    const snapshots = await listConfigSnapshots(app.kv);
+    const snapshots = await listConfigSnapshots(app.state);
     return withCorsResponse(json({ ok: true, snapshots: snapshots.map(publicConfigSnapshot) }, 200));
   }
 
@@ -1533,13 +1763,13 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/clients" && request.method === "GET") {
-    return withCorsResponse(json(await listClientIndexWithUsage(app.kv), 200));
+    return withCorsResponse(json(await listClientIndexWithUsage(app), 200));
   }
 
   if (apiPath === "/api/clients" && request.method === "POST") {
     const payload = parseJsonBody(await readRequestText(request));
     const record = buildClientRecord(payload);
-    await saveClientRecord(app.kv, record);
+    await saveClientRecord(app.state, record);
 
     return withCorsResponse(
       json(
@@ -1560,14 +1790,14 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   const clientMatch = apiPath.match(/^\/api\/clients\/([^/]+)$/);
   if (clientMatch && request.method === "GET") {
     const id = decodeURIComponent(clientMatch[1]);
-    const existing = await app.kv.get(clientIdKey(id), "json");
+    const existing = await app.state.get(clientIdKey(id), "json");
     if (!existing?.key) throw httpError(404, "Client not found.");
     const baseUrl = `${url.origin}/v1`;
     const response = withCorsResponse(json({
       ...publicClientRecord(existing),
       api_key: existing.key,
       base_url: baseUrl,
-      today_usage: await readClientDailyUsage(app.kv, existing),
+      today_usage: await readClientDailyUsage(app.state, existing),
       setup: clientSetupPayload(existing, baseUrl),
     }, 200));
     const headers = new Headers(response.headers);
@@ -1577,7 +1807,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   if (clientMatch && request.method === "PUT") {
     const id = decodeURIComponent(clientMatch[1]);
-    const existing = await app.kv.get(clientIdKey(id), "json");
+    const existing = await app.state.get(clientIdKey(id), "json");
     if (!existing?.key) throw httpError(404, "Client not found.");
     const payload = parseJsonBody(await readRequestText(request));
     const record = buildClientRecord({
@@ -1587,13 +1817,13 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
       key: existing.key,
       created_at: existing.created_at,
     });
-    await saveClientRecord(app.kv, record);
+    await saveClientRecord(app.state, record);
     return withCorsResponse(json({ ok: true, client: publicClientRecord(record) }, 200));
   }
 
   if (clientMatch && request.method === "DELETE") {
     const id = decodeURIComponent(clientMatch[1]);
-    await deleteClientRecord(app.kv, id);
+    await deleteClientRecord(app.state, id);
     return withCorsResponse(json({ ok: true, id }, 200));
   }
 
@@ -1602,7 +1832,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, logs }, 200));
   }
 
-  // Keep the current two hours on the KV mirror while Analytics Engine catches up.
+  // Keep the current two hours in state storage while Analytics Engine catches up.
   if (apiPath === "/api/stats" && request.method === "GET") {
     const now = utcNowMs();
     const hourKeys = [];
@@ -1611,7 +1841,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     }
     const [analyticsBuckets, raws, logs] = await Promise.all([
       getAnalyticsStats(app, hourKeys).catch(() => null),
-      app.kv ? Promise.all(hourKeys.map((key) => app.kv.get(STATS_PREFIX + key, "json"))) : Promise.resolve(hourKeys.map(() => null)),
+      app.state ? Promise.all(hourKeys.map((key) => app.state.get(STATS_PREFIX + key, "json"))) : Promise.resolve(hourKeys.map(() => null)),
       getBestLogs(app),
     ]);
     const analyticsPending = analyticsBuckets ? recentPendingStats() : {};
@@ -1692,8 +1922,8 @@ async function saveAdminConfig(request, app) {
     upstreams: hasUpstreams && Array.isArray(payload.upstreams) ? payload.upstreams : (existing.upstreams || []),
   };
   const normalized = await normalizeGatewayConfigPayload(merged, app);
-  await saveConfigSnapshot(app.kv, existing);
-  await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
+  await saveConfigSnapshot(app.state, existing);
+  await app.state.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
   invalidateRuntimeCache();
   return withCorsResponse(json({
     ok: true,
@@ -1791,7 +2021,7 @@ async function detectAdminUpstream(app, upstreamName) {
     if (target) {
       target.capability = capability;
       target.paths = paths;
-      await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(config));
+      await app.state.put(GATEWAY_CONFIG_KEY, JSON.stringify(config));
       invalidateRuntimeCache();
     }
     return withCorsResponse(json({ ok: true, capability, paths, latency_ms: latency }, 200));
@@ -1801,7 +2031,7 @@ async function detectAdminUpstream(app, upstreamName) {
 }
 
 async function getEditableConfig(app) {
-  const stored = app.kv ? await getKvJson(app.kv, GATEWAY_CONFIG_KEY) : null;
+  const stored = app.state ? await app.state.get(GATEWAY_CONFIG_KEY, "json") : null;
   const config = unwrapGatewayConfig(stored);
   if (config) {
     return repairStoredGatewayConfig(config, app);
@@ -2042,8 +2272,8 @@ function uniqueValidUpstreams(upstreams) {
   });
 }
 
-async function listConfigSnapshots(kv) {
-  const snapshots = await kv.get(CONFIG_SNAPSHOTS_KEY, "json");
+async function listConfigSnapshots(store) {
+  const snapshots = await store.get(CONFIG_SNAPSHOTS_KEY, "json");
   return Array.isArray(snapshots) ? snapshots : [];
 }
 
@@ -2056,9 +2286,9 @@ function publicConfigSnapshot(snapshot) {
   };
 }
 
-async function saveConfigSnapshot(kv, config, clientNote = "before-save") {
+async function saveConfigSnapshot(store, config, clientNote = "before-save") {
   if (!config || !Array.isArray(config.upstreams)) return;
-  const snapshots = await listConfigSnapshots(kv);
+  const snapshots = await listConfigSnapshots(store);
   snapshots.unshift({
     id: `cfg_${Date.now()}_${randomString(6).toLowerCase()}`,
     created_at: utcNowIso(),
@@ -2066,19 +2296,19 @@ async function saveConfigSnapshot(kv, config, clientNote = "before-save") {
     client_note: clientNote,
     config,
   });
-  await kv.put(CONFIG_SNAPSHOTS_KEY, JSON.stringify(snapshots.slice(0, CONFIG_SNAPSHOT_LIMIT)));
+  await store.put(CONFIG_SNAPSHOTS_KEY, JSON.stringify(snapshots.slice(0, CONFIG_SNAPSHOT_LIMIT)));
 }
 
 async function restoreConfigSnapshot(app, snapshotId) {
-  const snapshots = await listConfigSnapshots(app.kv);
+  const snapshots = await listConfigSnapshots(app.state);
   const snapshot = snapshots.find((item) => String(item.id || "").toLowerCase() === String(snapshotId || "").toLowerCase());
   if (!snapshot?.config) {
     return withCorsResponse(json(openAiError("Config snapshot not found.", "not_found_error"), 404));
   }
   const current = await getEditableConfig(app);
-  await saveConfigSnapshot(app.kv, current, "before-restore");
+  await saveConfigSnapshot(app.state, current, "before-restore");
   const restored = await repairStoredGatewayConfig(snapshot.config, app);
-  await app.kv.put(GATEWAY_CONFIG_KEY, JSON.stringify(restored));
+  await app.state.put(GATEWAY_CONFIG_KEY, JSON.stringify(restored));
   invalidateRuntimeCache();
   return withCorsResponse(json({ ok: true, config: toPublicGatewayConfig(restored) }, 200));
 }
@@ -2142,11 +2372,12 @@ async function buildRuntimeConfig(app) {
         api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
       }))
   );
-  const modelCache = await loadCachedModelMap(app.kv, decrypted);
+  const modelCache = await loadCachedModelMap(app.state, decrypted);
 
   const runtime = {
     clients: app.envClients.map(normalizeClient),
     kv: app.kv,
+    state: app.state,
     modelCacheTtl: editable.settings.model_cache_ttl,
     requestTimeoutMs: editable.settings.request_timeout_ms,
     streamIdleTimeoutMs: editable.settings.stream_idle_timeout_ms,
@@ -2196,11 +2427,11 @@ function invalidateRuntimeCache() {
   _runtimeLoading = null;
 }
 
-// ponytail: LRU cache per-isolate for client tokens �?saves KV read every proxy request
+// ponytail: LRU cache per-isolate for client tokens, saves a state read per request.
 var _clientCache = {};
 var _clientCacheTs = {};
 var _clientLoading = {};
-var CLIENT_CACHE_TTL_MS = 60000;
+var CLIENT_CACHE_TTL_MS = 300000;
 
 async function requireClient(request, runtime) {
   const token = getBearerToken(request);
@@ -2208,23 +2439,23 @@ async function requireClient(request, runtime) {
     throw httpError(401, "Missing API key.");
   }
 
-  // ponytail: hit in-memory cache if fresh (<60s)
+  // ponytail: hit in-memory cache if fresh
   var cached = _clientCache[token];
   if (cached && (Date.now() - (_clientCacheTs[token] || 0)) < CLIENT_CACHE_TTL_MS) {
     return cached;
   }
 
-  if (runtime.kv) {
-    const load = _clientLoading[token] || getKvJson(runtime.kv, clientTokenKey(token));
+  if (runtime.state) {
+    const load = _clientLoading[token] || runtime.state.get(clientTokenKey(token), KV_HOT_JSON_READ);
     _clientLoading[token] = load;
-    let kvClient;
+    let storedClient;
     try {
-      kvClient = await load;
+      storedClient = await load;
     } finally {
       if (_clientLoading[token] === load) delete _clientLoading[token];
     }
-    if (kvClient?.key) {
-      var nc = normalizeClient(kvClient);
+    if (storedClient?.key) {
+      var nc = normalizeClient(storedClient);
       _clientCache[token] = nc;
       _clientCacheTs[token] = Date.now();
       // ponytail: keep cache small, max 50 entries
@@ -2306,9 +2537,9 @@ async function enforceSessionModelLock(client, runtime, request, payload, model)
   const cacheKey = `${client.id}\n${scopeId}`;
   const now = Date.now();
   let lock = _sessionModelLocks[cacheKey];
-  if (!lock && runtime.kv) {
+  if (!lock && runtime.state) {
     try {
-      const stored = await runtime.kv.get(await sessionModelLockStorageKey(cacheKey), "json");
+      const stored = await runtime.state.get(await sessionModelLockStorageKey(cacheKey), "json");
       if (stored?.model && Number(stored.expires) > now) lock = stored;
     } catch {}
   }
@@ -2320,9 +2551,9 @@ async function enforceSessionModelLock(client, runtime, request, payload, model)
 
   lock = { model, expires: now + SESSION_MODEL_LOCK_TTL_SECONDS * 1000 };
   _sessionModelLocks[cacheKey] = lock;
-  if (runtime.kv) {
+  if (runtime.state) {
     try {
-      await runtime.kv.put(await sessionModelLockStorageKey(cacheKey), JSON.stringify(lock), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS });
+      await runtime.state.put(await sessionModelLockStorageKey(cacheKey), JSON.stringify(lock), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS });
     } catch {}
   }
   const lockKeys = Object.keys(_sessionModelLocks);
@@ -2370,10 +2601,10 @@ function rememberSessionCurrentModel(client, request, payload, model) {
 async function persistSessionCurrentModel(runtime, client, request, payload, ctx) {
   const key = sessionCurrentModelKey(client, request, payload);
   const item = key && _sessionCurrentModels[key];
-  if (!runtime.kv || !item?.model || item.persistedModel === item.model) return;
+  if (!runtime.state || !item?.model || item.persistedModel === item.model) return;
   item.persistedModel = item.model;
   const task = sessionCurrentModelStorageKey(key)
-    .then((storageKey) => runtime.kv.put(storageKey, JSON.stringify({ model: item.model, expires: item.expires }), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS }))
+    .then((storageKey) => runtime.state.put(storageKey, JSON.stringify({ model: item.model, expires: item.expires }), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS }))
     .catch(() => { if (_sessionCurrentModels[key]?.model === item.model) _sessionCurrentModels[key].persistedModel = ""; });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
   else await task;
@@ -2384,9 +2615,9 @@ async function currentSessionModel(client, runtime, request, payload) {
   const item = key && _sessionCurrentModels[key];
   if (item?.expires > Date.now()) return item.model;
   if (key) delete _sessionCurrentModels[key];
-  if (!key || !runtime.kv) return "";
+  if (!key || !runtime.state) return "";
   try {
-    const stored = await runtime.kv.get(await sessionCurrentModelStorageKey(key), "json");
+    const stored = await runtime.state.get(await sessionCurrentModelStorageKey(key), "json");
     if (stored?.model && stored.expires > Date.now()) {
       _sessionCurrentModels[key] = { ...stored, persistedModel: stored.model };
       return stored.model;
@@ -2529,14 +2760,14 @@ async function refreshModelCache(runtime) {
 }
 
 async function getFreshModels(runtime, upstream) {
-  if (!runtime.kv) {
+  if (!runtime.state) {
     return Array.isArray(upstream.models) ? upstream.models : [];
   }
 
   try {
     const models = await fetchUpstreamModelIds(upstream, runtime.requestTimeoutMs);
 
-    await runtime.kv.put(
+    await runtime.state.put(
       modelsCacheKey(upstream.name),
       JSON.stringify({
         fetched_at: utcNowIso(),
@@ -2669,7 +2900,7 @@ async function checkAndPersistUpstreamHealth(app, upstream, timeoutMs) {
     ...(cooldownMs ? { route_cooldown_until: Date.now() + cooldownMs } : {}),
   };
   try {
-    await app.kv.put(await upstreamHealthStorageKey(upstream), JSON.stringify(state), { expirationTtl: UPSTREAM_HEALTH_TTL_SECONDS });
+    await app.state.put(await upstreamHealthStorageKey(upstream), JSON.stringify(state), { expirationTtl: UPSTREAM_HEALTH_TTL_SECONDS });
   } catch {}
   return result;
 }
@@ -4633,10 +4864,6 @@ function noteActiveUpstream(upstream, client, delta) {
   else delete _activeUpstreamClients[name];
 }
 
-function getKvJson(kv, key) {
-  return kv.get(key, { type: "json", cacheTtl: KV_HOT_READ_CACHE_TTL_SECONDS });
-}
-
 function streamPendingOpenAiResponse(open) {
   return streamPendingSseResponse(
     open,
@@ -4708,7 +4935,9 @@ function rememberUpstreamLatency(runtime, upstream, model, latencyMs, ctx) {
   const updatedAt = Date.now();
   _upstreamLatency[name] = score;
   _upstreamLatencyUpdatedAt[name] = updatedAt;
-  if (!runtime?.kv) return Promise.resolve();
+  if (!runtime?.state) return Promise.resolve();
+  if (Number(_upstreamLatencyPersistedAt[name] || 0) > 0 && updatedAt - Number(_upstreamLatencyPersistedAt[name] || 0) < UPSTREAM_LATENCY_PERSIST_INTERVAL_MS) return Promise.resolve();
+  _upstreamLatencyPersistedAt[name] = updatedAt;
   const task = persistUpstreamLatency(runtime, name, score, updatedAt);
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
   return task;
@@ -4725,7 +4954,11 @@ function weightedShuffle(items) {
 }
 
 async function hydrateUpstreamState(runtime, upstreams, model) {
-  if (!runtime?.kv || !upstreams?.length) return;
+  if (!runtime?.state || !upstreams?.length) return;
+  const hydrateKey = `${String(model || "*")}\n${upstreams.map(upstreamKey).join("|")}`;
+  const hydratedAt = Date.now();
+  if (hydratedAt - Number(_upstreamStateHydratedAt[hydrateKey] || 0) < UPSTREAM_STATE_HYDRATE_INTERVAL_MS) return;
+  _upstreamStateHydratedAt[hydrateKey] = hydratedAt;
   await Promise.all(upstreams.map(async (upstream) => {
     const key = upstreamModelKey(upstream, model);
     try {
@@ -4735,9 +4968,9 @@ async function hydrateUpstreamState(runtime, upstreams, model) {
         upstreamHealthStorageKey(upstream),
       ]);
       const [cooldown, latency, health] = await Promise.all([
-        runtime.kv.get(cooldownKey, "json"),
-        runtime.kv.get(latencyKey, "json"),
-        runtime.kv.get(healthKey, "json"),
+        runtime.state.get(cooldownKey, "json"),
+        runtime.state.get(latencyKey, "json"),
+        runtime.state.get(healthKey, "json"),
       ]);
       if (cooldown?.until && Number(cooldown.until) > Date.now()) _upstreamCooldowns[key] = cooldown;
       else delete _upstreamCooldowns[key];
@@ -4758,7 +4991,7 @@ async function hydrateUpstreamState(runtime, upstreams, model) {
 
 async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
   try {
-    await runtime.kv.put(
+    await runtime.state.put(
       await upstreamLatencyStorageKey(key),
       JSON.stringify({ latency_ms: latency, updated_at: updatedAt }),
       { expirationTtl: UPSTREAM_LATENCY_TTL_SECONDS },
@@ -4772,9 +5005,9 @@ async function markUpstreamFailure(runtime, upstream, model, response = null) {
   const ttl = retryAfterCooldownSeconds(response, runtime.upstreamCooldownTtl);
   const status = { until: Date.now() + ttl * 1000 };
   _upstreamCooldowns[key] = status;
-  if (runtime.kv) {
+  if (runtime.state) {
     try {
-      await runtime.kv.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: ttl });
+      await runtime.state.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: ttl });
     } catch {}
   }
 }
@@ -4783,8 +5016,8 @@ async function clearUpstreamFailure(runtime, upstream, model) {
   const key = upstreamModelKey(upstream, model);
   const hadCooldown = Boolean(_upstreamCooldowns[key]);
   delete _upstreamCooldowns[key];
-  if (hadCooldown && runtime.kv) {
-    try { await runtime.kv.delete(await upstreamCooldownStorageKey(key)); } catch {}
+  if (hadCooldown && runtime.state) {
+    try { await runtime.state.delete(await upstreamCooldownStorageKey(key)); } catch {}
   }
 }
 
@@ -4907,8 +5140,8 @@ function buildClientRecord(payload) {
   });
 }
 
-async function saveClientRecord(kv, record) {
-  const existing = await kv.get(clientIdKey(record.id), "json");
+async function saveClientRecord(store, record) {
+  const existing = await store.get(clientIdKey(record.id), "json");
   const createdAt = existing?.created_at || record.created_at;
   const stored = {
     ...record,
@@ -4916,31 +5149,30 @@ async function saveClientRecord(kv, record) {
     updated_at: utcNowIso(),
   };
 
-  await kv.put(clientIdKey(stored.id), JSON.stringify(stored));
-  await kv.put(clientTokenKey(stored.key), JSON.stringify(stored));
+  await store.put(clientIdKey(stored.id), JSON.stringify(stored));
+  await store.put(clientTokenKey(stored.key), JSON.stringify(stored));
 
-  const index = await listClientIndex(kv);
+  const index = await listClientIndex(store);
   const next = index.filter((item) => item.id !== stored.id);
   next.push(publicClientRecord(stored));
   next.sort((a, b) => a.name.localeCompare(b.name));
 
-  // ponytail: rewrite the full index in KV; move to D1 only if admin writes become frequent.
-  await kv.put(clientIndexKey(), JSON.stringify(next));
+  await store.put(clientIndexKey(), JSON.stringify(next));
   delete _clientCache[stored.key];
   delete _clientCacheTs[stored.key];
 }
 
-async function deleteClientRecord(kv, id) {
-  const record = await kv.get(clientIdKey(id), "json");
+async function deleteClientRecord(store, id) {
+  const record = await store.get(clientIdKey(id), "json");
   if (!record || !record.key) {
     throw httpError(404, "Client not found.");
   }
 
-  await kv.delete(clientIdKey(id));
-  await kv.delete(clientTokenKey(record.key));
+  await store.delete(clientIdKey(id));
+  await store.delete(clientTokenKey(record.key));
 
-  const index = await listClientIndex(kv);
-  await kv.put(
+  const index = await listClientIndex(store);
+  await store.put(
     clientIndexKey(),
     JSON.stringify(index.filter((item) => item.id !== id)),
   );
@@ -4948,22 +5180,24 @@ async function deleteClientRecord(kv, id) {
   delete _clientCacheTs[record.key];
 }
 
-async function listClientIndex(kv) {
-  return (await kv.get(clientIndexKey(), "json")) || [];
+async function listClientIndex(store) {
+  return (await store.get(clientIndexKey(), "json")) || [];
 }
 
-async function listClientIndexWithUsage(kv) {
-  const rows = await listClientIndex(kv);
+async function listClientIndexWithUsage(app) {
+  const rows = await listClientIndex(app.state);
   return Promise.all(rows.map(async (record) => ({
     ...record,
-    today_usage: await readClientDailyUsage(kv, record),
+    today_usage: await readClientDailyUsage(app.state, record),
   })));
 }
 
-async function readClientDailyUsage(kv, record) {
+async function readClientDailyUsage(store, record) {
   const day = legacyStatsDayKey();
+  const storageKey = await clientDailyUsageStorageKey(record.id, day);
   try {
-    return publicClientDailyUsage(await kv.get(await clientDailyUsageStorageKey(record.id, day), "json") || emptyClientDailyUsage(day, record.name));
+    const existing = store ? await store.get(storageKey, "json") : null;
+    return publicClientDailyUsage(mergeClientUsageSnapshot(existing, _pendingClientUsage[storageKey]) || emptyClientDailyUsage(day, record.name));
   } catch {
     return emptyClientDailyUsage(day, record.name);
   }

@@ -1759,7 +1759,7 @@ const kvPutsBeforeWaitUntil = kvPuts.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
-  body: JSON.stringify({ model: "qwen3", messages: [] }),
+  body: JSON.stringify({ model: "qwen3-throttle-check", messages: [] }),
 }), env, { waitUntil(task) { waitUntilTasks.push(task); } });
 assert.equal(waitUntilTasks.length > 0, true);
 await Promise.all(waitUntilTasks);
@@ -1780,11 +1780,11 @@ const analyticsEnv = {
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
-  body: JSON.stringify({ model: "qwen3", messages: [] }),
+  body: JSON.stringify({ model: "qwen3-analytics-check", messages: [] }),
 }), analyticsEnv, { waitUntil(task) { analyticsTasks.push(task); } });
 await Promise.all(analyticsTasks);
 assert.equal(analyticsPoints.length > 0, true);
-assert.equal(analyticsPoints.at(-1).blobs[3], "qwen3");
+assert.equal(analyticsPoints.at(-1).blobs[3], "qwen3-analytics-check");
 assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
 assert.equal(kvPuts.length > kvPutsBeforeAnalytics, true);
 const realDateNow = Date.now;
@@ -3352,5 +3352,162 @@ const failLogsResp = await worker.default.fetch(new Request("https://gw.test/adm
 const failLogs = await failLogsResp.json();
 assert.equal(failLogs.logs.some((entry) => entry.upstream === "boom" && entry.status === 502), true);
 assert.equal(failLogs.logs.some((entry) => entry.trace_id === "trace-fail"), true);
+
+function makeD1Mock() {
+  const rows = new Map();
+  const db = {
+    rows,
+    prepare(sql) {
+      const statement = {
+        bind(...args) {
+          return {
+            async first() {
+              const key = args[0];
+              const row = rows.get(key);
+              if (!row || (row.expires_at && row.expires_at <= Date.now())) return null;
+              return { value: row.value };
+            },
+            async run() {
+              if (/CREATE TABLE/.test(sql)) return { meta: {} };
+              const key = args[0];
+              if (/DELETE FROM/.test(sql)) rows.delete(key);
+              else rows.set(key, { value: args[1], expires_at: args[2] ?? null });
+              return { meta: {} };
+            },
+          };
+        },
+        async run() {
+          if (/CREATE TABLE/.test(sql)) return { meta: {} };
+          throw new Error("run without bind is not expected");
+        },
+      };
+      return statement;
+    },
+  };
+  return db;
+}
+
+function makeDoNamespace(storage) {
+  const ttls = [];
+  const instance = new worker.LlmMergeStore({
+    storage: {
+      async get(key) { return storage.get(key) ?? null; },
+      async put(key, value, options) { storage.set(key, value); ttls.push([key, options || null]); },
+      async delete(key) { storage.delete(key); },
+    },
+  }, {});
+  const namespace = {
+    idFromName() { return "llmmerge-state"; },
+    get() { return { fetch: (input, init) => instance.fetch(new Request(input, init)) }; },
+    _ttls: ttls,
+  };
+  return namespace;
+}
+
+const d1 = makeD1Mock();
+const d1Env = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: null,
+  llmerge: d1,
+  CLIENTS_JSON: JSON.stringify([{ name: "d1-static", key: "sk-d1-static", models: ["*"], upstreams: ["nim"] }]),
+};
+assert.equal((await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), d1Env)).status, 200);
+const d1SaveResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ settings: { time_zone_label: "D1 test" } }),
+}), d1Env);
+assert.equal(d1SaveResp.status, 200);
+const d1ClientResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "d1-created" }),
+}), d1Env);
+const d1Client = (await d1ClientResp.json()).client;
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: `Bearer ${d1Client.api_key}` },
+}), d1Env)).status, 200);
+assert.equal(d1.rows.has("gateway:config"), true);
+assert.equal(d1.rows.has("client:index"), true);
+const d1Usage = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), d1Env)).json();
+assert.equal(d1Usage.active, false);
+assert.equal(d1Usage.storage, "d1");
+
+const migrationKv = new Map();
+const migratedClient = {
+  id: "migrated-client",
+  name: "migrated",
+  key: "sk-migrated",
+  models: ["*"],
+  upstreams: [],
+  metadata: {},
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+};
+migrationKv.set("gateway:config", JSON.stringify({
+  routing: {},
+  settings: {},
+  upstreams: [{ name: "nim", base_url: "https://integrate.api.nvidia.com/v1", api_key_encrypted: "x", models: ["*"], paths: ["/v1/chat/completions"] }],
+}));
+migrationKv.set("client:index", JSON.stringify([{ id: migratedClient.id, name: migratedClient.name, key_preview: "sk-migra...ated", models: ["*"], upstreams: [] }]));
+migrationKv.set(`client:id:${migratedClient.id}`, JSON.stringify(migratedClient));
+migrationKv.set(`client:token:${migratedClient.key}`, JSON.stringify(migratedClient));
+const migrationD1 = makeD1Mock();
+const migrationEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = migrationKv.get(key);
+      const wantJson = type === "json" || type?.type === "json";
+      return wantJson && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { migrationKv.set(key, value); },
+    async delete(key) { migrationKv.delete(key); },
+  },
+  llmerge: migrationD1,
+};
+await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), migrationEnv);
+assert.equal(migrationD1.rows.has("gateway:config"), true);
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-migrated" },
+}), migrationEnv)).status, 200);
+migrationKv.clear();
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-migrated" },
+}), migrationEnv)).status, 200);
+
+const doStorage = new Map();
+const doNamespace = makeDoNamespace(doStorage);
+const doEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: null,
+  llmerge: doNamespace,
+};
+assert.equal((await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), doEnv)).status, 200);
+const doClientResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "do-created" }),
+}), doEnv);
+const doClient = (await doClientResp.json()).client;
+assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: `Bearer ${doClient.api_key}` },
+}), doEnv)).status, 200);
+assert.equal(doStorage.has("client:index"), true);
+assert.equal(doNamespace._ttls.find(([key]) => key === "client:index")?.[1], null);
+const doLatencyTasks = [];
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: `Bearer ${doClient.api_key}`, "content-type": "application/json" },
+  body: JSON.stringify({ model: "do-latency-check", messages: [] }),
+}), doEnv, { waitUntil(task) { doLatencyTasks.push(task); } });
+await Promise.all(doLatencyTasks);
+assert.equal(doNamespace._ttls.some(([key, options]) => key.startsWith("state:latency:") && options?.expirationTtl === 6 * 3600), true);
+const doUsage = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), doEnv)).json();
+assert.equal(doUsage.active, false);
+assert.equal(doUsage.storage, "do");
 
 console.log("ok");

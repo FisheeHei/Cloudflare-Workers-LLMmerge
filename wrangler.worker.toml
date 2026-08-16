@@ -7,5 +7,21 @@ compatibility_date = "2026-07-30"
 # binding = "KV"
 # id = "<YOUR_KV_NAMESPACE_ID>"
 
+# Recommended: D1 primary storage. Binding name must be `llmerge`.
+# [[d1_databases]]
+# binding = "llmerge"
+# database_name = "llmmerge"
+# database_id = "<YOUR_D1_DATABASE_ID>"
+# migrations_dir = "d1_migrations"
+
+# Alternative for Worker deployments: Durable Object storage. Binding name must be `llmerge`.
+# [[durable_objects.bindings]]
+# name = "llmerge"
+# class_name = "LlmMergeStore"
+
+# [[migrations]]
+# tag = "v1"
+# new_sqlite_classes = ["LlmMergeStore"]
+
 [triggers]
 crons = ["* * * * *"]

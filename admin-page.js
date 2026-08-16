@@ -529,10 +529,10 @@ function renderAdminMarkup(origin, version) {
   <div class="panel kv-panel" id="kv-panel">
     <div class="usage-section">
       <div class="usage-section-head">
-        <h3>KV Usage</h3>
+        <h3>Storage Usage</h3>
         <span class="note" id="kv-usage-updated">checking...</span>
       </div>
-      <div class="kv-meter" id="kv-usage-meter"><div class="note">Loading KV quota...</div></div>
+      <div class="kv-meter" id="kv-usage-meter"><div class="note">Loading storage status...</div></div>
     </div>
     <div class="usage-section">
       <div class="usage-section-head">
@@ -1914,6 +1914,11 @@ function renderAdminScript(version) {
       if (stamp) stamp.textContent = "unavailable";
       return;
     }
+    if (payload.active === false) {
+      meter.innerHTML = '<div class="note">KV bypassed · state stored in ' + esc(String(payload.storage || "D1").toUpperCase()) + '</div>';
+      if (stamp) stamp.textContent = formatGatewayTime(payload.updated_at);
+      return;
+    }
     const quotas = payload.quotas || {};
     const ops = payload.operations || {};
     const rows = [
@@ -1928,6 +1933,7 @@ function renderAdminScript(version) {
       return '<div class="kv-row"><span>' + esc(row[0]) + '</span><div class="kv-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div><span class="mono">' + esc(value) + '</span></div>';
     }).join("");
     if (stamp) stamp.textContent = formatGatewayTime(payload.updated_at);
+    meter.insertAdjacentHTML("beforeend", '<div class="note">Free-plan defaults · override via KV_DAILY_READ_BUDGET / KV_DAILY_WRITE_BUDGET</div>');
   }
 
   async function loadWorkersUsage() {

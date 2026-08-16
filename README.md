@@ -14,7 +14,7 @@ LLM-merge 是一个运行在 Cloudflare Workers / Pages Advanced Mode 上的单�
 - 模型选择器：按来源和标签筛选，支持上下文长度备注
 - NIM 桥接：对 GLM、Qwen、MiniMax、Kimi、DeepSeek、Nemotron、Mistral 等模型做轻量参数适配
 - Prompt / Context 注入：按客户端 Key 生效，支持上下文片段、关键词和导入/导出
-- 统计与日志：内存实时显示 + Analytics Engine 历史统计，KV fallback
+- 统计与日志：内存实时显示 + Analytics Engine 历史统计，D1/DO 或 KV 镜像兜底
 - 上游导入/导出、健康检查、模型测速、活跃上游显示
 
 ## 部署
@@ -29,15 +29,31 @@ wrangler deploy
 
 Pages 使用 Advanced Mode，将 `_worker.js` 作为入口。项目不需要构建步骤。
 
-### 2. 绑定 KV
+### 2. 绑定存储（KV / D1 / Durable Object）
 
-KV 变量名必须是：
+三种模式按优先级自动选择：Durable Object `llmerge` > D1 `llmerge` > KV `KV`。
+
+推荐用 D1，绑定名必须是：
 
 ```txt
-KV
+llmerge
 ```
 
-KV 空间名称可以任意。KV 用于保存配置、客户端 Key、上游、Prompt、Context、模型缓存、cooldown 和 6 小时上游延迟评分。
+首次使用前执行建表 SQL（绑定名统一为 `llmerge`，Worker 部署也可用同名的 Durable Object）：
+
+```sql
+CREATE TABLE IF NOT EXISTS llmmerge_store (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  expires_at INTEGER
+);
+```
+
+仓库已提供 `d1_migrations/0001_create_store.sql`，也可以自动建表（首次读写时自动执行）。
+
+如果暂时只使用 KV，绑定名必须是 `KV`。D1/DO 启用后，KV 只作为一次性迁移源：原来存在 KV 里的网关配置、上游配置、客户端 Key 会在第一次读取时自动写入新存储，原有 Key 对接方式不变。
+
+Worker 部署的 Durable Object 示例见 `wrangler.worker.toml`。
 
 ### 3. 绑定 Analytics Engine
 
@@ -78,7 +94,8 @@ https://your-domain.example/{ADMIN_TOKEN}
 
 | 变量 | 必要 | 说明 |
 | --- | --- | --- |
-| `KV` | 是 | Cloudflare KV binding |
+| `KV` | 可选 | Cloudflare KV binding；D1/DO 未启用时的轻量状态存储 |
+| `llmerge` | 可选 | D1 或 Durable Object binding；启用后 KV 只做一次性迁移回退 |
 | `ADMIN_TOKEN` | 建议 | 后台路径 token |
 | `API_KEY_CRYPT_SECRET` | 建议 | 上游 API Key 加密密钥，生产环境固定后不要随意更换 |
 | `ANALYTICS` | 可选 | Analytics Engine binding，用于请求统计写入 |
@@ -92,6 +109,10 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `STDTIME_URL` | 可选 | 默认 `https://stdtime.gov.hk/` |
 | `UPSTREAMS_JSON` | 可选 | 初始上游种子配置 |
 | `CLIENTS_JSON` | 可选 | 初始客户端 Key 种子配置 |
+| `KV_FLUSH_INTERVAL_MS` | 可选 | KV-only 模式下日志/统计镜像刷新间隔，默认 `120000` 毫秒 |
+| `KV_DAILY_READ_BUDGET` | 可选 | 后台 KV 用量表读取配额，默认 `100000`（Free 方案） |
+| `KV_DAILY_WRITE_BUDGET` | 可选 | 后台 KV 用量表写入配额，默认 `1000`（Free 方案） |
+| `WORKERS_DAILY_REQUEST_BUDGET` | 可选 | 后台 Workers 请求用量表配额，默认 `1000000` |
 
 ## 上游
 
@@ -190,19 +211,19 @@ const res = await client.chat.completions.create({
 
 - 内存：最近请求实时显示，包含请求数、Token、日志和活跃上游
 - Analytics Engine：长期统计与日志查询
-- KV mirror：后台实时日志和近两小时统计镜像，Analytics Engine 查询延迟或不可用时仍能显示当前状态
+- 状态存储镜像：后台实时日志和近两小时统计镜像（D1/DO 或 KV），Analytics Engine 查询延迟或不可用时仍能显示当前状态
 
-也就是说：内存负责快，Analytics Engine 负责长期历史，KV 负责配置、当前遥测镜像和跨 isolate 路由状态。
+也就是说：内存负责快，Analytics Engine 负责长期历史，D1/DO/KV 负责配置、当前遥测镜像和跨 isolate 路由状态。启用 D1/DO 后 KV 读写降到接近零，适合 Free 方案的小 KV 配额。
 
 ## 路由机制
 
 - `failover`：上游失败后尝试下一个
 - `load_balance`：按权重分配
 - `coordination_level`（0-5，默认 3）：按活跃/预留请求分散到负载较低的上游，并按权重折算承载能力
-- 成功请求和后台测速会把 6 小时延迟 EWMA 写入 KV，新 isolate 也能优先选择近期更快的上游
+- 成功请求和后台测速会把 6 小时延迟 EWMA 写入状态存储，新 isolate 也能优先选择近期更快的上游
 - 流式请求只会在首个可见输出前故障转移；已经向客户端输出后不会重放，避免 Agent 内容或工具调用重复
 - 上游返回 `Retry-After` 时会写入对应上游/模型冷却状态，备用上游会立即尝试，不等待失败上游恢复
-- 健康检查会缓存 `/models` 和最小 Chat 探针能力到 KV；探针不包含用户 Prompt、Context 或会话内容
+- 健康检查会缓存 `/models` 和最小 Chat 探针能力到状态存储；探针不包含用户 Prompt、Context 或会话内容
 - 健康探针、模型刷新和测速使用有限并发，避免上游数量增加时瞬时耗尽 Workers Request
 - `Hedged Request`：同一模型多个上游竞速
 - `Gateway Fast 模式`：加速前两个候选上游抢首包
@@ -216,5 +237,5 @@ const res = await client.chat.completions.create({
 - 上游导出文件会包含明文 API Key，请妥善保存
 - Analytics Engine 查询需要 `Account > Account Analytics > Read`
 - Worker 内存实时统计可能因 isolate 回收而丢失，历史统计以 Analytics Engine 为准
-- KV 路由状态是短期提示，不是严格全局锁；若需要强一致调度，应改用 Durable Objects
+- KV 路由状态是短期提示，不是严格全局锁；需要强一致调度时可改用同名的 Durable Object `llmerge`
 - 长推理模型首包可能很慢，建议开启合适的超时、Hedged Request 或 Gateway Fast 模式
