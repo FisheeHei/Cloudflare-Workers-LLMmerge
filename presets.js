@@ -49,6 +49,13 @@ export const PRESET_TEMPLATES = [
     requires_base_url: false,
   },
   {
+    id: "groq",
+    name: "Groq Cloud",
+    base_url: "https://api.groq.com/openai/v1",
+    paths: ["/v1/chat/completions", "/v1/embeddings"],
+    requires_base_url: false,
+  },
+  {
     id: "zhipu",
     name: "GLM / \u667a\u8c31 AI",
     base_url: "https://open.bigmodel.cn/api/paas/v4",
@@ -89,6 +96,7 @@ export function inferPresetId(baseUrl) {
   if (value.includes("api.moonshot.ai") || value.includes("api.kimi.com")) return "moonshot";
   if (value.includes("api.minimax.io") || value.includes("api.minimaxi.com")) return "minimax";
   if (value.includes("openrouter.ai")) return "openrouter";
+  if (value.includes("api.groq.com")) return "groq";
   if (value.includes("api.cloudflare.com/client/v4/accounts/") && value.includes("/ai/v1")) return "workers-ai";
   if (value.includes("open.bigmodel.cn/api/coding/paas/v4")) return "zhipu-coding";
   if (value.includes("open.bigmodel.cn/api/paas/v4")) return "zhipu";

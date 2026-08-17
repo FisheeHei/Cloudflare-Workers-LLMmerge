@@ -143,6 +143,7 @@ Built-in templates:
 - Kimi / Moonshot AI
 - MiniMax
 - OpenRouter
+- Groq Cloud
 - GLM / Zhipu
 - Cloudflare Workers AI REST
 - Custom OpenAI-compatible upstream

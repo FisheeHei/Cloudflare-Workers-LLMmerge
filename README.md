@@ -143,6 +143,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 - Kimi / Moonshot AI
 - MiniMax
 - OpenRouter
+- Groq Cloud
 - GLM / 智谱
 - Cloudflare Workers AI REST
 - 自定义 OpenAI 兼容上游

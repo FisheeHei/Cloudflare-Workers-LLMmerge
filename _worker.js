@@ -77,7 +77,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-16-kv-snapshot";
+const VERSION = "v26-08-17-groq-template";
 
 export default {
   async fetch(request, env, ctx) {
