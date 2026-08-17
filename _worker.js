@@ -77,7 +77,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-17-groq-template";
+const VERSION = "v26-08-17-syntax-const";
 
 export default {
   async fetch(request, env, ctx) {
@@ -172,7 +172,7 @@ export default {
         const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
 
         const started = Date.now();
-        var pt = Math.max(1, Math.round(proxyBodyText.length / 4));
+        const pt = Math.max(1, Math.round(proxyBodyText.length / 4));
         if (pathname === CHAT_PATH && payload.stream === true) {
           const headers = pendingSseHeaders(client, traceId);
           const body = streamPendingOpenAiResponse(async () => {
@@ -289,44 +289,44 @@ export default {
 };
 
 // ponytail: cache createApp result per-isolate since env is stable across requests
-var _cachedApp = null;
-var _cachedEnvRef = null;
+let _cachedApp = null;
+let _cachedEnvRef = null;
 // ponytail: per-isolate EWMA; state storage shares route scores across fresh isolates.
-var _upstreamLatency = {};
-var _upstreamLatencyUpdatedAt = {};
-var _upstreamLatencyPersistedAt = {};
-var _upstreamCooldowns = {};
-var _upstreamStateHydratedAt = {};
+const _upstreamLatency = {};
+const _upstreamLatencyUpdatedAt = {};
+const _upstreamLatencyPersistedAt = {};
+const _upstreamCooldowns = {};
+const _upstreamStateHydratedAt = {};
 // ponytail: per-isolate and per-model; DO if strict global rotation ever matters
-var _lastSuccessfulUpstreamName = {};
-var _activeUpstreams = {};
-var _activeUpstreamClients = {};
-var _activeUpstreamEpoch = 0;
-var _activeUpstreamControllers = new Set();
+const _lastSuccessfulUpstreamName = {};
+let _activeUpstreams = {};
+let _activeUpstreamClients = {};
+let _activeUpstreamEpoch = 0;
+const _activeUpstreamControllers = new Set();
 // ponytail: isolate-local soft reservations; DO only if cross-edge fairness ever matters
-var _upstreamReservations = {};
+let _upstreamReservations = {};
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
-var _nimMinuteCounters = {};
+const _nimMinuteCounters = {};
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
-var _runtimeCache = null;
-var _runtimeCacheTs = 0;
-var RUNTIME_CACHE_TTL_MS = 600000;
-var _runtimeLoading = null;
+let _runtimeCache = null;
+let _runtimeCacheTs = 0;
+const RUNTIME_CACHE_TTL_MS = 600000;
+let _runtimeLoading = null;
 // ponytail: encryption secret changes only on redeploy; reuse its imported CryptoKey per isolate.
-var _aesKeySecret = "";
-var _aesKeyPromise = null;
-var _stdTimeOffsetMs = 0;
-var _stdTimeSyncedAt = 0;
-var _stdTimeSyncing = null;
-var _d1SchemaReady = null;
-var _upstreamHealthRefreshAt = 0;
-var _upstreamHealthRefreshing = null;
-var _analyticsQueryCache = {};
-var _kvUsageCache = null;
-var _workersUsageCache = null;
+let _aesKeySecret = "";
+let _aesKeyPromise = null;
+let _stdTimeOffsetMs = 0;
+let _stdTimeSyncedAt = 0;
+let _stdTimeSyncing = null;
+let _d1SchemaReady = null;
+let _upstreamHealthRefreshAt = 0;
+let _upstreamHealthRefreshing = null;
+const _analyticsQueryCache = {};
+let _kvUsageCache = null;
+let _workersUsageCache = null;
 // ponytail: local copies avoid repeated state reads; state is the cross-isolate session source of truth.
-var _sessionModelLocks = {};
-var _sessionCurrentModels = {};
+const _sessionModelLocks = {};
+const _sessionCurrentModels = {};
 
 function pickStateBackend(env) {
   const llmerge = env?.llmerge;
@@ -674,13 +674,13 @@ async function clientDailyUsageStorageKey(clientId, day) {
 }
 
 // State storage mirrors request logs and hourly stats in batched writes; Analytics Engine remains the long-term store.
-var _pendingLogs = [];
-var _pendingStats = {}; // hourKey -> bucket
-var _pendingClientUsage = {}; // storageKey -> delta
-var _lastFlush = Date.now();
+const _pendingLogs = [];
+const _pendingStats = {}; // hourKey -> bucket
+const _pendingClientUsage = {}; // storageKey -> delta
+let _lastFlush = Date.now();
 const DEFAULT_KV_FLUSH_INTERVAL_MS = 120 * 1000;
-var FLUSH_PENDING_LIMIT = 200;
-var _flushPromise = null;
+const FLUSH_PENDING_LIMIT = 200;
+let _flushPromise = null;
 
 // ponytail: appendLog just pushes; caller calls flushBatch after log+stats
 function appendLog(app, entry) {
@@ -689,7 +689,7 @@ function appendLog(app, entry) {
 }
 
 function recordStats(app, entry) {
-  var hour = legacyStatsHourKey(entry.ts);
+  const hour = legacyStatsHourKey(entry.ts);
   if (!_pendingStats[hour]) {
     _pendingStats[hour] = emptyStatsBucket();
   }
@@ -813,7 +813,7 @@ function scheduleLogFlush(app, ctx) {
 
 async function flushBatch(app, force = false) {
   if (!app.state) return;
-  var now = Date.now();
+  const now = Date.now();
   if (!force && now - _lastFlush < app.kvFlushIntervalMs && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
   if (_flushPromise) return _flushPromise;
   _lastFlush = now;
@@ -823,13 +823,13 @@ async function flushBatch(app, force = false) {
 
 // ponytail: parallel log+stats flush instead of sequential blocks
 async function _doFlush(app) {
-  var logPromise = Promise.resolve();
+  let logPromise = Promise.resolve();
   if (_pendingLogs.length > 0) {
-    var logsToFlush = _pendingLogs.splice(0);
+    const logsToFlush = _pendingLogs.splice(0);
     logPromise = (async () => {
       try {
-        var raw = await app.state.get(LOG_KEY, "json");
-        var existing = Array.isArray(raw) ? raw : [];
+        const raw = await app.state.get(LOG_KEY, "json");
+        const existing = Array.isArray(raw) ? raw : [];
         existing.push(...logsToFlush);
         if (existing.length > 50) existing.splice(0, existing.length - 50);
         await app.state.put(LOG_KEY, JSON.stringify(existing));
@@ -839,16 +839,16 @@ async function _doFlush(app) {
       }
     })();
   }
-  var statsPromise = Promise.resolve();
-  var keys = Object.keys(_pendingStats);
+  let statsPromise = Promise.resolve();
+  const keys = Object.keys(_pendingStats);
   if (keys.length > 0) {
-    var deltas = {};
-    for (var k of keys) { deltas[k] = _pendingStats[k]; delete _pendingStats[k]; }
+    const deltas = {};
+    for (const k of keys) { deltas[k] = _pendingStats[k]; delete _pendingStats[k]; }
     statsPromise = Promise.all(keys.map(async function(hourKey) {
-      var delta = deltas[hourKey];
+      const delta = deltas[hourKey];
       try {
-        var raw = await app.state.get(STATS_PREFIX + hourKey, "json");
-        var bucket = mergeStatsBucket(raw, delta);
+        const raw = await app.state.get(STATS_PREFIX + hourKey, "json");
+        const bucket = mergeStatsBucket(raw, delta);
         await app.state.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
       } catch {
         _pendingStats[hourKey] = mergeStatsBucket(_pendingStats[hourKey], delta);
@@ -856,15 +856,15 @@ async function _doFlush(app) {
       }
     }));
   }
-  var usagePromise = Promise.resolve();
-  var usageKeys = Object.keys(_pendingClientUsage);
+  let usagePromise = Promise.resolve();
+  const usageKeys = Object.keys(_pendingClientUsage);
   if (usageKeys.length > 0) {
-    var usageDeltas = {};
-    for (var usageKey of usageKeys) { usageDeltas[usageKey] = _pendingClientUsage[usageKey]; delete _pendingClientUsage[usageKey]; }
+    const usageDeltas = {};
+    for (const usageKey of usageKeys) { usageDeltas[usageKey] = _pendingClientUsage[usageKey]; delete _pendingClientUsage[usageKey]; }
     usagePromise = Promise.all(usageKeys.map(async function(storageKey) {
-      var delta = usageDeltas[storageKey];
+      const delta = usageDeltas[storageKey];
       try {
-        var existing = await app.state.get(storageKey, "json");
+        const existing = await app.state.get(storageKey, "json");
         await app.state.put(storageKey, JSON.stringify(mergeClientUsageSnapshot(existing, delta)), { expirationTtl: CLIENT_DAILY_USAGE_TTL_SECONDS });
       } catch {
         _pendingClientUsage[storageKey] = mergeClientUsageSnapshot(_pendingClientUsage[storageKey], delta);
@@ -885,19 +885,19 @@ function addStatsEntry(bucket, entry) {
   else bucket.fail += 1;
   bucket.prompt_tokens += entry.prompt_tokens || 0;
   bucket.completion_tokens += entry.completion_tokens || 0;
-  var up = entry.upstream || "unknown";
+  const up = entry.upstream || "unknown";
   bucket.upstreams[up] = (bucket.upstreams[up] || 0) + 1;
-  var mdl = entry.model || "unknown";
+  const mdl = entry.model || "unknown";
   bucket.models[mdl] = (bucket.models[mdl] || 0) + 1;
   if (!bucket.model_statuses) bucket.model_statuses = {};
-  var status = entry.status >= 200 && entry.status < 400 ? "success" : "fail";
-  var modelStatus = bucket.model_statuses[mdl] || { success: 0, fail: 0 };
+  const status = entry.status >= 200 && entry.status < 400 ? "success" : "fail";
+  const modelStatus = bucket.model_statuses[mdl] || { success: 0, fail: 0 };
   modelStatus[status] += 1;
   bucket.model_statuses[mdl] = modelStatus;
 }
 
 function mergeStatsBucket(base, delta) {
-  var bucket = (base && typeof base === "object") ? {
+  const bucket = (base && typeof base === "object") ? {
     total: base.total || 0,
     success: base.success || 0,
     fail: base.fail || 0,
@@ -913,11 +913,11 @@ function mergeStatsBucket(base, delta) {
   bucket.fail += delta.fail || 0;
   bucket.prompt_tokens += delta.prompt_tokens || 0;
   bucket.completion_tokens += delta.completion_tokens || 0;
-  for (var u in (delta.upstreams || {})) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
-  for (var m in (delta.models || {})) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
-  for (var sm in (delta.model_statuses || {})) {
-    var next = delta.model_statuses[sm] || {};
-    var prev = bucket.model_statuses[sm] || { success: 0, fail: 0 };
+  for (const u in (delta.upstreams || {})) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
+  for (const m in (delta.models || {})) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
+  for (const sm in (delta.model_statuses || {})) {
+    const next = delta.model_statuses[sm] || {};
+    const prev = bucket.model_statuses[sm] || { success: 0, fail: 0 };
     bucket.model_statuses[sm] = {
       success: (prev.success || 0) + (next.success || 0),
       fail: (prev.fail || 0) + (next.fail || 0),
@@ -2479,10 +2479,10 @@ function invalidateRuntimeCache() {
 }
 
 // ponytail: LRU cache per-isolate for client tokens, saves a state read per request.
-var _clientCache = {};
-var _clientCacheTs = {};
-var _clientLoading = {};
-var CLIENT_CACHE_TTL_MS = 300000;
+const _clientCache = {};
+const _clientCacheTs = {};
+const _clientLoading = {};
+const CLIENT_CACHE_TTL_MS = 300000;
 
 async function requireClient(request, runtime) {
   const token = getBearerToken(request);
@@ -2491,7 +2491,7 @@ async function requireClient(request, runtime) {
   }
 
   // ponytail: hit in-memory cache if fresh
-  var cached = _clientCache[token];
+  const cached = _clientCache[token];
   if (cached && (Date.now() - (_clientCacheTs[token] || 0)) < CLIENT_CACHE_TTL_MS) {
     return cached;
   }
@@ -2506,13 +2506,13 @@ async function requireClient(request, runtime) {
       if (_clientLoading[token] === load) delete _clientLoading[token];
     }
     if (storedClient?.key) {
-      var nc = normalizeClient(storedClient);
+      const nc = normalizeClient(storedClient);
       _clientCache[token] = nc;
       _clientCacheTs[token] = Date.now();
       // ponytail: keep cache small, max 50 entries
-      var keys = Object.keys(_clientCache);
+      const keys = Object.keys(_clientCache);
       if (keys.length > 50) {
-        var oldest = keys.reduce(function(a, b) { return _clientCacheTs[a] < _clientCacheTs[b] ? a : b; });
+        const oldest = keys.reduce(function(a, b) { return _clientCacheTs[a] < _clientCacheTs[b] ? a : b; });
         delete _clientCache[oldest];
         delete _clientCacheTs[oldest];
       }

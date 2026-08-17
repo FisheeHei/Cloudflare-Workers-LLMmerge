@@ -1267,11 +1267,11 @@ function renderAdminScript(version) {
     host.querySelectorAll(".fetch-models-btn").forEach((btn) => {
       btn.addEventListener("click", async (event) => {
         event.preventDefault();
-        var name = btn.dataset.upstream;
-        var card = btn.closest(".upstream-card");
-        var textarea = card ? card.querySelector('[data-field="models"]') : null;
+        const name = btn.dataset.upstream;
+        const card = btn.closest(".upstream-card");
+        const textarea = card ? card.querySelector('[data-field="models"]') : null;
         await withButtonBusy(btn, "\u5bfc\u5165\u4e2d...", async function() {
-          var models = await fetchUpstreamModels(name, card);
+          const models = await fetchUpstreamModels(name, card);
           if (!models.length) throw new Error("\u8be5\u4e0a\u6e38\u65e0\u53ef\u7528\u6a21\u578b");
           showModelPicker(name, models, textarea, card);
         });
@@ -1372,8 +1372,8 @@ function renderAdminScript(version) {
 
   /* ---- Settings ---- */
   function renderSettings() {
-    var s = state.config && state.config.settings || {};
-    var r = state.config && state.config.routing || {};
+    const s = state.config && state.config.settings || {};
+    const r = state.config && state.config.routing || {};
     byId("request-timeout").value = s.request_timeout_ms || "";
     byId("stream-idle-timeout").value = s.stream_idle_timeout_ms || "";
     byId("cooldown-ttl").value = s.upstream_cooldown_ttl || "";
@@ -2485,7 +2485,7 @@ async function loadKvUsage() {
     const skeleton = buckets;
 
     // Aggregate totals
-    var total = 0, success = 0, fail = 0, pt = 0, ct = 0;
+    let total = 0, success = 0, fail = 0, pt = 0, ct = 0;
     skeleton.forEach(function(b) { total += b.total; success += b.success; fail += b.fail; pt += b.prompt_tokens; ct += b.completion_tokens; });
     byId("stat-total").textContent = total;
     byId("stat-success").textContent = success;
@@ -2499,23 +2499,23 @@ async function loadKvUsage() {
     byId("stat-ct-session").textContent = state.sessionOutputTokens.toLocaleString();
 
     // Last model
-    var currentModel = payload.last_model || "";
-    var lastBucket = skeleton.slice().reverse().find(function(b) { return b.total > 0; });
+    let currentModel = payload.last_model || "";
+    const lastBucket = skeleton.slice().reverse().find(function(b) { return b.total > 0; });
     if (!currentModel && lastBucket && lastBucket.models) {
-      var topModel = Object.entries(lastBucket.models).sort(function(a,b){return b[1]-a[1];})[0];
+      const topModel = Object.entries(lastBucket.models).sort(function(a,b){return b[1]-a[1];})[0];
       currentModel = topModel ? topModel[0] : "";
     }
     byId("stat-current-model").textContent = currentModel;
 
     // Chart 1: Requests (green=success, red=fail)
-    var maxReq = 1;
+    let maxReq = 1;
     skeleton.forEach(function(b) { if (b.total > maxReq) maxReq = b.total; });
     byId("chart-requests").innerHTML = skeleton.map(function(b, i) {
-      var barH = Math.max(2, Math.round(b.total / maxReq * 100));
-      var seg = "";
+      const barH = Math.max(2, Math.round(b.total / maxReq * 100));
+      let seg = "";
       if (b.total > 0) {
-        var okH = Math.max(1, Math.round(b.success / b.total * barH));
-        var failH = barH - okH;
+        const okH = Math.max(1, Math.round(b.success / b.total * barH));
+        const failH = barH - okH;
         seg = '<div style="height:' + okH + 'px;background:var(--accent);border-radius:2px 2px 0 0"></div>';
         if (failH > 0) seg += '<div style="height:' + failH + 'px;background:var(--danger)"></div>';
       }
@@ -2524,15 +2524,15 @@ async function loadKvUsage() {
     }).join("");
 
     // Chart 2: Tokens (indigo=input, violet=output)
-    var maxTok = 1;
-    skeleton.forEach(function(b) { var t = b.prompt_tokens + b.completion_tokens; if (t > maxTok) maxTok = t; });
+    let maxTok = 1;
+    skeleton.forEach(function(b) { const t = b.prompt_tokens + b.completion_tokens; if (t > maxTok) maxTok = t; });
     byId("chart-tokens").innerHTML = skeleton.map(function(b, i) {
-      var tok = b.prompt_tokens + b.completion_tokens;
-      var barH = Math.max(2, Math.round(tok / maxTok * 100));
-      var seg = "";
+      const tok = b.prompt_tokens + b.completion_tokens;
+      const barH = Math.max(2, Math.round(tok / maxTok * 100));
+      let seg = "";
       if (tok > 0) {
-        var inH = Math.max(1, Math.round(b.prompt_tokens / tok * barH));
-        var outH = barH - inH;
+        const inH = Math.max(1, Math.round(b.prompt_tokens / tok * barH));
+        const outH = barH - inH;
         seg = '<div style="height:' + inH + 'px;background:#6366f1;border-radius:2px 2px 0 0"></div>';
         if (outH > 0) seg += '<div style="height:' + outH + 'px;background:#a78bfa"></div>';
       }
@@ -2733,6 +2733,8 @@ async function loadKvUsage() {
 
   /* ---- Boot ---- */
   async function boot() {
+    let hero = null;
+    let bootSpan = null;
     try {
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
@@ -2906,8 +2908,8 @@ async function loadKvUsage() {
       );
 
       // ponytail: parallel boot — config + clients + quota fetch together
-      var hero = document.querySelector('.hero');
-      var bootSpan = document.createElement('span');
+      hero = document.querySelector('.hero');
+      bootSpan = document.createElement('span');
       bootSpan.className = 'note';
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
@@ -2916,7 +2918,7 @@ async function loadKvUsage() {
       if (refreshStorageBtn) refreshStorageBtn.addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", loadKvUsage).catch(showError)
       );
-      if (bootSpan.parentNode) bootSpan.remove();
+      if (bootSpan?.parentNode) bootSpan.remove();
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
       setInterval(refreshLivePanels, 5000);
@@ -2924,8 +2926,6 @@ async function loadKvUsage() {
       setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000);
       // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
       setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000);
-
-
     } catch (error) {
       if (bootSpan?.parentNode) bootSpan.remove();
       const topbarStatus = byId("topbar-status");
@@ -2935,9 +2935,9 @@ async function loadKvUsage() {
       }
       showError(error);
       // ponytail: visible fallback so user sees something is wrong
-      var hero = document.querySelector('.hero');
+      hero = document.querySelector('.hero');
       if (hero) {
-        var banner = document.createElement('div');
+        const banner = document.createElement('div');
         banner.style.cssText = 'margin-top:12px;padding:12px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;color:#991b1b;font-size:13px';
         banner.textContent = '[Boot Error] ' + (error.message || 'Unknown') + ' — check browser console (F12)';
         hero.appendChild(banner);
