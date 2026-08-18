@@ -39,6 +39,7 @@ const bodyIsolationHits = [];
 const softFastHits = [];
 const attemptBudgetHits = [];
 const nimHits = [];
+const nimLocalHits = [];
 const responseHits = [];
 const responseStreamHits = [];
 const nativeResponseHits = [];
@@ -349,6 +350,13 @@ globalThis.fetch = async (url, init) => {
       output_text: "native",
       usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
     }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("nim-local.example")) {
+    nimLocalHits.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ id: "nim-local", choices: [{ message: { content: "local ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   }
   if (String(url).includes("completions.example")) {
     const body = JSON.parse(init.body);
@@ -861,6 +869,9 @@ assert.equal(minimaxPreset.base_url, "https://api.minimax.io/v1");
 const groqPreset = configPayload.presets.find((item) => item.id === "groq");
 assert.equal(groqPreset.name, "Groq Cloud");
 assert.equal(groqPreset.base_url, "https://api.groq.com/openai/v1");
+const nimPreset = configPayload.presets.find((item) => item.id === "nvidia-nim");
+assert.equal(nimPreset.base_url, "https://integrate.api.nvidia.com/v1");
+assert.deepEqual(nimPreset.paths, ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]);
 const zhipuPreset = configPayload.presets.find((item) => item.id === "zhipu");
 assert.equal(zhipuPreset.name, "GLM / \u667a\u8c31 AI");
 assert.equal(zhipuPreset.base_url, "https://open.bigmodel.cn/api/paas/v4");
@@ -2613,6 +2624,71 @@ const nativeStreamText = await nativeStreamResp.text();
 assert.equal(nativeResponseStreamHits.length, 1);
 assert.equal(nativeResponseStreamHits[0].stream, true);
 assert.equal(nativeStreamText.includes('"type":"response.completed"'), true);
+
+const nimLocalStore = new Map();
+nimLocalStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "nim-local", preset: "nvidia-nim", base_url: "https://nim-local.example/v1", api_key_encrypted: "n", models: ["local-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const nimLocalEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = nimLocalStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { nimLocalStore.set(key, value); },
+    async delete(key) { nimLocalStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "nim-local-client", key: "sk-nim-local", models: ["*"], upstreams: ["nim-local"] }]),
+};
+const nimLocalStart = nimLocalHits.length;
+const nimLocalResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-local", "content-type": "application/json" },
+  body: JSON.stringify({ model: "local-model", input: "hi" }),
+}), nimLocalEnv);
+assert.equal(nimLocalResp.status, 200);
+assert.equal(nimLocalHits.length, nimLocalStart + 1);
+assert.equal(nimLocalHits[nimLocalStart].messages[0].content, "hi");
+assert.equal((await nimLocalResp.json()).output_text, "local ok");
+
+const mixedStore = new Map();
+mixedStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "nim-native", preset: "nvidia-nim", base_url: "https://nim-native.example/v1", api_key_encrypted: "n", models: ["native-model"], paths: ["/v1/chat/completions", "/v1/responses"], priority: 1, weight: 1, enabled: true },
+    { name: "mixed-chat", base_url: "https://responses.example/v1", api_key_encrypted: "r", models: ["mixed-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const mixedEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = mixedStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { mixedStore.set(key, value); },
+    async delete(key) { mixedStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "mixed-client", key: "sk-mixed", models: ["*"], upstreams: ["nim-native", "mixed-chat"] }]),
+};
+const mixedStart = responseHits.length;
+const mixedResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-mixed", "content-type": "application/json" },
+  body: JSON.stringify({ model: "mixed-model", input: "hi" }),
+}), mixedEnv);
+assert.equal(mixedResp.status, 200);
+assert.equal(responseHits.length, mixedStart + 1);
+assert.equal(responseHits[mixedStart].model, "mixed-model");
+assert.equal((await mixedResp.json()).output_text, "hello");
 
 const completionStore = new Map();
 completionStore.set("gateway:config", JSON.stringify({

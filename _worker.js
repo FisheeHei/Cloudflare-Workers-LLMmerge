@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-19-nim-responses";
+const VERSION = "v26-08-19-nim-responses-fix";
 
 export default {
   async fetch(request, env, ctx) {
@@ -3530,12 +3530,13 @@ async function handleResponsesCancel(request, app, ctx, responseId) {
   return withCorsResponse(json({ ...stored, status: stored.status === "completed" ? "completed" : "cancelled" }, 200));
 }
 
-function nativeResponsesAvailable(runtime, client) {
-  return runtime.upstreams.some((upstream) =>
-    clientAllowsUpstream(client, upstream.name) &&
-    upstreamSupportsPath(upstream, RESPONSES_PATH) &&
-    providerCapabilities(upstream).native_responses
-  );
+function nativeResponsesAvailable(runtime, client, model) {
+  return proxyCandidates(runtime, client, model, RESPONSES_PATH).length > 0 &&
+    runtime.upstreams.some((upstream) =>
+      clientAllowsUpstream(client, upstream.name) &&
+      upstreamSupportsPath(upstream, RESPONSES_PATH) &&
+      providerCapabilities(upstream).native_responses
+    );
 }
 
 function responsesNativeBody(translated, payload, settings, client) {
@@ -3579,7 +3580,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const translated = translateResponsesRequest(payload, { previousResponse });
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
-  const useNative = nativeResponsesAvailable(runtime, client);
+  const useNative = nativeResponsesAvailable(runtime, client, translated.model);
 
   if (translated.stream) {
     const headers = pendingSseHeaders(client, traceId);
