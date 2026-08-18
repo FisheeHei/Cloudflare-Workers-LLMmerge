@@ -16,35 +16,21 @@ const NIM_STRICT_ONLY_FIELDS = [
   "include",
 ];
 
-const NIM_COMPLETIONS_STRIP_FIELDS = [
-  "max_completion_tokens",
-  "suffix",
-  "best_of",
-  "logit_bias",
-  "functions",
-  "function_call",
-  "tool_choice",
-  "parallel_tool_calls",
-  "stream_options",
-  "metadata",
-  "store",
-  "truncation",
-  "prompt_cache_key",
-  "include",
-  "reasoning",
-  "reasoningBudget",
-  "reasoning_effort",
-  "reasoningEffort",
-  "reasoning_budget",
-  "reasoning_summary",
-  "reasoningSummary",
-  "reasoning_split",
-  "thinking",
-  "enable_thinking",
-  "chat_template_kwargs",
-  "providerOptions",
-  "provider_options",
-];
+const NIM_COMPLETION_FIELDS = new Set([
+  "model",
+  "prompt",
+  "max_tokens",
+  "temperature",
+  "top_p",
+  "n",
+  "stream",
+  "stop",
+  "seed",
+  "frequency_penalty",
+  "presence_penalty",
+  "echo",
+  "logprobs",
+]);
 
 export function resolveProvider(upstream) {
   if (isNvidiaNimUpstream(upstream)) return { id: "nim", name: "NVIDIA NIM" };
@@ -91,7 +77,12 @@ export function sanitizeCompletionBody(bodyText, upstream) {
     payload.max_tokens = payload.max_completion_tokens;
     changed = true;
   }
-  changed = deleteKeys(payload, NIM_COMPLETIONS_STRIP_FIELDS) || changed;
+  for (const key of Object.keys(payload)) {
+    if (!NIM_COMPLETION_FIELDS.has(key)) {
+      delete payload[key];
+      changed = true;
+    }
+  }
   return changed ? JSON.stringify(payload) : bodyText;
 }
 

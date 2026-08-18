@@ -3774,12 +3774,12 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-  const completionChunk = (text, finishReason = null, usage = null, index = 0) => ({
+  const completionChunk = (text, finishReason = null, usage = null) => ({
     id: seed.id,
     object: "text_completion",
     created: seed.created,
     model: seed.model,
-    choices: [{ index, text, logprobs: null, finish_reason: finishReason }],
+    choices: [{ index: 0, text, logprobs: null, finish_reason: finishReason }],
     ...(usage ? { usage } : {}),
   });
   const write = (chunk) => writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
@@ -3791,30 +3791,22 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
     let streamError = "";
     let closeReason = "done";
     let sawDone = false;
-    const outputs = new Map();
-    const finishByIndex = new Map();
-    const echoed = new Set();
+    let outputText = "";
+    let emitted = false;
     const diag = createStreamDiag(started);
     const stripText = hideReasoning ? createThinkTagStripper() : null;
     const processChunk = (chunk, now = Date.now()) => {
       streamError = streamEventErrorMessage(chunk) || streamError;
       usage = chunk.usage || usage;
       finishReason = responseFinishReason(chunk) || finishReason;
-      const writes = [];
-      for (const choice of Array.isArray(chunk.choices) ? chunk.choices : []) {
-        const index = Number(choice?.index ?? 0);
-        if (choice?.finish_reason) finishByIndex.set(index, String(choice.finish_reason));
-        const content = chatContentToText(choice?.delta?.content || "");
-        if (!content) continue;
-        const cleaned = hideReasoning && stripText ? stripText(content) : content;
-        if (!cleaned) continue;
-        noteStreamToken(diag, now);
-        outputs.set(index, (outputs.get(index) || "") + cleaned);
-        const text = seed.echo && !echoed.has(index) ? seed.prompt + cleaned : cleaned;
-        echoed.add(index);
-        writes.push(write(completionChunk(text, null, null, index)));
-      }
-      return Promise.all(writes);
+      const content = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+      const text = hideReasoning && stripText ? stripText(content) : content;
+      if (!text) return Promise.resolve();
+      noteStreamToken(diag, now);
+      outputText += text;
+      const payload = completionChunk(seed.echo && !emitted ? seed.prompt + text : text);
+      emitted = true;
+      return write(payload);
     };
 
     try {
@@ -3837,24 +3829,18 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
         await Promise.all(writes);
         if (streamError) throw new Error(streamError);
       }
-      if (seed.echo && !outputs.has(0)) {
-        outputs.set(0, seed.prompt);
-        await write(completionChunk(seed.prompt));
-      }
-      const indices = outputs.size ? [...outputs.keys()].sort((a, b) => a - b) : [0];
-      for (const index of indices) {
-        await write(completionChunk("", finishByIndex.get(index) || finishReason || "stop", usage || undefined, index));
-      }
+      if (seed.echo && !emitted) await write(completionChunk(seed.prompt));
+      await write(completionChunk("", finishReason || "stop", usage || undefined));
       await writer.write(encoder.encode("data: [DONE]\n\n"));
       if (!sawDone) closeReason = "eof";
-      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens([...outputs.values()].join(""))), {
+      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
         close_reason: closeReason,
         finish_reason: finishReason,
         ...streamDiagExtra(diag),
       });
     } catch (error) {
       closeReason = "error";
-      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens([...outputs.values()].join(""))), {
+      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
         close_reason: closeReason,
         finish_reason: finishReason,
         ...streamDiagExtra(diag),
@@ -3876,7 +3862,7 @@ function recordCompletionsLog(app, client, upstreamName, model, started, status,
     path: COMPLETIONS_PATH,
     status: status || 200,
     started,
-    promptTokens: usage?.prompt_tokens || fallbackPrompt || Math.max(1, Math.round(model.length / 4)),
+    promptTokens: usage?.prompt_tokens || fallbackPrompt || 1,
     completionTokens: usage?.completion_tokens || 0,
     extra: { trace_id: traceId, ...extra },
   }), ctx);
@@ -3891,13 +3877,24 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
   const useNative = completionsNativeAvailable(runtime, client, translated.model);
+  const bodyText = useNative ? JSON.stringify({ ...payload, model: translated.model }) : translated.bodyText;
+  const logError = (error, upstreamName = "none") => recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model: translated.model,
+    path: COMPLETIONS_PATH,
+    status: error.statusCode || 502,
+    started,
+    promptTokens: translated.seed.promptTokens,
+    completionTokens: 0,
+    extra: { trace_id: traceId },
+  }), ctx);
 
   if (translated.stream) {
     const headers = pendingSseHeaders(client, traceId);
     const body = streamPendingOpenAiResponse(async () => {
       let proxyResponse;
       try {
-        const bodyText = useNative ? JSON.stringify({ ...payload, model: translated.model }) : translated.bodyText;
         proxyResponse = await proxyRequest({
           client,
           model: translated.model,
@@ -3916,17 +3913,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
         }
         return streamCompletionsFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
       } catch (error) {
-        recordRequestLog(app, makeRequestLogEntry({
-          client,
-          upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
-          model: translated.model,
-          path: COMPLETIONS_PATH,
-          status: error.statusCode || 502,
-          started,
-          promptTokens: translated.seed.promptTokens,
-          completionTokens: 0,
-          extra: { trace_id: traceId },
-        }), ctx);
+        logError(error, error.upstreamName || proxyResponse?.upstream?.name || "none");
         throw error;
       }
     });
@@ -3934,7 +3921,6 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
   }
 
   try {
-    const bodyText = useNative ? JSON.stringify({ ...payload, model: translated.model }) : translated.bodyText;
     const proxyResponse = await proxyRequest({
       client,
       model: translated.model,
@@ -3979,17 +3965,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
     headers.set("content-type", "application/json; charset=utf-8");
     return new Response(JSON.stringify(responsePayload), { status: 200, headers });
   } catch (error) {
-    recordRequestLog(app, makeRequestLogEntry({
-      client,
-      upstream: error.upstreamName || "none",
-      model: translated.model,
-      path: COMPLETIONS_PATH,
-      status: error.statusCode || 502,
-      started,
-      promptTokens: translated.seed.promptTokens,
-      completionTokens: 0,
-      extra: { trace_id: traceId },
-    }), ctx);
+    logError(error, error.upstreamName || "none");
     return gatewayErrorResponse(error, traceId);
   }
 }
