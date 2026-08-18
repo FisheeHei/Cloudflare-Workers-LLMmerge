@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-19-nim-responses-fix";
+const VERSION = "v26-08-19-nim-completions";
 
 export default {
   async fetch(request, env, ctx) {
@@ -161,8 +161,12 @@ export default {
         return new Response(res.body, { status: res.status, statusText: res.statusText, headers: hdrs });
       }
 
+      if (pathname === COMPLETIONS_PATH && request.method === "POST") {
+        return await handleCompletionsRequest(request, url, app, ctx, requestTraceId(request));
+      }
+
       if (
-        (pathname === CHAT_PATH || pathname === COMPLETIONS_PATH || pathname === EMBEDDINGS_PATH) &&
+        (pathname === CHAT_PATH || pathname === EMBEDDINGS_PATH) &&
         request.method === "POST"
       ) {
         const traceId = requestTraceId(request);
@@ -3698,6 +3702,291 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
       status: error.statusCode || 502,
       started,
       promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+      completionTokens: 0,
+      extra: { trace_id: traceId },
+    }), ctx);
+    return gatewayErrorResponse(error, traceId);
+  }
+}
+
+function completionsNativeAvailable(runtime, client, model) {
+  return proxyCandidates(runtime, client, model, COMPLETIONS_PATH).length > 0;
+}
+
+function translateCompletionsRequest(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Request body must be a JSON object.");
+  }
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    throw httpError(400, "`model` is required.");
+  }
+  if (payload.prompt == null || (Array.isArray(payload.prompt) && payload.prompt.length === 0)) {
+    throw httpError(400, "`prompt` is required.");
+  }
+  const prompts = Array.isArray(payload.prompt) ? payload.prompt : [payload.prompt];
+  if (prompts.length > 1) {
+    throw httpError(400, "Array `prompt` needs a native `/v1/completions` upstream; the chat fallback supports a single prompt.");
+  }
+  const prompt = String(prompts[0] == null ? "" : prompts[0]);
+  const chat = { model, messages: [{ role: "user", content: prompt }], stream: payload.stream === true };
+  copyIfPresent(payload, chat, ["temperature", "top_p", "n", "stop", "seed", "frequency_penalty", "presence_penalty", "user"]);
+  if (payload.max_tokens != null) chat.max_tokens = payload.max_tokens;
+  const promptText = prompts.map((item) => String(item == null ? "" : item)).join("");
+  return {
+    bodyText: JSON.stringify(chat),
+    model,
+    stream: chat.stream,
+    seed: {
+      created: Math.floor(utcNowMs() / 1000),
+      echo: payload.echo === true,
+      id: `cmpl_${crypto.randomUUID().replace(/-/g, "")}`,
+      model,
+      prompt,
+      promptTokens: Math.max(1, Math.round(promptText.length / 4)),
+    },
+  };
+}
+
+function chatToCompletionsPayload(chatPayload, seed, hideReasoning = false) {
+  const choices = (Array.isArray(chatPayload?.choices) ? chatPayload.choices : []).map((choice, index) => {
+    const raw = chatContentToText(choice?.message?.content || "");
+    const text = hideReasoning ? stripThinkTags(raw) : raw;
+    return {
+      text: seed.echo ? `${seed.prompt}${text}` : text,
+      index: Number(choice?.index ?? index),
+      logprobs: choice?.logprobs ?? null,
+      finish_reason: choice?.finish_reason ?? null,
+    };
+  });
+  return {
+    id: seed.id,
+    object: "text_completion",
+    created: seed.created,
+    model: seed.model,
+    choices,
+    usage: normalizeOpenAiLogUsage(chatPayload?.usage, seed.promptTokens, estimateTokens(choices.map((choice) => choice.text).join(""))),
+  };
+}
+
+function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const completionChunk = (text, finishReason = null, usage = null, index = 0) => ({
+    id: seed.id,
+    object: "text_completion",
+    created: seed.created,
+    model: seed.model,
+    choices: [{ index, text, logprobs: null, finish_reason: finishReason }],
+    ...(usage ? { usage } : {}),
+  });
+  const write = (chunk) => writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
+  (async () => {
+    let buffer = "";
+    let usage = null;
+    let finishReason = "";
+    let streamError = "";
+    let closeReason = "done";
+    let sawDone = false;
+    const outputs = new Map();
+    const finishByIndex = new Map();
+    const echoed = new Set();
+    const diag = createStreamDiag(started);
+    const stripText = hideReasoning ? createThinkTagStripper() : null;
+    const processChunk = (chunk, now = Date.now()) => {
+      streamError = streamEventErrorMessage(chunk) || streamError;
+      usage = chunk.usage || usage;
+      finishReason = responseFinishReason(chunk) || finishReason;
+      const writes = [];
+      for (const choice of Array.isArray(chunk.choices) ? chunk.choices : []) {
+        const index = Number(choice?.index ?? 0);
+        if (choice?.finish_reason) finishByIndex.set(index, String(choice.finish_reason));
+        const content = chatContentToText(choice?.delta?.content || "");
+        if (!content) continue;
+        const cleaned = hideReasoning && stripText ? stripText(content) : content;
+        if (!cleaned) continue;
+        noteStreamToken(diag, now);
+        outputs.set(index, (outputs.get(index) || "") + cleaned);
+        const text = seed.echo && !echoed.has(index) ? seed.prompt + cleaned : cleaned;
+        echoed.add(index);
+        writes.push(write(completionChunk(text, null, null, index)));
+      }
+      return Promise.all(writes);
+    };
+
+    try {
+      const reader = openaiResp.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const now = Date.now();
+        noteStreamByte(diag, now);
+        buffer += decoder.decode(value, { stream: true });
+        const writes = [];
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; });
+        await Promise.all(writes);
+        if (streamError) throw new Error(streamError);
+        if (sawDone) break;
+      }
+      if (buffer) {
+        const writes = [];
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; });
+        await Promise.all(writes);
+        if (streamError) throw new Error(streamError);
+      }
+      if (seed.echo && !outputs.has(0)) {
+        outputs.set(0, seed.prompt);
+        await write(completionChunk(seed.prompt));
+      }
+      const indices = outputs.size ? [...outputs.keys()].sort((a, b) => a - b) : [0];
+      for (const index of indices) {
+        await write(completionChunk("", finishByIndex.get(index) || finishReason || "stop", usage || undefined, index));
+      }
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+      if (!sawDone) closeReason = "eof";
+      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens([...outputs.values()].join(""))), {
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        ...streamDiagExtra(diag),
+      });
+    } catch (error) {
+      closeReason = "error";
+      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens([...outputs.values()].join(""))), {
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        ...streamDiagExtra(diag),
+      });
+      await write({ error: { message: error.message || "Stream error.", type: "server_error" } });
+    } finally {
+      await writer.close();
+    }
+  })();
+
+  return readable;
+}
+
+function recordCompletionsLog(app, client, upstreamName, model, started, status, usage, ctx, traceId, fallbackPrompt, extra = {}) {
+  recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model,
+    path: COMPLETIONS_PATH,
+    status: status || 200,
+    started,
+    promptTokens: usage?.prompt_tokens || fallbackPrompt || Math.max(1, Math.round(model.length / 4)),
+    completionTokens: usage?.completion_tokens || 0,
+    extra: { trace_id: traceId, ...extra },
+  }), ctx);
+}
+
+async function handleCompletionsRequest(request, url, app, ctx, traceId) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await readRequestText(request));
+  const translated = translateCompletionsRequest(payload);
+  await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
+  await persistSessionCurrentModel(runtime, client, request, payload, ctx);
+  const useNative = completionsNativeAvailable(runtime, client, translated.model);
+
+  if (translated.stream) {
+    const headers = pendingSseHeaders(client, traceId);
+    const body = streamPendingOpenAiResponse(async () => {
+      let proxyResponse;
+      try {
+        const bodyText = useNative ? JSON.stringify({ ...payload, model: translated.model }) : translated.bodyText;
+        proxyResponse = await proxyRequest({
+          client,
+          model: translated.model,
+          pathname: useNative ? COMPLETIONS_PATH : CHAT_PATH,
+          request,
+          bodyText,
+          runtime,
+          search: url.search,
+          ctx,
+        });
+        const upstreamResp = proxyResponse.response;
+        if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
+        const finish = (usage, extra) => recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, usage, ctx, traceId, translated.seed.promptTokens, extra);
+        if (useNative) {
+          return trackOpenAiStreamUsage(upstreamResp.body, translated.seed.promptTokens, finish, started, translated.model !== translated.seed.model ? translated.seed.model : "", shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
+        }
+        return streamCompletionsFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
+      } catch (error) {
+        recordRequestLog(app, makeRequestLogEntry({
+          client,
+          upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
+          model: translated.model,
+          path: COMPLETIONS_PATH,
+          status: error.statusCode || 502,
+          started,
+          promptTokens: translated.seed.promptTokens,
+          completionTokens: 0,
+          extra: { trace_id: traceId },
+        }), ctx);
+        throw error;
+      }
+    });
+    return new Response(body, { status: 200, headers });
+  }
+
+  try {
+    const bodyText = useNative ? JSON.stringify({ ...payload, model: translated.model }) : translated.bodyText;
+    const proxyResponse = await proxyRequest({
+      client,
+      model: translated.model,
+      pathname: useNative ? COMPLETIONS_PATH : CHAT_PATH,
+      request,
+      bodyText,
+      runtime,
+      search: url.search,
+      ctx,
+    });
+    const upstreamResp = proxyResponse.response;
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+    if (!upstreamResp.ok) {
+      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, null, ctx, traceId, translated.seed.promptTokens);
+      return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
+
+    const openaiText = await upstreamResp.text();
+    const openaiPayload = safeJson(openaiText);
+    const applicationError = upstreamApplicationErrorMessage(openaiPayload || openaiText);
+    if (!openaiPayload || looksLikeHtmlDocument(openaiText) || applicationError) {
+      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, null, ctx, traceId, translated.seed.promptTokens);
+      return upstreamBadGatewayResponse(applicationError || "Upstream returned a non-JSON API response.", headers);
+    }
+
+    const hideReasoning = shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream);
+    let responsePayload;
+    if (useNative) {
+      sanitizeOpenAiPayload(openaiPayload, hideReasoning);
+      responsePayload = {
+        ...openaiPayload,
+        id: openaiPayload.id || translated.seed.id,
+        model: translated.seed.model,
+      };
+    } else {
+      responsePayload = chatToCompletionsPayload(openaiPayload, translated.seed, hideReasoning);
+    }
+    const usage = responsePayload.usage || normalizeOpenAiLogUsage(openaiPayload?.usage, translated.seed.promptTokens, estimateOpenAiCompletionTokens(openaiPayload));
+    recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, usage, ctx, traceId, translated.seed.promptTokens, {
+      finish_reason: responseFinishReason(openaiPayload),
+    });
+    headers.set("content-type", "application/json; charset=utf-8");
+    return new Response(JSON.stringify(responsePayload), { status: 200, headers });
+  } catch (error) {
+    recordRequestLog(app, makeRequestLogEntry({
+      client,
+      upstream: error.upstreamName || "none",
+      model: translated.model,
+      path: COMPLETIONS_PATH,
+      status: error.statusCode || 502,
+      started,
+      promptTokens: translated.seed.promptTokens,
       completionTokens: 0,
       extra: { trace_id: traceId },
     }), ctx);

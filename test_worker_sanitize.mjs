@@ -45,6 +45,8 @@ const responseStreamHits = [];
 const nativeResponseHits = [];
 const nativeResponseStreamHits = [];
 const completionHits = [];
+const completionChatHits = [];
+const nimCompletionHits = [];
 const anthropicHits = [];
 const anthropicStreamHits = [];
 const delayedAnthropicHits = [];
@@ -373,6 +375,35 @@ globalThis.fetch = async (url, init) => {
       model: body.model,
       choices: [{ index: 0, text: "hello", finish_reason: "stop" }],
       usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("completion-chat.example")) {
+    const body = JSON.parse(init.body);
+    completionChatHits.push(body);
+    if (body.stream) {
+      return new Response([
+        'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\n',
+        "data: [DONE]\n\n",
+      ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify({
+      id: "chatcmpl-1",
+      object: "chat.completion",
+      model: body.model,
+      choices: [{ index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("nim-cmp.example")) {
+    const body = JSON.parse(init.body);
+    nimCompletionHits.push(body);
+    return new Response(JSON.stringify({
+      id: "cmpl-nim",
+      object: "text_completion",
+      model: body.model,
+      choices: [{ index: 0, text: "nim ok", finish_reason: "stop" }],
+      usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
     }), { status: 200, headers: { "content-type": "application/json" } });
   }
   if (String(url).includes("anthropic-stream.example")) {
@@ -2696,6 +2727,8 @@ completionStore.set("gateway:config", JSON.stringify({
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "completions", base_url: "https://completions.example/v1", api_key_encrypted: "c", models: ["completion-model"], paths: ["/v1/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "completion-chat", base_url: "https://completion-chat.example/v1", api_key_encrypted: "cc", models: ["completion-chat-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "nim-completions", preset: "nvidia-nim", base_url: "https://nim-cmp.example/v1", api_key_encrypted: "n", models: ["nim-completion-model"], paths: ["/v1/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const completionEnv = {
@@ -2709,7 +2742,7 @@ const completionEnv = {
     async put(key, value) { completionStore.set(key, value); },
     async delete(key) { completionStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "completion-client", key: "sk-completion", models: ["*"], upstreams: ["completions"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "completion-client", key: "sk-completion", models: ["*"], upstreams: ["completions", "completion-chat", "nim-completions"] }]),
 };
 const completionResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
   method: "POST",
@@ -2727,6 +2760,40 @@ const completionStreamResp = await worker.default.fetch(new Request("https://gw.
 assert.equal(completionStreamResp.headers.get("content-type").includes("text/event-stream"), true);
 const completionStreamText = await completionStreamResp.text();
 assert.equal(completionStreamText.includes('"text":"hello"'), true);
+const chatCompletionStart = completionChatHits.length;
+const chatCompletionResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-completion", "content-type": "application/json" },
+  body: JSON.stringify({ model: "completion-chat-model", prompt: "hello", echo: true }),
+}), completionEnv);
+assert.equal(chatCompletionResp.status, 200);
+assert.equal(completionChatHits[chatCompletionStart].messages[0].content, "hello");
+const chatCompletionPayload = await chatCompletionResp.json();
+assert.equal(chatCompletionPayload.object, "text_completion");
+assert.equal(chatCompletionPayload.choices[0].text, "hellohello");
+assert.equal(chatCompletionPayload.usage.prompt_tokens, 2);
+const chatCompletionStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-completion", "content-type": "application/json" },
+  body: JSON.stringify({ model: "completion-chat-model", prompt: "hello", stream: true }),
+}), completionEnv);
+assert.equal(chatCompletionStreamResp.headers.get("content-type").includes("text/event-stream"), true);
+const chatCompletionStreamText = await chatCompletionStreamResp.text();
+assert.equal(chatCompletionStreamText.includes('"object":"text_completion"'), true);
+assert.equal(chatCompletionStreamText.includes('"text":"hel"'), true);
+assert.equal(chatCompletionStreamText.includes('"text":"lo"'), true);
+assert.equal(chatCompletionStreamText.includes("data: [DONE]"), true);
+const nimCompletionResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-completion", "content-type": "application/json" },
+  body: JSON.stringify({ model: "nim-completion-model", prompt: "hi", max_completion_tokens: 32, suffix: "?", best_of: 2, logprobs: 2 }),
+}), completionEnv);
+assert.equal(nimCompletionResp.status, 200);
+assert.equal(nimCompletionHits[0].max_tokens, 32);
+assert.equal("suffix" in nimCompletionHits[0], false);
+assert.equal("best_of" in nimCompletionHits[0], false);
+assert.equal(nimCompletionHits[0].logprobs, 2);
+assert.equal((await nimCompletionResp.json()).choices[0].text, "nim ok");
 
 const anthropicStore = new Map();
 anthropicStore.set("gateway:config", JSON.stringify({

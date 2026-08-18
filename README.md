@@ -204,7 +204,7 @@ const res = await client.chat.completions.create({
 | `GET` | `/health` | 存活检查 |
 | `GET` | `/v1/models` | 聚合模型列表 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/completions` | OpenAI Completions（NIM 文档协议） |
+| `POST` | `/v1/completions` | OpenAI Completions（NIM 文档协议，无原生上游时自动转 Chat） |
 | `POST` | `/v1/responses` | Responses API 兼容层（自托管 NIM 可原生直通） |
 | `POST` | `/v1/messages` | Claude / Anthropic 风格入口 |
 | `POST` | `/v1/embeddings` | Embeddings |
@@ -216,6 +216,8 @@ Responses API 额外支持：
 - `previous_response_id`：把上一轮输出（消息、函数调用和结果）接回当前输入
 
 NVIDIA NIM 托管端点按官方 Chat Completions schema 做严格适配；自托管 NIM 在上游路径中加入 `/v1/responses` 时，网关会优先原生直通 Responses API，否则统一转为 Chat Completions 后再聚合。
+
+`/v1/completions` 优先直通支持该路径的上游（NIM 按官方 Completions schema 收紧字段）；如果没有上游声明 `/v1/completions`，网关会自动把单条 `prompt` 转成 Chat Completions，再转回标准 `text_completion` 响应，流式和非流式均支持。
 
 ## 统计机制
 
