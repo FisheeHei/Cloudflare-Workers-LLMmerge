@@ -2,6 +2,49 @@ export function isNvidiaNimUpstream(upstream) {
   return upstreamMatches(upstream, ["nvidia-nim"], ["integrate.api.nvidia.com"]);
 }
 
+const NIM_STRICT_ONLY_FIELDS = [
+  "max_completion_tokens",
+  "parallel_tool_calls",
+  "stream_options",
+  "logprobs",
+  "top_logprobs",
+  "logit_bias",
+  "metadata",
+  "store",
+  "truncation",
+  "prompt_cache_key",
+  "include",
+];
+
+export function resolveProvider(upstream) {
+  if (isNvidiaNimUpstream(upstream)) return { id: "nim", name: "NVIDIA NIM" };
+  if (isDeepSeekUpstream(upstream)) return { id: "deepseek", name: "DeepSeek" };
+  if (isMoonshotUpstream(upstream)) return { id: "moonshot", name: "Moonshot AI" };
+  if (isMiniMaxUpstream(upstream)) return { id: "minimax", name: "MiniMax" };
+  if (isOpenRouterUpstream(upstream)) return { id: "openrouter", name: "OpenRouter" };
+  if (isZhipuUpstream(upstream)) return { id: "zhipu", name: "Zhipu AI" };
+  if (isWorkersAiUpstream(upstream)) return { id: "workers-ai", name: "Cloudflare Workers AI" };
+  if (isGenericOpenAiUpstream(upstream)) return { id: "openai", name: "OpenAI Compatible" };
+  return { id: "none", name: "Generic" };
+}
+
+export function providerCapabilities(upstream) {
+  const provider = resolveProvider(upstream);
+  const baseUrl = String(upstream?.base_url || "").toLowerCase();
+  return {
+    provider: provider.id,
+    name: provider.name,
+    supports_developer_role: upstreamSupportsDeveloperRole(upstream),
+    native_responses: provider.id === "nim" && !baseUrl.includes("integrate.api.nvidia.com"),
+    strict_chat: provider.id === "nim",
+  };
+}
+
+export function adaptUpstreamBody(bodyText, upstream, pathname = "/v1/chat/completions") {
+  if (String(pathname || "").toLowerCase() !== "/v1/chat/completions") return bodyText;
+  return sanitizeProxyBody(bodyText, upstream);
+}
+
 const MODEL_FAMILY_PATTERNS = {
   glm: /(^|[\/_.-])glm([\/_.-]|$)/i,
   "minimax-m3": /(^|[\/_.-])minimax[\/_.-]*m3([\/_.-]|$)/i,
@@ -45,6 +88,7 @@ export function sanitizeProxyBody(bodyText, upstream) {
   if (bridge.provider === "zhipu") changed = applyZhipuBridge(payload) || changed;
   if (bridge.provider === "openai") changed = applyGenericOpenAiBridge(payload, { keepReasoningEffort: bridge.family !== "workers-ai" }) || changed;
   if (bridge.provider === "nim") changed = applyNimBridge(payload, modelName, bridge.family) || changed;
+  if (bridge.provider === "nim") changed = applyNimStrictSchema(payload) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
 }
@@ -87,7 +131,18 @@ function bodyNeedsSanitizing(bodyText, bodyLower) {
     bodyText.includes('"function_call"') ||
     bodyText.includes('"tool_choice"') ||
     bodyText.includes('"temperature"') ||
-    bodyLower.includes("minimax-m3");
+    bodyLower.includes("minimax-m3") ||
+    bodyText.includes('"max_completion_tokens"') ||
+    bodyText.includes('"parallel_tool_calls"') ||
+    bodyText.includes('"stream_options"') ||
+    bodyText.includes('"logprobs"') ||
+    bodyText.includes('"top_logprobs"') ||
+    bodyText.includes('"logit_bias"') ||
+    bodyText.includes('"metadata"') ||
+    bodyText.includes('"store"') ||
+    bodyText.includes('"truncation"') ||
+    bodyText.includes('"prompt_cache_key"') ||
+    bodyText.includes('"include"');
 }
 
 function upstreamSupportsDeveloperRole(upstream) {
@@ -487,6 +542,15 @@ function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
   }
 
   return changed;
+}
+
+function applyNimStrictSchema(payload) {
+  let changed = false;
+  if (payload.max_completion_tokens != null && payload.max_tokens == null) {
+    payload.max_tokens = payload.max_completion_tokens;
+    changed = true;
+  }
+  return deleteKeys(payload, NIM_STRICT_ONLY_FIELDS) || changed;
 }
 
 function removeNimReasoningPayloadFields(payload, options = {}) {

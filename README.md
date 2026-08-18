@@ -6,8 +6,8 @@ LLM-merge 是一个运行在 Cloudflare Workers / Pages Advanced Mode 上的单�
 
 ## 功能
 
-- OpenAI 兼容接口：`/v1/models`、`/v1/chat/completions`、`/v1/embeddings`
-- Responses API 简单兼容层：`/v1/responses`
+- OpenAI 兼容接口：`/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`
+- Responses API 兼容层：`/v1/responses`、`/v1/responses/compact`，支持 `store`、响应检索/取消和 `previous_response_id`
 - Claude / Anthropic 风格入口：`/v1/messages`
 - 多上游聚合：启用/停用、权重、优先级、路径、模型白名单
 - 路由策略：故障转移、负载均衡、Hedged Request、Gateway Fast 模式
@@ -204,9 +204,18 @@ const res = await client.chat.completions.create({
 | `GET` | `/health` | 存活检查 |
 | `GET` | `/v1/models` | 聚合模型列表 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/responses` | Responses API 兼容层 |
+| `POST` | `/v1/completions` | OpenAI Completions（NIM 文档协议） |
+| `POST` | `/v1/responses` | Responses API 兼容层（自托管 NIM 可原生直通） |
 | `POST` | `/v1/messages` | Claude / Anthropic 风格入口 |
 | `POST` | `/v1/embeddings` | Embeddings |
+
+Responses API 额外支持：
+
+- `GET /v1/responses/{response_id}`：读取已 `store` 的响应
+- `POST /v1/responses/{response_id}/cancel`：取消进行中的流式响应
+- `previous_response_id`：把上一轮输出（消息、函数调用和结果）接回当前输入
+
+NVIDIA NIM 托管端点按官方 Chat Completions schema 做严格适配；自托管 NIM 在上游路径中加入 `/v1/responses` 时，网关会优先原生直通 Responses API，否则统一转为 Chat Completions 后再聚合。
 
 ## 统计机制
 

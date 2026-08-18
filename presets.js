@@ -3,7 +3,7 @@ export const PRESET_TEMPLATES = [
     id: "nvidia-nim",
     name: "NVIDIA NIM",
     base_url: "https://integrate.api.nvidia.com/v1",
-    paths: ["/v1/chat/completions", "/v1/embeddings"],
+    paths: ["/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings"],
     requires_base_url: false,
   },
   {

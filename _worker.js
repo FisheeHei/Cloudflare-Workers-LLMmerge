@@ -1,6 +1,13 @@
 import { renderAdminPage } from "./admin-page.js";
 import { PRESET_TEMPLATES, inferPresetId, presetById } from "./presets.js";
-import { isGlmModel, isMiniMaxM3Model, isNvidiaNimUpstream, sanitizeProxyBody } from "./provider-bridges.js";
+import {
+  adaptUpstreamBody,
+  isGlmModel,
+  isMiniMaxM3Model,
+  isNvidiaNimUpstream,
+  providerCapabilities,
+  sanitizeProxyBody,
+} from "./provider-bridges.js";
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
@@ -20,11 +27,14 @@ const CORS_HEADERS = {
 
 const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529]);
 const MODEL_PATH = "/v1/models";
+const COMPLETIONS_PATH = "/v1/completions";
 const CHAT_PATH = "/v1/chat/completions";
 const RESPONSES_PATH = "/v1/responses";
 const RESPONSES_COMPACT_PATH = "/v1/responses/compact";
 const EMBEDDINGS_PATH = "/v1/embeddings";
 const MESSAGES_PATH = "/v1/messages";
+const RESPONSE_STORE_PREFIX = "responses:store:";
+const RESPONSE_STORE_TTL_SECONDS = 7 * 24 * 3600;
 const GATEWAY_CONFIG_KEY = "gateway:config";
 const CONFIG_SNAPSHOTS_KEY = "gateway:config:snapshots";
 const CONFIG_SNAPSHOT_LIMIT = 5;
@@ -77,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-17-syntax-const";
+const VERSION = "v26-08-19-nim-responses";
 
 export default {
   async fetch(request, env, ctx) {
@@ -152,7 +162,7 @@ export default {
       }
 
       if (
-        (pathname === CHAT_PATH || pathname === EMBEDDINGS_PATH) &&
+        (pathname === CHAT_PATH || pathname === COMPLETIONS_PATH || pathname === EMBEDDINGS_PATH) &&
         request.method === "POST"
       ) {
         const traceId = requestTraceId(request);
@@ -173,7 +183,7 @@ export default {
 
         const started = Date.now();
         const pt = Math.max(1, Math.round(proxyBodyText.length / 4));
-        if (pathname === CHAT_PATH && payload.stream === true) {
+        if (pathname !== EMBEDDINGS_PATH && payload.stream === true) {
           const headers = pendingSseHeaders(client, traceId);
           const body = streamPendingOpenAiResponse(async () => {
             let proxyResponse;
@@ -255,6 +265,19 @@ export default {
         });
       }
 
+      const responseIdMatch = pathname.startsWith(`${RESPONSES_PATH}/`) &&
+        pathname !== RESPONSES_COMPACT_PATH &&
+        !pathname.startsWith(`${RESPONSES_COMPACT_PATH}/`);
+      if (responseIdMatch && request.method === "GET") {
+        const responseId = decodeURIComponent(pathname.slice(RESPONSES_PATH.length + 1));
+        return await handleResponsesRetrieve(request, app, ctx, responseId);
+      }
+
+      if (responseIdMatch && request.method === "POST" && pathname.endsWith("/cancel")) {
+        const responseId = decodeURIComponent(pathname.slice(RESPONSES_PATH.length + 1, -"/cancel".length));
+        return await handleResponsesCancel(request, app, ctx, responseId);
+      }
+
       if (pathname === RESPONSES_PATH && request.method === "POST") {
         return await handleResponsesRequest(request, url, app, ctx, requestTraceId(request));
       }
@@ -307,6 +330,8 @@ const _activeUpstreamControllers = new Set();
 let _upstreamReservations = {};
 // ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
 const _nimMinuteCounters = {};
+// ponytail: per-isolate active Responses streams, keyed by response id for cancel support
+const _activeResponses = new Map();
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
 let _runtimeCache = null;
 let _runtimeCacheTs = 0;
@@ -1355,7 +1380,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
     usage = chunk.usage || usage;
     finishReason = responseFinishReason(chunk) || finishReason;
     noteStreamToolCalls(chunk, toolCallKeys);
-    const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+    const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || (chunk.choices || [])[0]?.text || "");
     if (delta) noteStreamToken(diag, now);
     outputText += delta;
     return error;
@@ -3459,26 +3484,138 @@ function recordAnthropicLog(app, client, upstreamName, model, started, status, t
   }), ctx);
 }
 
+function responseStoreKey(id) {
+  return `${RESPONSE_STORE_PREFIX}${String(id || "")}`;
+}
+
+function maybeStoreResponse(runtime, responsePayload, ctx) {
+  if (!runtime?.state || !responsePayload?.id || responsePayload.store !== true) return;
+  const task = runtime.state.put(
+    responseStoreKey(responsePayload.id),
+    JSON.stringify(responsePayload),
+    { expirationTtl: RESPONSE_STORE_TTL_SECONDS },
+  ).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+  else void task;
+}
+
+async function readStoredResponse(runtime, id) {
+  if (!runtime?.state || !id) return null;
+  try {
+    return await runtime.state.get(responseStoreKey(id), "json");
+  } catch {
+    return null;
+  }
+}
+
+async function handleResponsesRetrieve(request, app, ctx, responseId) {
+  const runtime = await loadRuntimeConfig(app);
+  await requireClient(request, runtime);
+  const stored = await readStoredResponse(runtime, responseId);
+  if (!stored) return withCorsResponse(json(openAiError(`Response ${responseId} not found.`, "not_found_error"), 404));
+  return withCorsResponse(json(stored, 200));
+}
+
+async function handleResponsesCancel(request, app, ctx, responseId) {
+  const runtime = await loadRuntimeConfig(app);
+  await requireClient(request, runtime);
+  const active = _activeResponses.get(responseId);
+  if (active) {
+    active.abort("response cancelled");
+    _activeResponses.delete(responseId);
+    return withCorsResponse(json({ id: responseId, object: "response", status: "cancelled", output: [], usage: null }, 200));
+  }
+  const stored = await readStoredResponse(runtime, responseId);
+  if (!stored) return withCorsResponse(json(openAiError(`Response ${responseId} not found.`, "not_found_error"), 404));
+  return withCorsResponse(json({ ...stored, status: stored.status === "completed" ? "completed" : "cancelled" }, 200));
+}
+
+function nativeResponsesAvailable(runtime, client) {
+  return runtime.upstreams.some((upstream) =>
+    clientAllowsUpstream(client, upstream.name) &&
+    upstreamSupportsPath(upstream, RESPONSES_PATH) &&
+    providerCapabilities(upstream).native_responses
+  );
+}
+
+function responsesNativeBody(translated, payload, settings, client) {
+  const body = { ...payload, model: translated.model };
+  const clientIds = clientIdentitySet(client);
+  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
+  const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
+  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
+  const combinedSystemText = [systemText, subagentText].filter(Boolean).join("\n\n");
+  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
+    (settings?.context_on_demand === true && Array.isArray(settings?.context_items) && settings.context_items.some((item) => item && item.enabled !== false && item.text));
+  if (combinedSystemText) {
+    body.instructions = [combinedSystemText, body.instructions].filter(Boolean).join("\n\n");
+  }
+  if (hasContext) {
+    const contextText = selectGatewayContext(
+      { model: body.model, messages: responsesInputToMessages(body.input, body.instructions) },
+      settings,
+      client,
+      clientIds,
+    );
+    if (contextText) {
+      const contextMessage = { role: "user", content: [{ type: "input_text", text: "Global reference context. Use it when relevant, but do not mention it unless the user asks.\n\n" + contextText }] };
+      body.input = Array.isArray(body.input) ? [contextMessage, ...body.input] : [contextMessage, { role: "user", content: [{ type: "input_text", text: String(body.input || "") }] }];
+    }
+  }
+  return JSON.stringify(body);
+}
+
 async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const started = Date.now();
   const runtime = await loadRuntimeConfig(app);
   const client = await requireClient(request, runtime);
   const payload = parseJsonBody(await readRequestText(request));
-  const translated = translateResponsesRequest(payload);
+  const previousResponse = payload?.previous_response_id
+    ? await readStoredResponse(runtime, payload.previous_response_id)
+    : null;
+  if (payload?.previous_response_id && !previousResponse) {
+    throw httpError(404, `Response ${payload.previous_response_id} not found.`);
+  }
+  const translated = translateResponsesRequest(payload, { previousResponse });
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
+  const useNative = nativeResponsesAvailable(runtime, client);
 
   if (translated.stream) {
     const headers = pendingSseHeaders(client, traceId);
+    const controller = new AbortController();
+    _activeResponses.set(translated.seed.id, controller);
     const body = streamPendingResponsesResponse(async () => {
       let proxyResponse;
       try {
-        proxyResponse = await proxyRequest({ client, model: translated.model, pathname: CHAT_PATH, request, bodyText: translated.bodyText, runtime, search: url.search, ctx });
+        const bodyText = useNative
+          ? responsesNativeBody(translated, payload, runtime.settings, client)
+          : translated.bodyText;
+        proxyResponse = await proxyRequest({
+          client,
+          model: translated.model,
+          pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
+          request,
+          bodyText,
+          runtime,
+          search: url.search,
+          ctx,
+          signal: controller.signal,
+        });
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
-        const onDone = (usage, extra) => recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
-        return streamResponsesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
+        const finish = (usage, extra) => {
+          _activeResponses.delete(translated.seed.id);
+          recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
+        };
+        if (useNative) {
+          const onDone = (usage, extra) => finish(usage, extra);
+          return nativeResponsesStream(upstreamResp.body, onDone);
+        }
+        const onFinal = (responsePayload) => maybeStoreResponse(runtime, responsePayload, ctx);
+        return streamResponsesFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), onFinal);
       } catch (error) {
+        _activeResponses.delete(translated.seed.id);
         recordRequestLog(app, makeRequestLogEntry({
           client,
           upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
@@ -3497,12 +3634,15 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   }
 
   try {
+    const bodyText = useNative
+      ? responsesNativeBody(translated, payload, runtime.settings, client)
+      : translated.bodyText;
     const proxyResponse = await proxyRequest({
       client,
       model: translated.model,
-      pathname: CHAT_PATH,
+      pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
       request,
-      bodyText: translated.bodyText,
+      bodyText,
       runtime,
       search: url.search,
       ctx,
@@ -3510,7 +3650,6 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
 
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
-
     if (!upstreamResp.ok) {
       recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId);
       return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
@@ -3523,16 +3662,30 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
       recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx, traceId);
       return upstreamBadGatewayResponse(applicationError || "Upstream returned a non-JSON API response.", headers);
     }
-    const choice = (openaiPayload.choices || [])[0] || {};
-    const message = choice.message || {};
-    const hideReasoning = shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream);
-    const text = hideReasoning ? stripThinkTags(chatContentToText(message.content || "")) : chatContentToText(message.content || "");
-    const reasoning = hideReasoning ? "" : reasoningText(message.reasoning_content ?? message.reasoning ?? message.thinking);
-    const responsePayload = makeResponsesPayload(translated.seed, { text, usage: openaiPayload.usage, toolCalls: message.tool_calls || [], reasoning });
+
+    let responsePayload;
+    if (useNative) {
+      responsePayload = {
+        ...openaiPayload,
+        id: String(openaiPayload.id || translated.seed.id),
+        model: translated.seed.model,
+        previous_response_id: translated.seed.previousResponseId || null,
+        store: translated.seed.store === true,
+        output_text: openaiPayload.output_text ?? chatContentToText((openaiPayload.output || []).filter((item) => item.type === "message").flatMap((item) => item.content || []).map((part) => part.text || "").join("")),
+      };
+    } else {
+      const choice = (openaiPayload.choices || [])[0] || {};
+      const message = choice.message || {};
+      const hideReasoning = shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream);
+      const text = hideReasoning ? stripThinkTags(chatContentToText(message.content || "")) : chatContentToText(message.content || "");
+      const reasoning = hideReasoning ? "" : reasoningText(message.reasoning_content ?? message.reasoning ?? message.thinking);
+      responsePayload = makeResponsesPayload(translated.seed, { text, usage: openaiPayload.usage, toolCalls: message.tool_calls || [], reasoning });
+    }
+    maybeStoreResponse(runtime, responsePayload, ctx);
     headers.set("content-type", "application/json; charset=utf-8");
     recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId, {
-      finish_reason: responseFinishReason(openaiPayload),
-      tool_calls_count: responseToolCallsCount(openaiPayload),
+      finish_reason: useNative ? responsePayload.status : responseFinishReason(openaiPayload),
+      tool_calls_count: useNative ? (responsePayload.output || []).filter((item) => item.type === "function_call").length : responseToolCallsCount(openaiPayload),
     });
     return new Response(JSON.stringify(responsePayload), { status: 200, headers });
   } catch (error) {
@@ -3549,6 +3702,38 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     }), ctx);
     return gatewayErrorResponse(error, traceId);
   }
+}
+
+function nativeResponsesStream(body, onDone) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const decoder = new TextDecoder();
+  (async () => {
+    let buffer = "";
+    let usage = null;
+    let finishReason = "";
+    const reader = body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
+        usage = chunk.usage || usage;
+        finishReason = chunk.type === "response.completed" ? "stop" : finishReason;
+      });
+      await writer.write(value);
+    }
+    if (buffer) consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => {
+      usage = chunk.usage || usage;
+      finishReason = chunk.type === "response.completed" ? "stop" : finishReason;
+    });
+    onDone?.(normalizeResponsesUsage(usage), { finish_reason: finishReason });
+    await writer.close();
+  })().catch(async (error) => {
+    onDone?.(null, { finish_reason: "error", error: error.message });
+    try { await writer.abort(error); } catch {}
+  });
+  return readable;
 }
 
 // ponytail: Codex's internal compaction models (gpt-5.6-terra etc.) aren't in
@@ -3652,7 +3837,7 @@ function compactTranscript(input, instructions) {
   }).filter(Boolean).join("\n\n");
 }
 
-function translateResponsesRequest(payload) {
+function translateResponsesRequest(payload, { previousResponse = null } = {}) {
   if (!payload || typeof payload !== "object") {
     throw httpError(400, "Request body must be a JSON object.");
   }
@@ -3660,13 +3845,12 @@ function translateResponsesRequest(payload) {
   if (!model) {
     throw httpError(400, "`model` is required.");
   }
-  if (payload.previous_response_id) {
-    throw httpError(400, "`previous_response_id` is not supported by this gateway.");
-  }
   if (payload.background === true) {
     throw httpError(400, "`background` is not supported by this gateway.");
   }
-  const messages = responsesInputToMessages(payload.input, payload.instructions);
+  const previousRows = previousResponse ? responsesPreviousInput(previousResponse) : [];
+  const currentRows = Array.isArray(payload.input) ? payload.input : (payload.input == null ? [] : [payload.input]);
+  const messages = responsesInputToMessages([...previousRows, ...currentRows], payload.instructions);
   if (messages.length === 0) {
     throw httpError(400, "`input` is required.");
   }
@@ -3674,6 +3858,7 @@ function translateResponsesRequest(payload) {
   const chat = { model, messages, stream: payload.stream === true };
   copyIfPresent(payload, chat, ["temperature", "top_p", "presence_penalty", "frequency_penalty", "stop", "seed", "user"]);
   copyIfPresent(payload, chat, ["reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
+  copyIfPresent(payload, chat, ["parallel_tool_calls"]);
   const maxTokens = payload.max_output_tokens ?? payload.max_tokens;
   if (maxTokens != null) chat.max_tokens = maxTokens;
   if (payload.text?.format?.type && payload.text.format.type !== "text") {
@@ -3698,13 +3883,45 @@ function translateResponsesRequest(payload) {
       messageId,
       metadata: payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {},
       model,
+      parallelToolCalls: payload.parallel_tool_calls ?? true,
+      previousResponseId: payload.previous_response_id || null,
       reasoningId: `rs_${crypto.randomUUID().replace(/-/g, "")}`,
+      reasoningEffort: payload.reasoning?.effort ?? payload.reasoning_effort ?? payload.reasoningEffort ?? null,
+      reasoningSummary: payload.reasoning?.summary ?? payload.reasoningSummary ?? null,
+      store: payload.store === true,
       temperature: payload.temperature ?? null,
+      textFormat: payload.text?.format && typeof payload.text.format === "object" ? payload.text.format : { type: "text" },
       toolChoice: payload.tool_choice ?? "auto",
       tools: Array.isArray(payload.tools) ? payload.tools : [],
       topP: payload.top_p ?? null,
+      truncation: payload.truncation ?? "disabled",
     },
   };
+}
+
+function responsesPreviousInput(previousResponse) {
+  const rows = [];
+  for (const item of Array.isArray(previousResponse?.output) ? previousResponse.output : []) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "function_call") {
+      rows.push({
+        type: "function_call",
+        call_id: String(item.call_id || item.id || ""),
+        name: String(item.name || "tool"),
+        arguments: String(item.arguments || "{}"),
+      });
+    } else if (item.type === "function_call_output") {
+      rows.push(item);
+    } else if (item.type === "message" && String(item.role || "") === "assistant") {
+      const content = Array.isArray(item.content)
+        ? item.content.map((part) => part && part.type === "output_text"
+          ? { type: "input_text", text: String(part.text || "") }
+          : part)
+        : item.content;
+      rows.push({ role: "assistant", content });
+    }
+  }
+  return rows;
 }
 
 function responsesInputToMessages(input, instructions) {
@@ -3837,16 +4054,16 @@ function makeResponsesPayload(seed, { text = "", usage = null, status = "complet
     model: seed.model,
     output: status === "completed" ? [message, ...(reasoning ? [responsesReasoningItem(seed, reasoning)] : []), ...toolCalls.map((call) => responsesFunctionCallItem(call))] : [],
     output_text: text || "",
-    parallel_tool_calls: true,
-    previous_response_id: null,
-    reasoning: { effort: null, summary: null },
-    store: false,
+    parallel_tool_calls: seed.parallelToolCalls ?? true,
+    previous_response_id: seed.previousResponseId || null,
+    reasoning: { effort: seed.reasoningEffort ?? null, summary: seed.reasoningSummary ?? null },
+    store: seed.store === true,
     temperature: seed.temperature,
-    text: { format: { type: "text" } },
+    text: { format: seed.textFormat || { type: "text" } },
     tool_choice: seed.toolChoice,
     tools: seed.tools,
     top_p: seed.topP,
-    truncation: "disabled",
+    truncation: seed.truncation ?? "disabled",
     usage: normalizeResponsesUsage(usage, estimateTokens([text, reasoning, ...toolCalls.map((call) => call?.function?.arguments || "")].join(""))),
     metadata: seed.metadata || {},
   };
@@ -4082,7 +4299,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
   return readable;
 }
 
-function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false) {
+function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, onFinal = null) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -4151,6 +4368,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     };
     try {
       await write({ type: "response.created", response: makeResponsesPayload(seed, { status: "in_progress" }) });
+      await write({ type: "response.in_progress", response: makeResponsesPayload(seed, { status: "in_progress" }) });
       await write({ type: "response.output_item.added", output_index: 0, item: baseMessage });
       await write({ type: "response.content_part.added", item_id: seed.messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
 
@@ -4188,11 +4406,15 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         await write({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: item.arguments });
         await write({ type: "response.output_item.done", output_index: item.outputIndex, item: responsesFunctionCallItem(item) });
       }
-      await write({ type: "response.completed", response: makeResponsesPayload(seed, { text, usage, toolCalls: [...toolCalls.values()].map((item) => ({ id: item.id, function: { name: item.name, arguments: item.arguments } })), reasoning }) });
+      const completedResponse = makeResponsesPayload(seed, { text, usage, toolCalls: [...toolCalls.values()].map((item) => ({ id: item.id, function: { name: item.name, arguments: item.arguments } })), reasoning });
+      if (onFinal) onFinal(completedResponse);
+      await write({ type: "response.completed", response: completedResponse });
       await writer.write(encoder.encode("data: [DONE]\n\n"));
     } catch (error) {
       closeReason = "error";
-      await write({ type: "response.failed", response: { ...makeResponsesPayload(seed, { text: textParts.join(""), reasoning: reasoningParts.join(""), usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } } });
+      const failedResponse = { ...makeResponsesPayload(seed, { text: textParts.join(""), reasoning: reasoningParts.join(""), usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } };
+      if (onFinal) onFinal(failedResponse);
+      await write({ type: "response.failed", response: failedResponse });
       await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
     } finally {
       if (onDone) onDone(normalizeResponsesUsage(usage, Math.round(outputChars / 4)), {
@@ -4208,7 +4430,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
   return readable;
 }
 
-async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx }) {
+async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx, signal = null }) {
   if (pathname === CHAT_PATH) {
     bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
@@ -4229,7 +4451,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
     const used = new Set(hedgedAttempts.map(upstreamKey));
     const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-    return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx });
+    return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal });
   }
   let lastError = null;
 
@@ -4245,7 +4467,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         continue;
       }
       upstreamResult = await fetchProxyUpstream({
-        bodyText, client, pathname, request, runtime, search, upstream,
+        bodyText, client, pathname, request, runtime, search, signal, upstream,
         firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
       });
       let response = upstreamResult.response;
@@ -4282,6 +4504,11 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
     } catch (error) {
       await discardUpstreamResponse(upstreamResult, "upstream request failed");
+      if (signal?.aborted) {
+        const cancelled = httpError(499, "Response cancelled.");
+        cancelled.upstreamName = upstream.name;
+        throw cancelled;
+      }
       if (error.statusCode === 499) throw error;
       lastError = error;
       lastError.upstreamName = upstream.name;
@@ -4333,7 +4560,7 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
     activeRelease();
   };
   try {
-    const sanitizedBody = sanitizeProxyBody(bodyText, upstream);
+    const sanitizedBody = adaptUpstreamBody(bodyText, upstream, pathname);
     const init = {
       method: request.method,
       headers: buildUpstreamHeaders(request, upstream, sanitizedBody),
@@ -4553,7 +4780,7 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx }) {
+async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
@@ -4564,6 +4791,9 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
     : index * hedgeDelayMs;
   let done = false;
   const releaseReservation = reserveUpstreams(attempts);
+  const abortHedge = () => controllers.forEach((controller) => controller.abort(signal?.reason || "hedged request cancelled"));
+  if (signal?.aborted) abortHedge();
+  else signal?.addEventListener("abort", abortHedge, { once: true });
 
   function launchLater(index) {
     const upstream = attempts[index];
@@ -4598,6 +4828,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
     let lastResult = null;
     while (pending.length) {
       const raced = await Promise.race(pending.map((entry) => entry.promise.then((result) => ({ entry, result }))));
+      if (signal?.aborted) throw httpError(499, "Response cancelled.");
       pending.splice(pending.indexOf(raced.entry), 1);
       const result = raced.result;
       if (result.cancelled) continue;
@@ -4623,7 +4854,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       await markUpstreamFailure(runtime, result.upstream, model, result.response);
     }
 
-    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx });
+    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal });
     if (fallbackResult) return { ...fallbackResult, attempts: attempts.length + 1 };
 
     const err = httpError(502, lastResult?.error?.message || "All hedged upstreams failed.");
@@ -4631,11 +4862,12 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
     throw err;
   } finally {
     done = true;
+    signal?.removeEventListener("abort", abortHedge);
     releaseReservation();
   }
 }
 
-async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx }) {
+async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal = null }) {
   const upstream = attempts?.[0];
   if (!upstream || runtime.routing.failover === false) return null;
   let result = null;
@@ -4643,7 +4875,7 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
   try {
     if (!takeNimMinuteSlot(upstream)) return null;
     result = await fetchProxyUpstream({
-      bodyText, client, pathname, request, runtime, search, upstream,
+      bodyText, client, pathname, request, runtime, search, signal, upstream,
       firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
     });
     if (result.response.ok && streamRequest) {
@@ -4665,6 +4897,7 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     return { response: result.response, upstream };
   } catch (error) {
     await discardUpstreamResponse(result, "hedged fallback failed");
+    if (signal?.aborted) throw httpError(499, "Response cancelled.");
     if (error.statusCode === 499) throw error;
     await markUpstreamFailure(runtime, upstream, model);
     return null;
@@ -4740,7 +4973,7 @@ function ssePayloadHasOutput(payload, hideReasoning = false, stripText = null) {
   if (!payload || typeof payload !== "object") return false;
   if (String(payload.type || "").includes("delta")) return !hideReasoning || !String(payload.type || "").includes("reasoning");
   const delta = payload.choices?.[0]?.delta || {};
-  const text = chatContentToText(delta.content || "");
+  const text = chatContentToText(delta.content || "") || String(payload.choices?.[0]?.text || "");
   const visible = hideReasoning && stripText ? stripText(text) : text;
   return Boolean(visible || (!hideReasoning && (delta.reasoning_content || delta.reasoning || delta.thinking)) || delta.tool_calls?.length);
 }
@@ -4936,6 +5169,10 @@ function streamPendingResponsesResponse(open, seed) {
       const status = error.statusCode || 502;
       const message = error.message || "Upstream request failed.";
       const type = mapErrorType(status);
+      if (status === 499) {
+        const cancelled = makeResponsesPayload(seed, { status: "cancelled" });
+        return `data: ${JSON.stringify({ type: "response.cancelled", response: cancelled })}\n\n`;
+      }
       const failed = { ...makeResponsesPayload(seed, { status: "failed" }), error: { message, type } };
       return `data: ${JSON.stringify({ type: "response.failed", response: failed })}\n\ndata: ${JSON.stringify({ type: "error", error: { message, type } })}\n\n`;
     },

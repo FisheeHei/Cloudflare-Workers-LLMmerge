@@ -41,6 +41,9 @@ const attemptBudgetHits = [];
 const nimHits = [];
 const responseHits = [];
 const responseStreamHits = [];
+const nativeResponseHits = [];
+const nativeResponseStreamHits = [];
+const completionHits = [];
 const anthropicHits = [];
 const anthropicStreamHits = [];
 const delayedAnthropicHits = [];
@@ -322,6 +325,47 @@ globalThis.fetch = async (url, init) => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
+  }
+  if (String(url).includes("nim-native.example/v1/responses")) {
+    const body = JSON.parse(init.body);
+    if (body.stream) {
+      nativeResponseStreamHits.push(body);
+      return new Response([
+        'data: {"type":"response.created","response":{"id":"native_stream","object":"response","status":"in_progress"}}\n\n',
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_native","type":"message","status":"in_progress","role":"assistant","content":[]}}\n\n',
+        'data: {"type":"response.output_text.delta","item_id":"msg_native","output_index":0,"content_index":0,"delta":"native"}\n\n',
+        'data: {"type":"response.completed","response":{"id":"native_stream","object":"response","status":"completed","model":"native-model","output_text":"native","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n',
+        "data: [DONE]\n\n",
+      ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    nativeResponseHits.push(body);
+    return new Response(JSON.stringify({
+      id: "native_resp",
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: body.model,
+      output: [{ id: "msg_native", type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "native", annotations: [] }] }],
+      output_text: "native",
+      usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("completions.example")) {
+    const body = JSON.parse(init.body);
+    completionHits.push(body);
+    if (body.stream) {
+      return new Response([
+        'data: {"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":"hello"}]}\n\n',
+        "data: [DONE]\n\n",
+      ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify({
+      id: "cmpl-1",
+      object: "text_completion",
+      model: body.model,
+      choices: [{ index: 0, text: "hello", finish_reason: "stop" }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
   }
   if (String(url).includes("anthropic-stream.example")) {
     const body = JSON.parse(init.body);
@@ -2383,6 +2427,7 @@ const responsesResp = await worker.default.fetch(new Request("https://gw.test/v1
     max_output_tokens: 8,
     reasoningEffort: "medium",
     reasoningSummary: "auto",
+    store: true,
   }),
 }), responsesEnv);
 const responsesPayload = await responsesResp.json();
@@ -2504,6 +2549,108 @@ const responsesAppErrorResp = await worker.default.fetch(new Request("https://gw
 }), responsesEnv);
 assert.equal(responsesAppErrorResp.status, 502);
 assert.equal((await responsesAppErrorResp.text()).includes("Internal server error"), true);
+
+const storedResponseId = responsesPayload.id;
+const storedRetrieveResp = await worker.default.fetch(new Request(`https://gw.test/v1/responses/${storedResponseId}`, {
+  headers: { authorization: "Bearer sk-resp" },
+}), responsesEnv);
+assert.equal(storedRetrieveResp.status, 200);
+assert.equal((await storedRetrieveResp.json()).id, storedResponseId);
+const previousStart = responseHits.length;
+const previousResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "resp-model", previous_response_id: storedResponseId, input: "continue" }),
+}), responsesEnv);
+assert.equal(previousResp.status, 200);
+assert.equal(responseHits[previousStart].messages.some((message) => message.role === "assistant" && String(message.content || "").includes("hello")), true);
+assert.equal(responseHits[previousStart].messages.some((message) => message.tool_calls?.[0]?.id === "call_search"), true);
+const cancelResp = await worker.default.fetch(new Request(`https://gw.test/v1/responses/${storedResponseId}/cancel`, {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp" },
+}), responsesEnv);
+assert.equal(cancelResp.status, 200);
+assert.equal((await cancelResp.json()).status, "completed");
+
+const nativeStore = new Map();
+nativeStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "nim-native", preset: "nvidia-nim", base_url: "https://nim-native.example/v1", api_key_encrypted: "n", models: ["native-model"], paths: ["/v1/chat/completions", "/v1/responses"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const nativeEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = nativeStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { nativeStore.set(key, value); },
+    async delete(key) { nativeStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "native-client", key: "sk-native", models: ["*"], upstreams: ["nim-native"] }]),
+};
+const nativeStart = nativeResponseHits.length;
+const nativeResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-native", "content-type": "application/json" },
+  body: JSON.stringify({ model: "native-model", input: "hi", store: true }),
+}), nativeEnv);
+assert.equal(nativeResp.status, 200);
+assert.equal(nativeResponseHits.length, nativeStart + 1);
+assert.equal(nativeResponseHits[nativeStart].model, "native-model");
+assert.equal((await nativeResp.json()).output_text, "native");
+const nativeStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-native", "content-type": "application/json" },
+  body: JSON.stringify({ model: "native-model", input: "hi", stream: true }),
+}), nativeEnv);
+assert.equal(nativeStreamResp.headers.get("content-type").includes("text/event-stream"), true);
+const nativeStreamText = await nativeStreamResp.text();
+assert.equal(nativeResponseStreamHits.length, 1);
+assert.equal(nativeResponseStreamHits[0].stream, true);
+assert.equal(nativeStreamText.includes('"type":"response.completed"'), true);
+
+const completionStore = new Map();
+completionStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "completions", base_url: "https://completions.example/v1", api_key_encrypted: "c", models: ["completion-model"], paths: ["/v1/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const completionEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = completionStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { completionStore.set(key, value); },
+    async delete(key) { completionStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "completion-client", key: "sk-completion", models: ["*"], upstreams: ["completions"] }]),
+};
+const completionResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-completion", "content-type": "application/json" },
+  body: JSON.stringify({ model: "completion-model", prompt: "hello" }),
+}), completionEnv);
+assert.equal(completionResp.status, 200);
+assert.equal(completionHits[0].prompt, "hello");
+assert.equal((await completionResp.json()).choices[0].text, "hello");
+const completionStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-completion", "content-type": "application/json" },
+  body: JSON.stringify({ model: "completion-model", prompt: "hello", stream: true }),
+}), completionEnv);
+assert.equal(completionStreamResp.headers.get("content-type").includes("text/event-stream"), true);
+const completionStreamText = await completionStreamResp.text();
+assert.equal(completionStreamText.includes('"text":"hello"'), true);
 
 const anthropicStore = new Map();
 anthropicStore.set("gateway:config", JSON.stringify({

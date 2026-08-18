@@ -204,9 +204,18 @@ Main endpoints:
 | `GET` | `/health` | Health check |
 | `GET` | `/v1/models` | Aggregated model list |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/responses` | Responses API compatibility |
+| `POST` | `/v1/completions` | OpenAI Completions (NIM documented protocol) |
+| `POST` | `/v1/responses` | Responses API compatibility layer (native passthrough for self-hosted NIM) |
 | `POST` | `/v1/messages` | Claude / Anthropic-style messages |
 | `POST` | `/v1/embeddings` | Embeddings |
+
+Additional Responses API support:
+
+- `GET /v1/responses/{response_id}`: retrieve a previously `store`d response
+- `POST /v1/responses/{response_id}/cancel`: cancel an in-flight streaming response
+- `previous_response_id`: chain the previous turn (messages, function calls, and results) into the current input
+
+NVIDIA NIM hosted endpoints are strictly adapted to the official Chat Completions schema. When a self-hosted NIM upstream includes `/v1/responses` in its paths, the gateway prefers native Responses API passthrough; otherwise it converts to Chat Completions before aggregation.
 
 ## Statistics
 
