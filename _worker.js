@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-19-nim-completions";
+const VERSION = "v26-08-19-completions-lean";
 
 export default {
   async fetch(request, env, ctx) {
