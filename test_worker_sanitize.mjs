@@ -856,7 +856,6 @@ assert.equal(adminPage.includes("subagent-prompt-client-scope"), true);
 assert.equal(adminPage.includes("global-context-client-scope"), true);
 assert.equal(adminPage.includes("__platform_"), true);
 assert.equal(adminPage.includes("Rikkahub"), true);
-assert.equal(adminPage.includes("custom-platform-input"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("context-on-demand"), true);
@@ -2246,13 +2245,14 @@ const platformEnv = {
     async delete(key) { platformStore.delete(key); },
   },
   CLIENTS_JSON: JSON.stringify([
-    { id: "platform-client", name: "platform-client", key: "sk-platform", models: ["*"], upstreams: ["platform"], metadata: { platform: "codex" } },
-    { id: "platform-rikka-client", name: "platform-rikka-client", key: "sk-platform-rikka", models: ["*"], upstreams: ["platform"] },
+    { id: "platform-client", name: "platform-client", key: "sk-platform", models: ["*"], upstreams: ["platform"], metadata: { platform: "opencode,codex" } },
+    { id: "platform-rikka-client", name: "platform-rikka-client", key: "sk-platform-rikka", models: ["*"], upstreams: ["platform"], metadata: { platform: "rikkahub" } },
+    { id: "platform-myc-client", name: "platform-myc-client", key: "sk-platform-myc", models: ["*"], upstreams: ["platform"], metadata: { platform: "myagent" } },
   ]),
 };
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
-  headers: { authorization: "Bearer sk-platform", "content-type": "application/json", "user-agent": "OpenCode/1.0" },
+  headers: { authorization: "Bearer sk-platform", "content-type": "application/json" },
   body: JSON.stringify({ model: "platform-model", messages: [] }),
 }), platformEnv);
 assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), true);
@@ -2261,7 +2261,7 @@ assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform context."
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
-  headers: { authorization: "Bearer sk-platform-rikka", "content-type": "application/json", "user-agent": "Rikkahub/0.9" },
+  headers: { authorization: "Bearer sk-platform-rikka", "content-type": "application/json" },
   body: JSON.stringify({ model: "platform-model", messages: [] }),
 }), platformEnv);
 assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), false);
@@ -2270,7 +2270,7 @@ assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform context."
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
-  headers: { authorization: "Bearer sk-platform-rikka", "content-type": "application/json", "x-client-platform": "myagent" },
+  headers: { authorization: "Bearer sk-platform-myc", "content-type": "application/json" },
   body: JSON.stringify({ model: "platform-model", messages: [] }),
 }), platformEnv);
 assert.equal(speedBodies.at(-1).messages[0].content.includes("use subagents"), true);

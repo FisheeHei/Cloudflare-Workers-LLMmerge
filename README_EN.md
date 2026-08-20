@@ -185,9 +185,9 @@ Scope targets for system prompt / global context / subagent / force-all injectio
 - `*` or `__all__`: all clients
 - `__none__`: disabled
 - Client `id` / `name` / `key`: exact match
-- `__platform_*`: platform match; any custom identifier works, e.g. `__platform_opencode`, `__platform_openclaw`, `__platform_codex`, `__platform_rikkahub`, `__platform_cherrystudio`, `__platform_claude`
+- `__platform_*`: platform match; the platform tag must be set on an existing client key, e.g. `__platform_opencode`, `__platform_openclaw`, `__platform_codex`, `__platform_rikkahub`, `__platform_cherrystudio`, `__platform_claude`
 
-Platform detection order: `x-client-platform` request header → User-Agent detection (built-in common clients) → client `metadata.platform` / `metadata.platforms`. The admin UI can add custom platforms directly in each scope.
+Effective-client scopes only apply to existing client keys; platform matching is evaluated against the existing key's `metadata.platform` / `metadata.platforms`. The client list lets you tag each key with platforms (comma-separated), and scope chips come only from existing keys and the platforms they actually carry.
 
 ## Usage
 

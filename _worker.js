@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-21-reasoning-universal-scope";
+const VERSION = "v26-08-21-client-key-scope-only";
 
 export default {
   async fetch(request, env, ctx) {
@@ -3592,14 +3592,14 @@ function nativeResponsesAvailable(runtime, client, model) {
     );
 }
 
-function responsesNativeBody(translated, payload, settings, client, request = null) {
+function responsesNativeBody(translated, payload, settings, client) {
   const body = { ...payload, model: translated.model };
   const clientIds = clientIdentitySet(client);
-  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds, request) ? String(settings?.system_prompt || "").trim() : "";
+  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
   const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
-  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds, request) ? SUBAGENT_PROMPT : "";
+  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
   const combinedSystemText = [systemText, subagentText].filter(Boolean).join("\n\n");
-  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds, request) && String(settings?.global_context || "").trim()) ||
+  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
     (settings?.context_on_demand === true && Array.isArray(settings?.context_items) && settings.context_items.some((item) => item && item.enabled !== false && item.text));
   if (combinedSystemText) {
     body.instructions = [combinedSystemText, body.instructions].filter(Boolean).join("\n\n");
@@ -3610,7 +3610,6 @@ function responsesNativeBody(translated, payload, settings, client, request = nu
       settings,
       client,
       clientIds,
-      request,
     );
     if (contextText) {
       const contextMessage = { role: "user", content: [{ type: "input_text", text: "Global reference context. Use it when relevant, but do not mention it unless the user asks.\n\n" + contextText }] };
@@ -3644,7 +3643,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
       let proxyResponse;
       try {
         const bodyText = useNative
-          ? responsesNativeBody(translated, payload, runtime.settings, client, request)
+          ? responsesNativeBody(translated, payload, runtime.settings, client)
           : translated.bodyText;
         proxyResponse = await proxyRequest({
           client,
@@ -3690,7 +3689,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
 
   try {
     const bodyText = useNative
-      ? responsesNativeBody(translated, payload, runtime.settings, client, request)
+      ? responsesNativeBody(translated, payload, runtime.settings, client)
       : translated.bodyText;
     const proxyResponse = await proxyRequest({
       client,
@@ -4843,7 +4842,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
 
 async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx, signal = null }) {
   if (pathname === CHAT_PATH) {
-    bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client, request);
+    bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
   const streamRequest = requestBodyStreams(bodyText);
 
@@ -5011,15 +5010,15 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
   }
 }
 
-function applyGatewayPromptContext(bodyText, settings, client, request = null) {
+function applyGatewayPromptContext(bodyText, settings, client) {
   if (!bodyText) return bodyText;
   const clientIds = clientIdentitySet(client);
-  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds, request) ? String(settings?.system_prompt || "").trim() : "";
+  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
   const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
-  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds, request) ? SUBAGENT_PROMPT : "";
+  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
   const combinedSystemText = [systemText, subagentText].filter(Boolean).join("\n\n");
   const items = Array.isArray(settings?.context_items) ? settings.context_items : [];
-  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds, request) && String(settings?.global_context || "").trim()) ||
+  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
     (settings?.context_on_demand === true && items.some((item) => item && item.enabled !== false && item.text));
   if (!combinedSystemText && !hasContext) return bodyText;
   let payload;
@@ -5030,7 +5029,7 @@ function applyGatewayPromptContext(bodyText, settings, client, request = null) {
   }
 
   if (!Array.isArray(payload.messages)) return bodyText;
-  const contextText = hasContext ? selectGatewayContext(payload, settings, client, clientIds, request) : "";
+  const contextText = hasContext ? selectGatewayContext(payload, settings, client, clientIds) : "";
   if (!combinedSystemText && !contextText) return bodyText;
   const injected = [];
   if (combinedSystemText) {
@@ -5049,8 +5048,8 @@ function applyGatewayPromptContext(bodyText, settings, client, request = null) {
   return JSON.stringify(payload);
 }
 
-function selectGatewayContext(payload, settings, client, clientIds, request = null) {
-  const base = promptAppliesToClient(settings?.global_context_clients, client, clientIds, request) ? String(settings?.global_context || "").trim() : "";
+function selectGatewayContext(payload, settings, client, clientIds) {
+  const base = promptAppliesToClient(settings?.global_context_clients, client, clientIds) ? String(settings?.global_context || "").trim() : "";
   if (settings?.context_on_demand !== true) return base;
   const items = Array.isArray(settings?.context_items) ? settings.context_items : normalizeContextItems(settings?.context_items);
   if (!items.length) return base;
@@ -5058,11 +5057,11 @@ function selectGatewayContext(payload, settings, client, clientIds, request = nu
   const model = String(payload?.model || "").toLowerCase();
   const query = ((payload?.messages || []).slice(-4).map((msg) => chatContentToText(msg?.content || "")).join("\n") + "\n" + model + "\n" + (client?.name || "")).toLowerCase();
   const candidates = items
-    .filter((item) => item.enabled !== false && contextScopeMatches(item.clients, client, clientIds, request) && contextModelMatches(item.models, model))
+    .filter((item) => item.enabled !== false && contextScopeMatches(item.clients, client, clientIds) && contextModelMatches(item.models, model))
     .map((item) => ({ item, score: contextKeywordScore(item, query) }))
     .sort((a, b) => b.score - a.score || b.item.priority - a.item.priority)
   const alwaysClients = normalizeStringArray(settings?.context_always_clients);
-  const forceAll = alwaysClients.length && promptAppliesToClient(alwaysClients, client, clientIds, request);
+  const forceAll = alwaysClients.length && promptAppliesToClient(alwaysClients, client, clientIds);
   const picked = forceAll
     ? candidates
     : candidates.filter((hit) => hit.score > 0).slice(0, Math.max(1, Math.min(3, Number(settings.context_item_limit || 1))));
@@ -5079,8 +5078,8 @@ function selectGatewayContext(payload, settings, client, clientIds, request = nu
   return parts.filter(Boolean).join("\n\n");
 }
 
-function contextScopeMatches(scope, client, clientIds, request = null) {
-  return !normalizeStringArray(scope).length || promptAppliesToClient(scope, client, clientIds, request);
+function contextScopeMatches(scope, client, clientIds) {
+  return !normalizeStringArray(scope).length || promptAppliesToClient(scope, client, clientIds);
 }
 
 function contextModelMatches(scope, model) {
@@ -5099,41 +5098,23 @@ function clientIdentitySet(client) {
   return new Set([client?.id, client?.name, client?.key].map((item) => String(item || "").trim()).filter(Boolean));
 }
 
-const CLIENT_PLATFORM_PATTERNS = [
-  ["opencode", /opencode/i],
-  ["openclaw", /openclaw|clawdbot|moltbot/i],
-  ["codex", /\bcodex/i],
-  ["rikkahub", /rikkahub|rikka\s*hub/i],
-  ["cherrystudio", /cherry\s*studio|cherrystudio/i],
-  ["claude", /\bclaude/i],
-  ["cursor", /\bcursor/i],
-  ["chatgpt", /chatgpt|openai/i],
-];
-
-function clientPlatforms(request, client) {
+function clientPlatforms(client) {
   const platforms = new Set();
   const add = (value) => String(value || "").split(",").map((item) => item.trim().toLowerCase().replace(/^__platform_/, "")).filter(Boolean).forEach((item) => platforms.add(item));
-  if (request?.headers) {
-    add(request.headers.get("x-client-platform"));
-    const userAgent = request.headers.get("user-agent") || "";
-    for (const [key, pattern] of CLIENT_PLATFORM_PATTERNS) {
-      if (pattern.test(userAgent)) platforms.add(key);
-    }
-  }
   const metadata = client?.metadata || {};
   add(metadata.platform);
   if (Array.isArray(metadata.platforms)) for (const item of metadata.platforms) add(item);
   return platforms;
 }
 
-function promptAppliesToClient(scope, client, clientIds, request = null) {
+function promptAppliesToClient(scope, client, clientIds) {
   const list = normalizeStringArray(scope);
   if (!list.length || list.includes("*") || list.includes("__all__")) return true;
   if (list.includes("__none__")) return false;
   const ids = clientIds || clientIdentitySet(client);
   if (list.some((item) => ids.has(item))) return true;
   if (list.some((item) => item.startsWith("__platform_"))) {
-    return [...clientPlatforms(request, client)].some((platform) => list.includes("__platform_" + platform));
+    return [...clientPlatforms(client)].some((platform) => list.includes("__platform_" + platform));
   }
   return false;
 }

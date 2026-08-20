@@ -1624,10 +1624,17 @@ function renderAdminScript(version) {
     let html = forceAll
       ? clientScopeChip("__none__", "\u4e0d\u542f\u7528\u5168\u91cf", !ids.size) + clientScopeChip("*", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive)
       : clientScopeChip("__all__", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive);
-    html += PROMPT_PLATFORM_CHIPS.map(([value, label]) => clientScopeChip("__platform_" + value, label, !allActive && ids.has("__platform_" + value))).join("");
-    const knownPlatforms = new Set(PROMPT_PLATFORM_CHIPS.map(([value]) => "__platform_" + value));
-    html += [...ids].filter((value) => value.startsWith("__platform_") && !knownPlatforms.has(value))
-      .map((value) => clientScopeChip(value, value.slice("__platform_".length), !allActive)).join("");
+    const platforms = new Set();
+    clients.forEach((c) => {
+      const metadata = c.metadata || {};
+      [metadata.platform, ...(Array.isArray(metadata.platforms) ? metadata.platforms : [])].forEach((value) => {
+        String(value || "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean).forEach((item) => platforms.add(item));
+      });
+    });
+    html += [...platforms].map((value) => {
+      const known = PROMPT_PLATFORM_CHIPS.find(([key]) => key === value);
+      return clientScopeChip("__platform_" + value, known ? known[1] : value, !allActive && ids.has("__platform_" + value));
+    }).join("");
     html += clients.length
       ? clients.map(function(c) {
         const id = text(c.id || c.name || c.key).trim();
@@ -1635,7 +1642,7 @@ function renderAdminScript(version) {
         return clientScopeChip(id, label, !allActive && ids.has(id));
       }).join("")
       : '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
-    return html + '<input class="custom-platform-input" placeholder="\u81ea\u5b9a\u4e49\u5e73\u53f0\uff0c\u56de\u8f66\u6dfb\u52a0">';
+    return html;
   }
 
   function clientScopeChip(value, label, checked) {
@@ -1665,29 +1672,6 @@ function renderAdminScript(version) {
 
   function bindPromptScope(host, forceAll) {
     host.querySelectorAll('input[type="checkbox"]').forEach((input) => attachScopeChip(input, host, forceAll));
-    const customInput = host.querySelector(".custom-platform-input");
-    if (customInput) {
-      customInput.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter") return;
-        event.preventDefault();
-        const value = customInput.value.trim().toLowerCase().replace(/^__platform_/, "").replace(/[^a-z0-9_-]+/g, "-");
-        customInput.value = "";
-        if (!value) return;
-        const token = "__platform_" + value;
-        if (host.querySelector('input[value="' + token + '"]')) return;
-        customInput.insertAdjacentHTML("beforebegin", clientScopeChip(token, value, true));
-        const input = host.querySelector('input[value="' + token + '"]');
-        attachScopeChip(input, host, forceAll);
-        if (forceAll) {
-          host.querySelectorAll('input[value="__none__"],input[value="*"]').forEach((other) => { other.checked = false; });
-        } else {
-          const all = host.querySelector('input[value="__all__"]');
-          if (all) all.checked = false;
-        }
-        syncClientScopeChips(host);
-        renderPromptContextStatus("\u5f85\u4fdd\u5b58");
-      });
-    }
     syncClientScopeChips(host);
   }
 
@@ -2707,6 +2691,7 @@ async function loadKvUsage() {
           '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
           '<span class="note">' + clientUsageText(c.today_usage) + '</span>' +
         '</div>' +
+        '<input class="client-platform" data-client-platform="' + esc(c.id) + '" value="' + esc(clientPlatformText(c)) + '" placeholder="\u5e73\u53f0\u6807\u8bb0\uff0c\u9017\u53f7\u5206\u9694">' +
         '<button type="button" class="small secondary" data-copy-client-id="' + esc(c.id) + '">\u590d\u5236 Key</button>' +
         '<button type="button" class="small secondary" data-copy-client-setup="' + esc(c.id) + '">\u590d\u5236\u914d\u7f6e</button>' +
         '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '">\u5220\u9664</button>' +
@@ -2730,6 +2715,32 @@ async function loadKvUsage() {
         });
       });
     });
+    host.querySelectorAll("input[data-client-platform]").forEach((input) => {
+      input.addEventListener("change", async () => {
+        const record = state.clients.find((c) => c.id === input.dataset.clientPlatform);
+        if (!record) return;
+        const value = input.value.trim();
+        try {
+          const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(input.dataset.clientPlatform), {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ metadata: { ...(record.metadata || {}), platform: value } }),
+          });
+          const payload = await parseApiResponse(resp);
+          if (!resp.ok) throw new Error(payload?.error?.message || "\u66f4\u65b0\u5931\u8d25");
+          await loadClients();
+          showToast("\u5df2\u66f4\u65b0\u5e73\u53f0\u6807\u8bb0");
+        } catch (error) {
+          input.value = clientPlatformText(record);
+          showError(error);
+        }
+      });
+    });
+  }
+
+  function clientPlatformText(client) {
+    const metadata = client && client.metadata || {};
+    return text(metadata.platform || (Array.isArray(metadata.platforms) ? metadata.platforms.join(", ") : ""));
   }
 
   async function createClient() {
