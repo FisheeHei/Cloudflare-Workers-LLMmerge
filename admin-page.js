@@ -1625,13 +1625,17 @@ function renderAdminScript(version) {
       ? clientScopeChip("__none__", "\u4e0d\u542f\u7528\u5168\u91cf", !ids.size) + clientScopeChip("*", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive)
       : clientScopeChip("__all__", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive);
     html += PROMPT_PLATFORM_CHIPS.map(([value, label]) => clientScopeChip("__platform_" + value, label, !allActive && ids.has("__platform_" + value))).join("");
-    if (!clients.length) return html + '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
-    return html +
-      clients.map(function(c) {
+    const knownPlatforms = new Set(PROMPT_PLATFORM_CHIPS.map(([value]) => "__platform_" + value));
+    html += [...ids].filter((value) => value.startsWith("__platform_") && !knownPlatforms.has(value))
+      .map((value) => clientScopeChip(value, value.slice("__platform_".length), !allActive)).join("");
+    html += clients.length
+      ? clients.map(function(c) {
         const id = text(c.id || c.name || c.key).trim();
         const label = text(c.name || c.id || "client");
         return clientScopeChip(id, label, !allActive && ids.has(id));
-      }).join("");
+      }).join("")
+      : '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
+    return html + '<input class="custom-platform-input" placeholder="\u81ea\u5b9a\u4e49\u5e73\u53f0\uff0c\u56de\u8f66\u6dfb\u52a0">';
   }
 
   function clientScopeChip(value, label, checked) {
@@ -1639,26 +1643,51 @@ function renderAdminScript(version) {
     return '<label class="' + (checked ? 'active' : '') + '"><input type="checkbox" value="' + esc(value) + '"' + (checked ? ' checked' : '') + '><span data-label="' + esc(label) + '" title="' + esc(label) + '">' + prefix + esc(label) + '</span></label>';
   }
 
+  function attachScopeChip(input, host, forceAll) {
+    input.addEventListener("change", function() {
+      if (forceAll) {
+        if (["__none__", "*"].includes(input.value) && input.checked) {
+          host.querySelectorAll('input[type="checkbox"]').forEach((other) => { if (other !== input) other.checked = false; });
+        } else if (input.checked) {
+          host.querySelectorAll('input[value="__none__"],input[value="*"]').forEach((other) => { other.checked = false; });
+        }
+        if (!host.querySelector('input:checked')) host.querySelector('input[value="__none__"]').checked = true;
+      } else {
+        const all = host.querySelector('input[value="__all__"]');
+        if (input.value === "__all__" && input.checked) host.querySelectorAll('input[type="checkbox"]:not([value="__all__"])').forEach((other) => { other.checked = false; });
+        if (input.value !== "__all__" && input.checked && all) all.checked = false;
+        if (all && !host.querySelector('input[type="checkbox"]:not([value="__all__"]):checked')) all.checked = true;
+      }
+      syncClientScopeChips(host);
+      renderPromptContextStatus("\u5f85\u4fdd\u5b58");
+    });
+  }
+
   function bindPromptScope(host, forceAll) {
-    host.querySelectorAll('input').forEach(function(input) {
-      input.addEventListener("change", function() {
+    host.querySelectorAll('input[type="checkbox"]').forEach((input) => attachScopeChip(input, host, forceAll));
+    const customInput = host.querySelector(".custom-platform-input");
+    if (customInput) {
+      customInput.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        const value = customInput.value.trim().toLowerCase().replace(/^__platform_/, "").replace(/[^a-z0-9_-]+/g, "-");
+        customInput.value = "";
+        if (!value) return;
+        const token = "__platform_" + value;
+        if (host.querySelector('input[value="' + token + '"]')) return;
+        customInput.insertAdjacentHTML("beforebegin", clientScopeChip(token, value, true));
+        const input = host.querySelector('input[value="' + token + '"]');
+        attachScopeChip(input, host, forceAll);
         if (forceAll) {
-          if (["__none__", "*"].includes(input.value) && input.checked) {
-            host.querySelectorAll('input').forEach((other) => { if (other !== input) other.checked = false; });
-          } else if (input.checked) {
-            host.querySelectorAll('input[value="__none__"],input[value="*"]').forEach((other) => { other.checked = false; });
-          }
-          if (!host.querySelector('input:checked')) host.querySelector('input[value="__none__"]').checked = true;
+          host.querySelectorAll('input[value="__none__"],input[value="*"]').forEach((other) => { other.checked = false; });
         } else {
           const all = host.querySelector('input[value="__all__"]');
-          if (input.value === "__all__" && input.checked) host.querySelectorAll('input:not([value="__all__"])').forEach((other) => { other.checked = false; });
-          if (input.value !== "__all__" && input.checked && all) all.checked = false;
-          if (all && !host.querySelector('input:not([value="__all__"]):checked')) all.checked = true;
+          if (all) all.checked = false;
         }
         syncClientScopeChips(host);
         renderPromptContextStatus("\u5f85\u4fdd\u5b58");
       });
-    });
+    }
     syncClientScopeChips(host);
   }
 

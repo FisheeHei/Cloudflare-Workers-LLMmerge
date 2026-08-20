@@ -185,9 +185,9 @@ curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \
 - `*` 或 `__all__`：全部客户端
 - `__none__`：不生效
 - 客户端 `id` / `name` / `key`：精确匹配
-- `__platform_*`：按平台匹配，例如 `__platform_opencode`、`__platform_openclaw`、`__platform_codex`、`__platform_rikkahub`、`__platform_cherrystudio`、`__platform_claude`
+- `__platform_*`：按平台匹配，任意自定义标识都可用，例如 `__platform_opencode`、`__platform_openclaw`、`__platform_codex`、`__platform_rikkahub`、`__platform_cherrystudio`、`__platform_claude`
 
-平台识别顺序：请求头 `x-client-platform` → User-Agent 自动识别 → 客户端 `metadata.platform` / `metadata.platforms` 手动标记。
+平台识别顺序：请求头 `x-client-platform` → User-Agent 自动识别（内置常见客户端）→ 客户端 `metadata.platform` / `metadata.platforms` 手动标记。前端每个作用域都可以直接输入自定义平台并保存。
 
 ## 使用
 
@@ -227,7 +227,7 @@ Responses API 额外支持：
 
 NVIDIA NIM 托管端点按官方 Chat Completions schema 做严格适配；自托管 NIM 在上游路径中加入 `/v1/responses` 时，网关会优先原生直通 Responses API，否则统一转为 Chat Completions 后再聚合。
 
-NIM 上的 DeepSeek V4（例如 `deepseek-ai/deepseek-v4-flash-0731`）会按 NIM 文档注入 `chat_template_kwargs.reasoning_effort`（`none` / `high` / `max`，未指定时默认 `high`），并把上游 `reasoning_content` 原样透传；经 `/v1/responses` 或 `/v1/messages` 调用时会转换为 reasoning 条目 / thinking 块。官方 DeepSeek 端点仍按原策略隐藏推理内容。
+DeepSeek 模型经任意非官方上游（NIM、OpenRouter、自建端点等）调用时，网关会原样透传 `reasoning_content`；经 `/v1/responses` 或 `/v1/messages` 调用时会转换为 reasoning 条目 / thinking 块。NIM 上的 DeepSeek V4（例如 `deepseek-ai/deepseek-v4-flash-0731`）还会按 NIM 文档注入 `chat_template_kwargs.reasoning_effort`（`none` / `high` / `max`，未指定时默认 `high`）。官方 DeepSeek 端点仍按原策略隐藏推理内容。
 
 `/v1/completions` 优先直通支持该路径的上游（NIM 按官方 Completions schema 收紧字段）；如果没有上游声明 `/v1/completions`，网关会自动把单条 `prompt` 转成 Chat Completions，再转回标准 `text_completion` 响应，流式和非流式均支持。
 

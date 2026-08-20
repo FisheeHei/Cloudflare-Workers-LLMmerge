@@ -41,6 +41,7 @@ const attemptBudgetHits = [];
 const nimHits = [];
 const nimLocalHits = [];
 const nimDeepSeekHits = [];
+const genericDeepSeekHits = [];
 const responseHits = [];
 const responseStreamHits = [];
 const nativeResponseHits = [];
@@ -737,6 +738,13 @@ globalThis.fetch = async (url, init) => {
       usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
     }), { status: 200, headers: { "content-type": "application/json" } });
   }
+  if (String(url).includes("generic-deepseek.example")) {
+    genericDeepSeekHits.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      id: "generic-deepseek",
+      choices: [{ message: { reasoning_content: "generic thought", content: "generic answer" } }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).endsWith("/models")) {
     return new Response(JSON.stringify({ data: [
       { id: "deepseek-ai/deepseek-v4-pro" },
@@ -848,6 +856,7 @@ assert.equal(adminPage.includes("subagent-prompt-client-scope"), true);
 assert.equal(adminPage.includes("global-context-client-scope"), true);
 assert.equal(adminPage.includes("__platform_"), true);
 assert.equal(adminPage.includes("Rikkahub"), true);
+assert.equal(adminPage.includes("custom-platform-input"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("context-on-demand"), true);
@@ -1491,6 +1500,28 @@ const nimDeepSeekResponsesResp = await worker.default.fetch(new Request("https:/
 const nimDeepSeekResponsesText = await nimDeepSeekResponsesResp.text();
 assert.equal(nimDeepSeekResponsesText.includes('"type":"reasoning"'), true);
 assert.equal(nimDeepSeekResponsesText.includes('"summary":[{"type":"summary_text","text":"thinking step one"}]'), true);
+
+const genericDeepSeekEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get() { return null; },
+    async put() {},
+    async delete() {},
+  },
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "generic-deepseek", base_url: "https://generic-deepseek.example/v1", api_key: "g", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ]),
+  CLIENTS_JSON: JSON.stringify([{ name: "generic-deepseek-client", key: "sk-generic-deepseek", models: ["*"], upstreams: ["generic-deepseek"] }]),
+};
+const genericDeepSeekResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-generic-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-v4-pro", messages: [] }),
+}), genericDeepSeekEnv);
+const genericDeepSeekText = await genericDeepSeekResp.text();
+assert.equal(genericDeepSeekText.includes('"reasoning_content":"generic thought"'), true);
+assert.equal(genericDeepSeekText.includes('"content":"generic answer"'), true);
 
 const moonshotEnv = {
   ADMIN_TOKEN: "admin-test-token",
@@ -2195,7 +2226,7 @@ platformStore.set("gateway:config", JSON.stringify({
     upstream_cooldown_ttl: 60,
     system_prompt: "Platform system.",
     system_prompt_clients: ["__platform_opencode"],
-    subagent_prompt_clients: ["__platform_codex"],
+    subagent_prompt_clients: ["__platform_codex", "__platform_myagent"],
     global_context: "Platform context.",
     global_context_clients: ["__platform_rikkahub"],
   },
@@ -2236,6 +2267,14 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), false);
 assert.equal(speedBodies.at(-1).messages.length, 1);
 assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform context."), true);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-platform-rikka", "content-type": "application/json", "x-client-platform": "myagent" },
+  body: JSON.stringify({ model: "platform-model", messages: [] }),
+}), platformEnv);
+assert.equal(speedBodies.at(-1).messages[0].content.includes("use subagents"), true);
+assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), false);
 
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({
@@ -2457,8 +2496,8 @@ deepSeekHedgeStreamStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 600, upstream_cooldown_ttl: 60 },
   upstreams: [
-    { name: "deepseek-hedge-slow", base_url: "https://hedge-stream-slow.example/v1", api_key_encrypted: "s", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "deepseek-hedge-fast", base_url: "https://hedge-stream-fast.example/v1", api_key_encrypted: "f", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "deepseek-hedge-slow", preset: "deepseek", base_url: "https://hedge-stream-slow.example/v1", api_key_encrypted: "s", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "deepseek-hedge-fast", preset: "deepseek", base_url: "https://hedge-stream-fast.example/v1", api_key_encrypted: "f", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
   ],
 }));
 const deepSeekHedgeStreamEnv = {

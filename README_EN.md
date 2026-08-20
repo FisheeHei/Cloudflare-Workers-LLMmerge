@@ -185,9 +185,9 @@ Scope targets for system prompt / global context / subagent / force-all injectio
 - `*` or `__all__`: all clients
 - `__none__`: disabled
 - Client `id` / `name` / `key`: exact match
-- `__platform_*`: platform match, e.g. `__platform_opencode`, `__platform_openclaw`, `__platform_codex`, `__platform_rikkahub`, `__platform_cherrystudio`, `__platform_claude`
+- `__platform_*`: platform match; any custom identifier works, e.g. `__platform_opencode`, `__platform_openclaw`, `__platform_codex`, `__platform_rikkahub`, `__platform_cherrystudio`, `__platform_claude`
 
-Platform detection order: `x-client-platform` request header → User-Agent detection → client `metadata.platform` / `metadata.platforms`.
+Platform detection order: `x-client-platform` request header → User-Agent detection (built-in common clients) → client `metadata.platform` / `metadata.platforms`. The admin UI can add custom platforms directly in each scope.
 
 ## Usage
 
@@ -227,7 +227,7 @@ Additional Responses API support:
 
 NVIDIA NIM hosted endpoints are strictly adapted to the official Chat Completions schema. When a self-hosted NIM upstream includes `/v1/responses` in its paths, the gateway prefers native Responses API passthrough; otherwise it converts to Chat Completions before aggregation.
 
-For DeepSeek V4 models on NIM (for example `deepseek-ai/deepseek-v4-flash-0731`), the gateway injects `chat_template_kwargs.reasoning_effort` (`none` / `high` / `max`, defaulting to `high`) per the NIM documentation and passes upstream `reasoning_content` through; `/v1/responses` and `/v1/messages` calls translate it into reasoning items / thinking blocks. Official DeepSeek endpoints keep the original reasoning-hiding behavior.
+DeepSeek models called through any non-official upstream (NIM, OpenRouter, self-hosted endpoints, etc.) have upstream `reasoning_content` passed through; `/v1/responses` and `/v1/messages` calls translate it into reasoning items / thinking blocks. For DeepSeek V4 on NIM (for example `deepseek-ai/deepseek-v4-flash-0731`), the gateway also injects `chat_template_kwargs.reasoning_effort` (`none` / `high` / `max`, defaulting to `high`) per the NIM documentation. Official DeepSeek endpoints keep the original reasoning-hiding behavior.
 
 `/v1/completions` prefers native passthrough to upstreams that declare that path (NIM fields are tightened to the official Completions schema). If no upstream declares `/v1/completions`, a single `prompt` is translated to Chat Completions and converted back to the standard `text_completion` response, for both streaming and non-streaming calls.
 

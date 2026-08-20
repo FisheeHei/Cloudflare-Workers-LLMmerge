@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-21-nim-reasoning-scope-lean";
+const VERSION = "v26-08-21-reasoning-universal-scope";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1704,10 +1704,9 @@ function requestToolsCount(payload) {
 }
 
 function shouldHideDeepSeekReasoning(model, responseModel = "", upstream = null) {
-  if (isNvidiaNimUpstream(upstream)) return false;
   const preset = String(upstream?.preset || "").trim();
-  return isDeepSeekModelName(model) || isDeepSeekModelName(responseModel) ||
-    preset === "deepseek" || inferPresetId(upstream?.base_url) === "deepseek";
+  const official = preset === "deepseek" || inferPresetId(upstream?.base_url) === "deepseek";
+  return official && (isDeepSeekModelName(model) || isDeepSeekModelName(responseModel));
 }
 
 function isDeepSeekModelName(value) {
