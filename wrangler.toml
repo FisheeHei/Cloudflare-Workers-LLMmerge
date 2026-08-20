@@ -7,7 +7,7 @@ compatibility_date = "2026-06-29"
 # Do not set `pages_build_output_dir` here, so Pages production config stays managed in Cloudflare.
 # Configure production Variables / Secrets in the Workers & Pages dashboard instead.
 # Required runtime secret: ADMIN_TOKEN. Supported optional names: API_KEY_CRYPT_SECRET, REQUEST_TIMEOUT_MS,
-# UPSTREAM_COOLDOWN_TTL, MODEL_CACHE_TTL, UPSTREAMS_JSON, CLIENTS_JSON.
+# STREAM_IDLE_TIMEOUT_MS, SSE_KEEPALIVE_MS, UPSTREAM_COOLDOWN_TTL, MODEL_CACHE_TTL, UPSTREAMS_JSON, CLIENTS_JSON.
 
 # Optional local binding for `wrangler pages dev`.
 # [[kv_namespaces]]

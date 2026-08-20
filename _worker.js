@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-19-completions-lean";
+const VERSION = "v26-08-20-stream-stability";
 
 export default {
   async fetch(request, env, ctx) {
@@ -318,6 +318,7 @@ export default {
 // ponytail: cache createApp result per-isolate since env is stable across requests
 let _cachedApp = null;
 let _cachedEnvRef = null;
+let _sseKeepaliveMs = SSE_KEEPALIVE_MS;
 // ponytail: per-isolate EWMA; state storage shares route scores across fresh isolates.
 const _upstreamLatency = {};
 const _upstreamLatencyUpdatedAt = {};
@@ -563,6 +564,7 @@ export class LlmMergeStore {
 
 function createApp(env) {
   if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
+  _sseKeepaliveMs = parsePositiveInt(env.SSE_KEEPALIVE_MS, SSE_KEEPALIVE_MS);
   const adminToken = pickAdminToken(env);
 
   if (!adminToken) {
@@ -1331,6 +1333,8 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
       return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
     }
     sanitizeOpenAiPayload(payload, hideReasoning);
+    const normalizedUsage = withFallbackChatUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
+    if (normalizedUsage) payload.usage = normalizedUsage;
     const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
     log(usage, 0, { finish_reason: responseFinishReason(payload), tool_calls_count: responseToolCallsCount(payload) });
     payload.model = responseModel;
@@ -1381,6 +1385,8 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   const noteChunk = (chunk, now = Date.now()) => {
     const error = streamEventErrorMessage(chunk) || upstreamApplicationErrorMessage(chunk);
     if (error) failureStatus = 502;
+    const normalizedUsage = normalizeChatUsageChunk(chunk.usage, outputText, fallbackPrompt);
+    if (normalizedUsage) chunk.usage = normalizedUsage;
     usage = chunk.usage || usage;
     finishReason = responseFinishReason(chunk) || finishReason;
     noteStreamToolCalls(chunk, toolCallKeys);
@@ -1405,12 +1411,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
       const reader = body.getReader();
       try {
         for (;;) {
-          const result = shouldApplyToolFinishGrace(finishReason) && !sawDone
-            ? await Promise.race([
-              reader.read(),
-              sleep(SSE_FINISH_GRACE_MS).then(() => ({ finishGrace: true })),
-            ])
-            : await reader.read();
+          const result = await readSseChunk(reader, finishReason);
           if (result.finishGrace) {
             closeReason = "finish_grace";
             Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
@@ -1439,26 +1440,41 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
               sawDone = true;
               parsedOutput += "data: [DONE]\n\n";
             });
-            controller.enqueue(streamError ? encoder.encode(parsedOutput) : value);
+            if (parsedOutput) controller.enqueue(encoder.encode(parsedOutput));
             if (streamError) sawDone = true;
           }
           if (sawDone) break;
         }
+        buffer += decoder.decode();
         if (buffer) {
           buffer += "\n\n";
           if (transformChunk) emitTransformed(controller);
           else {
-            consumeOpenAiStreamBuffer(buffer, (chunk) => { streamError = streamError || noteChunk(chunk); }, () => { sawDone = true; });
+            let parsedOutput = "";
+            consumeOpenAiStreamBuffer(buffer, (chunk) => {
+              const error = noteChunk(chunk);
+              if (error) {
+                streamError = streamError || error;
+                parsedOutput += errorEvent(error);
+              } else {
+                parsedOutput += "data: " + JSON.stringify(chunk) + "\n\n";
+              }
+            }, () => { sawDone = true; });
+            if (parsedOutput) controller.enqueue(encoder.encode(parsedOutput));
             if (streamError && !sawDone) {
-              controller.enqueue(errorChunk(streamError));
               sawDone = true;
             }
           }
         }
         if (!sawDone && closeReason === "done") {
-          closeReason = "eof";
-          failureStatus = failureStatus || 502;
-          controller.enqueue(errorChunk("Upstream stream ended without [DONE]."));
+          if (finishReason) {
+            closeReason = "eof_grace";
+            controller.enqueue(doneChunk);
+          } else {
+            closeReason = "eof";
+            failureStatus = failureStatus || 502;
+            controller.enqueue(errorChunk("Upstream stream ended without [DONE]."));
+          }
         }
         finish();
         controller.close();
@@ -1472,12 +1488,12 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   });
 }
 
-export function withSseKeepAlive(body, intervalMs = SSE_KEEPALIVE_MS) {
+export function withSseKeepAlive(body, intervalMs = _sseKeepaliveMs) {
   if (!body) return body;
   const encoder = new TextEncoder();
   const ping = encoder.encode(": keepalive\n\n");
   const errorChunk = (error) => encoder.encode("data: " + JSON.stringify(openAiError(error?.message || "Stream error.", "server_error")) + "\n\n");
-  const interval = Math.max(1, Number(intervalMs) || SSE_KEEPALIVE_MS);
+  const interval = Math.max(1, Number(intervalMs) || _sseKeepaliveMs);
   let reader = null;
   let timer = null;
   let closed = false;
@@ -1566,7 +1582,7 @@ function streamPendingSseResponse(open, initial, heartbeat, errorEvent) {
         }
       };
       send(initialChunk);
-      timer = setInterval(() => { if (controller.desiredSize > 0) send(heartbeatChunk); }, SSE_KEEPALIVE_MS);
+      timer = setInterval(() => { if (controller.desiredSize > 0) send(heartbeatChunk); }, _sseKeepaliveMs);
       (async () => {
         try {
           const body = await open();
@@ -1639,10 +1655,34 @@ function safeJson(text) {
 }
 
 function normalizeOpenAiLogUsage(usage, fallbackPrompt, fallbackCompletion) {
+  const reportedCompletion = Number(usage?.completion_tokens ?? usage?.output_tokens);
   return {
     prompt_tokens: Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? fallbackPrompt) || 0),
-    completion_tokens: Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? fallbackCompletion) || 0),
+    completion_tokens: Math.max(0, Number.isFinite(reportedCompletion) && reportedCompletion > 0 ? reportedCompletion : fallbackCompletion),
   };
+}
+
+function normalizeChatUsageChunk(usage, outputText = "", fallbackPrompt = 0) {
+  return withFallbackChatUsage(usage, fallbackPrompt, outputText ? estimateTokens(outputText) : 0);
+}
+
+function withFallbackChatUsage(usage, fallbackPrompt, fallbackCompletion) {
+  if (!usage || typeof usage !== "object") return null;
+  const next = { ...usage };
+  const reportedCompletion = Number(next.completion_tokens ?? next.output_tokens);
+  const reportedInput = Number(next.prompt_tokens ?? next.input_tokens);
+  if ((!Number.isFinite(reportedCompletion) || reportedCompletion <= 0) && fallbackCompletion > 0) {
+    next.completion_tokens = fallbackCompletion;
+    if (next.output_tokens != null) next.output_tokens = next.completion_tokens;
+  }
+  if ((!Number.isFinite(reportedInput) || reportedInput <= 0) && fallbackPrompt > 0) {
+    next.prompt_tokens = fallbackPrompt;
+  }
+  const reportedTotal = Number(next.total_tokens);
+  if (!Number.isFinite(reportedTotal) || reportedTotal <= 0) {
+    next.total_tokens = Math.max(0, Number(next.prompt_tokens || 0) + Number(next.completion_tokens || 0));
+  }
+  return next;
 }
 
 function estimateOpenAiCompletionTokens(payload) {
@@ -1799,8 +1839,16 @@ function responseFinishReason(payload) {
   return [...reasons].join(",");
 }
 
-function shouldApplyToolFinishGrace(finishReason) {
-  return String(finishReason || "").split(",").includes("tool_calls");
+function shouldApplyFinishGrace(finishReason) {
+  return Boolean(String(finishReason || "").trim());
+}
+
+async function readSseChunk(reader, finishReason = "") {
+  if (!shouldApplyFinishGrace(finishReason)) return reader.read();
+  return Promise.race([
+    reader.read(),
+    sleep(SSE_FINISH_GRACE_MS).then(() => ({ finishGrace: true })),
+  ]);
 }
 
 function noteStreamToolCalls(chunk, seen) {
@@ -3423,7 +3471,8 @@ function openAiFinishToAnthropicStop(reason) {
 function normalizeAnthropicUsage(usage, content = []) {
   const input = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
   const outputFallback = estimateTokens((content || []).map((block) => block.text || JSON.stringify(block.input || "")).join(""));
-  const output = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? outputFallback) || 0);
+  const reportedOutput = Number(usage?.completion_tokens ?? usage?.output_tokens);
+  const output = Math.max(0, Number.isFinite(reportedOutput) && reportedOutput > 0 ? reportedOutput : outputFallback);
   return { input_tokens: input, output_tokens: output };
 }
 
@@ -3678,6 +3727,9 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
         store: translated.seed.store === true,
         output_text: openaiPayload.output_text ?? chatContentToText((openaiPayload.output || []).filter((item) => item.type === "message").flatMap((item) => item.content || []).map((part) => part.text || "").join("")),
       };
+      if (responsePayload.usage) {
+        responsePayload.usage = normalizeResponsesUsage(responsePayload.usage, estimateTokens(responsePayload.output_text || ""));
+      }
     } else {
       const choice = (openaiPayload.choices || [])[0] || {};
       const message = choice.message || {};
@@ -3797,7 +3849,7 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
     const stripText = hideReasoning ? createThinkTagStripper() : null;
     const processChunk = (chunk, now = Date.now()) => {
       streamError = streamEventErrorMessage(chunk) || streamError;
-      usage = chunk.usage || usage;
+      usage = normalizeChatUsageChunk(chunk.usage, outputText, seed.promptTokens) || usage;
       finishReason = responseFinishReason(chunk) || finishReason;
       const content = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
       const text = hideReasoning && stripText ? stripText(content) : content;
@@ -3812,7 +3864,13 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
     try {
       const reader = openaiResp.body.getReader();
       for (;;) {
-        const { done, value } = await reader.read();
+        const result = await readSseChunk(reader, finishReason);
+        if (result.finishGrace) {
+          closeReason = "finish_grace";
+          Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+          break;
+        }
+        const { done, value } = result;
         if (done) break;
         const now = Date.now();
         noteStreamByte(diag, now);
@@ -3823,24 +3881,37 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
         if (streamError) throw new Error(streamError);
         if (sawDone) break;
       }
+      buffer += decoder.decode();
       if (buffer) {
         const writes = [];
         consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; });
         await Promise.all(writes);
         if (streamError) throw new Error(streamError);
       }
-      if (seed.echo && !emitted) await write(completionChunk(seed.prompt));
-      await write(completionChunk("", finishReason || "stop", usage || undefined));
-      await writer.write(encoder.encode("data: [DONE]\n\n"));
-      if (!sawDone) closeReason = "eof";
-      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
-        close_reason: closeReason,
-        finish_reason: finishReason,
-        ...streamDiagExtra(diag),
-      });
+      if (!sawDone && !finishReason) {
+        closeReason = "eof";
+        await write({ error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+        if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
+          status: 502,
+          close_reason: closeReason,
+          finish_reason: finishReason,
+          ...streamDiagExtra(diag),
+        });
+      } else {
+        if (!sawDone) closeReason = "eof_grace";
+        if (seed.echo && !emitted) await write(completionChunk(seed.prompt));
+        await write(completionChunk("", finishReason || "stop", usage || undefined));
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
+        if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
+          close_reason: closeReason,
+          finish_reason: finishReason,
+          ...streamDiagExtra(diag),
+        });
+      }
     } catch (error) {
       closeReason = "error";
       if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
+        status: 502,
         close_reason: closeReason,
         finish_reason: finishReason,
         ...streamDiagExtra(diag),
@@ -3973,30 +4044,72 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
 function nativeResponsesStream(body, onDone) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
+  const encoder = new TextEncoder();
   const decoder = new TextDecoder();
+  const writeEvent = (event) => writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
   (async () => {
     let buffer = "";
     let usage = null;
     let finishReason = "";
+    let sawDone = false;
+    let completed = false;
+    let outputChars = 0;
+    let closeReason = "done";
     const reader = body.getReader();
+    const processChunk = (chunk) => {
+      if (chunk.usage) usage = chunk.usage;
+      if (chunk.type === "response.completed") {
+        completed = true;
+        finishReason = "stop";
+        const response = chunk.response || {};
+        const normalizedUsage = normalizeResponsesUsage(response.usage, Math.round(outputChars / 4));
+        if ((!response.usage || (Number(response.usage.output_tokens ?? response.usage.completion_tokens) || 0) <= 0) && outputChars > 0) {
+          return { ...chunk, response: { ...response, usage: normalizedUsage } };
+        }
+      }
+      if (chunk.type === "response.output_text.delta") outputChars += String(chunk.delta || "").length;
+      if (chunk.type === "response.function_call_arguments.delta") outputChars += String(chunk.delta || "").length;
+      return chunk;
+    };
     for (;;) {
-      const { done, value } = await reader.read();
+      const result = await readSseChunk(reader, finishReason);
+      if (result.finishGrace) {
+        closeReason = "finish_grace";
+        Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
+        break;
+      }
+      const { done, value } = result;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
-        usage = chunk.usage || usage;
-        finishReason = chunk.type === "response.completed" ? "stop" : finishReason;
-      });
-      await writer.write(value);
+      const events = [];
+      buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; });
+      for (const event of events) await writeEvent(event);
+      if (sawDone) break;
     }
-    if (buffer) consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => {
-      usage = chunk.usage || usage;
-      finishReason = chunk.type === "response.completed" ? "stop" : finishReason;
+    buffer += decoder.decode();
+    if (buffer) {
+      const events = [];
+      consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; });
+      for (const event of events) await writeEvent(event);
+    }
+    if (!sawDone && !completed) {
+      closeReason = "eof";
+      await writeEvent({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+    } else {
+      if (!sawDone) {
+        closeReason = "eof_grace";
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
+      }
+    }
+    onDone?.(normalizeResponsesUsage(usage, Math.round(outputChars / 4)), {
+      close_reason: closeReason,
+      finish_reason: finishReason,
+      ...(closeReason === "eof" ? { status: 502 } : {}),
     });
-    onDone?.(normalizeResponsesUsage(usage), { finish_reason: finishReason });
     await writer.close();
   })().catch(async (error) => {
-    onDone?.(null, { finish_reason: "error", error: error.message });
+    onDone?.(null, { close_reason: "error", finish_reason: "error", status: 502, error: error.message });
     try { await writer.abort(error); } catch {}
   });
   return readable;
@@ -4337,7 +4450,8 @@ function makeResponsesPayload(seed, { text = "", usage = null, status = "complet
 
 function normalizeResponsesUsage(usage, fallbackOutput = 0) {
   const input = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
-  const output = Math.max(0, Number(usage?.completion_tokens ?? usage?.output_tokens ?? fallbackOutput) || 0);
+  const reportedOutput = Number(usage?.completion_tokens ?? usage?.output_tokens);
+  const output = Math.max(0, Number.isFinite(reportedOutput) && reportedOutput > 0 ? reportedOutput : fallbackOutput);
   return {
     input_tokens: input,
     input_tokens_details: { cached_tokens: Number(usage?.prompt_tokens_details?.cached_tokens || usage?.input_tokens_details?.cached_tokens || 0) || 0 },
@@ -4508,12 +4622,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
 
       const reader = openaiResp.body.getReader();
       for (;;) {
-        const result = shouldApplyToolFinishGrace(finishReason) && !sawDone
-          ? await Promise.race([
-            reader.read(),
-            sleep(SSE_FINISH_GRACE_MS).then(() => ({ finishGrace: true })),
-          ])
-          : await reader.read();
+        const result = await readSseChunk(reader, finishReason);
         if (result.finishGrace) {
           closeReason = "finish_grace";
           Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
@@ -4529,11 +4638,26 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
         await Promise.all(writes);
         if (sawDone) break;
       }
+      buffer += decoder.decode();
       if (buffer) {
         const writes = [];
         consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; });
         await Promise.all(writes);
       }
+      if (!sawDone && !finishReason) {
+        closeReason = "eof";
+        try { await stopOpenBlocks(); } catch {}
+        await write("error", { type: "error", error: { type: "api_error", message: "Upstream stream ended without [DONE]." } });
+        if (onDone) onDone(normalizeAnthropicUsage(usage, [{ text: outputText }]), {
+          status: 502,
+          close_reason: closeReason,
+          finish_reason: finishReason,
+          tool_calls_count: toolBlocks.size,
+          ...streamDiagExtra(diag),
+        });
+        return;
+      }
+      if (!sawDone) closeReason = "eof_grace";
       await stopOpenBlocks();
       const stopReason = openAiFinishToAnthropicStop(finishReason);
       const finalUsage = normalizeAnthropicUsage(usage, [{ text: outputText }]);
@@ -4552,6 +4676,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       try { await stopOpenBlocks(); } catch {}
       await write("error", { type: "error", error: { type: "api_error", message: error.message || "Stream error." } });
       if (onDone) onDone(normalizeAnthropicUsage(usage, [{ text: outputText }]), {
+        status: 502,
         close_reason: closeReason,
         finish_reason: finishReason,
         tool_calls_count: toolBlocks.size,
@@ -4582,6 +4707,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     let usage = null;
     let streamError = "";
     let finishReason = "";
+    let sawDone = false;
     const toolCalls = new Map();
     let nextOutputIndex = 1;
     const diag = createStreamDiag(started);
@@ -4596,7 +4722,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     };
     const processChunk = (chunk, now = Date.now()) => {
       streamError = streamEventErrorMessage(chunk) || streamError;
-      usage = chunk.usage || usage;
+      usage = withFallbackChatUsage(chunk.usage, 0, Math.round(outputChars / 4)) || usage;
       finishReason = responseFinishReason(chunk) || finishReason;
       const delta = (chunk.choices || [])[0]?.delta || {};
       const reasoningDelta = hideReasoning ? "" : reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
@@ -4640,17 +4766,25 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
 
       const reader = openaiResp.body.getReader();
       for (;;) {
-        const { done, value } = await reader.read();
+        const result = await readSseChunk(reader, finishReason);
+        if (result.finishGrace) {
+          closeReason = "finish_grace";
+          Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+          break;
+        }
+        const { done, value } = result;
         if (done) break;
         const now = Date.now();
         noteStreamByte(diag, now);
         buffer += decoder.decode(value, { stream: true });
-        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => processChunk(chunk, now));
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => processChunk(chunk, now), () => { sawDone = true; });
         await Promise.all(writes.splice(0));
         if (streamError) throw new Error(streamError);
+        if (sawDone) break;
       }
+      buffer += decoder.decode();
       if (buffer) {
-        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => processChunk(chunk));
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => processChunk(chunk), () => { sawDone = true; });
         await Promise.all(writes.splice(0));
         if (streamError) throw new Error(streamError);
       }
@@ -4658,6 +4792,15 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       const text = textParts.join("");
       const reasoning = reasoningParts.join("");
       for (const item of toolCalls.values()) item.arguments = item.argumentParts.join("");
+      if (!sawDone && !finishReason) {
+        closeReason = "eof";
+        const failedResponse = { ...makeResponsesPayload(seed, { text, reasoning, usage, status: "failed" }), error: { message: "Upstream stream ended without [DONE].", type: "server_error" } };
+        if (onFinal) onFinal(failedResponse);
+        await write({ type: "response.failed", response: failedResponse });
+        await write({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+        return;
+      }
+      if (!sawDone) closeReason = "eof_grace";
       const donePart = { type: "output_text", text, annotations: [] };
       await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: 0, content_index: 0, text });
       await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: 0, content_index: 0, part: donePart });
@@ -4684,6 +4827,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
     } finally {
       if (onDone) onDone(normalizeResponsesUsage(usage, Math.round(outputChars / 4)), {
+        ...(closeReason === "eof" || closeReason === "error" ? { status: 502 } : {}),
         close_reason: closeReason,
         finish_reason: finishReason,
         tool_calls_count: toolCalls.size,
