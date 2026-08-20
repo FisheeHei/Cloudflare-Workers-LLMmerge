@@ -854,8 +854,6 @@ assert.equal(adminPage.includes("global-context-input"), true);
 assert.equal(adminPage.includes("system-prompt-client-scope"), true);
 assert.equal(adminPage.includes("subagent-prompt-client-scope"), true);
 assert.equal(adminPage.includes("global-context-client-scope"), true);
-assert.equal(adminPage.includes("__platform_"), true);
-assert.equal(adminPage.includes("Rikkahub"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("context-on-demand"), true);
@@ -2216,65 +2214,41 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), scopedEnv);
 assert.deepEqual(speedBodies.at(-1).messages, []);
 
-const platformStore = new Map();
-platformStore.set("gateway:config", JSON.stringify({
+const noPlatformStore = new Map();
+noPlatformStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
   settings: {
     model_cache_ttl: 3600,
     request_timeout_ms: 30000,
     upstream_cooldown_ttl: 60,
     system_prompt: "Platform system.",
-    system_prompt_clients: ["__platform_opencode"],
-    subagent_prompt_clients: ["__platform_codex", "__platform_myagent"],
-    global_context: "Platform context.",
-    global_context_clients: ["__platform_rikkahub"],
+    system_prompt_clients: ["__platform_codex"],
   },
   upstreams: [
     { name: "platform", base_url: "https://speed-fast.example/v1", api_key_encrypted: "p", models: ["platform-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
-const platformEnv = {
+const noPlatformEnv = {
   ADMIN_TOKEN: "admin-test-token",
   ...env,
   KV: {
     async get(key, type) {
-      const value = platformStore.get(key);
+      const value = noPlatformStore.get(key);
       return type === "json" && value ? JSON.parse(value) : value || null;
     },
-    async put(key, value) { platformStore.set(key, value); },
-    async delete(key) { platformStore.delete(key); },
+    async put(key, value) { noPlatformStore.set(key, value); },
+    async delete(key) { noPlatformStore.delete(key); },
   },
   CLIENTS_JSON: JSON.stringify([
-    { id: "platform-client", name: "platform-client", key: "sk-platform", models: ["*"], upstreams: ["platform"], metadata: { platform: "opencode,codex" } },
-    { id: "platform-rikka-client", name: "platform-rikka-client", key: "sk-platform-rikka", models: ["*"], upstreams: ["platform"], metadata: { platform: "rikkahub" } },
-    { id: "platform-myc-client", name: "platform-myc-client", key: "sk-platform-myc", models: ["*"], upstreams: ["platform"], metadata: { platform: "myagent" } },
+    { id: "platform-client", name: "platform-client", key: "sk-platform", models: ["*"], upstreams: ["platform"], metadata: { platform: "codex" } },
   ]),
 };
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-platform", "content-type": "application/json" },
   body: JSON.stringify({ model: "platform-model", messages: [] }),
-}), platformEnv);
-assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), true);
-assert.equal(speedBodies.at(-1).messages[0].content.includes("use subagents"), true);
-assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform context."), false);
-
-await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-platform-rikka", "content-type": "application/json" },
-  body: JSON.stringify({ model: "platform-model", messages: [] }),
-}), platformEnv);
-assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), false);
-assert.equal(speedBodies.at(-1).messages.length, 1);
-assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform context."), true);
-
-await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-platform-myc", "content-type": "application/json" },
-  body: JSON.stringify({ model: "platform-model", messages: [] }),
-}), platformEnv);
-assert.equal(speedBodies.at(-1).messages[0].content.includes("use subagents"), true);
-assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), false);
+}), noPlatformEnv);
+assert.deepEqual(speedBodies.at(-1).messages, []);
 
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({

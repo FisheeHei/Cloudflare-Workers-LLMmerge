@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-21-client-key-scope-only";
+const VERSION = "v26-08-21-scope-keys-clean";
 
 export default {
   async fetch(request, env, ctx) {
@@ -5098,25 +5098,12 @@ function clientIdentitySet(client) {
   return new Set([client?.id, client?.name, client?.key].map((item) => String(item || "").trim()).filter(Boolean));
 }
 
-function clientPlatforms(client) {
-  const platforms = new Set();
-  const add = (value) => String(value || "").split(",").map((item) => item.trim().toLowerCase().replace(/^__platform_/, "")).filter(Boolean).forEach((item) => platforms.add(item));
-  const metadata = client?.metadata || {};
-  add(metadata.platform);
-  if (Array.isArray(metadata.platforms)) for (const item of metadata.platforms) add(item);
-  return platforms;
-}
-
 function promptAppliesToClient(scope, client, clientIds) {
   const list = normalizeStringArray(scope);
   if (!list.length || list.includes("*") || list.includes("__all__")) return true;
   if (list.includes("__none__")) return false;
   const ids = clientIds || clientIdentitySet(client);
-  if (list.some((item) => ids.has(item))) return true;
-  if (list.some((item) => item.startsWith("__platform_"))) {
-    return [...clientPlatforms(client)].some((platform) => list.includes("__platform_" + platform));
-  }
-  return false;
+  return list.some((item) => ids.has(item));
 }
 
 async function isRetryableUpstreamResponse(response) {

@@ -185,9 +185,8 @@ curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \
 - `*` 或 `__all__`：全部客户端
 - `__none__`：不生效
 - 客户端 `id` / `name` / `key`：精确匹配
-- `__platform_*`：按平台匹配，平台标记必须挂在已有的客户端 Key 上，例如 `__platform_opencode`、`__platform_openclaw`、`__platform_codex`、`__platform_rikkahub`、`__platform_cherrystudio`、`__platform_claude`
 
-生效客户端只认已有的客户端 Key；平台匹配也只在已有 Key 的 `metadata.platform` / `metadata.platforms` 上判定。客户端列表里可以给每个 Key 填写平台标记（逗号分隔多个），作用域 chips 只来自已有 Keys 和它们实际标记的平台。
+生效客户端只认已有的客户端 Key，未出现在客户端列表中的标识不会触发注入。
 
 ## 使用
 

@@ -1606,17 +1606,6 @@ function renderAdminScript(version) {
     renderPromptContextStatus("\u5f85\u4fdd\u5b58");
   }
 
-  const PROMPT_PLATFORM_CHIPS = [
-    ["opencode", "OpenCode"],
-    ["openclaw", "OpenClaw"],
-    ["codex", "Codex"],
-    ["rikkahub", "Rikkahub"],
-    ["cherrystudio", "Cherry Studio"],
-    ["claude", "Claude Code"],
-    ["cursor", "Cursor"],
-    ["chatgpt", "ChatGPT"],
-  ];
-
   function clientScopeHtml(selected, forceAll) {
     const ids = new Set(selected || []);
     const clients = state.clients || [];
@@ -1624,17 +1613,6 @@ function renderAdminScript(version) {
     let html = forceAll
       ? clientScopeChip("__none__", "\u4e0d\u542f\u7528\u5168\u91cf", !ids.size) + clientScopeChip("*", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive)
       : clientScopeChip("__all__", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive);
-    const platforms = new Set();
-    clients.forEach((c) => {
-      const metadata = c.metadata || {};
-      [metadata.platform, ...(Array.isArray(metadata.platforms) ? metadata.platforms : [])].forEach((value) => {
-        String(value || "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean).forEach((item) => platforms.add(item));
-      });
-    });
-    html += [...platforms].map((value) => {
-      const known = PROMPT_PLATFORM_CHIPS.find(([key]) => key === value);
-      return clientScopeChip("__platform_" + value, known ? known[1] : value, !allActive && ids.has("__platform_" + value));
-    }).join("");
     html += clients.length
       ? clients.map(function(c) {
         const id = text(c.id || c.name || c.key).trim();
@@ -1716,16 +1694,7 @@ function renderAdminScript(version) {
   function promptScopeLabel(id, emptyLabel) {
     const values = selectedPromptClients(id);
     if (values.includes("*")) return "\u5168\u90e8";
-    if (!values.length) return emptyLabel;
-    return values.map((value) => {
-      if (value === "__all__") return "\u5168\u90e8";
-      if (value.startsWith("__platform_")) {
-        const key = value.slice("__platform_".length);
-        const chip = PROMPT_PLATFORM_CHIPS.find(([platform]) => platform === key);
-        return chip ? chip[1] : key;
-      }
-      return value;
-    }).join(", ");
+    return values.length || emptyLabel;
   }
 
   function renderPromptContextStatus(prefix) {
@@ -2691,7 +2660,6 @@ async function loadKvUsage() {
           '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
           '<span class="note">' + clientUsageText(c.today_usage) + '</span>' +
         '</div>' +
-        '<input class="client-platform" data-client-platform="' + esc(c.id) + '" value="' + esc(clientPlatformText(c)) + '" placeholder="\u5e73\u53f0\u6807\u8bb0\uff0c\u9017\u53f7\u5206\u9694">' +
         '<button type="button" class="small secondary" data-copy-client-id="' + esc(c.id) + '">\u590d\u5236 Key</button>' +
         '<button type="button" class="small secondary" data-copy-client-setup="' + esc(c.id) + '">\u590d\u5236\u914d\u7f6e</button>' +
         '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '">\u5220\u9664</button>' +
@@ -2715,32 +2683,6 @@ async function loadKvUsage() {
         });
       });
     });
-    host.querySelectorAll("input[data-client-platform]").forEach((input) => {
-      input.addEventListener("change", async () => {
-        const record = state.clients.find((c) => c.id === input.dataset.clientPlatform);
-        if (!record) return;
-        const value = input.value.trim();
-        try {
-          const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(input.dataset.clientPlatform), {
-            method: "PUT",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ metadata: { ...(record.metadata || {}), platform: value } }),
-          });
-          const payload = await parseApiResponse(resp);
-          if (!resp.ok) throw new Error(payload?.error?.message || "\u66f4\u65b0\u5931\u8d25");
-          await loadClients();
-          showToast("\u5df2\u66f4\u65b0\u5e73\u53f0\u6807\u8bb0");
-        } catch (error) {
-          input.value = clientPlatformText(record);
-          showError(error);
-        }
-      });
-    });
-  }
-
-  function clientPlatformText(client) {
-    const metadata = client && client.metadata || {};
-    return text(metadata.platform || (Array.isArray(metadata.platforms) ? metadata.platforms.join(", ") : ""));
   }
 
   async function createClient() {
