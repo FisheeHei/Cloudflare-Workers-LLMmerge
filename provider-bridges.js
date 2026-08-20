@@ -150,6 +150,10 @@ function modelFamily(modelName) {
   return Object.entries(MODEL_FAMILY_PATTERNS).find(([, pattern]) => pattern.test(value))?.[0] || "generic";
 }
 
+function isNimDeepSeekV4Model(modelName) {
+  return /(^|[\/_.-])deepseek[\/_.-]*v4([\/_.-]|$)/i.test(String(modelName || ""));
+}
+
 function glmThinkingRequested(payload) {
   return hasReasoningInput(payload, { includeSummary: true });
 }
@@ -167,6 +171,7 @@ function bodyNeedsSanitizing(bodyText, bodyLower) {
     bodyText.includes('"enable_thinking"') ||
     bodyText.includes('"chat_template_kwargs"') ||
     bodyText.includes('"developer"') ||
+    bodyLower.includes("deepseek") ||
     bodyLower.includes("kimi-k2") ||
     bodyText.includes('"functions"') ||
     bodyText.includes('"function_call"') ||
@@ -514,6 +519,7 @@ function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
   const isQwen = family === "qwen";
   const isKimi = family === "kimi";
   const isNemotron3 = family === "nemotron-3";
+  const isDeepSeekV4 = family === "deepseek" && isNimDeepSeekV4Model(modelName);
   const reasoningEffort = nimFamilyReasoningEffort(family, payload);
   if (isGlm) {
     if (glmThinkingRequested(payload)) {
@@ -560,7 +566,17 @@ function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
     changed = removeNimReasoningPayloadFields(payload, { keepReasoningBudget: true }) || changed;
   }
 
-  if (reasoningEffort) {
+  if (isDeepSeekV4) {
+    let effort = reasoningEffort;
+    if (!effort && payload?.chat_template_kwargs?.reasoning_effort != null) {
+      effort = mapNimReasoningEffort(payload.chat_template_kwargs.reasoning_effort, ["none", "high", "max"], "high");
+    }
+    setChatTemplateKwargs(payload, { reasoning_effort: effort || "high" });
+    changed = true;
+    changed = removeNimReasoningPayloadFields(payload) || changed;
+  }
+
+  if (reasoningEffort && !isDeepSeekV4) {
     if (payload.reasoning_effort !== reasoningEffort) {
       payload.reasoning_effort = reasoningEffort;
       changed = true;

@@ -1606,6 +1606,17 @@ function renderAdminScript(version) {
     renderPromptContextStatus("\u5f85\u4fdd\u5b58");
   }
 
+  const PROMPT_PLATFORM_CHIPS = [
+    ["opencode", "OpenCode"],
+    ["openclaw", "OpenClaw"],
+    ["codex", "Codex"],
+    ["rikkahub", "Rikkahub"],
+    ["cherrystudio", "Cherry Studio"],
+    ["claude", "Claude Code"],
+    ["cursor", "Cursor"],
+    ["chatgpt", "ChatGPT"],
+  ];
+
   function clientScopeHtml(selected, forceAll) {
     const ids = new Set(selected || []);
     const clients = state.clients || [];
@@ -1613,6 +1624,7 @@ function renderAdminScript(version) {
     let html = forceAll
       ? clientScopeChip("__none__", "\u4e0d\u542f\u7528\u5168\u91cf", !ids.size) + clientScopeChip("*", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive)
       : clientScopeChip("__all__", "\u5168\u90e8\u5ba2\u6237\u7aef", allActive);
+    html += PROMPT_PLATFORM_CHIPS.map(([value, label]) => clientScopeChip("__platform_" + value, label, !allActive && ids.has("__platform_" + value))).join("");
     if (!clients.length) return html + '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
     return html +
       clients.map(function(c) {
@@ -1691,7 +1703,16 @@ function renderAdminScript(version) {
   function promptScopeLabel(id, emptyLabel) {
     const values = selectedPromptClients(id);
     if (values.includes("*")) return "\u5168\u90e8";
-    return values.length || emptyLabel;
+    if (!values.length) return emptyLabel;
+    return values.map((value) => {
+      if (value === "__all__") return "\u5168\u90e8";
+      if (value.startsWith("__platform_")) {
+        const key = value.slice("__platform_".length);
+        const chip = PROMPT_PLATFORM_CHIPS.find(([platform]) => platform === key);
+        return chip ? chip[1] : key;
+      }
+      return value;
+    }).join(", ");
   }
 
   function renderPromptContextStatus(prefix) {

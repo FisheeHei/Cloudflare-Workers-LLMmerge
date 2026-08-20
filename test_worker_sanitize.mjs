@@ -40,6 +40,7 @@ const softFastHits = [];
 const attemptBudgetHits = [];
 const nimHits = [];
 const nimLocalHits = [];
+const nimDeepSeekHits = [];
 const responseHits = [];
 const responseStreamHits = [];
 const nativeResponseHits = [];
@@ -719,6 +720,23 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("nim-deepseek.example")) {
+    const body = JSON.parse(init.body);
+    nimDeepSeekHits.push(body);
+    if (body.stream) {
+      return new Response([
+        'data: {"model":"deepseek-ai/deepseek-v4-flash-0731","choices":[{"delta":{"reasoning_content":"thinking step "}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify({
+      id: "nim-deepseek",
+      model: body.model,
+      choices: [{ message: { reasoning_content: "thinking step one", content: "answer text" } }],
+      usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).endsWith("/models")) {
     return new Response(JSON.stringify({ data: [
       { id: "deepseek-ai/deepseek-v4-pro" },
@@ -828,6 +846,8 @@ assert.equal(adminPage.includes("global-context-input"), true);
 assert.equal(adminPage.includes("system-prompt-client-scope"), true);
 assert.equal(adminPage.includes("subagent-prompt-client-scope"), true);
 assert.equal(adminPage.includes("global-context-client-scope"), true);
+assert.equal(adminPage.includes("__platform_"), true);
+assert.equal(adminPage.includes("Rikkahub"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("context-on-demand"), true);
@@ -1396,6 +1416,81 @@ const deepSeekLeakMessagesStreamText = await deepSeekLeakMessagesStreamResp.text
 assertNoDeepSeekLeak(deepSeekLeakMessagesStreamText);
 assert.equal(deepSeekLeakMessagesStreamText.includes('"type":"thinking_delta"'), false);
 assert.equal(deepSeekLeakMessagesStreamText.includes('"text":"visible"'), true);
+
+const nimDeepSeekStore = new Map();
+nimDeepSeekStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: {},
+  upstreams: [
+    { name: "nim-deepseek", preset: "nvidia-nim", base_url: "https://nim-deepseek.example/v1", api_key: "n", models: ["deepseek-ai/deepseek-v4-flash-0731"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const nimDeepSeekEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = nimDeepSeekStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { nimDeepSeekStore.set(key, value); },
+    async delete(key) { nimDeepSeekStore.delete(key); },
+  },
+  UPSTREAMS_JSON: JSON.stringify([]),
+  CLIENTS_JSON: JSON.stringify([{ name: "nim-deepseek-client", key: "sk-nim-deepseek", models: ["*"], upstreams: ["nim-deepseek"] }]),
+};
+const nimDeepSeekStart = nimDeepSeekHits.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", messages: [], reasoningEffort: "high" }),
+}), nimDeepSeekEnv);
+assert.deepEqual(nimDeepSeekHits[nimDeepSeekStart].chat_template_kwargs, { reasoning_effort: "high" });
+assert.equal("reasoning_effort" in nimDeepSeekHits[nimDeepSeekStart], false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", messages: [] }),
+}), nimDeepSeekEnv);
+assert.deepEqual(nimDeepSeekHits[nimDeepSeekStart + 1].chat_template_kwargs, { reasoning_effort: "high" });
+
+const nimDeepSeekChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", messages: [], reasoningEffort: "high" }),
+}), nimDeepSeekEnv);
+const nimDeepSeekChatText = await nimDeepSeekChatResp.text();
+assert.equal(nimDeepSeekChatText.includes('"reasoning_content":"thinking step one"'), true);
+assert.equal(nimDeepSeekChatText.includes('"content":"answer text"'), true);
+
+const nimDeepSeekStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", messages: [], stream: true, reasoningEffort: "high" }),
+}), nimDeepSeekEnv);
+const nimDeepSeekStreamText = await nimDeepSeekStreamResp.text();
+assert.equal(nimDeepSeekStreamText.includes('"reasoning_content":"thinking step "'), true);
+assert.equal(nimDeepSeekStreamText.includes('"content":"answer"'), true);
+assert.equal(nimDeepSeekStreamText.includes("data: [DONE]"), true);
+
+const nimDeepSeekMessagesResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-nim-deepseek", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", max_tokens: 64, messages: [{ role: "user", content: "hi" }] }),
+}), nimDeepSeekEnv);
+const nimDeepSeekMessagesText = await nimDeepSeekMessagesResp.text();
+assert.equal(nimDeepSeekMessagesText.includes('"type":"thinking"'), true);
+assert.equal(nimDeepSeekMessagesText.includes('"thinking":"thinking step one"'), true);
+
+const nimDeepSeekResponsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", input: "hi" }),
+}), nimDeepSeekEnv);
+const nimDeepSeekResponsesText = await nimDeepSeekResponsesResp.text();
+assert.equal(nimDeepSeekResponsesText.includes('"type":"reasoning"'), true);
+assert.equal(nimDeepSeekResponsesText.includes('"summary":[{"type":"summary_text","text":"thinking step one"}]'), true);
 
 const moonshotEnv = {
   ADMIN_TOKEN: "admin-test-token",
@@ -2090,6 +2185,57 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "scoped-model", messages: [] }),
 }), scopedEnv);
 assert.deepEqual(speedBodies.at(-1).messages, []);
+
+const platformStore = new Map();
+platformStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: {
+    model_cache_ttl: 3600,
+    request_timeout_ms: 30000,
+    upstream_cooldown_ttl: 60,
+    system_prompt: "Platform system.",
+    system_prompt_clients: ["__platform_opencode"],
+    subagent_prompt_clients: ["__platform_codex"],
+    global_context: "Platform context.",
+    global_context_clients: ["__platform_rikkahub"],
+  },
+  upstreams: [
+    { name: "platform", base_url: "https://speed-fast.example/v1", api_key_encrypted: "p", models: ["platform-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+}));
+const platformEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = platformStore.get(key);
+      return type === "json" && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { platformStore.set(key, value); },
+    async delete(key) { platformStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([
+    { id: "platform-client", name: "platform-client", key: "sk-platform", models: ["*"], upstreams: ["platform"], metadata: { platform: "codex" } },
+    { id: "platform-rikka-client", name: "platform-rikka-client", key: "sk-platform-rikka", models: ["*"], upstreams: ["platform"] },
+  ]),
+};
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-platform", "content-type": "application/json", "user-agent": "OpenCode/1.0" },
+  body: JSON.stringify({ model: "platform-model", messages: [] }),
+}), platformEnv);
+assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), true);
+assert.equal(speedBodies.at(-1).messages[0].content.includes("use subagents"), true);
+assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform context."), false);
+
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-platform-rikka", "content-type": "application/json", "user-agent": "Rikkahub/0.9" },
+  body: JSON.stringify({ model: "platform-model", messages: [] }),
+}), platformEnv);
+assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform system."), false);
+assert.equal(speedBodies.at(-1).messages.length, 1);
+assert.equal(speedBodies.at(-1).messages[0].content.includes("Platform context."), true);
 
 const speedStore = new Map();
 speedStore.set("gateway:config", JSON.stringify({
