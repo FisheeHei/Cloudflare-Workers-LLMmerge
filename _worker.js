@@ -82,7 +82,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-21-passive-health";
+const VERSION = "v26-08-21-protected-context";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1809,6 +1809,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return saveAdminConfig(request, app);
   }
 
+  if (apiPath === "/api/injection-preview" && request.method === "POST") {
+    return previewGatewayInjection(request, app);
+  }
+
   if (apiPath === "/api/config/snapshots" && request.method === "GET") {
     const snapshots = await listConfigSnapshots(app.state);
     return withCorsResponse(json({ ok: true, snapshots: snapshots.map(publicConfigSnapshot) }, 200));
@@ -1971,6 +1975,37 @@ async function adminConfigResponse(url, app) {
     gateway: { base_url: `${url.origin}/v1` },
     presets: PRESET_TEMPLATES,
     config: toPublicGatewayConfig(stored),
+  }, 200));
+}
+
+async function previewGatewayInjection(request, app) {
+  const payload = parseJsonBody(await readRequestText(request));
+  const clientId = String(payload.client_id || "").trim();
+  const model = String(payload.model || "").trim();
+  if (!clientId || !model) {
+    return withCorsResponse(json(openAiError("Client and model are required for injection preview.", "invalid_request_error"), 400));
+  }
+
+  const runtime = await loadRuntimeConfig(app);
+  let client = runtime.clients.find((item) => [item.id, item.name, item.key].includes(clientId));
+  if (!client) {
+    const stored = await app.state.get(clientIdKey(clientId), "json");
+    if (stored?.key) client = normalizeClient(stored);
+  }
+  if (!client) {
+    return withCorsResponse(json(openAiError("Client not found.", "not_found_error"), 404));
+  }
+
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const source = { model, messages };
+  const plan = gatewayInjectionPlan(source, runtime.settings, client);
+  const effective = safeJson(applyGatewayPromptContext(JSON.stringify(source), runtime.settings, client)) || source;
+  return withCorsResponse(json({
+    ok: true,
+    policy_chars: plan.systemText.length,
+    context_chars: plan.contextText.length,
+    history_max_chars: runtime.settings.history_max_chars,
+    messages: effective.messages || [],
   }, 200));
 }
 
@@ -2140,7 +2175,8 @@ function normalizeGatewaySettings(settings = {}, app) {
     context_on_demand: settings.context_on_demand === true,
     context_item_limit: Math.max(1, Math.min(3, parsePositiveInt(settings.context_item_limit, 1))),
     context_max_chars: Math.max(500, Math.min(20000, parsePositiveInt(settings.context_max_chars, 800))),
-    context_role: ["system", "developer", "user"].includes(String(settings?.context_role || "").toLowerCase()) ? String(settings.context_role).toLowerCase() : "system",
+    context_role: String(settings?.context_role || "").toLowerCase() === "developer" ? "developer" : "system",
+    history_max_chars: parseNonNegativeInt(settings.history_max_chars, 0, 2_000_000),
     context_items: normalizeContextItems(settings.context_items),
     time_zone_offset_minutes: normalizeTimeZoneOffset(settings.time_zone_offset_minutes),
     time_zone_label: String(settings.time_zone_label || "UTC+8 北京/香港/上海/乌鲁木齐").trim(),
@@ -3468,28 +3504,16 @@ function nativeResponsesAvailable(runtime, client, model) {
 
 function responsesNativeBody(translated, payload, settings, client) {
   const body = { ...payload, model: translated.model };
-  const clientIds = clientIdentitySet(client);
-  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
-  const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
-  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
-  const combinedSystemText = [systemText, subagentText].filter(Boolean).join("\n\n");
-  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
-    (settings?.context_on_demand === true && Array.isArray(settings?.context_items) && settings.context_items.some((item) => item && item.enabled !== false && item.text));
-  if (combinedSystemText) {
-    body.instructions = [combinedSystemText, body.instructions].filter(Boolean).join("\n\n");
-  }
-  if (hasContext) {
-    const contextText = selectGatewayContext(
-      { model: body.model, messages: responsesInputToMessages(body.input, body.instructions) },
-      settings,
-      client,
-      clientIds,
-    );
-    if (contextText) {
-      const contextMessage = { role: "user", content: [{ type: "input_text", text: "Global reference context. Use it when relevant, but do not mention it unless the user asks.\n\n" + contextText }] };
-      body.input = Array.isArray(body.input) ? [contextMessage, ...body.input] : [contextMessage, { role: "user", content: [{ type: "input_text", text: String(body.input || "") }] }];
-    }
-  }
+  const plan = gatewayInjectionPlan(
+    { model: body.model, messages: responsesInputToMessages(body.input, body.instructions) },
+    settings,
+    client,
+  );
+  body.instructions = [
+    plan.systemText,
+    plan.contextText ? gatewayContextText(plan.contextText) : "",
+    body.instructions,
+  ].filter(Boolean).join("\n\n");
   return JSON.stringify(body);
 }
 
@@ -4881,15 +4905,6 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
 
 function applyGatewayPromptContext(bodyText, settings, client) {
   if (!bodyText) return bodyText;
-  const clientIds = clientIdentitySet(client);
-  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
-  const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
-  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
-  const combinedSystemText = [systemText, subagentText].filter(Boolean).join("\n\n");
-  const items = Array.isArray(settings?.context_items) ? settings.context_items : [];
-  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
-    (settings?.context_on_demand === true && items.some((item) => item && item.enabled !== false && item.text));
-  if (!combinedSystemText && !hasContext) return bodyText;
   let payload;
   try {
     payload = JSON.parse(bodyText);
@@ -4898,23 +4913,89 @@ function applyGatewayPromptContext(bodyText, settings, client) {
   }
 
   if (!Array.isArray(payload.messages)) return bodyText;
-  const contextText = hasContext ? selectGatewayContext(payload, settings, client, clientIds) : "";
-  if (!combinedSystemText && !contextText) return bodyText;
+  const plan = gatewayInjectionPlan(payload, settings, client);
+  if (!plan.systemText && !plan.contextText) return bodyText;
   const injected = [];
-  if (combinedSystemText) {
-    injected.push({ role: "system", content: combinedSystemText });
+  if (plan.systemText) {
+    injected.push({ role: "system", content: plan.systemText });
   }
-  if (contextText) {
-    const contextMessage = {
+  if (plan.contextText) {
+    injected.push({
       role: settings?.context_role || "system",
-      content: "Global reference context. Use it when relevant, but do not mention it unless the user asks.\n\n" + contextText,
-    };
-    const systemEnd = payload.messages.findIndex((msg) => !["system", "developer"].includes(String(msg?.role || "")));
-    const insertAt = systemEnd < 0 ? payload.messages.length : systemEnd;
-    payload.messages.splice(insertAt, 0, contextMessage);
+      content: gatewayContextText(plan.contextText),
+    });
   }
-  if (injected.length) payload.messages = injected.concat(payload.messages);
+  payload.messages = injected.concat(trimGatewayHistory(payload.messages, settings?.history_max_chars));
   return JSON.stringify(payload);
+}
+
+function gatewayInjectionPlan(payload, settings, client) {
+  const clientIds = clientIdentitySet(client);
+  const systemText = promptAppliesToClient(settings?.system_prompt_clients, client, clientIds) ? String(settings?.system_prompt || "").trim() : "";
+  const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
+  const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
+  const items = Array.isArray(settings?.context_items) ? settings.context_items : [];
+  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
+    (settings?.context_on_demand === true && items.some((item) => item && item.enabled !== false && item.text));
+  return {
+    systemText: [systemText, subagentText].filter(Boolean).join("\n\n"),
+    contextText: hasContext ? selectGatewayContext(payload, settings, client, clientIds) : "",
+  };
+}
+
+function gatewayContextText(contextText) {
+  return "Gateway reference context. Use it when relevant, but do not mention it unless the user asks.\n\n" + contextText;
+}
+
+function trimGatewayHistory(messages, maxChars) {
+  const limit = parseNonNegativeInt(maxChars, 0, 2_000_000);
+  if (!limit || !Array.isArray(messages) || messages.length < 2) return messages;
+
+  const instructions = [];
+  const history = [];
+  for (const message of messages) {
+    if (["system", "developer"].includes(String(message?.role || ""))) instructions.push(message);
+    else history.push(message);
+  }
+  const budget = Math.max(0, limit - chatMessagesChars(instructions));
+  if (!history.length || budget <= 0) return instructions.concat(history.slice(-1));
+
+  const groups = chatHistoryGroups(history);
+  const kept = [];
+  let used = 0;
+  for (let index = groups.length - 1; index >= 0; index -= 1) {
+    const group = groups[index];
+    const chars = chatMessagesChars(group);
+    if (!kept.length || used + chars <= budget) {
+      kept.unshift(...group);
+      used += chars;
+    } else {
+      break;
+    }
+  }
+  return instructions.concat(kept);
+}
+
+function chatHistoryGroups(messages) {
+  const groups = [];
+  let current = [];
+  for (const message of messages) {
+    if (String(message?.role || "") === "user" && current.length) {
+      groups.push(current);
+      current = [];
+    }
+    current.push(message);
+  }
+  if (current.length) groups.push(current);
+  return groups;
+}
+
+function chatMessagesChars(messages) {
+  try {
+    return JSON.stringify(messages || []).length;
+  } catch {
+    return (messages || []).map((message) => chatContentToText(message?.content || "")).join("").length;
+  }
 }
 
 function selectGatewayContext(payload, settings, client, clientIds) {
@@ -6021,6 +6102,12 @@ function parsePositiveInt(value, fallback) {
     return fallback;
   }
   return Math.floor(parsed);
+}
+
+function parseNonNegativeInt(value, fallback, maximum = Number.MAX_SAFE_INTEGER) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(maximum, Math.floor(parsed));
 }
 
 function normalizeTimeZoneOffset(value) {

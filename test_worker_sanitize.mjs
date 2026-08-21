@@ -853,6 +853,8 @@ assert.equal(adminPage.includes("global-context-client-scope"), true);
 assert.equal(adminPage.includes("prompt-splitter-input"), true);
 assert.equal(adminPage.includes("splitPromptContextDraft"), true);
 assert.equal(adminPage.includes("context-on-demand"), true);
+assert.equal(adminPage.includes("history-max-chars"), true);
+assert.equal(adminPage.includes("preview-injection"), true);
 assert.equal(adminPage.includes("context-items"), true);
 assert.equal(adminPage.includes("classifyContextItemsDraft"), true);
 assert.equal(adminPage.includes("export-prompt-config"), true);
@@ -2124,6 +2126,7 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/a
       context_on_demand: true,
       context_item_limit: 2,
       context_max_chars: 2000,
+      history_max_chars: 12000,
       context_items: [
         { title: "Coding", keywords: ["bugfix"], text: "Use tests and minimal patches.", enabled: true, max_chars: 1200 },
         { title: "Travel", keywords: ["hotel"], text: "This travel note should not be injected.", enabled: true, max_chars: 1200 },
@@ -2140,6 +2143,7 @@ const savedConfigPayload = await saveConfigResp.clone().json();
 assert.equal(savedConfigPayload.config.upstreams[0].model_contexts.qwen3, "1m");
 assert.equal(savedConfigPayload.config.settings.global_context, "Project context should guide details.");
 assert.equal(savedConfigPayload.config.settings.context_on_demand, true);
+assert.equal(savedConfigPayload.config.settings.history_max_chars, 12000);
 assert.equal(savedConfigPayload.config.settings.context_items.length, 2);
 
 const snapshotStore = new Map();
@@ -2228,12 +2232,66 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
 }), scopedEnv);
 assert.equal(speedBodies.at(-1).messages[0].content, "Scoped system.\n\nWhen the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.");
 assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped context."), true);
+const injectionPreviewResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/injection-preview", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ client_id: "scoped-client", model: "scoped-model", messages: [{ role: "user", content: "draft a scene" }] }),
+}), scopedEnv);
+assert.equal(injectionPreviewResp.status, 200);
+const injectionPreview = await injectionPreviewResp.json();
+assert.equal(injectionPreview.policy_chars > 0, true);
+assert.equal(injectionPreview.context_chars > 0, true);
+assert.equal(injectionPreview.messages[0].content.includes("Scoped system."), true);
+assert.equal(injectionPreview.messages[1].content.includes("Scoped context."), true);
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-plain", "content-type": "application/json" },
   body: JSON.stringify({ model: "scoped-model", messages: [] }),
 }), scopedEnv);
 assert.deepEqual(speedBodies.at(-1).messages, []);
+
+const historyStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: {
+    model_cache_ttl: 3600,
+    request_timeout_ms: 30000,
+    system_prompt: "Pinned gateway rule.",
+    global_context: "Pinned story bible.",
+    history_max_chars: 120,
+    upstream_cooldown_ttl: 60,
+  },
+  upstreams: [
+    { name: "history", base_url: "https://speed-fast.example/v1", api_key_encrypted: "h", models: ["history-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+})]]);
+const historyEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = historyStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { historyStore.set(key, value); },
+    async delete(key) { historyStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "history-client", key: "sk-history", models: ["*"], upstreams: ["history"] }]),
+};
+const historyStart = speedBodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-history", "content-type": "application/json" },
+  body: JSON.stringify({
+    model: "history-model",
+    messages: [
+      { role: "user", content: "old draft " + "x".repeat(240) },
+      { role: "assistant", content: "old reply" },
+      { role: "user", content: "latest draft instruction" },
+    ],
+  }),
+}), historyEnv);
+const historyMessages = speedBodies[historyStart].messages;
+assert.equal(historyMessages[0].content, "Pinned gateway rule.");
+assert.equal(historyMessages[1].content.includes("Pinned story bible."), true);
+assert.equal(historyMessages.some((message) => String(message.content || "").includes("old draft")), false);
+assert.equal(historyMessages.at(-1).content, "latest draft instruction");
 
 const noPlatformStore = new Map();
 noPlatformStore.set("gateway:config", JSON.stringify({
@@ -2827,7 +2885,13 @@ assert.equal((await cancelResp.json()).status, "completed");
 const nativeStore = new Map();
 nativeStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  settings: {
+    model_cache_ttl: 3600,
+    request_timeout_ms: 30000,
+    system_prompt: "Native gateway rule.",
+    global_context: "Native story bible.",
+    upstream_cooldown_ttl: 60,
+  },
   upstreams: [
     { name: "nim-native", preset: "nvidia-nim", base_url: "https://nim-native.example/v1", api_key_encrypted: "n", models: ["native-model"], paths: ["/v1/chat/completions", "/v1/responses"], priority: 1, weight: 1, enabled: true },
   ],
@@ -2854,6 +2918,9 @@ const nativeResp = await worker.default.fetch(new Request("https://gw.test/v1/re
 assert.equal(nativeResp.status, 200);
 assert.equal(nativeResponseHits.length, nativeStart + 1);
 assert.equal(nativeResponseHits[nativeStart].model, "native-model");
+assert.equal(nativeResponseHits[nativeStart].instructions.includes("Native gateway rule."), true);
+assert.equal(nativeResponseHits[nativeStart].instructions.includes("Native story bible."), true);
+assert.equal(nativeResponseHits[nativeStart].input, "hi");
 assert.equal((await nativeResp.json()).output_text, "native");
 const nativeStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",

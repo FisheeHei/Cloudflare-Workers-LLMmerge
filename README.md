@@ -187,6 +187,13 @@ curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \
 
 生效客户端只认已有的客户端 Key，未出现在客户端列表中的标识不会触发注入。
 
+### 提示词与长对话
+
+- 网关规则（系统提示词）与命中的资料上下文会在每次 Chat、Messages 和 Responses 请求中重新构建；原生 Responses 同样写入 instructions，不会把资料伪装成用户消息。
+- 管理端“最终注入预览”只在网关本地生成最终消息顺序，不请求上游。
+- history_max_chars 默认为 0（不裁剪）。设置为正数后，Chat、Messages 和转换式 Responses 只保留预算内最新对话轮次；网关规则、资料上下文和客户端的 system / developer 消息不会被裁剪。
+- 原生 Responses 的历史由上游 previous_response_id 链管理；网关仍会在每次请求中重新注入规则与资料。接近模型窗口时，使用 /v1/responses/compact 显式压缩历史。
+
 ## 使用
 
 OpenAI SDK：

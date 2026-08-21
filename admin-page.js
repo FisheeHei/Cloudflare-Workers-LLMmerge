@@ -787,6 +787,7 @@ function renderAdminMarkup(origin, version) {
           <label class="note"><input type="checkbox" id="context-on-demand"> \u6309\u9700\u6ce8\u5165\u7247\u6bb5</label>
           <label class="note">\u6700\u591a\u7247\u6bb5 <input id="context-item-limit" type="number" min="1" max="5" value="3"></label>
           <label class="note">\u6700\u591a\u5b57\u7b26 <input id="context-max-chars" type="number" min="500" max="20000" value="4000"></label>
+          <label class="note">\u5386\u53f2\u4fdd\u7559\u5b57\u7b26 <input id="history-max-chars" type="number" min="0" max="2000000" value="0"></label>
           <button type="button" class="secondary small" id="add-context-item">\u65b0\u589e\u7247\u6bb5</button>
           <button type="button" class="secondary small" id="classify-context-items">\u4ece\u5927\u6587\u672c\u751f\u6210\u7247\u6bb5</button>
           <button type="button" class="secondary small" id="export-context-items">\u5bfc\u51fa\u4e0a\u4e0b\u6587</button>
@@ -794,6 +795,16 @@ function renderAdminMarkup(origin, version) {
         </div>
         <input type="file" id="import-context-file" accept=".json,application/json" hidden>
         <div class="context-items" id="context-items"></div>
+        <div class="field">
+          <label>\u6700\u7ec8\u6ce8\u5165\u9884\u89c8</label>
+          <div class="context-controls">
+            <select id="injection-preview-client"></select>
+            <select id="injection-preview-model"></select>
+            <button type="button" class="secondary small" id="preview-injection">\u9884\u89c8</button>
+          </div>
+          <textarea id="injection-preview-input" class="context-prompt-textarea" placeholder="\u6a21\u62df\u6700\u8fd1\u4e00\u6761\u7528\u6237\u8bf7\u6c42"></textarea>
+          <textarea id="injection-preview-output" class="context-prompt-textarea" readonly placeholder="\u9884\u89c8\u4f1a\u663e\u793a\u5b9e\u9645\u6ce8\u5165\u7684\u6d88\u606f\u987a\u5e8f"></textarea>
+        </div>
       </div>
       <div class="prompt-scope-column">
         <div class="field">
@@ -1348,6 +1359,7 @@ function renderAdminScript(version) {
         context_on_demand: byId("context-on-demand").checked,
         context_item_limit: Number(byId("context-item-limit").value || 1),
         context_max_chars: Number(byId("context-max-chars").value || 800),
+        history_max_chars: Number(byId("history-max-chars").value || 0),
         context_items: collectContextItems(),
         time_zone_offset_minutes: timeZoneOffsetMinutes(byId("time-zone-offset").value),
         time_zone_label: selectedTimeZoneLabel(),
@@ -1377,6 +1389,7 @@ function renderAdminScript(version) {
     byId("context-on-demand").checked = s.context_on_demand === true;
     byId("context-item-limit").value = s.context_item_limit || 1;
     byId("context-max-chars").value = s.context_max_chars || 800;
+    byId("history-max-chars").value = s.history_max_chars || 0;
     byId("time-zone-offset").value = s.time_zone_offset_minutes ?? 480;
     setTimeZonePreset(s.time_zone_offset_minutes ?? 480, s.time_zone_label || "");
     renderContextItems(s.context_items || []);
@@ -1438,6 +1451,7 @@ function renderAdminScript(version) {
 
   function openSystemPromptModal() {
     renderPromptClientScopes();
+    renderInjectionPreviewOptions();
     renderPromptContextStatus();
     byId("system-prompt-modal").classList.add("open");
     byId("system-prompt-input").focus();
@@ -1445,6 +1459,48 @@ function renderAdminScript(version) {
 
   function closeSystemPromptModal() {
     byId("system-prompt-modal").classList.remove("open");
+  }
+
+  function renderInjectionPreviewOptions() {
+    const clientSelect = byId("injection-preview-client");
+    const modelSelect = byId("injection-preview-model");
+    if (!clientSelect || !modelSelect) return;
+    const clientValue = clientSelect.value;
+    const modelValue = modelSelect.value;
+    const clients = state.clients || [];
+    const models = [...new Set((state.config?.upstreams || []).flatMap((upstream) => upstream.models || []))].sort();
+    clientSelect.innerHTML = clients.length
+      ? clients.map((client) => '<option value="' + esc(client.id) + '">' + esc(client.name || client.id) + '</option>').join("")
+      : '<option value="">\u6682\u65e0\u5ba2\u6237\u7aef Key</option>';
+    modelSelect.innerHTML = models.length
+      ? models.map((model) => '<option value="' + esc(model) + '">' + esc(modelDisplayName(model)) + '</option>').join("")
+      : '<option value="">\u6682\u65e0\u6a21\u578b</option>';
+    if ([...clientSelect.options].some((option) => option.value === clientValue)) clientSelect.value = clientValue;
+    if ([...modelSelect.options].some((option) => option.value === modelValue)) modelSelect.value = modelValue;
+  }
+
+  async function previewGatewayInjection() {
+    const clientId = byId("injection-preview-client").value;
+    const model = byId("injection-preview-model").value;
+    if (!clientId || !model) throw new Error("\u8bf7\u5148\u521b\u5efa\u5ba2\u6237\u7aef Key \u5e76\u914d\u7f6e\u6a21\u578b");
+    const content = byId("injection-preview-input").value.trim();
+    const resp = await fetch(API_BASE + "/injection-preview", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_id: clientId,
+        model,
+        messages: content ? [{ role: "user", content }] : [],
+      }),
+    });
+    const payload = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(payload?.error?.message || "\u9884\u89c8\u5931\u8d25");
+    byId("injection-preview-output").value = JSON.stringify({
+      policy_chars: payload.policy_chars,
+      context_chars: payload.context_chars,
+      history_max_chars: payload.history_max_chars,
+      messages: payload.messages,
+    }, null, 2);
   }
 
   function collectContextItems() {
@@ -1473,6 +1529,7 @@ function renderAdminScript(version) {
       context_on_demand: byId("context-on-demand").checked,
       context_item_limit: Number(byId("context-item-limit").value || 1),
       context_max_chars: Number(byId("context-max-chars").value || 800),
+      history_max_chars: Number(byId("history-max-chars").value || 0),
       context_items: collectContextItems(),
     };
   }
@@ -1509,6 +1566,7 @@ function renderAdminScript(version) {
       context_on_demand: source.context_on_demand === true || items.length > 0,
       context_item_limit: Number(source.context_item_limit || 1),
       context_max_chars: Number(source.context_max_chars || 800),
+      history_max_chars: Number(source.history_max_chars || 0),
       context_items: items.map(function(item) {
         return {
           id: text(item && item.id).trim() || crypto.randomUUID(),
@@ -1556,6 +1614,7 @@ function renderAdminScript(version) {
     byId("context-on-demand").checked = bundle.context_on_demand;
     byId("context-item-limit").value = bundle.context_item_limit;
     byId("context-max-chars").value = bundle.context_max_chars;
+    byId("history-max-chars").value = bundle.history_max_chars;
     renderPromptClientScopes();
     renderContextItems(bundle.context_items);
     renderPromptContextStatus("\u5df2\u5bfc\u5165\uff0c\u4fdd\u5b58\u4e2d");
@@ -1704,7 +1763,9 @@ function renderAdminScript(version) {
       byId("system-prompt-status").textContent = "\u672a\u542f\u7528";
       return;
     }
-    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0cSubagent " + subagentScope + "\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef\uff0c\u7247\u6bb5 " + itemCount + "\uff0c\u5168\u91cf " + alwaysScope + ")";
+    const historyLimit = Number(byId("history-max-chars").value || 0);
+    const history = historyLimit > 0 ? historyLimit + " \u5b57\u7b26" : "\u4e0d\u88c1\u526a";
+    byId("system-prompt-status").textContent = (prefix || "\u5df2\u542f\u7528") + " (\u7cfb\u7edf " + systemLen + " / " + systemScope + " \u5ba2\u6237\u7aef\uff0cSubagent " + subagentScope + "\uff0c\u4e0a\u4e0b\u6587 " + contextLen + " / " + contextScope + " \u5ba2\u6237\u7aef\uff0c\u7247\u6bb5 " + itemCount + "\uff0c\u5168\u91cf " + alwaysScope + "\uff0c\u5386\u53f2 " + history + ")";
   }
 
   function splitPromptContextDraft() {
@@ -2621,6 +2682,7 @@ async function loadKvUsage() {
     state.clients = payload;
     renderClients();
     renderPromptClientScopes();
+    renderInjectionPreviewOptions();
   }
 
   function renderClients() {
@@ -2769,8 +2831,11 @@ async function loadKvUsage() {
           await importContextFromFile(file);
         }).catch(showError)
       );
-      ["context-on-demand", "context-item-limit", "context-max-chars"].forEach((id) =>
+      ["context-on-demand", "context-item-limit", "context-max-chars", "history-max-chars"].forEach((id) =>
         byId(id).addEventListener("input", () => renderPromptContextStatus("\u5f85\u4fdd\u5b58"))
+      );
+      byId("preview-injection").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u9884\u89c8\u4e2d...", previewGatewayInjection).catch(showError)
       );
       byId("apply-system-prompt-modal").addEventListener("click", () => {
         renderPromptContextStatus("\u5f85\u4fdd\u5b58");

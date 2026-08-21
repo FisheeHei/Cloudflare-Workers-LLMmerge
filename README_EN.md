@@ -187,6 +187,13 @@ Scope targets for system prompt / global context / subagent / force-all injectio
 
 Effective-client scopes only apply to existing client keys; identifiers that do not exist in the client list never trigger injection.
 
+### Prompt And Long Conversations
+
+- Gateway policy (system prompt) and matching reference context are rebuilt on every Chat, Messages, and Responses request. Native Responses also receives them through instructions, never as user input.
+- The admin "final injection preview" builds the effective message order locally in the gateway and never calls an upstream.
+- history_max_chars defaults to 0 (no trimming). A positive value keeps only the newest conversation turns within the budget for Chat, Messages, and translated Responses; gateway policy, reference context, and client system / developer messages are retained.
+- Native Responses history remains managed by the upstream previous_response_id chain; the gateway still reinjects policy and context every time. Use /v1/responses/compact explicitly near the model window.
+
 ## Usage
 
 OpenAI SDK:
