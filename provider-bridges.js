@@ -135,14 +135,9 @@ export function sanitizeProxyBody(bodyText, upstream) {
 }
 
 function providerModelBridge(upstream, modelName) {
-  if (isNvidiaNimUpstream(upstream)) return { provider: "nim", family: modelFamily(modelName) };
-  if (isDeepSeekUpstream(upstream)) return { provider: "deepseek", family: modelFamily(modelName) };
-  if (isMoonshotUpstream(upstream)) return { provider: "moonshot", family: modelFamily(modelName) };
-  if (isMiniMaxUpstream(upstream)) return { provider: "minimax", family: modelFamily(modelName) };
-  if (isOpenRouterUpstream(upstream)) return { provider: "openrouter", family: modelFamily(modelName) };
-  if (isZhipuUpstream(upstream)) return { provider: "zhipu", family: modelFamily(modelName) };
-  if (isGenericOpenAiUpstream(upstream)) return { provider: "openai", family: isWorkersAiUpstream(upstream) ? "workers-ai" : modelFamily(modelName) };
-  return { provider: "none", family: modelFamily(modelName) };
+  const provider = resolveProvider(upstream).id;
+  if (provider === "workers-ai") return { provider: "openai", family: "workers-ai" };
+  return { provider, family: modelFamily(modelName) };
 }
 
 function modelFamily(modelName) {
@@ -221,10 +216,6 @@ function applyProviderReasoningOptions(payload) {
   if (openaiOptions && typeof openaiOptions === "object") {
     if (openaiOptions.reasoningEffort != null && !("reasoning_effort" in payload)) {
       payload.reasoning_effort = openaiOptions.reasoningEffort;
-      changed = true;
-    }
-    if (openaiOptions.reasoning_effort != null && !("reasoning_effort" in payload)) {
-      payload.reasoning_effort = openaiOptions.reasoning_effort;
       changed = true;
     }
     if (openaiOptions.reasoning != null && !("reasoning" in payload)) {

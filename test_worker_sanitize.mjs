@@ -82,12 +82,6 @@ function assertNoDeepSeekLeak(text) {
 }
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
-  if (String(url).includes("stdtime.gov.hk")) {
-    return new Response(null, {
-      status: 200,
-      headers: { date: "Sat, 04 Jul 2026 04:00:00 GMT" },
-    });
-  }
   if (String(url).includes("admin-abort.example")) {
     notifyAdminAbortStarted?.();
     return new Promise((resolve, reject) => {
@@ -960,7 +954,7 @@ assert.equal(groqPreset.name, "Groq Cloud");
 assert.equal(groqPreset.base_url, "https://api.groq.com/openai/v1");
 const nimPreset = configPayload.presets.find((item) => item.id === "nvidia-nim");
 assert.equal(nimPreset.base_url, "https://integrate.api.nvidia.com/v1");
-assert.deepEqual(nimPreset.paths, ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"]);
+assert.deepEqual(nimPreset.paths, ["/v1/chat/completions", "/v1/embeddings"]);
 const zhipuPreset = configPayload.presets.find((item) => item.id === "zhipu");
 assert.equal(zhipuPreset.name, "GLM / \u667a\u8c31 AI");
 assert.equal(zhipuPreset.base_url, "https://open.bigmodel.cn/api/paas/v4");
@@ -1990,6 +1984,31 @@ assert.equal(probeHealth.results[0].capabilities.models, true);
 assert.equal(probeHealth.results[0].capabilities.chat, true);
 assert.equal([...probeHealthStore.keys()].some((key) => key.startsWith("state:health:")), true);
 
+const noAutoHealthStore = new Map([["gateway:config", JSON.stringify({
+  routing: {}, settings: {},
+  upstreams: [{ name: "probe", base_url: "https://health-probe.example/v1", api_key_encrypted: "p", models: ["probe-model"], paths: ["/v1/chat/completions"], enabled: true }],
+})]]);
+const noAutoHealthEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = noAutoHealthStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { noAutoHealthStore.set(key, value); },
+    async delete(key) { noAutoHealthStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "no-auto-health", key: "sk-no-auto-health", models: ["*"], upstreams: ["probe"] }]),
+};
+const noAutoHealthStart = healthProbeHits.length;
+const noAutoHealthTasks = [];
+const noAutoHealthResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-no-auto-health", "content-type": "application/json" },
+  body: JSON.stringify({ model: "missing-model", messages: [] }),
+}), noAutoHealthEnv, { waitUntil(task) { noAutoHealthTasks.push(task); } });
+assert.equal(noAutoHealthResp.status, 404);
+await Promise.all(noAutoHealthTasks);
+assert.deepEqual(healthProbeHits.slice(noAutoHealthStart), []);
+
 const exportResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/upstreams/export"), env);
 const exported = await exportResp.json();
 assert.equal(exportResp.ok, true);
@@ -2612,13 +2631,11 @@ for (let i = 0; i < 41; i += 1) {
     body: JSON.stringify({ model: "nim-model", messages: [] }),
   }), nimEnv);
 }
-assert.equal(nimHits.length, 40);
-assert.equal(nimResp.headers.get("x-llm-gateway-upstream"), "nim-fallback");
+assert.equal(nimHits.length, 41);
+assert.equal(nimResp.headers.get("x-llm-gateway-upstream"), "nim-limit");
 const runtimeResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), nimEnv);
 const runtimeStatus = await runtimeResp.json();
-assert.equal(runtimeStatus.nim_rpm["nim-limit"].count, 40);
-assert.equal(runtimeStatus.nim_rpm["nim-limit"].limit, 40);
-assert.equal(runtimeStatus.nim_rpm["nim-limit"].reset_in_ms > 0, true);
+assert.equal("nim_rpm" in runtimeStatus, false);
 
 const responsesStore = new Map();
 responsesStore.set("gateway:config", JSON.stringify({
@@ -4152,5 +4169,6 @@ assert.equal(doNamespace._ttls.some(([key, options]) => key.startsWith("state:la
 const doUsage = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/kv-usage"), doEnv)).json();
 assert.equal(doUsage.active, false);
 assert.equal(doUsage.storage, "do");
+assert.equal(fetchUrls.some((url) => url.includes("stdtime.gov.hk")), false);
 
 console.log("ok");

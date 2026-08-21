@@ -50,17 +50,12 @@ const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const UPSTREAM_HEALTH_TTL_SECONDS = 10 * 60;
-const UPSTREAM_HEALTH_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
 const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 30 * 1000;
 const D1_STORE_TABLE = "llmmerge_store";
 const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
-const STDTIME_URL = "https://stdtime.gov.hk/";
-const STDTIME_SYNC_INTERVAL_MS = 60 * 60 * 1000;
-const NVIDIA_NIM_RPM_LIMIT = 40;
-const NVIDIA_NIM_RPM_WINDOW_MS = 60000;
 // Keep the SSE connection visibly active through an additional proxy layer.
 const SSE_KEEPALIVE_MS = 3000;
 const SSE_FINISH_GRACE_MS = 5000;
@@ -129,8 +124,6 @@ export default {
       }
 
       const app = createApp(env);
-      scheduleStdTimeSync(app, ctx);
-      scheduleUpstreamHealthRefresh(app, ctx);
       const adminRoute = matchAdminRoute(pathnameLower, app);
       const adminAuth = adminRoute && authorizeAdminRequest(request, url, app, adminRoute);
 
@@ -299,10 +292,6 @@ export default {
         }
       }
 
-      if (request.method === "GET") {
-        return html(renderNginxWelcomePage());
-      }
-
       return withCorsResponse(json(openAiError("Not found.", "not_found_error"), 404));
     } catch (error) {
       return withCorsResponse(
@@ -333,8 +322,6 @@ let _activeUpstreamEpoch = 0;
 const _activeUpstreamControllers = new Set();
 // ponytail: isolate-local soft reservations; DO only if cross-edge fairness ever matters
 let _upstreamReservations = {};
-// ponytail: per-isolate NIM RPM window starts on first request; KV not worth it for provider-side soft guard
-const _nimMinuteCounters = {};
 // ponytail: per-isolate active Responses streams, keyed by response id for cancel support
 const _activeResponses = new Map();
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -345,12 +332,7 @@ let _runtimeLoading = null;
 // ponytail: encryption secret changes only on redeploy; reuse its imported CryptoKey per isolate.
 let _aesKeySecret = "";
 let _aesKeyPromise = null;
-let _stdTimeOffsetMs = 0;
-let _stdTimeSyncedAt = 0;
-let _stdTimeSyncing = null;
 let _d1SchemaReady = null;
-let _upstreamHealthRefreshAt = 0;
-let _upstreamHealthRefreshing = null;
 const _analyticsQueryCache = {};
 let _kvUsageCache = null;
 let _workersUsageCache = null;
@@ -604,60 +586,13 @@ function createApp(env) {
     kv: env.KV || null,
     state: appState,
     storage: appState.kind,
-    stdTimeUrl: String(env.STDTIME_URL || STDTIME_URL),
     workersDailyRequestBudget: parsePositiveInt(env.WORKERS_DAILY_REQUEST_BUDGET, DEFAULT_WORKERS_DAILY_REQUEST_BUDGET),
   };
   _cachedEnvRef = env;
   return _cachedApp;
 }
 
-function scheduleStdTimeSync(app, ctx) {
-  if (!ctx || typeof ctx.waitUntil !== "function") return;
-  if (_stdTimeSyncing || Date.now() - _stdTimeSyncedAt < STDTIME_SYNC_INTERVAL_MS) return;
-  _stdTimeSyncing = syncStdTime(app).finally(() => { _stdTimeSyncing = null; });
-  ctx.waitUntil(_stdTimeSyncing);
-}
-
-function scheduleUpstreamHealthRefresh(app, ctx) {
-  if (!app.state || !ctx || typeof ctx.waitUntil !== "function") return;
-  if (_upstreamHealthRefreshing || Date.now() < _upstreamHealthRefreshAt) return;
-  _upstreamHealthRefreshAt = Date.now() + UPSTREAM_HEALTH_REFRESH_INTERVAL_MS;
-  _upstreamHealthRefreshing = refreshStaleUpstreamHealth(app).finally(() => { _upstreamHealthRefreshing = null; });
-  ctx.waitUntil(_upstreamHealthRefreshing);
-}
-
-async function refreshStaleUpstreamHealth(app) {
-  const runtime = await loadRuntimeConfig(app);
-  const states = await Promise.all(runtime.upstreams.map(async (upstream) => {
-    try { return await app.state.get(await upstreamHealthStorageKey(upstream), "json"); } catch { return null; }
-  }));
-  const stale = runtime.upstreams.filter((_, index) =>
-    Date.now() - Number(states[index]?.updated_at || 0) >= UPSTREAM_HEALTH_TTL_SECONDS * 1000
-  );
-  await mapConcurrent(stale, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000));
-}
-
-async function syncStdTime(app) {
-  const localStart = Date.now();
-  try {
-    const resp = await fetch(app.stdTimeUrl, {
-      method: "HEAD",
-      headers: { "cache-control": "no-cache" },
-      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(1500) : undefined,
-    });
-    const serverMs = Date.parse(resp.headers.get("date") || "");
-    if (Number.isFinite(serverMs)) {
-      _stdTimeOffsetMs = serverMs + Math.round((Date.now() - localStart) / 2) - Date.now();
-    }
-  } catch {}
-  _stdTimeSyncedAt = Date.now();
-}
-
-function utcNowMs() {
-  return Date.now() + _stdTimeOffsetMs;
-}
-
-function utcNowIso(ms = utcNowMs()) {
+function utcNowIso(ms = Date.now()) {
   return new Date(ms).toISOString();
 }
 
@@ -675,7 +610,7 @@ function parseGatewayTime(value) {
 
 function timestampMs(value) {
   const ms = parseGatewayTime(value);
-  return Number.isFinite(ms) ? ms : utcNowMs();
+  return Number.isFinite(ms) ? ms : Date.now();
 }
 
 function utcTimestamp(value) {
@@ -1962,7 +1897,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   // Keep the current two hours in state storage while Analytics Engine catches up.
   if (apiPath === "/api/stats" && request.method === "GET") {
-    const now = utcNowMs();
+    const now = Date.now();
     const hourKeys = [];
     for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
       hourKeys.push(legacyStatsHourKey(now - h * 3600000));
@@ -1992,7 +1927,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/runtime" && request.method === "GET") {
-    return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), active_upstream_clients: getActiveUpstreamClientSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName, nim_rpm: getNimRpmSnapshot() }, 200));
+    return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), active_upstream_clients: getActiveUpstreamClientSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName }, 200));
   }
 
   if (apiPath === "/api/runtime/release" && request.method === "POST") {
@@ -2978,9 +2913,6 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
     let chatResp = null;
     if (model && upstreamSupportsPath(upstream, CHAT_PATH) && (modelsOk || ![401, 403, 429].includes(modelsResp.status))) {
       try { await modelsResp.body?.cancel("health model list complete"); } catch {}
-      if (!takeNimMinuteSlot(upstream)) {
-        return { name: upstream.name, ok: false, status: 429, error: "NVIDIA NIM RPM limit reached", latency_ms: Date.now() - started, capabilities: { models: modelsOk, chat: false } };
-      }
       const body = sanitizeProxyBody(JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false }), upstream);
       chatResp = await fetchWithTimeout(
         buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
@@ -3042,9 +2974,6 @@ function healthCooldownMs(status) {
 
 async function speedTestUpstream(runtime, upstream, model) {
   const started = Date.now();
-  if (!takeNimMinuteSlot(upstream)) {
-    return { name: upstream.name, ok: false, status: 429, error: "NVIDIA NIM RPM limit reached", latency_ms: 0 };
-  }
   let resp = null;
   let release = null;
   try {
@@ -3301,7 +3230,7 @@ function translateAnthropicMessagesRequest(payload) {
     toolsCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
     seed: {
       id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
-      createdAt: Math.floor(utcNowMs() / 1000),
+      createdAt: Math.floor(Date.now() / 1000),
       model,
     },
   };
@@ -3790,7 +3719,7 @@ function translateCompletionsRequest(payload) {
     model,
     stream: chat.stream,
     seed: {
-      created: Math.floor(utcNowMs() / 1000),
+      created: Math.floor(Date.now() / 1000),
       echo: payload.echo === true,
       id: `cmpl_${crypto.randomUUID().replace(/-/g, "")}`,
       model,
@@ -4255,7 +4184,7 @@ function translateResponsesRequest(payload, { previousResponse = null } = {}) {
     model,
     stream: chat.stream,
     seed: {
-      createdAt: Math.floor(utcNowMs() / 1000),
+      createdAt: Math.floor(Date.now() / 1000),
       id: responseId,
       instructions: typeof payload.instructions === "string" ? payload.instructions : null,
       maxOutputTokens: maxTokens ?? null,
@@ -4871,11 +4800,6 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     let upstreamResult = null;
 
     try {
-      if (!takeNimMinuteSlot(upstream)) {
-        lastError = new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`);
-        lastError.upstreamName = upstream.name;
-        continue;
-      }
       upstreamResult = await fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
@@ -5209,9 +5133,6 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
     const upstream = attempts[index];
     return sleep(launchDelay(index)).then(async () => {
       if (done) return { cancelled: true, upstream, index };
-      if (!takeNimMinuteSlot(upstream)) {
-        return { limited: true, error: new Error(`NVIDIA NIM RPM limit reached for ${upstream.name}`), upstream, index };
-      }
       let result = null;
       try {
         result = await fetchProxyUpstream({
@@ -5283,7 +5204,6 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
   let result = null;
   const releaseReservation = reserveUpstreams([upstream]);
   try {
-    if (!takeNimMinuteSlot(upstream)) return null;
     result = await fetchProxyUpstream({
       bodyText, client, pathname, request, runtime, search, signal, upstream,
       firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
@@ -5407,38 +5327,6 @@ function prependResponseChunks(response, reader, chunks) {
       try { await reader.cancel(reason); } catch {}
     },
   }), { status: response.status, statusText: response.statusText, headers: responseBodyHeaders(response.headers) });
-}
-
-function takeNimMinuteSlot(upstream) {
-  if (!isNvidiaNimUpstream(upstream)) return true;
-  const now = Date.now();
-  for (const key of Object.keys(_nimMinuteCounters)) {
-    if ((_nimMinuteCounters[key]?.resetAt || 0) <= now) delete _nimMinuteCounters[key];
-  }
-  const key = String(upstream.name || "").trim();
-  const bucket = _nimMinuteCounters[key] || { count: 0, resetAt: now + NVIDIA_NIM_RPM_WINDOW_MS };
-  if (bucket.count >= NVIDIA_NIM_RPM_LIMIT) return false;
-  bucket.count += 1;
-  _nimMinuteCounters[key] = bucket;
-  return true;
-}
-
-function getNimRpmSnapshot() {
-  const now = Date.now();
-  const result = {};
-  for (const key of Object.keys(_nimMinuteCounters)) {
-    const bucket = _nimMinuteCounters[key];
-    if (!bucket || bucket.resetAt <= now) {
-      delete _nimMinuteCounters[key];
-      continue;
-    }
-    result[key] = {
-      count: bucket.count,
-      limit: NVIDIA_NIM_RPM_LIMIT,
-      reset_in_ms: bucket.resetAt - now,
-    };
-  }
-  return result;
 }
 
 function orderUpstreams(runtime, candidates, model) {
@@ -6494,14 +6382,6 @@ function json(payload, status) {
   });
 }
 
-// ponytail: no-store on dynamic admin page to prevent stale cache
-// ponytail: allow CDN cache with ETag revalidation (admin HTML is static, data loaded by JS)
-function html(markup, status = 200) {
-  const h = new Headers(HTML_HEADERS);
-  h.set("cache-control", "public, max-age=86400");
-  return new Response(markup, { status, headers: h });
-}
-
 function withCorsResponse(response) {
   const headers = new Headers(response.headers);
 
@@ -6527,11 +6407,6 @@ function httpError(statusCode, message) {
 
 function badConfig(message) {
   return httpError(500, message);
-}
-
-// ponytail: minimal nginx decoy �?just enough to look real, ~60% smaller
-function renderNginxWelcomePage() {
-  return "<!doctype html><html lang=en><head><meta charset=utf-8><title>Welcome to nginx!</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7fa;color:#111827;font:16px/1.6 Georgia,serif}main{width:min(600px,calc(100vw - 32px));background:#fff;border:1px solid #d1d5db;padding:32px}h1{margin:0 0 16px}p{margin:0 0 12px}</style></head><body><main><h1>Welcome to nginx!</h1><p>If you see this page, the web server is successfully installed and working.</p><p>Further configuration is required.</p></main></body></html>";
 }
 
 // ponytail: origin param lets us pre-fill gateway URL server-side (no API wait)

@@ -107,7 +107,6 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `SSE_KEEPALIVE_MS` | 可选 | 默认 `3000`；流式响应的心跳注释间隔 |
 | `UPSTREAM_COOLDOWN_TTL` | 可选 | 默认 `60` 秒 |
 | `MODEL_CACHE_TTL` | 可选 | 默认 `3600` 秒 |
-| `STDTIME_URL` | 可选 | 默认 `https://stdtime.gov.hk/` |
 | `UPSTREAMS_JSON` | 可选 | 初始上游种子配置 |
 | `CLIENTS_JSON` | 可选 | 初始客户端 Key 种子配置 |
 | `KV_FLUSH_INTERVAL_MS` | 可选 | KV-only 模式下日志/统计镜像刷新间隔，默认 `120000` 毫秒 |
@@ -126,7 +125,7 @@ https://your-domain.example/{ADMIN_TOKEN}
     "preset": "nvidia-nim",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-...",
-    "models": ["z-ai/glm-5.2", "moonshotai/kimi-k2.5"],
+    "models": ["nvidia/nemotron-3-nano-30b-a3b", "moonshotai/kimi-k2.5"],
     "paths": ["/v1/chat/completions", "/v1/embeddings"],
     "priority": 1,
     "weight": 1,
@@ -201,7 +200,7 @@ const client = new OpenAI({
 });
 
 const res = await client.chat.completions.create({
-  model: "z-ai/glm-5.2",
+  model: "nvidia/nemotron-3-nano-30b-a3b",
   messages: [{ role: "user", content: "hello" }],
 });
 ```
@@ -213,7 +212,7 @@ const res = await client.chat.completions.create({
 | `GET` | `/health` | 存活检查 |
 | `GET` | `/v1/models` | 聚合模型列表 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/completions` | OpenAI Completions（NIM 文档协议，无原生上游时自动转 Chat） |
+| `POST` | `/v1/completions` | OpenAI Completions（显式声明该路径的上游直通，否则自动转 Chat） |
 | `POST` | `/v1/responses` | Responses API 兼容层（自托管 NIM 可原生直通） |
 | `POST` | `/v1/messages` | Claude / Anthropic 风格入口 |
 | `POST` | `/v1/embeddings` | Embeddings |
@@ -224,11 +223,12 @@ Responses API 额外支持：
 - `POST /v1/responses/{response_id}/cancel`：取消进行中的流式响应
 - `previous_response_id`：把上一轮输出（消息、函数调用和结果）接回当前输入
 
-NVIDIA NIM 托管端点按官方 Chat Completions schema 做严格适配；自托管 NIM 在上游路径中加入 `/v1/responses` 时，网关会优先原生直通 Responses API，否则统一转为 Chat Completions 后再聚合。
+NVIDIA NIM 托管模板默认启用官方文档明确列出的 Chat Completions 和 Embeddings 路径；自托管 NIM 在上游路径中加入 `/v1/responses` 时，网关会优先原生直通 Responses API，否则统一转为 Chat Completions 后再聚合。
+`nvidia/nemotron-3-embed-1b` 的 Embeddings 请求需显式传入 `input_type`（`query` 或 `passage`）；网关会原样透传该字段。
 
 DeepSeek 模型经任意非官方上游（NIM、OpenRouter、自建端点等）调用时，网关会原样透传 `reasoning_content`；经 `/v1/responses` 或 `/v1/messages` 调用时会转换为 reasoning 条目 / thinking 块。NIM 上的 DeepSeek V4（例如 `deepseek-ai/deepseek-v4-flash-0731`）还会按 NIM 文档注入 `chat_template_kwargs.reasoning_effort`（`none` / `high` / `max`，未指定时默认 `high`）。官方 DeepSeek 端点仍按原策略隐藏推理内容。
 
-`/v1/completions` 优先直通支持该路径的上游（NIM 按官方 Completions schema 收紧字段）；如果没有上游声明 `/v1/completions`，网关会自动把单条 `prompt` 转成 Chat Completions，再转回标准 `text_completion` 响应，流式和非流式均支持。
+`/v1/completions` 优先直通显式声明该路径的上游；如果没有这类上游，网关会自动把单条 `prompt` 转成 Chat Completions，再转回标准 `text_completion` 响应，流式和非流式均支持。
 
 ## 统计机制
 

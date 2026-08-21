@@ -111,7 +111,6 @@ If `ADMIN_TOKEN` is not set, the default admin path is `/llmmerge-admin`. Do not
 | `KV_DAILY_READ_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `100000` (Free plan) |
 | `KV_DAILY_WRITE_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `1000` (Free plan) |
 | `WORKERS_DAILY_REQUEST_BUDGET` | Optional | Admin Workers request-meter budget; defaults to `1000000` |
-| `STDTIME_URL` | Optional | Defaults to `https://stdtime.gov.hk/` |
 | `UPSTREAMS_JSON` | Optional | Initial upstream seed config |
 | `CLIENTS_JSON` | Optional | Initial client-key seed config |
 
@@ -126,7 +125,7 @@ You can add upstreams in the admin panel or seed them with `UPSTREAMS_JSON`:
     "preset": "nvidia-nim",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-...",
-    "models": ["z-ai/glm-5.2", "moonshotai/kimi-k2.5"],
+    "models": ["nvidia/nemotron-3-nano-30b-a3b", "moonshotai/kimi-k2.5"],
     "paths": ["/v1/chat/completions", "/v1/embeddings"],
     "priority": 1,
     "weight": 1,
@@ -201,7 +200,7 @@ const client = new OpenAI({
 });
 
 const res = await client.chat.completions.create({
-  model: "z-ai/glm-5.2",
+  model: "nvidia/nemotron-3-nano-30b-a3b",
   messages: [{ role: "user", content: "hello" }],
 });
 ```
@@ -213,7 +212,7 @@ Main endpoints:
 | `GET` | `/health` | Health check |
 | `GET` | `/v1/models` | Aggregated model list |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/completions` | OpenAI Completions (NIM documented protocol; falls back to Chat when no native upstream) |
+| `POST` | `/v1/completions` | OpenAI Completions (passes through to upstreams that explicitly declare the path; otherwise falls back to Chat) |
 | `POST` | `/v1/responses` | Responses API compatibility layer (native passthrough for self-hosted NIM) |
 | `POST` | `/v1/messages` | Claude / Anthropic-style messages |
 | `POST` | `/v1/embeddings` | Embeddings |
@@ -224,11 +223,12 @@ Additional Responses API support:
 - `POST /v1/responses/{response_id}/cancel`: cancel an in-flight streaming response
 - `previous_response_id`: chain the previous turn (messages, function calls, and results) into the current input
 
-NVIDIA NIM hosted endpoints are strictly adapted to the official Chat Completions schema. When a self-hosted NIM upstream includes `/v1/responses` in its paths, the gateway prefers native Responses API passthrough; otherwise it converts to Chat Completions before aggregation.
+NVIDIA NIM hosted templates enable the documented Chat Completions and Embeddings paths. When a self-hosted NIM upstream includes `/v1/responses` in its paths, the gateway prefers native Responses API passthrough; otherwise it converts to Chat Completions before aggregation.
+`nvidia/nemotron-3-embed-1b` Embeddings requests must include `input_type` (`query` or `passage`); the gateway passes the field through unchanged.
 
 DeepSeek models called through any non-official upstream (NIM, OpenRouter, self-hosted endpoints, etc.) have upstream `reasoning_content` passed through; `/v1/responses` and `/v1/messages` calls translate it into reasoning items / thinking blocks. For DeepSeek V4 on NIM (for example `deepseek-ai/deepseek-v4-flash-0731`), the gateway also injects `chat_template_kwargs.reasoning_effort` (`none` / `high` / `max`, defaulting to `high`) per the NIM documentation. Official DeepSeek endpoints keep the original reasoning-hiding behavior.
 
-`/v1/completions` prefers native passthrough to upstreams that declare that path (NIM fields are tightened to the official Completions schema). If no upstream declares `/v1/completions`, a single `prompt` is translated to Chat Completions and converted back to the standard `text_completion` response, for both streaming and non-streaming calls.
+`/v1/completions` prefers native passthrough to upstreams that explicitly declare the path. If no such upstream exists, a single `prompt` is translated to Chat Completions and converted back to the standard `text_completion` response, for both streaming and non-streaming calls.
 
 ## Statistics
 

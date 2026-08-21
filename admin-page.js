@@ -221,7 +221,6 @@ function renderAdminStyle() {
     }
     .upstream-card summary .card-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
     .upstream-enable-toggle { padding: 5px 9px; }
-    .nim-rpm-timer[hidden] { display: none; }
     .upstream-card .card-body { padding: 0 16px 14px; }
     .model-entry-list { display: grid; gap: 6px; margin-top: 4px; }
     .model-entry {
@@ -1200,7 +1199,6 @@ function renderAdminScript(version) {
           '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u5df2\u542f\u7528' : '\u5df2\u505c\u7528') + '</span>' +
-          (isNimConfig(item) ? '<span class="card-meta nim-rpm" data-upstream="' + esc(item.name) + '"><span class="nim-rpm-count">NIM 0/40</span><span class="nim-rpm-timer" hidden> · 60s</span></span>' : '') +
           '<button type="button" class="small upstream-enable-toggle ' + (item.enabled ? 'secondary' : 'good') + '" data-enabled="' + (item.enabled ? 'true' : 'false') + '">' + (item.enabled ? '\u505c\u7528' : '\u542f\u7528') + '</button>' +
         '</summary>' +
         '<div class="card-body">' +
@@ -1364,10 +1362,6 @@ function renderAdminScript(version) {
       },
       upstreams,
     };
-  }
-
-  function isNimConfig(upstream) {
-    return upstream && (upstream.preset === "nvidia-nim" || text(upstream.base_url).toLowerCase().includes("integrate.api.nvidia.com"));
   }
 
   /* ---- Settings ---- */
@@ -1872,25 +1866,6 @@ function renderAdminScript(version) {
     });
     updateUpstreamGroupActive(active, activeClients);
     updateUpstreamLiveSummary(active, activeClients, recent);
-    const nim = payload.nim_rpm || {};
-    document.querySelectorAll(".nim-rpm").forEach(function(el) {
-      const item = nim[el.dataset.upstream];
-      const countEl = el.querySelector(".nim-rpm-count");
-      const timerEl = el.querySelector(".nim-rpm-timer");
-      if (!item) {
-        if (countEl) countEl.textContent = "NIM 0/40";
-        if (timerEl) timerEl.hidden = true;
-        el.title = "\u5c1a\u672a\u5f00\u59cb\u8ba1\u65f6";
-        return;
-      }
-      const seconds = Math.max(0, Math.ceil(Number(item.reset_in_ms || 0) / 1000));
-      if (countEl) countEl.textContent = "NIM " + item.count + "/" + item.limit;
-      if (timerEl) {
-        timerEl.hidden = false;
-        timerEl.textContent = " · " + seconds + "s";
-      }
-      el.title = seconds + "s \u540e\u6e05\u96f6";
-    });
     } finally {
       runtimeRefreshRunning = false;
     }

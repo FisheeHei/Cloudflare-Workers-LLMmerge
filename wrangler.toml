@@ -1,5 +1,3 @@
-"$schema" = "./node_modules/wrangler/config-schema.json"
-
 name = "llm-gateway"
 compatibility_date = "2026-06-29"
 

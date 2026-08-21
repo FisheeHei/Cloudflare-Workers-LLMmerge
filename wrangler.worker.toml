@@ -22,6 +22,3 @@ compatibility_date = "2026-07-30"
 # [[migrations]]
 # tag = "v1"
 # new_sqlite_classes = ["LlmMergeStore"]
-
-[triggers]
-crons = ["* * * * *"]
