@@ -49,7 +49,7 @@ const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
-const UPSTREAM_HEALTH_TTL_SECONDS = 10 * 60;
+const MAX_RETRY_AFTER_COOLDOWN_SECONDS = 10 * 60;
 const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
 const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 30 * 1000;
 const D1_STORE_TABLE = "llmmerge_store";
@@ -82,7 +82,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-21-scope-keys-clean";
+const VERSION = "v26-08-21-passive-health";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1944,10 +1944,10 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
     return withCorsResponse(json({ ok: true, ...exported }, 200));
   }
 
-// ponytail: parallel health checks instead of sequential loop
+// ponytail: health checks only verify the upstream model endpoint; speed tests verify a chosen model
   if (apiPath === "/api/health" && request.method === "POST") {
     const upstreams = await loadHealthUpstreams(app);
-    const results = await mapConcurrent(upstreams, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkAndPersistUpstreamHealth(app, upstream, 10000));
+    const results = await mapConcurrent(upstreams, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkUpstreamHealth(upstream, 10000));
     return withCorsResponse(json({ ok: true, results }, 200));
   }
 
@@ -2903,73 +2903,18 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
       return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: total, capabilities: { models: true, chat: null } };
     }
 
-    const model = configuredUpstreamModels(upstream).find((item) => item && item !== "*");
-    let modelsResp = await fetchWithTimeout(
+    const response = await fetchWithTimeout(
       buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
       { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
       timeoutMs,
     );
-    const modelsOk = modelsResp.ok;
-    let chatResp = null;
-    if (model && upstreamSupportsPath(upstream, CHAT_PATH) && (modelsOk || ![401, 403, 429].includes(modelsResp.status))) {
-      try { await modelsResp.body?.cancel("health model list complete"); } catch {}
-      const body = sanitizeProxyBody(JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false }), upstream);
-      chatResp = await fetchWithTimeout(
-        buildUpstreamUrl(upstream.base_url, CHAT_PATH, ""),
-        {
-          method: "POST",
-          headers: buildUpstreamHeaders(null, upstream),
-          body,
-        },
-        timeoutMs,
-      );
-    }
-    const chatOk = chatResp ? await validHealthChatResponse(chatResp) : (model && upstreamSupportsPath(upstream, CHAT_PATH) ? false : null);
-    const response = chatResp || modelsResp;
-    const ok = chatOk === null ? modelsOk : chatOk === true;
+    const ok = response.ok;
     const error = ok ? "" : await responseErrorMessage(response);
-    try { await modelsResp.body?.cancel("health check complete"); } catch {}
-    try { await chatResp?.body?.cancel("health check complete"); } catch {}
-    return { name: upstream.name, ok, status: response.status, ...(error ? { error } : {}), latency_ms: Date.now() - started, capabilities: { models: modelsOk, chat: chatOk } };
+    try { await response.body?.cancel("health check complete"); } catch {}
+    return { name: upstream.name, ok, status: response.status, ...(error ? { error } : {}), latency_ms: Date.now() - started, capabilities: { models: ok, chat: null } };
   } catch (err) {
     return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started, capabilities: { models: false, chat: false } };
   }
-}
-
-async function validHealthChatResponse(response) {
-  if (!response?.ok) return false;
-  try {
-    const text = await response.clone().text();
-    const payload = safeJson(text);
-    return Boolean(payload && Array.isArray(payload.choices) && payload.choices.length > 0 &&
-      !upstreamApplicationErrorMessage(payload) && !looksLikeHtmlDocument(text));
-  } catch {
-    return false;
-  }
-}
-
-async function checkAndPersistUpstreamHealth(app, upstream, timeoutMs) {
-  const result = await checkUpstreamHealth(upstream, timeoutMs);
-  const cooldownMs = result.ok ? 0 : healthCooldownMs(result.status);
-  const state = {
-    ok: Boolean(result.ok),
-    status: Number(result.status) || 0,
-    latency_ms: Number(result.latency_ms) || 0,
-    capabilities: result.capabilities || { models: false, chat: false },
-    updated_at: Date.now(),
-    ...(cooldownMs ? { route_cooldown_until: Date.now() + cooldownMs } : {}),
-  };
-  try {
-    await app.state.put(await upstreamHealthStorageKey(upstream), JSON.stringify(state), { expirationTtl: UPSTREAM_HEALTH_TTL_SECONDS });
-  } catch {}
-  return result;
-}
-
-function healthCooldownMs(status) {
-  if ([401, 403].includes(Number(status))) return 15 * 60 * 1000;
-  if (Number(status) === 429) return 60 * 1000;
-  if (Number(status) >= 500 || Number(status) === 0) return 30 * 1000;
-  return 0;
 }
 
 async function speedTestUpstream(runtime, upstream, model) {
@@ -5048,7 +4993,7 @@ async function isRetryableUpstreamResponse(response) {
 
 function retryAfterCooldownSeconds(response, fallbackSeconds) {
   const ms = retryAfterMs(response?.headers?.get("retry-after"));
-  return Math.max(1, Math.min(UPSTREAM_HEALTH_TTL_SECONDS, Math.ceil((ms || fallbackSeconds * 1000) / 1000)));
+  return Math.max(1, Math.min(MAX_RETRY_AFTER_COOLDOWN_SECONDS, Math.ceil((ms || fallbackSeconds * 1000) / 1000)));
 }
 
 function retryAfterMs(value) {
@@ -5548,22 +5493,16 @@ async function hydrateUpstreamState(runtime, upstreams, model) {
   await Promise.all(upstreams.map(async (upstream) => {
     const key = upstreamModelKey(upstream, model);
     try {
-      const [cooldownKey, latencyKey, healthKey] = await Promise.all([
+      const [cooldownKey, latencyKey] = await Promise.all([
         upstreamCooldownStorageKey(key),
         upstreamLatencyStorageKey(key),
-        upstreamHealthStorageKey(upstream),
       ]);
-      const [cooldown, latency, health] = await Promise.all([
+      const [cooldown, latency] = await Promise.all([
         runtime.state.get(cooldownKey, "json"),
         runtime.state.get(latencyKey, "json"),
-        runtime.state.get(healthKey, "json"),
       ]);
       if (cooldown?.until && Number(cooldown.until) > Date.now()) _upstreamCooldowns[key] = cooldown;
       else delete _upstreamCooldowns[key];
-      const healthCooldown = Number(health?.route_cooldown_until);
-      if (healthCooldown > Date.now() && healthCooldown > Number(_upstreamCooldowns[key]?.until || 0)) {
-        _upstreamCooldowns[key] = { until: healthCooldown };
-      }
       const score = Number(latency?.latency_ms);
       const updatedAt = Number(latency?.updated_at);
       const localUpdatedAt = Number(_upstreamLatencyUpdatedAt[key] || 0);
@@ -5613,10 +5552,6 @@ async function upstreamCooldownStorageKey(value) {
 
 async function upstreamLatencyStorageKey(value) {
   return "state:latency:" + await storageKeyHash(value);
-}
-
-async function upstreamHealthStorageKey(upstream) {
-  return "state:health:" + await storageKeyHash(`${String(upstream?.name || "").trim()}\n${String(upstream?.base_url || "").trim()}`);
 }
 
 function upstreamModelKey(upstream, model) {

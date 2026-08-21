@@ -834,6 +834,8 @@ assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("live-upstream-count"), true);
 assert.equal(adminPage.includes("run-cloudflare-self-check"), true);
+assert.equal(adminPage.includes("\u68c0\u67e5\u8fde\u901a\u6027"), true);
+assert.equal(adminPage.includes("\u6a21\u578b\u5217\u8868\u53ef\u8bbf\u95ee"), true);
 assert.equal(adminPage.includes("release-active-upstreams"), true);
 assert.equal(adminPage.includes("getSelfCheckClient"), true);
 assert.equal(adminPage.includes("client-models"), false);
@@ -1938,8 +1940,8 @@ const disabledHealthResp = await worker.default.fetch(new Request("https://gw.te
 }), disabledEnv);
 const disabledHealth = await disabledHealthResp.json();
 assert.equal(disabledHealth.results.some((item) => item.name === "disabled" && item.ok), true);
-assert.equal(disabledHealth.results.find((item) => item.name === "disabled").capabilities.chat, true);
-assert.equal(disabledHits.length, disabledHitStart + 2);
+assert.equal(disabledHealth.results.find((item) => item.name === "disabled").capabilities.chat, null);
+assert.equal(disabledHits.length, disabledHitStart + 1);
 
 const authHealthStore = new Map([["gateway:config", JSON.stringify({
   routing: {},
@@ -1979,10 +1981,10 @@ const probeHealthEnv = {
 };
 const probeHealthStart = healthProbeHits.length;
 const probeHealth = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", { method: "POST" }), probeHealthEnv)).json();
-assert.deepEqual(healthProbeHits.slice(probeHealthStart), ["models", "chat"]);
+assert.deepEqual(healthProbeHits.slice(probeHealthStart), ["models"]);
 assert.equal(probeHealth.results[0].capabilities.models, true);
-assert.equal(probeHealth.results[0].capabilities.chat, true);
-assert.equal([...probeHealthStore.keys()].some((key) => key.startsWith("state:health:")), true);
+assert.equal(probeHealth.results[0].capabilities.chat, null);
+assert.equal([...probeHealthStore.keys()].some((key) => key.startsWith("state:health:")), false);
 
 const noAutoHealthStore = new Map([["gateway:config", JSON.stringify({
   routing: {}, settings: {},

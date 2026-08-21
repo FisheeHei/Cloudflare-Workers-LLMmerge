@@ -594,7 +594,7 @@ function renderAdminMarkup(origin, version) {
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
-      <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u5065\u5eb7\u5ea6</button>
+      <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u8fde\u901a\u6027</button>
       <span class="toolbar-spacer"></span>
       <div class="menu-wrap" id="upstream-actions">
         <button type="button" class="secondary" id="upstream-actions-toggle">\u66f4\u591a\u64cd\u4f5c</button>
@@ -1196,7 +1196,7 @@ function renderAdminScript(version) {
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
           '<span class="upstream-status-emoji" data-upstream="' + esc(item.name) + '" title="' + (item.enabled ? '' : '\u5df2\u505c\u7528') + '">' + (item.enabled ? '' : '\u26d4') + '</span>' +
           '<span class="note upstream-active-client" data-upstream="' + esc(item.name) + '"></span>' +
-          '<span class="health-dot" data-upstream="' + esc(item.name) + '"></span>' +
+          '<span class="health-dot" data-upstream="' + esc(item.name) + '" title="\u672a\u68c0\u67e5\u6a21\u578b\u5217\u8868\u8fde\u901a\u6027"></span>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u5df2\u542f\u7528' : '\u5df2\u505c\u7528') + '</span>' +
           '<button type="button" class="small upstream-enable-toggle ' + (item.enabled ? 'secondary' : 'good') + '" data-enabled="' + (item.enabled ? 'true' : 'false') + '">' + (item.enabled ? '\u505c\u7528' : '\u542f\u7528') + '</button>' +
@@ -1755,22 +1755,31 @@ function renderAdminScript(version) {
 
   async function checkHealth(silent) {
     const dots = document.querySelectorAll(".health-dot");
+    const previous = [...dots].map((dot) => ({ dot, className: dot.className, title: dot.title }));
     dots.forEach((d) => { d.className = "health-dot checking"; d.title = "\u68c0\u67e5\u4e2d..."; });
     updateUpstreamGroupHealth();
-    const resp = await fetch(API_BASE + "/health", { method: "POST" });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "\u5065\u5eb7\u5ea6\u68c0\u67e5\u5931\u8d25");
-    (payload.results || []).forEach((r) => {
-      const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
-      if (!dot) return;
-      dot.className = "health-dot " + (r.ok ? "ok" : "fail");
-      dot.title = r.ok ? ("HTTP " + r.status + ", " + r.latency_ms + "ms") : ("\u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
-    });
-    const ok = (payload.results || []).filter((r) => r.ok).length;
-    const total = (payload.results || []).length;
-    updateUpstreamGroupHealth();
-    if (!silent) showToast("\u5065\u5eb7\u5ea6: " + ok + "/" + total + " \u6b63\u5e38");
-    return { ok, total };
+    try {
+      const resp = await fetch(API_BASE + "/health", { method: "POST" });
+      const payload = await parseApiResponse(resp);
+      if (!resp.ok) throw new Error(payload?.error?.message || "\u8fde\u901a\u6027\u68c0\u67e5\u5931\u8d25");
+      (payload.results || []).forEach((r) => {
+        const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
+        if (!dot) return;
+        dot.className = "health-dot " + (r.ok ? "ok" : "fail");
+        dot.title = r.ok
+          ? ("\u6a21\u578b\u5217\u8868\u53ef\u8bbf\u95ee: HTTP " + r.status + ", " + r.latency_ms + "ms")
+          : ("\u6a21\u578b\u5217\u8868\u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+      });
+      const ok = (payload.results || []).filter((r) => r.ok).length;
+      const total = (payload.results || []).length;
+      updateUpstreamGroupHealth();
+      if (!silent) showToast("\u6a21\u578b\u5217\u8868\u8fde\u901a\u6027: " + ok + "/" + total + " \u6b63\u5e38");
+      return { ok, total };
+    } catch (error) {
+      previous.forEach(({ dot, className, title }) => { dot.className = className; dot.title = title; });
+      updateUpstreamGroupHealth();
+      throw error;
+    }
   }
 
   async function runCloudflareSelfCheck() {
@@ -1788,7 +1797,7 @@ function renderAdminScript(version) {
     const gatewayMs = Math.round(performance.now() - started);
     const upstream = await checkHealth(true);
     const source = client ? ("Key " + client.name) : "\u7ba1\u7406\u7aef";
-    const text = "Cloudflare \u81ea\u68c0: " + source + "->\u7f51\u5173 " + gatewayMs + "ms \u00b7 \u7f51\u5173->\u4e0a\u6e38 " + upstream.ok + "/" + upstream.total;
+    const text = "Cloudflare \u81ea\u68c0: " + source + "->\u7f51\u5173 " + gatewayMs + "ms \u00b7 \u7f51\u5173->\u6a21\u578b\u5217\u8868 " + upstream.ok + "/" + upstream.total;
     byId("config-status").textContent = "\u2713 " + text;
     showToast(text);
   }
@@ -2020,17 +2029,11 @@ async function loadKvUsage() {
     });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "\u6d4b\u901f\u5931\u8d25");
-    (payload.results || []).forEach((r) => {
-      const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
-      if (!dot) return;
-      dot.className = "health-dot " + (r.ok ? "ok" : "fail");
-      dot.title = (r.ok ? "\u9996\u8f93\u51fa " : "\u6d4b\u901f\u5931\u8d25 ") + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms";
-    });
     const best = (payload.results || []).filter((r) => r.ok).sort((a,b) => a.latency_ms - b.latency_ms)[0];
-    showToast(best ? ("\u6700\u5feb: " + best.name + " " + best.latency_ms + "ms") : "\u6ca1\u6709\u4e0a\u6e38\u901a\u8fc7\u6d4b\u901f");
+    showToast(best ? (picker.model + " · \u6700\u5feb: " + best.name + " " + best.latency_ms + "ms") : (picker.model + " · \u6ca1\u6709\u4e0a\u6e38\u901a\u8fc7\u6d4b\u901f"));
     byId("speed-picker-status").textContent = best
-      ? best.name + " · \u9996\u8f93\u51fa " + best.latency_ms + "ms"
-      : ((payload.results || [])[0]?.error || "\u6d4b\u901f\u5931\u8d25");
+      ? picker.model + " · " + best.name + " · \u9996\u8f93\u51fa " + best.latency_ms + "ms"
+      : (picker.model + " · " + ((payload.results || [])[0]?.error || "\u6d4b\u901f\u5931\u8d25"));
   }
 
   async function detectCapability(upstreamName) {

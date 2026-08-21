@@ -246,7 +246,7 @@ In short: memory is for live display, Analytics Engine is for long-term history,
 - Successful requests and speed tests write a six-hour latency EWMA to state storage so fresh isolates can prefer recently faster upstreams
 - Streaming failover only happens before the first visible output; once bytes are visible to the client, the gateway never replays the request, avoiding duplicate Agent text or tool calls
 - An upstream `Retry-After` response becomes an upstream/model cooldown state; a healthy fallback is attempted immediately instead of waiting on the failed provider
-- Health checks cache `/models` and minimal Chat capability probes in state storage; probes never include user Prompt, Context, or session data
+- Health checks only verify upstream `/models`; use the admin speed test to verify a chosen model without default model probes
 - Health probes, model refreshes, and speed tests use bounded concurrency so a large upstream pool does not burst through the Workers Request budget
 - `Hedged Request`: race multiple upstreams for the same model
 - `Gateway Fast mode`: speed up the first two candidates for faster first byte
