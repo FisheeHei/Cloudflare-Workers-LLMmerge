@@ -57,7 +57,7 @@ const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
-const SSE_KEEPALIVE_MS = 3000;
+const SSE_KEEPALIVE_MS = 15000;
 const SSE_FINISH_GRACE_MS = 5000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
@@ -4751,7 +4751,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   }
 
   await hydrateUpstreamState(runtime, candidates, model);
-  const attempts = orderUpstreams(runtime, candidates, model);
+  const attempts = orderUpstreams(runtime, candidates, model, client);
   const maxAttempts = runtime.routing.failover === false
     ? 1
     : Math.min(attempts.length, runtime.routing.hedge_max || 2);
@@ -5025,7 +5025,7 @@ function selectGatewayContext(payload, settings, client, clientIds) {
     parts.push(`[${item.title}]\n${text}`);
     remaining -= text.length;
   }
-  return parts.filter(Boolean).join("\n\n");
+  return [base, ...parts].filter(Boolean).join("\n\n");
 }
 
 function contextScopeMatches(scope, client, clientIds) {
@@ -5035,7 +5035,7 @@ function contextScopeMatches(scope, client, clientIds) {
 function contextModelMatches(scope, model) {
   const list = Array.isArray(scope) ? scope : normalizeStringArray(scope);
   if (!list.length || list.includes("*")) return true;
-  return list.some((item) => modelsMatch(model, item) || model.includes(String(item).toLowerCase()));
+  return list.some((item) => modelsMatch(model, item));
 }
 
 function contextKeywordScore(item, query) {
@@ -5355,7 +5355,7 @@ function prependResponseChunks(response, reader, chunks) {
   }), { status: response.status, statusText: response.statusText, headers: responseBodyHeaders(response.headers) });
 }
 
-function orderUpstreams(runtime, candidates, model) {
+function orderUpstreams(runtime, candidates, model, client) {
   if (candidates.length <= 1) {
     return candidates;
   }
@@ -5374,8 +5374,8 @@ function orderUpstreams(runtime, candidates, model) {
     healthy.push(upstream);
   });
 
-  const orderedHealthy = coordinationSort(runtime, healthy, model);
-  const orderedCooling = coordinationSort(runtime, cooling, model);
+  const orderedHealthy = coordinationSort(runtime, healthy, model, client);
+  const orderedCooling = coordinationSort(runtime, cooling, model, client);
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
   if (runtime.routing.failover === false) {
@@ -5390,11 +5390,12 @@ function prioritySort(items) {
   return [...items].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
 }
 
-function coordinationSort(runtime, items, model) {
-  const base = runtime.routing.load_balance === false ? prioritySort(items) : weightedShuffle(items);
+function coordinationSort(runtime, items, model, client) {
+  const loadBalance = runtime.routing.load_balance !== false;
+  const base = loadBalance ? weightedAffinitySort(items, client) : prioritySort(items);
   return base
     .map((item, index) => ({ item, index, pressure: upstreamCoordinationPressure(runtime, item), latency: upstreamLatencySortScore(item, model) }))
-    .sort((a, b) => a.pressure - b.pressure || a.latency - b.latency || a.index - b.index)
+    .sort((a, b) => a.pressure - b.pressure || (loadBalance ? a.index - b.index || a.latency - b.latency : a.latency - b.latency || a.index - b.index))
     .map((entry) => entry.item);
 }
 
@@ -5555,14 +5556,23 @@ function rememberUpstreamLatency(runtime, upstream, model, latencyMs, ctx) {
   return task;
 }
 
-function weightedShuffle(items) {
+function weightedAffinitySort(items, client) {
+  const clientKey = String(client?.key || client?.id || client?.name || "gateway").trim();
   return [...items]
     .map((item) => ({
       item,
-      sortKey: Math.pow(Math.random(), 1 / Math.max(1, Number(item.weight) || 1)),
+      sortKey: -Math.log((stableHash32(`${clientKey}\n${upstreamKey(item)}`) + 1) / 4294967297) / Math.max(1, Number(item.weight) || 1),
     }))
-    .sort((a, b) => b.sortKey - a.sortKey)
+    .sort((a, b) => a.sortKey - b.sortKey || a.item.name.localeCompare(b.item.name))
     .map((entry) => entry.item);
+}
+
+function stableHash32(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = Math.imul(hash ^ value.charCodeAt(index), 16777619);
+  }
+  return hash >>> 0;
 }
 
 async function hydrateUpstreamState(runtime, upstreams, model) {

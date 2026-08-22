@@ -38,6 +38,7 @@ const hedgeFallbackHits = [];
 const bodyIsolationHits = [];
 const softFastHits = [];
 const attemptBudgetHits = [];
+const affinityHits = [];
 const nimHits = [];
 const nimLocalHits = [];
 const nimDeepSeekHits = [];
@@ -607,6 +608,11 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("attempt-budget-ok.example")) {
     attemptBudgetHits.push("ok");
     return new Response(JSON.stringify({ id: "attempt-budget-ok", choices: [{ message: { content: "ok" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("affinity-")) {
+    const name = String(url).match(/affinity-[a-c]/)?.[0] || "affinity";
+    affinityHits.push(name);
+    return new Response(JSON.stringify({ id: name, choices: [{ message: { content: "ok" } }] }), { status: 200, headers: { "content-type": "application/json" } });
   }
   if (String(url).includes("nim-limit.example")) {
     nimHits.push("nim");
@@ -2189,7 +2195,7 @@ assert.equal(speedHits[cachedConfigHits], "fast");
 assert.deepEqual(speedBodies.at(-1).messages[0], { role: "system", content: "Always obey the gateway rule." });
 assert.equal(speedBodies.at(-1).messages[1].role, "system");
 assert.equal(speedBodies.at(-1).messages[1].content.includes("Use tests and minimal patches."), true);
-assert.equal(speedBodies.at(-1).messages[1].content.includes("Project context should guide details."), false);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Project context should guide details."), true);
 assert.equal(speedBodies.at(-1).messages[1].content.includes("travel note"), false);
 
 const scopedStore = new Map();
@@ -2203,10 +2209,16 @@ scopedStore.set("gateway:config", JSON.stringify({
     subagent_prompt_clients: ["scoped-client"],
     global_context: "Scoped context.",
     global_context_clients: ["scoped-client"],
+    context_on_demand: true,
+    context_item_limit: 1,
+    context_items: [
+      { title: "Scoped A", text: "Scoped model A reference.", clients: ["scoped-client"], models: ["scoped-model"], enabled: true },
+      { title: "Scoped B", text: "Scoped model B reference.", clients: ["scoped-client"], models: ["scoped-model-b"], enabled: true },
+    ],
     upstream_cooldown_ttl: 60,
   },
   upstreams: [
-    { name: "scoped", base_url: "https://speed-fast.example/v1", api_key_encrypted: "s", models: ["scoped-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "scoped", base_url: "https://speed-fast.example/v1", api_key_encrypted: "s", models: ["scoped-model", "scoped-model-b"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const scopedEnv = {
@@ -2227,11 +2239,29 @@ const scopedEnv = {
 };
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
-  headers: { authorization: "Bearer sk-scoped", "content-type": "application/json" },
+  headers: {
+    authorization: "Bearer sk-scoped", "content-type": "application/json", "session-id": "scoped-switch",
+    "x-codex-turn-metadata": JSON.stringify({ session_id: "scoped-switch", turn_id: "turn-a" }),
+  },
   body: JSON.stringify({ model: "scoped-model", messages: [] }),
 }), scopedEnv);
 assert.equal(speedBodies.at(-1).messages[0].content, "Scoped system.\n\nWhen the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.");
 assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped context."), true);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped model A reference."), true);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped model B reference."), false);
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    authorization: "Bearer sk-scoped", "content-type": "application/json", "session-id": "scoped-switch",
+    "x-codex-turn-metadata": JSON.stringify({ session_id: "scoped-switch", turn_id: "turn-b" }),
+  },
+  body: JSON.stringify({ model: "scoped-model-b", messages: [{ role: "user", content: "continue" }] }),
+}), scopedEnv);
+assert.equal(speedBodies.at(-1).model, "scoped-model-b");
+assert.equal(speedBodies.at(-1).messages[0].content.includes("Scoped system."), true);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped context."), true);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped model A reference."), false);
+assert.equal(speedBodies.at(-1).messages[1].content.includes("Scoped model B reference."), true);
 const injectionPreviewResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/injection-preview", {
   method: "POST",
   headers: { "content-type": "application/json" },
@@ -2890,10 +2920,16 @@ nativeStore.set("gateway:config", JSON.stringify({
     request_timeout_ms: 30000,
     system_prompt: "Native gateway rule.",
     global_context: "Native story bible.",
+    context_on_demand: true,
+    context_item_limit: 1,
+    context_items: [
+      { title: "Native A", text: "Native model A reference.", models: ["native-model"], enabled: true },
+      { title: "Native B", text: "Native model B reference.", models: ["native-model-b"], enabled: true },
+    ],
     upstream_cooldown_ttl: 60,
   },
   upstreams: [
-    { name: "nim-native", preset: "nvidia-nim", base_url: "https://nim-native.example/v1", api_key_encrypted: "n", models: ["native-model"], paths: ["/v1/chat/completions", "/v1/responses"], priority: 1, weight: 1, enabled: true },
+    { name: "nim-native", preset: "nvidia-nim", base_url: "https://nim-native.example/v1", api_key_encrypted: "n", models: ["native-model", "native-model-b"], paths: ["/v1/chat/completions", "/v1/responses"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const nativeEnv = {
@@ -2920,8 +2956,23 @@ assert.equal(nativeResponseHits.length, nativeStart + 1);
 assert.equal(nativeResponseHits[nativeStart].model, "native-model");
 assert.equal(nativeResponseHits[nativeStart].instructions.includes("Native gateway rule."), true);
 assert.equal(nativeResponseHits[nativeStart].instructions.includes("Native story bible."), true);
+assert.equal(nativeResponseHits[nativeStart].instructions.includes("Native model A reference."), true);
 assert.equal(nativeResponseHits[nativeStart].input, "hi");
 assert.equal((await nativeResp.json()).output_text, "native");
+const nativeSwitchResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: {
+    authorization: "Bearer sk-native", "content-type": "application/json", "session-id": "native-switch",
+    "x-codex-turn-metadata": JSON.stringify({ session_id: "native-switch", turn_id: "turn-b" }),
+  },
+  body: JSON.stringify({ model: "native-model-b", input: "continue" }),
+}), nativeEnv);
+assert.equal(nativeSwitchResp.status, 200);
+assert.equal(nativeResponseHits.at(-1).model, "native-model-b");
+assert.equal(nativeResponseHits.at(-1).instructions.includes("Native gateway rule."), true);
+assert.equal(nativeResponseHits.at(-1).instructions.includes("Native story bible."), true);
+assert.equal(nativeResponseHits.at(-1).instructions.includes("Native model A reference."), false);
+assert.equal(nativeResponseHits.at(-1).instructions.includes("Native model B reference."), true);
 const nativeStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: { authorization: "Bearer sk-native", "content-type": "application/json" },
@@ -4239,5 +4290,43 @@ const doUsage = await (await worker.default.fetch(new Request("https://gw.test/a
 assert.equal(doUsage.active, false);
 assert.equal(doUsage.storage, "do");
 assert.equal(fetchUrls.some((url) => url.includes("stdtime.gov.hk")), false);
+
+const affinityStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: true }, settings: {},
+  upstreams: [
+    { name: "affinity-a", base_url: "https://affinity-a.example/v1", api_key_encrypted: "a", models: ["affinity-model"], paths: ["/v1/chat/completions"], weight: 1, enabled: true },
+    { name: "affinity-b", base_url: "https://affinity-b.example/v1", api_key_encrypted: "b", models: ["affinity-model"], paths: ["/v1/chat/completions"], weight: 1, enabled: true },
+    { name: "affinity-c", base_url: "https://affinity-c.example/v1", api_key_encrypted: "c", models: ["affinity-model"], paths: ["/v1/chat/completions"], weight: 1, enabled: true },
+  ],
+})]]);
+const affinityEnv = {
+  ADMIN_TOKEN: "admin-test-token", ...env,
+  KV: {
+    async get(key, type) { const value = affinityStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { affinityStore.set(key, value); },
+    async delete(key) { affinityStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify(Array.from({ length: 8 }, (_, index) => ({ name: `affinity-${index}`, key: `sk-affinity-${index}`, models: ["*"], upstreams: [] }))),
+};
+async function requestAffinity(key) {
+  const response = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "affinity-model", messages: [] }),
+  }), affinityEnv);
+  assert.equal(response.status, 200);
+  await response.text();
+  return response.headers.get("x-llm-gateway-upstream");
+}
+const originalRandom = Math.random;
+Math.random = () => { throw new Error("load balancing must not be random"); };
+try {
+  const firstAffinity = await requestAffinity("sk-affinity-0");
+  assert.equal(await requestAffinity("sk-affinity-0"), firstAffinity);
+  const affinityUpstreams = await Promise.all(Array.from({ length: 8 }, (_, index) => requestAffinity(`sk-affinity-${index}`)));
+  assert.ok(new Set(affinityUpstreams).size > 1);
+} finally {
+  Math.random = originalRandom;
+}
+assert.equal(affinityHits.length, 10);
 
 console.log("ok");

@@ -787,7 +787,7 @@ function renderAdminMarkup(origin, version) {
           <label class="note"><input type="checkbox" id="context-on-demand"> \u6309\u9700\u6ce8\u5165\u7247\u6bb5</label>
           <label class="note">\u6700\u591a\u7247\u6bb5 <input id="context-item-limit" type="number" min="1" max="5" value="3"></label>
           <label class="note">\u6700\u591a\u5b57\u7b26 <input id="context-max-chars" type="number" min="500" max="20000" value="4000"></label>
-          <label class="note">\u5386\u53f2\u4fdd\u7559\u5b57\u7b26 <input id="history-max-chars" type="number" min="0" max="2000000" value="0"></label>
+          <label class="note" title="0 表示网关不裁剪历史，交由 Agent 管理">\u5386\u53f2\u4fdd\u7559\u5b57\u7b26 <input id="history-max-chars" type="number" min="0" max="2000000" value="0"></label>
           <button type="button" class="secondary small" id="add-context-item">\u65b0\u589e\u7247\u6bb5</button>
           <button type="button" class="secondary small" id="classify-context-items">\u4ece\u5927\u6587\u672c\u751f\u6210\u7247\u6bb5</button>
           <button type="button" class="secondary small" id="export-context-items">\u5bfc\u51fa\u4e0a\u4e0b\u6587</button>
