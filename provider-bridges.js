@@ -545,26 +545,28 @@ function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
   if (isNemotron3 && nimReasoningRequested(payload)) {
     const raw = reasoningEffortInput(payload);
     const disabled = nimReasoningDisabled(payload);
-    setChatTemplateKwargs(payload, {
-      enable_thinking: !disabled,
-      low_effort: !disabled && (raw === "low" || raw === "minimal"),
-    });
+    const effort = mapNimReasoningEffort(raw, ["none", "low", "medium", "high"], "high");
+    if (payload.reasoning_effort !== effort) {
+      payload.reasoning_effort = effort;
+    }
     const budget = nimReasoningBudget(payload);
     if (budget != null) {
       payload.reasoning_budget = budget;
     }
     changed = true;
-    changed = removeNimReasoningPayloadFields(payload, { keepReasoningBudget: true }) || changed;
+    changed = removeNimReasoningPayloadFields(payload, { keepReasoningEffort: true, keepReasoningBudget: true }) || changed;
   }
 
   if (isDeepSeekV4) {
     let effort = reasoningEffort;
-    if (!effort && payload?.chat_template_kwargs?.reasoning_effort != null) {
-      effort = mapNimReasoningEffort(payload.chat_template_kwargs.reasoning_effort, ["none", "high", "max"], "high");
+    if (!effort && payload?.reasoning_effort != null) {
+      effort = mapNimReasoningEffort(payload.reasoning_effort, ["none", "high", "max"], "high");
     }
-    setChatTemplateKwargs(payload, { reasoning_effort: effort || "high" });
+    if (payload.reasoning_effort !== (effort || "high")) {
+      payload.reasoning_effort = effort || "high";
+    }
     changed = true;
-    changed = removeNimReasoningPayloadFields(payload) || changed;
+    changed = removeNimReasoningPayloadFields(payload, { keepReasoningEffort: true }) || changed;
   }
 
   if (reasoningEffort && !isDeepSeekV4) {

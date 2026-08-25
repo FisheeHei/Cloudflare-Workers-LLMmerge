@@ -724,7 +724,16 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("nim-deepseek.example")) {
     const body = JSON.parse(init.body);
     nimDeepSeekHits.push(body);
+    const mixed = String(body.model || "").includes("mixed");
     if (body.stream) {
+      if (mixed) {
+        return new Response([
+          'data: {"choices":[{"delta":{"content":"<thi"}}]}\n\n',
+          'data: {"choices":[{"delta":{"content":"nk>embedded thought"}}]}\n\n',
+          'data: {"choices":[{"delta":{"content":"</think>answer"}}]}\n\n',
+          'data: [DONE]\n\n',
+        ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
       return new Response([
         'data: {"model":"deepseek-ai/deepseek-v4-flash-0731","choices":[{"delta":{"reasoning_content":"thinking step "}}]}\n\n',
         'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
@@ -734,7 +743,9 @@ globalThis.fetch = async (url, init) => {
     return new Response(JSON.stringify({
       id: "nim-deepseek",
       model: body.model,
-      choices: [{ message: { reasoning_content: "thinking step one", content: "answer text" } }],
+      choices: [{ message: mixed
+        ? { content: "<think>embedded thought</think>answer text" }
+        : { reasoning_content: "thinking step one", content: "answer text" } }],
       usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
     }), { status: 200, headers: { "content-type": "application/json" } });
   }
@@ -1296,10 +1307,8 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
   body: JSON.stringify({ model: "nvidia/nemotron-3-ultra", messages: [], reasoningEffort: "low", reasoningBudget: 4096 }),
 }), env);
-assert.equal(bodies[nimFamilyBodyStart + 3].chat_template_kwargs.enable_thinking, true);
-assert.equal(bodies[nimFamilyBodyStart + 3].chat_template_kwargs.low_effort, true);
+assert.equal(bodies[nimFamilyBodyStart + 3].reasoning_effort, "low");
 assert.equal(bodies[nimFamilyBodyStart + 3].reasoning_budget, 4096);
-assert.equal("reasoning_effort" in bodies[nimFamilyBodyStart + 3], false);
 assert.equal("reasoningBudget" in bodies[nimFamilyBodyStart + 3], false);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -1432,7 +1441,7 @@ nimDeepSeekStore.set("gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false },
   settings: {},
   upstreams: [
-    { name: "nim-deepseek", preset: "nvidia-nim", base_url: "https://nim-deepseek.example/v1", api_key: "n", models: ["deepseek-ai/deepseek-v4-flash-0731"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "nim-deepseek", preset: "nvidia-nim", base_url: "https://nim-deepseek.example/v1", api_key: "n", models: ["deepseek-ai/deepseek-v4-flash-0731", "deepseek-ai/deepseek-v4-flash-mixed"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const nimDeepSeekEnv = {
@@ -1455,15 +1464,15 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
   body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", messages: [], reasoningEffort: "high" }),
 }), nimDeepSeekEnv);
-assert.deepEqual(nimDeepSeekHits[nimDeepSeekStart].chat_template_kwargs, { reasoning_effort: "high" });
-assert.equal("reasoning_effort" in nimDeepSeekHits[nimDeepSeekStart], false);
+assert.equal(nimDeepSeekHits[nimDeepSeekStart].reasoning_effort, "high");
+assert.equal("chat_template_kwargs" in nimDeepSeekHits[nimDeepSeekStart], false);
 
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
   body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-0731", messages: [] }),
 }), nimDeepSeekEnv);
-assert.deepEqual(nimDeepSeekHits[nimDeepSeekStart + 1].chat_template_kwargs, { reasoning_effort: "high" });
+assert.equal(nimDeepSeekHits[nimDeepSeekStart + 1].reasoning_effort, "high");
 
 const nimDeepSeekChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -1483,6 +1492,46 @@ const nimDeepSeekStreamText = await nimDeepSeekStreamResp.text();
 assert.equal(nimDeepSeekStreamText.includes('"reasoning_content":"thinking step "'), true);
 assert.equal(nimDeepSeekStreamText.includes('"content":"answer"'), true);
 assert.equal(nimDeepSeekStreamText.includes("data: [DONE]"), true);
+
+const nimMixedChatResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-mixed", messages: [] }),
+}), nimDeepSeekEnv);
+const nimMixedChatText = await nimMixedChatResp.text();
+assert.equal(nimMixedChatText.includes('"reasoning_content":"embedded thought"'), true);
+assert.equal(nimMixedChatText.includes('"content":"answer text"'), true);
+assert.equal(nimMixedChatText.includes("<think>"), false);
+
+const nimMixedStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-mixed", messages: [], stream: true }),
+}), nimDeepSeekEnv);
+const nimMixedStreamText = await nimMixedStreamResp.text();
+assert.equal(nimMixedStreamText.includes('"reasoning_content":"embedded thought"'), true);
+assert.equal(nimMixedStreamText.includes('"content":"answer"'), true);
+assert.equal(nimMixedStreamText.includes("<think>"), false);
+
+const nimMixedResponsesResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-deepseek", "content-type": "application/json" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-mixed", input: "hi" }),
+}), nimDeepSeekEnv);
+const nimMixedResponsesText = await nimMixedResponsesResp.text();
+assert.equal(nimMixedResponsesText.includes('"type":"reasoning"'), true);
+assert.equal(nimMixedResponsesText.includes('"text":"embedded thought"'), true);
+assert.equal(nimMixedResponsesText.includes('"output_text":"answer text"'), true);
+
+const nimMixedMessagesResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
+  method: "POST",
+  headers: { "x-api-key": "sk-nim-deepseek", "content-type": "application/json", "anthropic-version": "2023-06-01" },
+  body: JSON.stringify({ model: "deepseek-ai/deepseek-v4-flash-mixed", max_tokens: 64, messages: [{ role: "user", content: "hi" }] }),
+}), nimDeepSeekEnv);
+const nimMixedMessagesText = await nimMixedMessagesResp.text();
+assert.equal(nimMixedMessagesText.includes('"type":"thinking"'), true);
+assert.equal(nimMixedMessagesText.includes('"thinking":"embedded thought"'), true);
+assert.equal(nimMixedMessagesText.includes('"text":"answer text"'), true);
 
 const nimDeepSeekMessagesResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
@@ -4249,6 +4298,12 @@ assert.equal(migrationD1.rows.has("gateway:config"), true);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: "Bearer sk-migrated" },
 }), migrationEnv)).status, 200);
+const migrationLookupByName = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients/migrated"), migrationEnv);
+assert.equal(migrationLookupByName.status, 200);
+assert.equal((await migrationLookupByName.json()).api_key, "sk-migrated");
+const migrationLookupByPreview = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients/sk-migra...ated"), migrationEnv);
+assert.equal(migrationLookupByPreview.status, 200);
+assert.equal((await migrationLookupByPreview.json()).api_key, "sk-migrated");
 migrationKv.clear();
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: "Bearer sk-migrated" },

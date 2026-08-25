@@ -104,7 +104,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `ANALYTICS_DATASET` | 可选 | 默认 `llmmerge_requests` |
 | `REQUEST_TIMEOUT_MS` | 可选 | 默认 `180000`；非流式请求最多等待 90 秒以避免自定义域名 524 |
 | `STREAM_IDLE_TIMEOUT_MS` | 可选 | 默认 `900000` |
-| `SSE_KEEPALIVE_MS` | 可选 | 默认 `3000`；流式响应的心跳注释间隔 |
+| `SSE_KEEPALIVE_MS` | 可选 | 默认 `5000`；流式响应的心跳注释间隔 |
 | `UPSTREAM_COOLDOWN_TTL` | 可选 | 默认 `60` 秒 |
 | `MODEL_CACHE_TTL` | 可选 | 默认 `3600` 秒 |
 | `UPSTREAMS_JSON` | 可选 | 初始上游种子配置 |
@@ -233,7 +233,7 @@ Responses API 额外支持：
 NVIDIA NIM 托管模板默认启用官方文档明确列出的 Chat Completions 和 Embeddings 路径；自托管 NIM 在上游路径中加入 `/v1/responses` 时，网关会优先原生直通 Responses API，否则统一转为 Chat Completions 后再聚合。
 `nvidia/nemotron-3-embed-1b` 的 Embeddings 请求需显式传入 `input_type`（`query` 或 `passage`）；网关会原样透传该字段。
 
-DeepSeek 模型经任意非官方上游（NIM、OpenRouter、自建端点等）调用时，网关会原样透传 `reasoning_content`；经 `/v1/responses` 或 `/v1/messages` 调用时会转换为 reasoning 条目 / thinking 块。NIM 上的 DeepSeek V4（例如 `deepseek-ai/deepseek-v4-flash-0731`）还会按 NIM 文档注入 `chat_template_kwargs.reasoning_effort`（`none` / `high` / `max`，未指定时默认 `high`）。官方 DeepSeek 端点仍按原策略隐藏推理内容。
+DeepSeek 模型经任意非官方上游（NIM、OpenRouter、自建端点等）调用时，网关会原样透传结构化 `reasoning_content`；经 `/v1/responses` 或 `/v1/messages` 调用时会转换为 reasoning 条目 / thinking 块。NIM 上的 DeepSeek V4（例如 `deepseek-ai/deepseek-v4-flash-0731`）使用顶层 `reasoning_effort`（`none` / `high` / `max`，未指定时默认 `high`）；Nemotron 3 使用顶层 `reasoning_effort` / `reasoning_budget`，Qwen、GLM、MiniMax 等模型继续按 NIM 文档使用对应的 `chat_template_kwargs`。如果 NIM 将 `<think>...</think>` 混入普通 `content`，网关会在四种兼容入口中拆出结构化推理，避免思考文本进入最终回答。
 
 `/v1/completions` 优先直通显式声明该路径的上游；如果没有这类上游，网关会自动把单条 `prompt` 转成 Chat Completions，再转回标准 `text_completion` 响应，流式和非流式均支持。
 

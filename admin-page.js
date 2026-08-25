@@ -242,6 +242,10 @@ function renderAdminStyle() {
     .client-item .client-meta .mono { color: var(--muted); word-break: break-all; }
     .client-create { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
     .client-create input { flex: 1; min-width: 160px; }
+    .client-panel-toggle { display: block; }
+    .client-recent-view { margin-top: 14px; }
+    .client-recent-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+    .client-recent-head strong { font-size: 13px; }
     .upstream-live-summary { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
     .upstream-live-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
     .upstream-live-summary strong { color: var(--ink); }
@@ -266,7 +270,8 @@ function renderAdminStyle() {
       content: "\u25B6"; font-size: 10px; color: var(--muted);
       transition: transform .2s ease;
     }
-    .settings-panel[open] summary::before { transform: rotate(90deg); }
+    .settings-panel[open] > summary::before,
+    .settings-panel details[open] > summary::before { transform: rotate(90deg); }
     .settings-panel summary h2 { margin: 0; }
     .settings-body { padding-top: 14px; }
 
@@ -568,10 +573,17 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
-  <details class="panel settings-panel" id="client-panel" open>
-    <summary><h2>\u5ba2\u6237\u7aef Keys</h2><span class="client-summary" id="client-summary">0 keys</span></summary>
-    <div class="settings-body">
-    <div id="client-list"></div>
+  <div class="panel settings-panel" id="client-panel">
+    <details class="client-panel-toggle" id="client-panel-toggle" open>
+      <summary><h2>\u5ba2\u6237\u7aef Keys</h2><span class="client-summary" id="client-summary">0 keys</span></summary>
+    </details>
+    <div class="client-recent-view" id="client-recent-view" hidden>
+      <div class="client-recent-head"><strong>\u6700\u8fd1\u521b\u5efa</strong><span class="note">\u6700\u591a 3 \u4e2a</span></div>
+      <div id="client-recent-list"></div>
+    </div>
+    <div class="settings-body" id="client-expanded-view">
+      <div id="client-list"></div>
+    </div>
     <div class="client-create">
       <input id="client-name" placeholder="\u540d\u79f0 (\u53ef\u9009)">
       <button class="good" id="create-client">\u751f\u6210 Key</button>
@@ -584,8 +596,7 @@ function renderAdminMarkup(origin, version) {
         <button class="small secondary" id="copy-client-json">\u590d\u5236 JSON</button>
       </div>
     </div>
-    </div>
-  </details>
+  </div>
 
   </section>
   <section class="page-view" id="view-upstreams" data-view="upstreams" hidden>
@@ -2687,42 +2698,63 @@ async function loadKvUsage() {
 
   function renderClients() {
     const host = byId("client-list");
+    const recentHost = byId("client-recent-list");
     const summary = byId("client-summary");
-    if (summary) summary.textContent = state.clients.length + " keys";
-    if (!state.clients.length) {
-      host.innerHTML = '<div class="note">\u8fd8\u6ca1\u6709\u5ba2\u6237\u7aef Key\uff0c\u70b9\u201c\u751f\u6210 Key\u201d\u521b\u5efa\u3002</div>';
-      return;
-    }
-    host.innerHTML = state.clients.map((c) =>
+    const clients = state.clients || [];
+    if (summary) summary.textContent = clients.length + " keys";
+    const itemHtml = (c, compact) =>
       '<div class="client-item">' +
         '<div class="client-meta">' +
           '<strong>' + esc(c.name) + '</strong>' +
           '<span class="mono">' + esc(c.key_preview || "") + '</span>' +
-          '<span class="note">' + clientUsageText(c.today_usage) + '</span>' +
+          (compact ? '<span class="note">' + esc(formatGatewayTime(c.created_at)) + '</span>' : '<span class="note">' + clientUsageText(c.today_usage) + '</span>') +
         '</div>' +
-        '<button type="button" class="small secondary" data-copy-client-id="' + esc(c.id) + '">\u590d\u5236 Key</button>' +
-        '<button type="button" class="small secondary" data-copy-client-setup="' + esc(c.id) + '">\u590d\u5236\u914d\u7f6e</button>' +
-        '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '">\u5220\u9664</button>' +
-      '</div>'
-    ).join("");
-    host.querySelectorAll("button[data-copy-client-id]").forEach((btn) => {
-      btn.addEventListener("click", () =>
-        withButtonBusy(btn, "\u590d\u5236\u4e2d...", () => copyClientKey(btn.dataset.copyClientId)).catch(showError)
-      );
-    });
-    host.querySelectorAll("button[data-copy-client-setup]").forEach((btn) => {
-      btn.addEventListener("click", () =>
-        withButtonBusy(btn, "\u590d\u5236\u4e2d...", () => copyClientSetup(btn.dataset.copyClientSetup)).catch(showError)
-      );
-    });
-    host.querySelectorAll("button[data-client-id]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        await withButtonBusy(btn, "\u5220\u9664\u4e2d...", async () => {
-          await deleteClient(btn.dataset.clientId);
-          showToast("\u5df2\u5220\u9664\u5ba2\u6237\u7aef");
+        '<button type="button" class="small secondary" data-copy-client-id="' + esc(c.id) + '" data-copy-client-name="' + esc(c.name) + '">\u590d\u5236 Key</button>' +
+        (compact ? '' : '<button type="button" class="small secondary" data-copy-client-setup="' + esc(c.id) + '" data-copy-client-name="' + esc(c.name) + '">\u590d\u5236\u914d\u7f6e</button>' +
+          '<button type="button" class="danger small" data-client-id="' + esc(c.id) + '" data-client-name="' + esc(c.name) + '">\u5220\u9664</button>') +
+      '</div>';
+    const bindActions = (target, compact) => {
+      target.querySelectorAll("button[data-copy-client-id]").forEach((btn) => {
+        btn.addEventListener("click", () =>
+          withButtonBusy(btn, "\u590d\u5236\u4e2d...", () => copyClientKey(btn.dataset.copyClientId, btn.dataset.copyClientName)).catch(showError)
+        );
+      });
+      if (compact) return;
+      target.querySelectorAll("button[data-copy-client-setup]").forEach((btn) => {
+        btn.addEventListener("click", () =>
+          withButtonBusy(btn, "\u590d\u5236\u4e2d...", () => copyClientSetup(btn.dataset.copyClientSetup, btn.dataset.copyClientName)).catch(showError)
+        );
+      });
+      target.querySelectorAll("button[data-client-id]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          await withButtonBusy(btn, "\u5220\u9664\u4e2d...", async () => {
+            await deleteClient(btn.dataset.clientId, btn.dataset.clientName);
+            showToast("\u5df2\u5220\u9664\u5ba2\u6237\u7aef");
+          });
         });
       });
-    });
+    };
+    host.innerHTML = clients.length
+      ? clients.map((c) => itemHtml(c, false)).join("")
+      : '<div class="note">\u8fd8\u6ca1\u6709\u5ba2\u6237\u7aef Key\uff0c\u70b9\u201c\u751f\u6210 Key\u201d\u521b\u5efa\u3002</div>';
+    const recent = clients.slice().sort((a, b) => {
+      const aTime = Date.parse(a.created_at || "");
+      const bTime = Date.parse(b.created_at || "");
+      return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+    }).slice(0, 3);
+    recentHost.innerHTML = recent.length
+      ? recent.map((c) => itemHtml(c, true)).join("")
+      : '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
+    bindActions(host, false);
+    bindActions(recentHost, true);
+    updateClientPanelView();
+  }
+
+  function updateClientPanelView() {
+    const toggle = byId("client-panel-toggle");
+    const collapsed = toggle ? !toggle.open : false;
+    byId("client-recent-view").hidden = !collapsed;
+    byId("client-expanded-view").hidden = collapsed;
   }
 
   async function createClient() {
@@ -2753,23 +2785,36 @@ async function loadKvUsage() {
     return requests + ' today / ' + tokens.toLocaleString() + ' tokens';
   }
 
-  async function copyClientKey(id) {
-    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(id));
-    const client = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(client?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef Key \u5931\u8d25");
+  async function fetchClientRecord(id, name) {
+    const refs = [...new Set([id, name].map((value) => text(value).trim()).filter(Boolean))];
+    let client = null;
+    for (const ref of refs) {
+      const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(ref));
+      client = await parseApiResponse(resp);
+      if (resp.ok) return client;
+    }
+    throw new Error(client?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u5931\u8d25");
+  }
+
+  async function copyClientKey(id, name) {
+    const client = await fetchClientRecord(id, name);
     await copyText(client.api_key, "API Key \u5df2\u590d\u5236");
   }
 
-  async function copyClientSetup(id) {
-    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(id));
-    const client = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(client?.error?.message || "\u8bfb\u53d6\u5ba2\u6237\u7aef\u914d\u7f6e\u5931\u8d25");
+  async function copyClientSetup(id, name) {
+    const client = await fetchClientRecord(id, name);
     await copyText(JSON.stringify(client.setup, null, 2), "\u5ba2\u6237\u7aef\u914d\u7f6e\u5df2\u590d\u5236");
   }
 
-  async function deleteClient(id) {
-    const resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(id), { method: "DELETE" });
-    const payload = await parseApiResponse(resp);
+  async function deleteClient(id, name) {
+    const refs = [...new Set([id, name].map((value) => text(value).trim()).filter(Boolean))];
+    let resp = null;
+    let payload = null;
+    for (const ref of refs) {
+      resp = await fetch(API_BASE + "/clients/" + encodeURIComponent(ref), { method: "DELETE" });
+      payload = await parseApiResponse(resp);
+      if (resp.ok) break;
+    }
     if (!resp.ok) throw new Error(payload?.error?.message || "\u5220\u9664\u5931\u8d25");
     await loadClients();
   }
@@ -2783,6 +2828,7 @@ async function loadKvUsage() {
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
       byId("speed-picker-modal").addEventListener("click", (e) => { if (e.target === byId("speed-picker-modal")) closeSpeedPicker(); });
       byId("system-prompt-modal").addEventListener("click", (e) => { if (e.target === byId("system-prompt-modal")) closeSystemPromptModal(); });
+      byId("client-panel-toggle")?.addEventListener("toggle", updateClientPanelView);
       document.addEventListener("keydown", (e) => {
         if (e.key !== "Escape") return;
         hideStatTip();

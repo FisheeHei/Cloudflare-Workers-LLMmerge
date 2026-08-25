@@ -57,7 +57,7 @@ const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
-const SSE_KEEPALIVE_MS = 15000;
+const SSE_KEEPALIVE_MS = 5000;
 const SSE_FINISH_GRACE_MS = 5000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
@@ -1252,7 +1252,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   }
   if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
     setSseHeaders(headers);
-    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : "", hideReasoning));
+    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : "", hideReasoning, isNvidiaNimUpstream(proxyResponse.upstream)));
     return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -1267,6 +1267,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
       log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
       return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
     }
+    normalizeNimChatPayload(payload, proxyResponse.upstream);
     sanitizeOpenAiPayload(payload, hideReasoning);
     const normalizedUsage = withFallbackChatUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
     if (normalizedUsage) payload.usage = normalizedUsage;
@@ -1280,7 +1281,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
 }
 
-function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "", hideReasoning = false) {
+function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "", hideReasoning = false, normalizeNimReasoning = false) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const doneChunk = encoder.encode("data: [DONE]\n\n");
@@ -1297,12 +1298,16 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   let closeReason = "done";
   let finishReason = "";
   let sawDone = false;
-  const transformChunk = Boolean(responseModel || hideReasoning);
+  const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
+  const transformChunk = Boolean(responseModel || hideReasoning || normalizeNimReasoning);
   const stripChoiceText = createChoiceThinkTagStripper();
   const emitTransformed = (controller, now = Date.now()) => {
     let output = "";
     buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
-      const out = sanitizeOpenAiStreamChunk(chunk, { responseModel, hideReasoning, stripChoiceText });
+      const out = normalizeNimChatStreamChunk(
+        sanitizeOpenAiStreamChunk(chunk, { responseModel, hideReasoning, stripChoiceText }),
+        splitChoiceText,
+      );
       const error = noteChunk(out, now);
       if (error) {
         streamError = streamError || error;
@@ -1705,6 +1710,102 @@ function createThinkTagStripper() {
   };
 }
 
+function createThinkContentSplitter() {
+  let inThink = false;
+  let pending = "";
+  return (value) => {
+    let text = pending + String(value || "");
+    pending = "";
+    let reasoning = "";
+    let content = "";
+    for (;;) {
+      const lower = text.toLowerCase();
+      if (inThink) {
+        const close = lower.indexOf("</think>");
+        if (close < 0) {
+          const tail = trailingThinkMarker(text);
+          reasoning += tail ? text.slice(0, -tail) : text;
+          if (tail) pending = text.slice(-tail);
+          return { reasoning, content };
+        }
+        reasoning += text.slice(0, close);
+        text = text.slice(close + 8);
+        inThink = false;
+        continue;
+      }
+      const open = lower.indexOf("<think");
+      const close = lower.indexOf("</think>");
+      if (close >= 0 && (open < 0 || close < open)) {
+        content += text.slice(0, close);
+        text = text.slice(close + 8);
+        continue;
+      }
+      if (open < 0) {
+        const tail = trailingThinkMarker(text);
+        content += tail ? text.slice(0, -tail) : text;
+        if (tail) pending = text.slice(-tail);
+        return { reasoning, content };
+      }
+      content += text.slice(0, open);
+      const end = text.indexOf(">", open);
+      if (end < 0) {
+        pending = text.slice(open);
+        return { reasoning, content };
+      }
+      text = text.slice(end + 1);
+      inThink = true;
+    }
+  };
+}
+
+function appendReasoningContent(target, value) {
+  const text = String(value || "");
+  if (!text) return;
+  const current = reasoningText(target.reasoning_content ?? target.reasoning ?? target.thinking);
+  target.reasoning_content = current + text;
+}
+
+function normalizeNimChatMessage(message) {
+  if (!message || typeof message.content !== "string" || !/<\/?think\b/i.test(message.content)) return false;
+  const split = createThinkContentSplitter()(message.content);
+  if (!split.reasoning && split.content === message.content) return false;
+  appendReasoningContent(message, split.reasoning);
+  message.content = split.content;
+  return true;
+}
+
+function normalizeNimChatPayload(payload, upstream) {
+  if (!isNvidiaNimUpstream(upstream) || !payload || !Array.isArray(payload.choices)) return payload;
+  for (const choice of payload.choices) normalizeNimChatMessage(choice?.message);
+  return payload;
+}
+
+function createChoiceThinkContentSplitter() {
+  const splitters = new Map();
+  return (key, value) => {
+    const id = String(key ?? 0);
+    if (!splitters.has(id)) splitters.set(id, createThinkContentSplitter());
+    return splitters.get(id)(value);
+  };
+}
+
+function normalizeNimChatStreamChunk(chunk, splitChoiceText) {
+  if (!splitChoiceText || !chunk || !Array.isArray(chunk.choices)) return chunk;
+  let changed = false;
+  const choices = chunk.choices.map((choice, index) => {
+    if (typeof choice?.delta?.content !== "string") return choice;
+    const split = splitChoiceText(choice.index ?? index, choice.delta.content);
+    if (!split.reasoning && split.content === choice.delta.content) return choice;
+    changed = true;
+    const delta = { ...choice.delta };
+    if (split.content) delta.content = split.content;
+    else delete delta.content;
+    if (split.reasoning) appendReasoningContent(delta, split.reasoning);
+    return { ...choice, delta };
+  });
+  return changed ? { ...chunk, choices } : chunk;
+}
+
 function createChoiceThinkTagStripper() {
   const strippers = new Map();
   return (key, value) => {
@@ -1857,7 +1958,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   const clientMatch = apiPath.match(/^\/api\/clients\/([^/]+)$/);
   if (clientMatch && request.method === "GET") {
     const id = decodeURIComponent(clientMatch[1]);
-    const existing = await app.state.get(clientIdKey(id), "json");
+    const existing = await resolveClientRecord(app.state, id);
     if (!existing?.key) throw httpError(404, "Client not found.");
     const baseUrl = `${url.origin}/v1`;
     const response = withCorsResponse(json({
@@ -1874,7 +1975,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   if (clientMatch && request.method === "PUT") {
     const id = decodeURIComponent(clientMatch[1]);
-    const existing = await app.state.get(clientIdKey(id), "json");
+    const existing = await resolveClientRecord(app.state, id);
     if (!existing?.key) throw httpError(404, "Client not found.");
     const payload = parseJsonBody(await readRequestText(request));
     const record = buildClientRecord({
@@ -3100,7 +3201,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
           throw error;
         }
         const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, extra);
-        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
+        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream));
       } catch (error) {
         if (!logged) {
           recordRequestLog(app, makeRequestLogEntry({
@@ -3148,6 +3249,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
       return anthropicErrorResponse(upstreamApplicationErrorMessage(openaiPayload) || "Upstream returned an invalid response.", 502, headers);
     }
 
+    normalizeNimChatPayload(openaiPayload, proxyResponse.upstream);
     const responsePayload = openAiChatToAnthropicMessage(openaiPayload, translated.seed, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
     headers.set("content-type", "application/json; charset=utf-8");
     recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated, responsePayload.usage, ctx, traceId, {
@@ -3565,7 +3667,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
           return nativeResponsesStream(upstreamResp.body, onDone);
         }
         const onFinal = (responsePayload) => maybeStoreResponse(runtime, responsePayload, ctx);
-        return streamResponsesFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), onFinal);
+        return streamResponsesFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), onFinal, isNvidiaNimUpstream(proxyResponse.upstream));
       } catch (error) {
         _activeResponses.delete(translated.seed.id);
         recordRequestLog(app, makeRequestLogEntry({
@@ -3629,6 +3731,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
         responsePayload.usage = normalizeResponsesUsage(responsePayload.usage, estimateTokens(responsePayload.output_text || ""));
       }
     } else {
+      normalizeNimChatPayload(openaiPayload, proxyResponse.upstream);
       const choice = (openaiPayload.choices || [])[0] || {};
       const message = choice.message || {};
       const hideReasoning = shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream);
@@ -3719,7 +3822,7 @@ function chatToCompletionsPayload(chatPayload, seed, hideReasoning = false) {
   };
 }
 
-function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false) {
+function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -3744,8 +3847,10 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
     let outputText = "";
     let emitted = false;
     const diag = createStreamDiag(started);
+    const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
     const stripText = hideReasoning ? createThinkTagStripper() : null;
     const processChunk = (chunk, now = Date.now()) => {
+      chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
       streamError = streamEventErrorMessage(chunk) || streamError;
       usage = normalizeChatUsageChunk(chunk.usage, outputText, seed.promptTokens) || usage;
       finishReason = responseFinishReason(chunk) || finishReason;
@@ -3880,7 +3985,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
         if (useNative) {
           return trackOpenAiStreamUsage(upstreamResp.body, translated.seed.promptTokens, finish, started, translated.model !== translated.seed.model ? translated.seed.model : "", shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
         }
-        return streamCompletionsFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
+        return streamCompletionsFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream));
       } catch (error) {
         logError(error, error.upstreamName || proxyResponse?.upstream?.name || "none");
         throw error;
@@ -3925,6 +4030,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
         model: translated.seed.model,
       };
     } else {
+      normalizeNimChatPayload(openaiPayload, proxyResponse.upstream);
       responsePayload = chatToCompletionsPayload(openaiPayload, translated.seed, hideReasoning);
     }
     const usage = responsePayload.usage || normalizeOpenAiLogUsage(openaiPayload?.usage, translated.seed.promptTokens, estimateOpenAiCompletionTokens(openaiPayload));
@@ -4401,7 +4507,7 @@ function recordResponsesLog(app, client, upstreamName, model, started, status, b
   }), ctx);
 }
 
-function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false) {
+function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -4420,6 +4526,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
     let nextIndex = 0;
     const toolBlocks = new Map();
     const diag = createStreamDiag(started);
+    const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
     const stripText = createThinkTagStripper();
     const closeText = async () => {
       if (textIndex == null) return;
@@ -4480,6 +4587,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       }
     };
     const processChunk = async (chunk, now = Date.now()) => {
+      chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
       const streamError = streamEventErrorMessage(chunk);
       if (streamError) throw new Error(streamError);
       usage = chunk.usage || usage;
@@ -4588,7 +4696,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
   return readable;
 }
 
-function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, onFinal = null) {
+function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, onFinal = null, normalizeNimReasoning = false) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -4609,6 +4717,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     const toolCalls = new Map();
     let nextOutputIndex = 1;
     const diag = createStreamDiag(started);
+    const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
     let closeReason = "done";
     const writes = [];
     const stripText = createThinkTagStripper();
@@ -4619,6 +4728,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       writes.push(write({ type: "response.reasoning_summary_part.added", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, part: { type: "summary_text", text: "" } }));
     };
     const processChunk = (chunk, now = Date.now()) => {
+      chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
       streamError = streamEventErrorMessage(chunk) || streamError;
       usage = withFallbackChatUsage(chunk.usage, 0, Math.round(outputChars / 4)) || usage;
       finishReason = responseFinishReason(chunk) || finishReason;
@@ -5561,9 +5671,9 @@ function weightedAffinitySort(items, client) {
   return [...items]
     .map((item) => ({
       item,
-      sortKey: -Math.log((stableHash32(`${clientKey}\n${upstreamKey(item)}`) + 1) / 4294967297) / Math.max(1, Number(item.weight) || 1),
+      sortKey: Math.pow((stableHash32(`${clientKey}\n${upstreamKey(item)}`) + 1) / 4294967297, 1 / Math.max(1, Number(item.weight) || 1)),
     }))
-    .sort((a, b) => a.sortKey - b.sortKey || a.item.name.localeCompare(b.item.name))
+    .sort((a, b) => b.sortKey - a.sortKey || a.item.name.localeCompare(b.item.name))
     .map((entry) => entry.item);
 }
 
@@ -5775,21 +5885,41 @@ async function saveClientRecord(store, record) {
 }
 
 async function deleteClientRecord(store, id) {
-  const record = await store.get(clientIdKey(id), "json");
+  const record = await resolveClientRecord(store, id);
   if (!record || !record.key) {
     throw httpError(404, "Client not found.");
   }
 
-  await store.delete(clientIdKey(id));
+  await store.delete(clientIdKey(record.id));
   await store.delete(clientTokenKey(record.key));
 
   const index = await listClientIndex(store);
   await store.put(
     clientIndexKey(),
-    JSON.stringify(index.filter((item) => item.id !== id)),
+    JSON.stringify(index.filter((item) => item.id !== id && item.id !== record.id)),
   );
   delete _clientCache[record.key];
   delete _clientCacheTs[record.key];
+}
+
+async function resolveClientRecord(store, reference) {
+  const value = String(reference || "").trim();
+  if (!value) return null;
+
+  const direct = await store.get(clientIdKey(value), "json");
+  if (direct?.key) return direct;
+
+  const byToken = await store.get(clientTokenKey(value), "json");
+  if (byToken?.key) return byToken;
+
+  const indexed = (await listClientIndex(store)).find((item) =>
+    [item?.id, item?.name, item?.key, item?.key_preview].some((candidate) => String(candidate || "") === value),
+  );
+  if (!indexed) return null;
+
+  const indexedRecord = indexed.id ? await store.get(clientIdKey(indexed.id), "json") : null;
+  if (indexedRecord?.key) return indexedRecord;
+  return indexed.key ? store.get(clientTokenKey(indexed.key), "json") : null;
 }
 
 async function listClientIndex(store) {
