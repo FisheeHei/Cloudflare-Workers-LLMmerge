@@ -82,7 +82,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-22-stable-routing";
+const VERSION = "v26-08-25-client-keys";
 
 export default {
   async fetch(request, env, ctx) {
