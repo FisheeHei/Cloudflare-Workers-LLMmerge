@@ -250,6 +250,7 @@ In short: memory is for live display, Analytics Engine is for long-term history,
 - `failover`: try another upstream after failure
 - `load_balance`: distribute by weight
 - `coordination_level` (0-5, default 3): higher values spread concurrent requests away from active or reserved upstreams, with weight treated as relative capacity
+- `soft_interval_ms` (default 50): stagger dispatches when multiple client keys select the same upstream; set it to `0` to disable, while requests already spread across upstreams are not delayed
 - Successful requests and speed tests write a six-hour latency EWMA to state storage so fresh isolates can prefer recently faster upstreams
 - Streaming failover only happens before the first visible output; once bytes are visible to the client, the gateway never replays the request, avoiding duplicate Agent text or tool calls
 - An upstream `Retry-After` response becomes an upstream/model cooldown state; a healthy fallback is attempted immediately instead of waiting on the failed provider

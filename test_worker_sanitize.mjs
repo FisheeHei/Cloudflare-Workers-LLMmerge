@@ -35,6 +35,8 @@ const hedgeStreamAborts = [];
 const hedgeCancels = [];
 const hedgeReserveHits = [];
 const hedgeFallbackHits = [];
+const parallelRouteHits = [];
+const softIntervalStarts = [];
 const bodyIsolationHits = [];
 const softFastHits = [];
 const attemptBudgetHits = [];
@@ -574,6 +576,23 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes("hedge-fallback-d.example")) {
     hedgeFallbackHits.push("d");
     return new Response(JSON.stringify({ id: "hedge-fallback-d", choices: [{ message: { content: "unused" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("parallel-route-a.example") || String(url).includes("parallel-route-b.example")) {
+    const name = String(url).includes("-a.") ? "a" : "b";
+    parallelRouteHits.push(name);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    return new Response(JSON.stringify({ id: name, choices: [{ message: { content: name } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("soft-interval.example")) {
+    softIntervalStarts.push(Date.now());
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    return new Response(JSON.stringify({ id: "soft-interval", choices: [{ message: { content: "ok" } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -3711,6 +3730,66 @@ const spreadResp = await worker.default.fetch(new Request("https://gw.test/v1/ch
 assert.equal(spreadResp.headers.get("x-llm-gateway-upstream"), "idle");
 await spreadBusyResp.text();
 await spreadResp.text();
+const parallelRouteStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false, coordination_level: 3, soft_interval_ms: 40 },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "parallel-route-a", base_url: "https://parallel-route-a.example/v1", api_key_encrypted: "a", models: ["parallel-route-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "parallel-route-b", base_url: "https://parallel-route-b.example/v1", api_key_encrypted: "b", models: ["parallel-route-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+  ],
+})]]);
+const parallelRouteEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = parallelRouteStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { parallelRouteStore.set(key, value); },
+    async delete(key) { parallelRouteStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([
+    { name: "parallel-a", key: "sk-parallel-a", models: ["*"], upstreams: ["parallel-route-a", "parallel-route-b"] },
+    { name: "parallel-b", key: "sk-parallel-b", models: ["*"], upstreams: ["parallel-route-a", "parallel-route-b"] },
+  ]),
+};
+const parallelRouteStart = parallelRouteHits.length;
+const parallelResponses = await Promise.all(["a", "b"].map((id) => worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-parallel-" + id, "content-type": "application/json" },
+  body: JSON.stringify({ model: "parallel-route-model", messages: [] }),
+}), parallelRouteEnv)));
+assert.deepEqual(parallelResponses.map((response) => response.headers.get("x-llm-gateway-upstream")).sort(), ["parallel-route-a", "parallel-route-b"]);
+assert.deepEqual(parallelRouteHits.slice(parallelRouteStart).sort(), ["a", "b"]);
+
+const softIntervalStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false, coordination_level: 3, soft_interval_ms: 40 },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "soft-interval", base_url: "https://soft-interval.example/v1", api_key_encrypted: "s", models: ["soft-interval-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+})]]);
+const softIntervalEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = softIntervalStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { softIntervalStore.set(key, value); },
+    async delete(key) { softIntervalStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([
+    { name: "soft-interval-a", key: "sk-soft-interval-a", models: ["*"], upstreams: ["soft-interval"] },
+    { name: "soft-interval-b", key: "sk-soft-interval-b", models: ["*"], upstreams: ["soft-interval"] },
+  ]),
+};
+const softIntervalStart = softIntervalStarts.length;
+await Promise.all(["a", "b"].map((id) => worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-soft-interval-" + id, "content-type": "application/json" },
+  body: JSON.stringify({ model: "soft-interval-model", messages: [] }),
+}), softIntervalEnv)));
+const softIntervalTimes = softIntervalStarts.slice(softIntervalStart);
+assert.equal(softIntervalTimes.length, 2);
+assert.ok(Math.abs(softIntervalTimes[1] - softIntervalTimes[0]) >= 30);
+
 const spreadZeroStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false, coordination_level: 0 },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },

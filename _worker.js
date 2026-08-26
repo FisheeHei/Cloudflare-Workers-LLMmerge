@@ -59,6 +59,7 @@ const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
 const SSE_KEEPALIVE_MS = 5000;
 const SSE_FINISH_GRACE_MS = 5000;
+const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
@@ -82,7 +83,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-25-client-keys";
+const VERSION = "v26-08-26-parallel-routing";
 
 export default {
   async fetch(request, env, ctx) {
@@ -322,6 +323,10 @@ let _activeUpstreamEpoch = 0;
 const _activeUpstreamControllers = new Set();
 // ponytail: isolate-local soft reservations; DO only if cross-edge fairness ever matters
 let _upstreamReservations = {};
+// ponytail: stagger same-upstream dispatches without delaying already-spread requests.
+let _upstreamDispatchAt = {};
+let _upstreamDispatchClients = {};
+const _routeSelectionTails = {};
 // ponytail: per-isolate active Responses streams, keyed by response id for cancel support
 const _activeResponses = new Map();
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -2258,6 +2263,7 @@ function normalizeGatewayRouting(routing = {}) {
     fast_routing: routing.fast_routing === true,
     hedge_enabled: routing.hedge_enabled === true,
     hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
+    soft_interval_ms: parseNonNegativeInt(routing.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000),
     load_balance: routing.load_balance !== false,
   };
 }
@@ -4861,15 +4867,35 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   }
 
   await hydrateUpstreamState(runtime, candidates, model);
-  const attempts = orderUpstreams(runtime, candidates, model, client);
-  const maxAttempts = runtime.routing.failover === false
-    ? 1
-    : Math.min(attempts.length, runtime.routing.hedge_max || 2);
-  if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
-    const used = new Set(hedgedAttempts.map(upstreamKey));
-    const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-    return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal });
+  let attempts = null;
+  let maxAttempts = 0;
+  let initialReservation = null;
+  let initialDispatchContested = false;
+  const releaseSelection = await acquireRouteSelectionLock(`${pathname}\n${model}`);
+  let selectionReleased = false;
+  const releaseSelectionOnce = () => {
+    if (selectionReleased) return;
+    selectionReleased = true;
+    releaseSelection();
+  };
+  try {
+    attempts = orderUpstreams(runtime, candidates, model, client);
+    maxAttempts = runtime.routing.failover === false
+      ? 1
+      : Math.min(attempts.length, runtime.routing.hedge_max || 2);
+    if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
+      const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
+      const used = new Set(hedgedAttempts.map(upstreamKey));
+      const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
+      const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal });
+      releaseSelectionOnce();
+      return result;
+    }
+    initialDispatchContested = upstreamHasCompetition(attempts[0]);
+    initialReservation = reserveUpstreams([attempts[0]]);
+  } catch (error) {
+    releaseSelectionOnce();
+    throw error;
   }
   let lastError = null;
 
@@ -4877,12 +4903,17 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const upstream = attempts[index];
     const isLast = index === maxAttempts - 1;
     let upstreamResult = null;
+    const dispatchContested = index === 0 ? initialDispatchContested : upstreamHasCompetition(upstream);
+    const releaseReservation = index === 0 ? initialReservation : reserveUpstreams([upstream]);
 
     try {
-      upstreamResult = await fetchProxyUpstream({
+      await waitForUpstreamDispatch(runtime, upstream, client, signal, dispatchContested);
+      const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
       });
+      releaseSelectionOnce();
+      upstreamResult = await upstreamPromise;
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
@@ -4916,6 +4947,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         };
       }
     } catch (error) {
+      releaseSelectionOnce();
       await discardUpstreamResponse(upstreamResult, "upstream request failed");
       if (signal?.aborted) {
         const cancelled = httpError(499, "Response cancelled.");
@@ -4929,6 +4961,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       if (isLast) {
         break;
       }
+    } finally {
+      releaseReservation();
     }
   }
 
@@ -5504,9 +5538,14 @@ function coordinationSort(runtime, items, model, client) {
   const loadBalance = runtime.routing.load_balance !== false;
   const base = loadBalance ? weightedAffinitySort(items, client) : prioritySort(items);
   return base
-    .map((item, index) => ({ item, index, pressure: upstreamCoordinationPressure(runtime, item), latency: upstreamLatencySortScore(item, model) }))
-    .sort((a, b) => a.pressure - b.pressure || (loadBalance ? a.index - b.index || a.latency - b.latency : a.latency - b.latency || a.index - b.index))
+    .map((item, index) => ({ item, index, specificity: upstreamModelSpecificity(item, model), pressure: upstreamCoordinationPressure(runtime, item, client), latency: upstreamLatencySortScore(item, model) }))
+    .sort((a, b) => a.specificity - b.specificity || a.pressure - b.pressure || (loadBalance ? a.index - b.index || a.latency - b.latency : a.latency - b.latency || a.index - b.index))
     .map((entry) => entry.item);
+}
+
+function upstreamModelSpecificity(upstream, model) {
+  const models = configuredUpstreamModels(upstream);
+  return !models.length || models.includes("*") ? 1 : 0;
 }
 
 function activeUpstreamCount(upstream) {
@@ -5517,11 +5556,21 @@ function upstreamReservationCount(upstream) {
   return Number(_upstreamReservations[upstreamKey(upstream)] || 0) || 0;
 }
 
-function upstreamCoordinationPressure(runtime, upstream) {
+function upstreamHasCompetition(upstream) {
+  return activeUpstreamCount(upstream) > 0 || upstreamReservationCount(upstream) > 0;
+}
+
+function upstreamCoordinationPressure(runtime, upstream, client) {
   const level = upstreamCoordinationPressureMs(runtime);
   if (level <= 0) return 0;
   const capacity = Math.max(1, Number(upstream?.weight) || 1);
-  return ((activeUpstreamCount(upstream) + upstreamReservationCount(upstream) * 1.5) / capacity) * level;
+  const pressure = ((activeUpstreamCount(upstream) + upstreamReservationCount(upstream) * 1.5) / capacity) * level;
+  const interval = upstreamSoftIntervalMs(runtime);
+  const recent = _upstreamDispatchClients[upstreamKey(upstream)];
+  const currentClient = String(client?.key || client?.id || client?.name || "gateway");
+  const busy = upstreamHasCompetition(upstream);
+  const crossClient = busy && recent && recent.client !== currentClient && Date.now() - Number(recent.at || 0) < interval;
+  return pressure + (crossClient ? level : 0);
 }
 
 function upstreamLatencySortScore(upstream, model) {
@@ -5532,6 +5581,43 @@ function upstreamLatencySortScore(upstream, model) {
 function upstreamCoordinationPressureMs(runtime) {
   const level = Number(runtime?.routing?.coordination_level ?? 3);
   return Math.max(0, Math.min(5, Number.isFinite(level) ? Math.floor(level) : 3)) * 500;
+}
+
+function upstreamSoftIntervalMs(runtime) {
+  return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000);
+}
+
+async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
+  const interval = upstreamSoftIntervalMs(runtime);
+  const name = upstreamKey(upstream);
+  if (!interval || !name) return;
+  const now = Date.now();
+  const scheduled = contested ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
+  _upstreamDispatchAt[name] = scheduled + interval;
+  _upstreamDispatchClients[name] = {
+    client: String(client?.key || client?.id || client?.name || "gateway"),
+    at: now,
+  };
+  const delay = scheduled - now;
+  if (delay > 0) await sleep(delay);
+  if (signal?.aborted) throw httpError(499, "Response cancelled.");
+}
+
+async function acquireRouteSelectionLock(key) {
+  const previous = _routeSelectionTails[key] || Promise.resolve();
+  let releaseCurrent;
+  const current = new Promise((resolve) => { releaseCurrent = resolve; });
+  const gate = previous.then(() => undefined);
+  const tail = gate.then(() => current);
+  _routeSelectionTails[key] = tail;
+  await gate;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseCurrent();
+    if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
+  };
 }
 
 function reserveUpstreams(upstreams) {
@@ -5644,6 +5730,9 @@ function clearActiveUpstreamState() {
   _activeUpstreams = {};
   _activeUpstreamClients = {};
   _upstreamReservations = {};
+  _upstreamDispatchAt = {};
+  _upstreamDispatchClients = {};
+  Object.keys(_routeSelectionTails).forEach((key) => delete _routeSelectionTails[key]);
   return released;
 }
 
