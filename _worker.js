@@ -21,7 +21,7 @@ const HTML_HEADERS = {
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "access-control-allow-headers": "authorization,content-type,x-admin-token,x-api-key,anthropic-version,anthropic-beta,session-id,thread-id,turn-id,x-turn-id,x-client-request-id,x-session-id,x-conversation-id,x-codex-turn-metadata",
+  "access-control-allow-headers": "authorization,content-type,x-admin-token,x-api-key,anthropic-version,anthropic-beta,session-id,thread-id,turn-id,x-turn-id,x-client-request-id,x-session-id,x-conversation-id,x-codex-turn-metadata,x-request-id,x-trace-id",
   "access-control-max-age": "3600",
 };
 
@@ -83,7 +83,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-26-parallel-routing";
+const VERSION = "v26-08-26-connection-tuning";
 
 export default {
   async fetch(request, env, ctx) {
@@ -187,7 +187,7 @@ export default {
             let proxyResponse;
             let logged = false;
             try {
-              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: proxyBodyText, runtime, search: url.search, ctx });
+              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: proxyBodyText, runtime, search: url.search, ctx, signal: request.signal });
               const upstreamResp = proxyResponse.response;
               const responseHeaders = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
               const response = await buildLoggedProxyResponse({ app, bodyText: proxyBodyText, client, ctx, headers: responseHeaders, model, responseModel: publicModel, pathname, requestPayload: payload, proxyResponse, started, traceId, upstreamResp });
@@ -227,6 +227,7 @@ export default {
             runtime,
             search: url.search,
             ctx,
+            signal: request.signal,
           });
         } catch (error) {
           recordRequestLog(app, makeRequestLogEntry({
@@ -3194,6 +3195,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
           runtime,
           search: url.search,
           ctx,
+          signal: request.signal,
         });
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) {
@@ -3238,6 +3240,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
       runtime,
       search: url.search,
       ctx,
+      signal: request.signal,
     });
 
     const upstreamResp = proxyResponse.response;
@@ -3660,7 +3663,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
           runtime,
           search: url.search,
           ctx,
-          signal: controller.signal,
+          signal: mergeAbortSignals(request.signal, controller.signal),
         });
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
@@ -3706,6 +3709,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
       runtime,
       search: url.search,
       ctx,
+      signal: request.signal,
     });
 
     const upstreamResp = proxyResponse.response;
@@ -3984,6 +3988,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
           runtime,
           search: url.search,
           ctx,
+          signal: request.signal,
         });
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
@@ -4010,6 +4015,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
       runtime,
       search: url.search,
       ctx,
+      signal: request.signal,
     });
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
@@ -4184,7 +4190,7 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   }), ctx);
 
   try {
-    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search, ctx });
+    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search, ctx, signal: request.signal });
     upstreamName = proxyResponse.upstream.name;
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
@@ -4866,12 +4872,15 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     throw httpError(404, `No upstream available for model: ${model}`);
   }
 
-  await hydrateUpstreamState(runtime, candidates, model);
-  let attempts = null;
-  let maxAttempts = 0;
+  const singleUpstream = candidates.length === 1;
+  if (!singleUpstream) await hydrateUpstreamState(runtime, candidates, model);
+  let attempts = singleUpstream ? candidates : null;
+  let maxAttempts = singleUpstream ? 1 : 0;
   let initialReservation = null;
   let initialDispatchContested = false;
-  const releaseSelection = await acquireRouteSelectionLock(`${pathname}\n${model}`);
+  const releaseSelection = singleUpstream
+    ? () => {}
+    : await acquireRouteSelectionLock(`${pathname}\n${model}`);
   let selectionReleased = false;
   const releaseSelectionOnce = () => {
     if (selectionReleased) return;
@@ -4879,17 +4888,19 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     releaseSelection();
   };
   try {
-    attempts = orderUpstreams(runtime, candidates, model, client);
-    maxAttempts = runtime.routing.failover === false
-      ? 1
-      : Math.min(attempts.length, runtime.routing.hedge_max || 2);
-    if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-      const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
-      const used = new Set(hedgedAttempts.map(upstreamKey));
-      const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-      const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal });
-      releaseSelectionOnce();
-      return result;
+    if (!singleUpstream) {
+      attempts = orderUpstreams(runtime, candidates, model, client);
+      maxAttempts = runtime.routing.failover === false
+        ? 1
+        : Math.min(attempts.length, runtime.routing.hedge_max || 2);
+      if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
+        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
+        const used = new Set(hedgedAttempts.map(upstreamKey));
+        const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
+        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal });
+        releaseSelectionOnce();
+        return result;
+      }
     }
     initialDispatchContested = upstreamHasCompetition(attempts[0]);
     initialReservation = reserveUpstreams([attempts[0]]);
@@ -5909,7 +5920,8 @@ function upstreamSupportsPath(upstream, pathname) {
 }
 
 function normalizeClient(client) {
-  if (!client || typeof client !== "object" || !client.key) {
+  const key = String(client?.key || "").trim();
+  if (!client || typeof client !== "object" || !key) {
     throw badConfig("Each client needs `key`.");
   }
 
@@ -5918,7 +5930,7 @@ function normalizeClient(client) {
     metadata: client.metadata || {},
     models: normalizeStringArray(client.models),
     name: client.name || client.id || "client",
-    key: client.key,
+    key,
     upstreams: normalizeStringArray(client.upstreams),
     created_at: client.created_at || utcNowIso(),
     updated_at: client.updated_at || utcNowIso(),
@@ -6424,9 +6436,7 @@ function isAllowedUpstreamUrl(value) {
 
 function getBearerToken(request) {
   const auth = request.headers.get("authorization") || "";
-  const token = auth.startsWith("Bearer ")
-    ? auth.slice("Bearer ".length).trim()
-    : (request.headers.get("x-api-key") || "").trim();
+  const token = auth.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || (request.headers.get("x-api-key") || "").trim();
   return token && token.length <= MAX_CLIENT_KEY_LENGTH ? token : null;
 }
 
@@ -6525,13 +6535,14 @@ function wrapIdleTimeout(response, timeoutMs, onClose) {
 
 function responseBodyHeaders(headers) {
   const safe = new Headers(headers);
-  ["content-length", "content-encoding", "transfer-encoding"].forEach((name) => safe.delete(name));
+  ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-encoding"].forEach((name) => safe.delete(name));
   return safe;
 }
 
 function proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId) {
   const headers = responseBodyHeaders(upstreamResp.headers);
   for (const [key, value] of Object.entries(CORS_HEADERS)) headers.set(key, value);
+  headers.set("cache-control", "no-store");
   headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
   headers.set("x-llm-gateway-client", client.name || client.id || "client");
   headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
@@ -6563,6 +6574,21 @@ function generateClientKey() {
 function requestTraceId(request) {
   const incoming = String(request.headers.get("x-request-id") || request.headers.get("x-trace-id") || "").trim();
   return incoming && incoming.length <= 128 ? incoming : `gw_${randomString(16)}`;
+}
+
+function mergeAbortSignals(...signals) {
+  const active = signals.filter(Boolean);
+  if (active.length <= 1) return active[0] || null;
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") return AbortSignal.any(active);
+  const controller = new AbortController();
+  const abort = (signal) => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  active.forEach((signal) => {
+    if (signal.aborted) abort(signal);
+    else signal.addEventListener("abort", () => abort(signal), { once: true });
+  });
+  return controller.signal;
 }
 
 function randomString(length) {

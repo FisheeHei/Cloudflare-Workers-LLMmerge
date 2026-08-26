@@ -823,7 +823,9 @@ const unconfiguredHealth = await worker.default.fetch(new Request("https://gw.te
 assert.equal(unconfiguredHealth.status, 200);
 assert.equal((await unconfiguredHealth.json()).admin_configured, false);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/favicon.ico"), unconfiguredEnv)).status, 200);
-assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", { method: "OPTIONS" }), unconfiguredEnv)).status, 204);
+const optionsResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", { method: "OPTIONS" }), unconfiguredEnv);
+assert.equal(optionsResp.status, 204);
+assert.equal(optionsResp.headers.get("access-control-allow-headers").includes("x-request-id"), true);
 const workersUsageNoTokenResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/workers-usage"), {
   ...env,
   ANALYTICS_ACCOUNT_ID: "",
@@ -931,6 +933,10 @@ const privateModelsResp = await worker.default.fetch(new Request("https://gw.tes
   headers: { authorization: "Bearer sk-test" },
 }), env);
 assert.equal(privateModelsResp.headers.get("cache-control"), "private, max-age=30");
+const lowercaseBearerResp = await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "bearer sk-test" },
+}), env);
+assert.equal(lowercaseBearerResp.status, 200);
 const modelCacheStore = new Map([["cache:models:cached-upstream", JSON.stringify({ models: ["vendor/cached-model"] })]]);
 const modelCacheEnv = {
   ADMIN_TOKEN: "admin-test-token",
