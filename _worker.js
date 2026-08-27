@@ -58,7 +58,6 @@ const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
 const SSE_KEEPALIVE_MS = 5000;
-const SSE_FINISH_GRACE_MS = 5000;
 const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
@@ -83,7 +82,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-26-connection-tuning";
+const VERSION = "v26-08-27-upstream-abort";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1258,7 +1257,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   }
   if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
     setSseHeaders(headers);
-    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : "", hideReasoning, isNvidiaNimUpstream(proxyResponse.upstream)));
+    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : "", hideReasoning, isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse)));
     return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
 
@@ -1287,7 +1286,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
   return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
 }
 
-function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "", hideReasoning = false, normalizeNimReasoning = false) {
+function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "", hideReasoning = false, normalizeNimReasoning = false, onComplete = null) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const doneChunk = encoder.encode("data: [DONE]\n\n");
@@ -1304,6 +1303,12 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   let closeReason = "done";
   let finishReason = "";
   let sawDone = false;
+  let upstreamStopped = false;
+  const stopUpstream = () => {
+    if (upstreamStopped) return;
+    upstreamStopped = true;
+    try { onComplete?.(); } catch {}
+  };
   const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
   const transformChunk = Boolean(responseModel || hideReasoning || normalizeNimReasoning);
   const stripChoiceText = createChoiceThinkTagStripper();
@@ -1324,6 +1329,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
       }
     }, () => {
       sawDone = true;
+      stopUpstream();
       output += "data: [DONE]\n\n";
     });
     if (output) controller.enqueue(encoder.encode(output));
@@ -1358,9 +1364,10 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
       try {
         for (;;) {
           const result = await readSseChunk(reader, finishReason);
-          if (result.finishGrace) {
-            closeReason = "finish_grace";
-            Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+          if (result.completed) {
+            closeReason = "completed";
+            stopUpstream();
+            Promise.resolve(reader.cancel("response completed")).catch(() => {});
             controller.enqueue(doneChunk);
             sawDone = true;
             break;
@@ -1384,15 +1391,19 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
               }
             }, () => {
               sawDone = true;
+              stopUpstream();
               parsedOutput += "data: [DONE]\n\n";
             });
             if (parsedOutput) controller.enqueue(encoder.encode(parsedOutput));
             if (streamError) sawDone = true;
           }
-          if (sawDone) break;
+          if (sawDone) {
+            Promise.resolve(reader.cancel("response completed")).catch(() => {});
+            break;
+          }
         }
         buffer += decoder.decode();
-        if (buffer) {
+        if (!sawDone && buffer) {
           buffer += "\n\n";
           if (transformChunk) emitTransformed(controller);
           else {
@@ -1405,7 +1416,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
               } else {
                 parsedOutput += "data: " + JSON.stringify(chunk) + "\n\n";
               }
-            }, () => { sawDone = true; });
+            }, () => { sawDone = true; stopUpstream(); });
             if (parsedOutput) controller.enqueue(encoder.encode(parsedOutput));
             if (streamError && !sawDone) {
               sawDone = true;
@@ -1414,7 +1425,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
         }
         if (!sawDone && closeReason === "done") {
           if (finishReason) {
-            closeReason = "eof_grace";
+            closeReason = "completed";
             controller.enqueue(doneChunk);
           } else {
             closeReason = "eof";
@@ -1566,12 +1577,23 @@ function consumeOpenAiStreamBuffer(text, onChunk, onDone = null) {
     if (!data) continue;
     if (data === "[DONE]") {
       if (onDone) onDone();
-      continue;
+      break;
     }
     const chunk = safeJson(data);
-    if (chunk) onChunk(chunk);
+    if (!chunk) continue;
+    onChunk(chunk);
+    if (isCompletedSseChunk(chunk)) break;
   }
   return rest;
+}
+
+function isCompletedSseChunk(chunk) {
+  if (!chunk || typeof chunk !== "object") return false;
+  if (chunk.type === "response.completed") return true;
+  return (chunk.choices || []).some((choice) => {
+    const reason = String(choice?.finish_reason || "").trim().toLowerCase();
+    return reason && reason !== "tool_calls";
+  });
 }
 
 function createStreamDiag(started = Date.now()) {
@@ -1881,16 +1903,9 @@ function responseFinishReason(payload) {
   return [...reasons].join(",");
 }
 
-function shouldApplyFinishGrace(finishReason) {
-  return Boolean(String(finishReason || "").trim());
-}
-
 async function readSseChunk(reader, finishReason = "") {
-  if (!shouldApplyFinishGrace(finishReason)) return reader.read();
-  return Promise.race([
-    reader.read(),
-    sleep(SSE_FINISH_GRACE_MS).then(() => ({ finishGrace: true })),
-  ]);
+  if (String(finishReason || "").trim()) return { completed: true };
+  return reader.read();
 }
 
 function noteStreamToolCalls(chunk, seen) {
@@ -3209,7 +3224,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
           throw error;
         }
         const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, extra);
-        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream));
+        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
       } catch (error) {
         if (!logged) {
           recordRequestLog(app, makeRequestLogEntry({
@@ -3673,10 +3688,10 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
         };
         if (useNative) {
           const onDone = (usage, extra) => finish(usage, extra);
-          return nativeResponsesStream(upstreamResp.body, onDone);
+          return nativeResponsesStream(upstreamResp.body, onDone, () => abortUpstreamResponse(proxyResponse));
         }
         const onFinal = (responsePayload) => maybeStoreResponse(runtime, responsePayload, ctx);
-        return streamResponsesFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), onFinal, isNvidiaNimUpstream(proxyResponse.upstream));
+        return streamResponsesFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), onFinal, isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
       } catch (error) {
         _activeResponses.delete(translated.seed.id);
         recordRequestLog(app, makeRequestLogEntry({
@@ -3832,7 +3847,7 @@ function chatToCompletionsPayload(chatPayload, seed, hideReasoning = false) {
   };
 }
 
-function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false) {
+function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false, onComplete = null) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -3856,6 +3871,12 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
     let sawDone = false;
     let outputText = "";
     let emitted = false;
+    let upstreamStopped = false;
+    const stopUpstream = () => {
+      if (upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+    };
     const diag = createStreamDiag(started);
     const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
     const stripText = hideReasoning ? createThinkTagStripper() : null;
@@ -3878,9 +3899,11 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
       const reader = openaiResp.body.getReader();
       for (;;) {
         const result = await readSseChunk(reader, finishReason);
-        if (result.finishGrace) {
-          closeReason = "finish_grace";
-          Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+        if (result.completed) {
+          closeReason = "completed";
+          stopUpstream();
+          Promise.resolve(reader.cancel("response completed")).catch(() => {});
+          sawDone = true;
           break;
         }
         const { done, value } = result;
@@ -3889,15 +3912,18 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
         noteStreamByte(diag, now);
         buffer += decoder.decode(value, { stream: true });
         const writes = [];
-        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; });
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; stopUpstream(); });
         await Promise.all(writes);
         if (streamError) throw new Error(streamError);
-        if (sawDone) break;
+        if (sawDone) {
+          Promise.resolve(reader.cancel("response completed")).catch(() => {});
+          break;
+        }
       }
       buffer += decoder.decode();
-      if (buffer) {
+      if (!sawDone && buffer) {
         const writes = [];
-        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; });
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; stopUpstream(); });
         await Promise.all(writes);
         if (streamError) throw new Error(streamError);
       }
@@ -3911,7 +3937,7 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
           ...streamDiagExtra(diag),
         });
       } else {
-        if (!sawDone) closeReason = "eof_grace";
+        if (!sawDone) closeReason = "completed";
         if (seed.echo && !emitted) await write(completionChunk(seed.prompt));
         await write(completionChunk("", finishReason || "stop", usage || undefined));
         await writer.write(encoder.encode("data: [DONE]\n\n"));
@@ -3994,9 +4020,9 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
         const finish = (usage, extra) => recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, usage, ctx, traceId, translated.seed.promptTokens, extra);
         if (useNative) {
-          return trackOpenAiStreamUsage(upstreamResp.body, translated.seed.promptTokens, finish, started, translated.model !== translated.seed.model ? translated.seed.model : "", shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
+          return trackOpenAiStreamUsage(upstreamResp.body, translated.seed.promptTokens, finish, started, translated.model !== translated.seed.model ? translated.seed.model : "", shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), false, () => abortUpstreamResponse(proxyResponse));
         }
-        return streamCompletionsFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream));
+        return streamCompletionsFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
       } catch (error) {
         logError(error, error.upstreamName || proxyResponse?.upstream?.name || "none");
         throw error;
@@ -4057,7 +4083,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
   }
 }
 
-function nativeResponsesStream(body, onDone) {
+function nativeResponsesStream(body, onDone, onComplete = null) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -4071,6 +4097,12 @@ function nativeResponsesStream(body, onDone) {
     let completed = false;
     let outputChars = 0;
     let closeReason = "done";
+    let upstreamStopped = false;
+    const stopUpstream = () => {
+      if (upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+    };
     const reader = body.getReader();
     const processChunk = (chunk) => {
       if (chunk.usage) usage = chunk.usage;
@@ -4089,9 +4121,11 @@ function nativeResponsesStream(body, onDone) {
     };
     for (;;) {
       const result = await readSseChunk(reader, finishReason);
-      if (result.finishGrace) {
-        closeReason = "finish_grace";
-        Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+      if (result.completed) {
+        closeReason = "completed";
+        stopUpstream();
+        Promise.resolve(reader.cancel("response completed")).catch(() => {});
+        sawDone = true;
         await writer.write(encoder.encode("data: [DONE]\n\n"));
         break;
       }
@@ -4099,14 +4133,17 @@ function nativeResponsesStream(body, onDone) {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const events = [];
-      buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; });
+      buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; stopUpstream(); });
       for (const event of events) await writeEvent(event);
-      if (sawDone) break;
+      if (sawDone) {
+        Promise.resolve(reader.cancel("response completed")).catch(() => {});
+        break;
+      }
     }
     buffer += decoder.decode();
-    if (buffer) {
+    if (!sawDone && buffer) {
       const events = [];
-      consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; });
+      consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; stopUpstream(); });
       for (const event of events) await writeEvent(event);
     }
     if (!sawDone && !completed) {
@@ -4114,7 +4151,7 @@ function nativeResponsesStream(body, onDone) {
       await writeEvent({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
     } else {
       if (!sawDone) {
-        closeReason = "eof_grace";
+        closeReason = "completed";
         await writer.write(encoder.encode("data: [DONE]\n\n"));
       }
     }
@@ -4519,7 +4556,7 @@ function recordResponsesLog(app, client, upstreamName, model, started, status, b
   }), ctx);
 }
 
-function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false) {
+function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false, onComplete = null) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -4537,6 +4574,12 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
     let thinkingIndex = null;
     let nextIndex = 0;
     const toolBlocks = new Map();
+    let upstreamStopped = false;
+    const stopUpstream = () => {
+      if (upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+    };
     const diag = createStreamDiag(started);
     const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
     const stripText = createThinkTagStripper();
@@ -4641,9 +4684,11 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       const reader = openaiResp.body.getReader();
       for (;;) {
         const result = await readSseChunk(reader, finishReason);
-        if (result.finishGrace) {
-          closeReason = "finish_grace";
-          Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+        if (result.completed) {
+          closeReason = "completed";
+          stopUpstream();
+          Promise.resolve(reader.cancel("response completed")).catch(() => {});
+          sawDone = true;
           break;
         }
         const { done, value } = result;
@@ -4652,14 +4697,17 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
         noteStreamByte(diag, now);
         buffer += decoder.decode(value, { stream: true });
         const writes = [];
-        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; });
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; stopUpstream(); });
         await Promise.all(writes);
-        if (sawDone) break;
+        if (sawDone) {
+          Promise.resolve(reader.cancel("response completed")).catch(() => {});
+          break;
+        }
       }
       buffer += decoder.decode();
-      if (buffer) {
+      if (!sawDone && buffer) {
         const writes = [];
-        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; });
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; stopUpstream(); });
         await Promise.all(writes);
       }
       if (!sawDone && !finishReason) {
@@ -4675,7 +4723,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
         });
         return;
       }
-      if (!sawDone) closeReason = "eof_grace";
+      if (!sawDone) closeReason = "completed";
       await stopOpenBlocks();
       const stopReason = openAiFinishToAnthropicStop(finishReason);
       const finalUsage = normalizeAnthropicUsage(usage, [{ text: outputText }]);
@@ -4708,7 +4756,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
   return readable;
 }
 
-function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, onFinal = null, normalizeNimReasoning = false) {
+function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, onFinal = null, normalizeNimReasoning = false, onComplete = null) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -4733,6 +4781,12 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     let closeReason = "done";
     const writes = [];
     const stripText = createThinkTagStripper();
+    let upstreamStopped = false;
+    const stopUpstream = () => {
+      if (upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+    };
     const ensureReasoning = () => {
       if (reasoningOutputIndex != null) return;
       reasoningOutputIndex = nextOutputIndex++;
@@ -4787,9 +4841,11 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       const reader = openaiResp.body.getReader();
       for (;;) {
         const result = await readSseChunk(reader, finishReason);
-        if (result.finishGrace) {
-          closeReason = "finish_grace";
-          Promise.resolve(reader.cancel("finish grace elapsed")).catch(() => {});
+        if (result.completed) {
+          closeReason = "completed";
+          stopUpstream();
+          Promise.resolve(reader.cancel("response completed")).catch(() => {});
+          sawDone = true;
           break;
         }
         const { done, value } = result;
@@ -4797,14 +4853,17 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         const now = Date.now();
         noteStreamByte(diag, now);
         buffer += decoder.decode(value, { stream: true });
-        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => processChunk(chunk, now), () => { sawDone = true; });
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => processChunk(chunk, now), () => { sawDone = true; stopUpstream(); });
         await Promise.all(writes.splice(0));
         if (streamError) throw new Error(streamError);
-        if (sawDone) break;
+        if (sawDone) {
+          Promise.resolve(reader.cancel("response completed")).catch(() => {});
+          break;
+        }
       }
       buffer += decoder.decode();
-      if (buffer) {
-        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => processChunk(chunk), () => { sawDone = true; });
+      if (!sawDone && buffer) {
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => processChunk(chunk), () => { sawDone = true; stopUpstream(); });
         await Promise.all(writes.splice(0));
         if (streamError) throw new Error(streamError);
       }
@@ -4820,7 +4879,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         await write({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
         return;
       }
-      if (!sawDone) closeReason = "eof_grace";
+      if (!sawDone) closeReason = "completed";
       const donePart = { type: "output_text", text, annotations: [] };
       await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: 0, content_index: 0, text });
       await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: 0, content_index: 0, part: donePart });
@@ -4955,6 +5014,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
           attempts: index + 1,
           response,
           upstream,
+          abortUpstream: upstreamResult.abortUpstream,
         };
       }
     } catch (error) {
@@ -5009,12 +5069,15 @@ function traceResponse(response, traceId) {
 async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal, upstream, firstByteTimeoutMs }) {
   const started = Date.now();
   const controller = new AbortController();
-  const abort = () => controller.abort(signal?.reason || "request aborted");
-  if (signal?.aborted) abort();
-  else signal?.addEventListener("abort", abort, { once: true });
+  const abortRequest = () => controller.abort(signal?.reason || "request aborted");
+  const abortUpstream = (reason = "response completed") => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
+  if (signal?.aborted) abortRequest();
+  else signal?.addEventListener("abort", abortRequest, { once: true });
   const activeRelease = trackActiveUpstream(upstream, client, controller);
   const release = () => {
-    signal?.removeEventListener("abort", abort);
+    signal?.removeEventListener("abort", abortRequest);
     activeRelease();
   };
   try {
@@ -5032,7 +5095,7 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
       runtime.streamIdleTimeoutMs,
       release,
     );
-    return { response, release, latency: Date.now() - started, startedAt: started };
+    return { response, release, abortUpstream, latency: Date.now() - started, startedAt: started };
   } catch (error) {
     release();
     if (controller.signal.aborted && controller.signal.reason === ACTIVE_UPSTREAM_ABORT_REASON) {
@@ -5282,8 +5345,13 @@ function upstreamBadGatewayResponse(message, headers) {
 }
 
 async function discardUpstreamResponse(result, reason) {
+  try { result?.abortUpstream?.(reason); } catch {}
   try { await result?.response?.body?.cancel(reason); } catch {}
   result?.release?.();
+}
+
+function abortUpstreamResponse(result, reason = "response completed") {
+  try { result?.abortUpstream?.(reason); } catch {}
 }
 
 function stopHedgeLosers(pending, controllers, winnerIndex) {
@@ -5358,7 +5426,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
         await clearUpstreamFailure(runtime, result.upstream, model);
         rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
         rememberSuccessfulUpstream(result.upstream, model);
-        return { attempts: result.index + 1, response: result.response, upstream: result.upstream };
+        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream };
       }
       if (result.response) {
         await discardUpstreamResponse(result, "retryable hedged response");
@@ -5405,7 +5473,7 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     await clearUpstreamFailure(runtime, upstream, model);
     rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
     rememberSuccessfulUpstream(upstream, model);
-    return { response: result.response, upstream };
+    return { response: result.response, upstream, abortUpstream: result.abortUpstream };
   } catch (error) {
     await discardUpstreamResponse(result, "hedged fallback failed");
     if (signal?.aborted) throw httpError(499, "Response cancelled.");

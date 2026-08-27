@@ -67,6 +67,7 @@ const usageHits = [];
 const acceptHits = [];
 const wrappedHits = [];
 const toolStreamHits = [];
+const doneCancelHits = [];
 const appErrorHits = [];
 const htmlHits = [];
 const emptyStreamHits = [];
@@ -191,6 +192,7 @@ globalThis.fetch = async (url, init) => {
     return new Response([
       'data: {"choices":[{"delta":{"content":"done early"}}]}\n\n',
       'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}\n\n',
+      'data: {"choices":[{"delta":{"content":"stale-after-complete"}}]}\n\n',
     ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("responses-eof.example")) {
@@ -237,6 +239,25 @@ globalThis.fetch = async (url, init) => {
       },
       cancel() {
         toolStreamHits.push("cancel");
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("done-cancel.example")) {
+    doneCancelHits.push("stream");
+    const encoder = new TextEncoder();
+    return new Response(new ReadableStream({
+      start(controller) {
+        init.signal?.addEventListener("abort", () => doneCancelHits.push("abort"), { once: true });
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n'));
+        setTimeout(() => {
+          try {
+            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"stale"}}]}\n\n'));
+            doneCancelHits.push("late");
+          } catch {}
+        }, 25);
+      },
+      cancel() {
+        doneCancelHits.push("cancel");
       },
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
@@ -3962,6 +3983,7 @@ streamFixStore.set("gateway:config", JSON.stringify({
     { name: "responses-stop-eof", base_url: "https://responses-stop-eof.example/v1", api_key_encrypted: "q", models: ["responses-stop-eof-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "native-eof", preset: "nvidia-nim", base_url: "https://native-eof.example/v1", api_key_encrypted: "n", models: ["native-eof-model"], paths: ["/v1/chat/completions", "/v1/responses"], priority: 1, weight: 1, enabled: true },
     { name: "native-abort", preset: "nvidia-nim", base_url: "https://native-abort.example/v1", api_key_encrypted: "a", models: ["native-abort-model"], paths: ["/v1/chat/completions", "/v1/responses"], priority: 1, weight: 1, enabled: true },
+    { name: "done-cancel", base_url: "https://done-cancel.example/v1", api_key_encrypted: "d", models: ["done-cancel-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
 }));
 const streamFixEnv = {
@@ -3975,7 +3997,7 @@ const streamFixEnv = {
     async put(key, value) { streamFixStore.set(key, value); },
     async delete(key) { streamFixStore.delete(key); },
   },
-  CLIENTS_JSON: JSON.stringify([{ name: "stream-fix-client", key: "sk-stream-fix", models: ["*"], upstreams: ["zero-usage", "stop-eof", "responses-eof", "responses-stop-eof", "native-eof", "native-abort"] }]),
+  CLIENTS_JSON: JSON.stringify([{ name: "stream-fix-client", key: "sk-stream-fix", models: ["*"], upstreams: ["zero-usage", "stop-eof", "responses-eof", "responses-stop-eof", "native-eof", "native-abort", "done-cancel"] }]),
 };
 const zeroUsageText = await (await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
@@ -3990,10 +4012,11 @@ const stopEofResp = await worker.default.fetch(new Request("https://gw.test/v1/c
   body: JSON.stringify({ model: "stop-eof-model", messages: [], stream: true }),
 }), streamFixEnv);
 const stopEofText = await stopEofResp.text();
+assert.equal(stopEofText.includes("stale-after-complete"), false);
 assert.equal(stopEofText.includes('"finish_reason":"stop"'), true);
 assert.equal(stopEofText.includes("data: [DONE]"), true);
 const stopEofLog = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), streamFixEnv)).json()).logs.find((entry) => entry.model === "stop-eof-model");
-assert.equal(stopEofLog.close_reason, "eof_grace");
+assert.equal(stopEofLog.close_reason, "completed");
 assert.equal(stopEofLog.status, 200);
 const responsesEofResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
@@ -4015,7 +4038,7 @@ const responsesStopEofText = await responsesStopEofResp.text();
 assert.equal(responsesStopEofText.includes('"type":"response.completed"'), true);
 assert.equal(responsesStopEofText.includes("data: [DONE]"), true);
 const responsesStopEofLog = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), streamFixEnv)).json()).logs.find((entry) => entry.model === "responses-stop-eof-model");
-assert.equal(responsesStopEofLog.close_reason, "eof_grace");
+assert.equal(responsesStopEofLog.close_reason, "completed");
 const nativeEofResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: { authorization: "Bearer sk-stream-fix", "content-type": "application/json" },
@@ -4026,7 +4049,7 @@ assert.equal(nativeEofText.includes('"type":"response.completed"'), true);
 assert.equal(nativeEofText.includes("data: [DONE]"), true);
 assert.equal(nativeEofText.includes('"output_tokens":1'), true);
 const nativeEofLog = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), streamFixEnv)).json()).logs.find((entry) => entry.model === "native-eof-model");
-assert.equal(nativeEofLog.close_reason, "eof_grace");
+assert.equal(nativeEofLog.close_reason, "completed");
 assert.equal(nativeEofLog.completion_tokens >= 1, true);
 const nativeAbortResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
@@ -4039,6 +4062,18 @@ assert.equal(nativeAbortText.includes("data: [DONE]"), false);
 const nativeAbortLog = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), streamFixEnv)).json()).logs.find((entry) => entry.model === "native-abort-model");
 assert.equal(nativeAbortLog.close_reason, "eof");
 assert.equal(nativeAbortLog.status, 502);
+const doneCancelResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-stream-fix", "content-type": "application/json" },
+  body: JSON.stringify({ model: "done-cancel-model", messages: [], stream: true }),
+}), streamFixEnv);
+const doneCancelText = await doneCancelResp.text();
+assert.equal(doneCancelText.includes("done"), true);
+assert.equal(doneCancelText.endsWith("data: [DONE]\n\n"), true);
+await new Promise((resolve) => setTimeout(resolve, 35));
+assert.equal(doneCancelHits.includes("abort"), true);
+assert.equal(doneCancelHits.includes("cancel"), true);
+assert.equal(doneCancelHits.includes("late"), false);
 
 const toolLogStore = new Map();
 toolLogStore.set("gateway:config", JSON.stringify({
@@ -4106,10 +4141,11 @@ const toolStreamResp = await worker.default.fetch(new Request("https://gw.test/v
 const toolStreamText = await toolStreamResp.text();
 assert.equal(toolStreamText.includes('"finish_reason":"tool_calls"'), true);
 assert.equal(toolStreamText.endsWith("data: [DONE]\n\n"), true);
+assert.equal(toolStreamHits.includes("cancel"), true);
 const toolStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), toolStreamEnv);
 const toolStreamLogs = await toolStreamLogsResp.json();
 const toolStreamLog = toolStreamLogs.logs.find((entry) => entry.model === "tool-stream-model");
-assert.equal(toolStreamLog.close_reason, "finish_grace");
+assert.equal(toolStreamLog.close_reason, "completed");
 assert.equal(toolStreamLog.finish_reason, "tool_calls");
 assert.equal(toolStreamLog.tools_count, 1);
 assert.equal(toolStreamLog.tool_calls_count, 1);
