@@ -1857,6 +1857,27 @@ function renderAdminScript(version) {
     }
   }
 
+  // ponytail: show the last cron health snapshot without probing upstreams again.
+  async function renderCachedHealth() {
+    try {
+      const resp = await fetch(API_BASE + "/health", { method: "GET" });
+      const payload = await parseApiResponse(resp);
+      if (!resp.ok || !Array.isArray(payload?.results)) return;
+      (payload.results || []).forEach((r) => {
+        const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
+        if (!dot) return;
+        dot.className = "health-dot " + (r.ok ? "ok" : "fail");
+        const ts = (payload.ts || "").slice(0, 16);
+        dot.title = r.ok
+          ? ("\u5b9a\u65f6\u68c0\u6d4b " + ts + ": HTTP " + r.status + ", " + r.latency_ms + "ms")
+          : ("\u5b9a\u65f6\u68c0\u6d4b " + ts + " \u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+      });
+      updateUpstreamGroupHealth();
+    } catch {
+      // cached snapshot is best-effort; the manual button still works
+    }
+  }
+
   async function runCloudflareSelfCheck() {
     const client = await getSelfCheckClient();
     const started = performance.now();
@@ -3013,6 +3034,7 @@ async function loadKvUsage() {
         loadKvUsage().catch(function(){}),
         loadWorkersUsage().catch(function(){}),
       ]);
+      void renderCachedHealth();
       const refreshStorageBtn = byId("refresh-storage-status");
       if (refreshStorageBtn) refreshStorageBtn.addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", loadKvUsage).catch(showError)

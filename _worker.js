@@ -52,6 +52,8 @@ const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const MAX_RETRY_AFTER_COOLDOWN_SECONDS = 10 * 60;
 const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
 const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 30 * 1000;
+const HEALTH_PROBE_KEY = "health:probe:last";
+const HEALTH_PROBE_TTL_SECONDS = 24 * 3600;
 const D1_STORE_TABLE = "llmmerge_store";
 const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
@@ -82,7 +84,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-02-ghost-cleanup";
+const VERSION = "v26-09-02-perf-cron";
 
 export default {
   async fetch(request, env, ctx) {
@@ -304,6 +306,24 @@ export default {
           error.statusCode || 500,
         ),
       );
+    }
+  },
+
+  // ponytail: cron health probe — checks each enabled upstream /v1/models and
+  // stores the snapshot so the admin panel shows it without a manual click.
+  async scheduled(event, env, ctx) {
+    try {
+      const app = createApp(env);
+      const upstreams = await loadHealthUpstreams(app);
+      if (!upstreams.length || !app.state) return;
+      const results = await mapConcurrent(upstreams, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkUpstreamHealth(upstream, 10000));
+      const snapshot = JSON.stringify({ ts: utcNowIso(), results });
+      const task = app.state.put(HEALTH_PROBE_KEY, snapshot, { expirationTtl: HEALTH_PROBE_TTL_SECONDS })
+        .catch(() => {});
+      if (typeof ctx?.waitUntil === "function") ctx.waitUntil(task);
+      else await task;
+    } catch {
+      // cron must never crash the isolate; the next run retries.
     }
   },
 };
@@ -1280,12 +1300,29 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
       log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
       return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
     }
+    const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
+    log(usage, 0, { finish_reason: responseFinishReason(payload), tool_calls_count: responseToolCallsCount(payload) });
+    // ponytail: passthrough when the upstream JSON needs no rewriting — the
+    // model field already matches the public alias, usage is complete, and
+    // there is no NIM normalize or reasoning cleanup. Return textBody verbatim
+    // instead of a JSON.parse + JSON.stringify round-trip.
+    const usageComplete = Boolean(
+      payload?.usage &&
+      Number(payload.usage.prompt_tokens ?? payload.usage.input_tokens) > 0 &&
+      Number(payload.usage.completion_tokens ?? payload.usage.output_tokens) > 0,
+    );
+    if (
+      !hideReasoning &&
+      !isNvidiaNimUpstream(proxyResponse.upstream) &&
+      String(payload?.model || "") === String(responseModel || "") &&
+      usageComplete
+    ) {
+      return new Response(textBody, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
     normalizeNimChatPayload(payload, proxyResponse.upstream);
     sanitizeOpenAiPayload(payload, hideReasoning);
     const normalizedUsage = withFallbackChatUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
     if (normalizedUsage) payload.usage = normalizedUsage;
-    const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
-    log(usage, 0, { finish_reason: responseFinishReason(payload), tool_calls_count: responseToolCallsCount(payload) });
     payload.model = responseModel;
     return new Response(JSON.stringify(payload), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
   }
@@ -2083,9 +2120,16 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
 // ponytail: health checks only verify the upstream model endpoint; speed tests verify a chosen model
+  if (apiPath === "/api/health" && request.method === "GET") {
+    const snapshot = app.state ? await app.state.get(HEALTH_PROBE_KEY, "json") : null;
+    return withCorsResponse(json({ ok: true, ts: snapshot?.ts || "", results: snapshot?.results || [] }, 200));
+  }
   if (apiPath === "/api/health" && request.method === "POST") {
     const upstreams = await loadHealthUpstreams(app);
     const results = await mapConcurrent(upstreams, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkUpstreamHealth(upstream, 10000));
+    if (app.state) {
+      await app.state.put(HEALTH_PROBE_KEY, JSON.stringify({ ts: utcNowIso(), results }), { expirationTtl: HEALTH_PROBE_TTL_SECONDS }).catch(() => {});
+    }
     return withCorsResponse(json({ ok: true, results }, 200));
   }
 
@@ -2715,7 +2759,14 @@ async function requireClient(request, runtime) {
 }
 
 async function listModels(client, runtime) {
-  const rows = modelRegistryRows(runtime)
+  // ponytail: sorted model rows are client-independent, cache per-runtime;
+  // filter keeps the sort order so per-request work is O(n), not O(n log n).
+  if (!runtime._sortedModelRows) {
+    runtime._sortedModelRows = modelRegistryRows(runtime)
+      .slice()
+      .sort((a, b) => a.alias.localeCompare(b.alias));
+  }
+  const rows = runtime._sortedModelRows
     .filter((row) => clientAllowsUpstream(client, row.upstream.name))
     .filter((row) => clientAllowsModelSelection(client, row.alias, row.model))
     .map((row) => ({
@@ -2724,7 +2775,6 @@ async function listModels(client, runtime) {
       owned_by: row.upstream.note || row.upstream.name || "gateway",
     }));
 
-  rows.sort((a, b) => a.id.localeCompare(b.id));
   return json(
     {
       object: "list",

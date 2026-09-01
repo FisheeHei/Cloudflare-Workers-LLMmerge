@@ -2,6 +2,11 @@ name = "llm-merge-worker"
 main = "_worker.js"
 compatibility_date = "2026-07-30"
 
+# Run the automatic upstream health probe every 6 hours. The snapshot is stored
+# in D1/KV under health:probe:last and shown by the admin panel.
+[triggers]
+crons = ["0 */6 * * *"]
+
 # Bind the same KV namespace used by the gateway before deploying this Worker.
 # [[kv_namespaces]]
 # binding = "KV"

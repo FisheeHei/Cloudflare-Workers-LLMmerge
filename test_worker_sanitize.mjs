@@ -702,6 +702,14 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("passthrough.example")) {
+    return new Response(JSON.stringify({
+      id: "passthrough",
+      model: "custom/passthrough-model",
+      choices: [{ message: { role: "assistant", content: "passthrough ok" } }],
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).includes("stream-alias.example")) {
     return new Response([
       'data: {"model":"deepseek-ai/deepseek-v4-flash","choices":[{"delta":{"content":"ok"}}]}\n\n',
@@ -859,7 +867,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-ghost-cleanup"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-perf-cron"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -2147,6 +2155,64 @@ const noAutoHealthResp = await worker.default.fetch(new Request("https://gw.test
 assert.equal(noAutoHealthResp.status, 404);
 await Promise.all(noAutoHealthTasks);
 assert.deepEqual(healthProbeHits.slice(noAutoHealthStart), []);
+
+// Cron scheduled health probe writes a snapshot that GET /api/health returns.
+const cronHealthStore = new Map([["gateway:config", JSON.stringify({
+  routing: {}, settings: {},
+  upstreams: [{ name: "probe", base_url: "https://health-probe.example/v1", api_key_encrypted: "p", models: ["probe-model"], paths: ["/v1/chat/completions"], enabled: true }],
+})]]);
+const cronHealthEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = cronHealthStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { cronHealthStore.set(key, value); },
+    async delete(key) { cronHealthStore.delete(key); },
+  },
+};
+const cronTasks = [];
+await worker.default.scheduled({ cron: "0 */6 * * *" }, cronHealthEnv, { waitUntil(task) { cronTasks.push(task); } });
+await Promise.all(cronTasks);
+assert.equal(cronHealthStore.has("health:probe:last"), true);
+const cronSnapshot = JSON.parse(cronHealthStore.get("health:probe:last"));
+assert.equal(cronSnapshot.results[0].name, "probe");
+assert.equal(cronSnapshot.results[0].ok, true);
+const cachedHealthResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", { method: "GET" }), cronHealthEnv);
+const cachedHealth = await cachedHealthResp.json();
+assert.equal(cachedHealthResp.status, 200);
+assert.equal(cachedHealth.results[0].name, "probe");
+assert.equal(cachedHealth.results[0].ok, true);
+assert.equal(typeof cachedHealth.ts, "string");
+assert.equal(cachedHealth.ts.length > 0, true);
+
+// Non-stream JSON passthrough: when the upstream model field already matches
+// the public alias and usage is complete, the response body is the upstream
+// text verbatim (no JSON.parse + stringify round-trip).
+const passthroughStore = new Map([["gateway:config", JSON.stringify({
+  routing: {}, settings: {},
+  upstreams: [{ name: "passthrough-up", base_url: "https://passthrough.example/v1", api_key_encrypted: "p", models: ["passthrough-model"], paths: ["/v1/chat/completions"], enabled: true }],
+})]]);
+const passthroughEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = passthroughStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { passthroughStore.set(key, value); },
+    async delete(key) { passthroughStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "passthrough-client", key: "sk-passthrough", models: ["*"], upstreams: ["passthrough-up"] }]),
+};
+const passthroughResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-passthrough", "content-type": "application/json" },
+  body: JSON.stringify({ model: "custom/passthrough-model", messages: [] }),
+}), passthroughEnv);
+assert.equal(passthroughResp.status, 200);
+const passthroughBody = await passthroughResp.text();
+const passthroughPayload = JSON.parse(passthroughBody);
+assert.equal(passthroughPayload.model, "custom/passthrough-model");
+assert.equal(passthroughPayload.usage.completion_tokens, 20);
+assert.equal(passthroughPayload.choices[0].message.content, "passthrough ok");
 
 const exportResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/upstreams/export"), env);
 const exported = await exportResp.json();

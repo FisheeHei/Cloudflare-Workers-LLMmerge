@@ -6,6 +6,8 @@ compatibility_date = "2026-06-29"
 # Configure production Variables / Secrets in the Workers & Pages dashboard instead.
 # Required runtime secret: ADMIN_TOKEN. Supported optional names: API_KEY_CRYPT_SECRET, REQUEST_TIMEOUT_MS,
 # STREAM_IDLE_TIMEOUT_MS, SSE_KEEPALIVE_MS, UPSTREAM_COOLDOWN_TTL, MODEL_CACHE_TTL, UPSTREAMS_JSON, CLIENTS_JSON.
+# For Pages production, add a Cron Trigger "0 */6 * * *" in the dashboard so the
+# scheduled upstream health probe (health:probe:last) runs automatically.
 
 # Optional local binding for `wrangler pages dev`.
 # [[kv_namespaces]]
