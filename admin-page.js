@@ -3002,13 +3002,17 @@ async function loadKvUsage() {
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", loadLogs).catch(showError)
       );
 
-      // ponytail: parallel boot — config + clients + quota fetch together
+      // ponytail: keep slow usage queries off the critical boot path
       hero = document.querySelector('.hero');
       bootSpan = document.createElement('span');
       bootSpan.className = 'note';
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
-      await Promise.all([loadConfig(), loadClients(), loadKvUsage(), loadWorkersUsage()]);
+      await Promise.all([loadConfig(), loadClients()]);
+      void Promise.all([
+        loadKvUsage().catch(function(){}),
+        loadWorkersUsage().catch(function(){}),
+      ]);
       const refreshStorageBtn = byId("refresh-storage-status");
       if (refreshStorageBtn) refreshStorageBtn.addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", loadKvUsage).catch(showError)

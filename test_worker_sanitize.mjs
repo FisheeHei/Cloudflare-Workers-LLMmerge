@@ -858,7 +858,13 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
-assert.equal(adminPageResp.headers.get("cache-control"), "private, no-store");
+assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-ghost-cleanup"$/);
+const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
+  headers: { "if-none-match": adminPageResp.headers.get("etag") },
+}), env);
+assert.equal(adminNotModifiedResp.status, 304);
+assert.equal(await adminNotModifiedResp.text(), "");
 assert.equal(adminPageResp.headers.get("x-frame-options"), "DENY");
 assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-admin"), env)).status, 401);
 const canonicalAdminResp = await worker.default.fetch(new Request("https://gw.test/llmmerge-admin?token=admin-test-token"), env);
@@ -1215,6 +1221,34 @@ await worker.default.fetch(new Request(`https://gw.test/admin-test-token/api/cli
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: `Bearer ${createdClient.api_key}` },
 }), env)).status, 401);
+
+// Ghost index entries (index references a client whose client:id:/client:token:
+// records are gone, e.g. stale KV index migrated into D1) must be deletable and
+// must not linger in the admin list.
+const ghostKv = new Map();
+ghostKv.set("gateway:config", JSON.stringify({ routing: {}, settings: {}, upstreams: [] }));
+ghostKv.set("client:index", JSON.stringify([
+  { id: "ghost-id", name: "ghost-client", key_preview: "sk-ghost...host", models: ["*"], upstreams: [] },
+]));
+const ghostD1 = makeD1Mock();
+const ghostEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = ghostKv.get(key); const wantJson = type === "json" || type?.type === "json"; return wantJson && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { ghostKv.set(key, value); },
+    async delete(key) { ghostKv.delete(key); },
+  },
+  llmerge: ghostD1,
+  CLIENTS_JSON: "[]",
+};
+const ghostListBefore = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients"), ghostEnv)).json();
+assert.equal(ghostListBefore.some((client) => client.id === "ghost-id"), true);
+const ghostDelResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients/ghost-id", { method: "DELETE" }), ghostEnv);
+assert.equal(ghostDelResp.status, 200);
+const ghostListAfter = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/clients"), ghostEnv)).json();
+assert.equal(ghostListAfter.some((client) => client.id === "ghost-id"), false);
+assert.equal(ghostD1.rows.has("client:id:ghost-id"), false);
 
 const restrictedEnv = {
   ADMIN_TOKEN: "admin-test-token",

@@ -82,7 +82,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-08-30-completion-guard";
+const VERSION = "v26-09-02-ghost-cleanup";
 
 export default {
   async fetch(request, env, ctx) {
@@ -129,13 +129,16 @@ export default {
 
       if (request.method === "GET" && adminRoute?.kind === "page") {
         if (!adminAuth?.ok) return adminUnauthorizedResponse(false);
-        // ponytail: ETag-based conditional request �?CDN caches, revalidates with 304
-        const pageBody = renderAdminPage(url.origin, VERSION);
         const pageHdrs = new Headers(HTML_HEADERS);
-        pageHdrs.set("cache-control", "private, no-store");
+        pageHdrs.set("cache-control", "private, max-age=300, must-revalidate");
+        pageHdrs.set("etag", `"llmmerge-${VERSION}"`);
         pageHdrs.set("x-frame-options", "DENY");
         pageHdrs.set("referrer-policy", "no-referrer");
         if (adminAuth.setCookie) pageHdrs.set("set-cookie", adminAuth.setCookie);
+        if (request.headers.get("if-none-match") === pageHdrs.get("etag")) {
+          return new Response(null, { status: 304, headers: pageHdrs });
+        }
+        const pageBody = renderAdminPage(url.origin, VERSION);
         return new Response(pageBody, { status: 200, headers: pageHdrs });
       }
 
@@ -433,6 +436,11 @@ function createD1StateStore(d1, kv) {
       } catch (error) {
         if (!kv || !isDurableStateKey(key)) throw error;
         store.degraded = true;
+        // Best effort: drop the stale D1 row so a later healthy read does not
+        // resurrect the old value; the KV fallback in get() migrates it back.
+        try {
+          await d1.prepare(`DELETE FROM ${D1_STORE_TABLE} WHERE key = ?1`).bind(key).run();
+        } catch {}
         await kv.put(key, String(value), options).catch(() => {});
       }
     },
@@ -2588,17 +2596,18 @@ async function loadRuntimeConfig(app) {
 async function buildRuntimeConfig(app) {
   const now = Date.now();
   const editable = await getEditableConfig(app);
-  const aesKey = await deriveAesKey(app.encryptionSecret);
+  const upstreams = editable.upstreams.filter((upstream) => upstream.enabled !== false);
+  const [aesKey, modelCache] = await Promise.all([
+    deriveAesKey(app.encryptionSecret),
+    loadCachedModelMap(app.state, upstreams),
+  ]);
 
   const decrypted = await Promise.all(
-    editable.upstreams
-      .filter((upstream) => upstream.enabled !== false)
-      .map(async (upstream) => ({
+    upstreams.map(async (upstream) => ({
         ...upstream,
         api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
       }))
   );
-  const modelCache = await loadCachedModelMap(app.state, decrypted);
 
   const runtime = {
     clients: app.envClients.map(normalizeClient),
@@ -2967,7 +2976,9 @@ function modelsMatch(left, right) {
 
 async function loadCachedModelMap(kv, upstreams) {
   if (!kv) return {};
-  const entries = await Promise.all((upstreams || []).map(async (upstream) => {
+  const entries = await Promise.all((upstreams || []).filter((upstream) =>
+    !configuredUpstreamModels(upstream).some((model) => model && model !== "*")
+  ).map(async (upstream) => {
     try {
       const cached = await kv.get(modelsCacheKey(upstream.name), "json");
       return [upstream.name, normalizeStringArray(cached?.models)];
@@ -6075,21 +6086,33 @@ async function saveClientRecord(store, record) {
 }
 
 async function deleteClientRecord(store, id) {
+  const value = String(id || "").trim();
   const record = await resolveClientRecord(store, id);
-  if (!record || !record.key) {
-    throw httpError(404, "Client not found.");
+  const index = await listClientIndex(store);
+
+  const matchesRef = (item) =>
+    [item?.id, item?.name, item?.key, item?.key_preview].some((candidate) => String(candidate || "") === value) ||
+    Boolean(record?.id && item.id === record.id);
+
+  const next = index.filter((item) => !matchesRef(item));
+
+  if (record?.key) {
+    await store.delete(clientIdKey(record.id));
+    await store.delete(clientTokenKey(record.key));
+    delete _clientCache[record.key];
+    delete _clientCacheTs[record.key];
   }
 
-  await store.delete(clientIdKey(record.id));
-  await store.delete(clientTokenKey(record.key));
+  // Ghost entries (index references a client whose records are already gone)
+  // still show up in the admin list and make copy/delete return "not found".
+  // Removing the index entry here lets the frontend clean them up.
+  if (next.length !== index.length) {
+    await store.put(clientIndexKey(), JSON.stringify(next));
+  }
 
-  const index = await listClientIndex(store);
-  await store.put(
-    clientIndexKey(),
-    JSON.stringify(index.filter((item) => item.id !== id && item.id !== record.id)),
-  );
-  delete _clientCache[record.key];
-  delete _clientCacheTs[record.key];
+  if (!record?.key && next.length === index.length) {
+    throw httpError(404, "Client not found.");
+  }
 }
 
 async function resolveClientRecord(store, reference) {
