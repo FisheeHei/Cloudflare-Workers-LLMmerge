@@ -876,7 +876,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-model-refresh"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-protocol-bridge"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -2977,6 +2977,7 @@ const responsesResp = await worker.default.fetch(new Request("https://gw.test/v1
     ],
     tools: [{ type: "function", name: "web_search", description: "Search", parameters: { type: "object", properties: { query: { type: "string" } } } }],
     tool_choice: { type: "function", name: "web_search" },
+    text: { format: { type: "json_schema", name: "answer", description: "Structured answer", strict: true, schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] } } },
     max_output_tokens: 8,
     reasoningEffort: "medium",
     reasoningSummary: "auto",
@@ -2993,6 +2994,10 @@ assert.equal(responseHits[0].messages.some((message) => message.tool_calls?.[0]?
 assert.equal(responseHits[0].messages.some((message) => message.role === "tool" && message.tool_call_id === "call_old"), true);
 assert.equal(responseHits[0].tools[0].function.name, "web_search");
 assert.equal(responseHits[0].tool_choice.function.name, "web_search");
+assert.equal(responseHits[0].response_format.type, "json_schema");
+assert.equal(responseHits[0].response_format.json_schema.name, "answer");
+assert.equal(responseHits[0].response_format.json_schema.strict, true);
+assert.equal(responseHits[0].response_format.json_schema.schema.properties.answer.type, "string");
 assert.equal(responseHits[0].max_tokens, 8);
 assert.equal(responseHits[0].reasoning_effort, "medium");
 assert.equal("reasoningEffort" in responseHits[0], false);

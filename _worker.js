@@ -84,7 +84,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-02-model-refresh";
+const VERSION = "v26-09-02-protocol-bridge";
 
 export default {
   async fetch(request, env, ctx) {
@@ -4413,9 +4413,8 @@ function translateResponsesRequest(payload, { previousResponse = null } = {}) {
   copyIfPresent(payload, chat, ["parallel_tool_calls"]);
   const maxTokens = payload.max_output_tokens ?? payload.max_tokens;
   if (maxTokens != null) chat.max_tokens = maxTokens;
-  if (payload.text?.format?.type && payload.text.format.type !== "text") {
-    chat.response_format = payload.text.format;
-  }
+  const responseFormat = responsesTextFormatToChatResponseFormat(payload.text?.format);
+  if (responseFormat) chat.response_format = responseFormat;
   const tools = responsesToolsToChatTools(payload.tools);
   if (tools.length) chat.tools = tools;
   const toolChoice = responsesToolChoiceToChat(payload.tool_choice);
@@ -4531,6 +4530,22 @@ function responsesToolsToChatTools(tools) {
       ...(typeof tool.strict === "boolean" ? { strict: tool.strict } : {}),
     },
   }));
+}
+
+function responsesTextFormatToChatResponseFormat(format) {
+  if (!format || typeof format !== "object" || format.type === "text") return null;
+  if (format.type !== "json_schema") return { ...format };
+
+  const source = format.json_schema && typeof format.json_schema === "object" ? format.json_schema : format;
+  return {
+    type: "json_schema",
+    json_schema: {
+      name: String(source.name || "response"),
+      ...(source.description != null ? { description: String(source.description) } : {}),
+      schema: source.schema && typeof source.schema === "object" ? source.schema : {},
+      ...(source.strict != null ? { strict: Boolean(source.strict) } : {}),
+    },
+  };
 }
 
 function responsesToolChoiceToChat(choice) {
