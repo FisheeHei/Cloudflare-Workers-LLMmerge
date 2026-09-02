@@ -37,6 +37,7 @@ const hedgeReserveHits = [];
 const hedgeFallbackHits = [];
 const parallelRouteHits = [];
 const softIntervalStarts = [];
+const crossEdgeStarts = [];
 const bodyIsolationHits = [];
 const softFastHits = [];
 const attemptBudgetHits = [];
@@ -618,6 +619,14 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("cross-edge.example")) {
+    crossEdgeStarts.push(Date.now());
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return new Response(JSON.stringify({ id: "cross-edge", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (String(url).includes("soft-fast-slow.example")) {
     softFastHits.push("slow");
     await new Promise((resolve) => setTimeout(resolve, 260));
@@ -867,7 +876,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-perf-cron"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-model-refresh"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -980,13 +989,22 @@ const modelCacheEnv = {
     async put(key, value) { modelCacheStore.set(key, value); },
     async delete(key) { modelCacheStore.delete(key); },
   },
-  UPSTREAMS_JSON: JSON.stringify([{ name: "cached-upstream", base_url: "https://cached.example/v1", api_key: "x", models: ["*"], paths: ["/v1/chat/completions"] }]),
+  UPSTREAMS_JSON: JSON.stringify([{ name: "cached-upstream", base_url: "https://health-probe.example/v1", api_key: "x", models: ["*"], paths: ["/v1/chat/completions"] }]),
   CLIENTS_JSON: JSON.stringify([{ name: "cached-client", key: "sk-cached", models: ["*"], upstreams: ["cached-upstream"] }]),
 };
 const cachedModels = await (await worker.default.fetch(new Request("https://gw.test/v1/models", {
   headers: { authorization: "Bearer sk-cached" },
 }), modelCacheEnv)).json();
 assert.equal(cachedModels.data.some((model) => model.id === "custom/cached-model"), true);
+const refreshedModelsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/refresh", {
+  method: "POST",
+}), modelCacheEnv);
+assert.equal(refreshedModelsResp.status, 200);
+const refreshedModels = await (await worker.default.fetch(new Request("https://gw.test/v1/models", {
+  headers: { authorization: "Bearer sk-cached" },
+}), modelCacheEnv)).json();
+assert.equal(refreshedModels.data.some((model) => model.id === "custom/probe-model"), true);
+assert.equal(refreshedModels.data.some((model) => model.id === "custom/cached-model"), false);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
@@ -3917,6 +3935,41 @@ const softIntervalTimes = softIntervalStarts.slice(softIntervalStart);
 assert.equal(softIntervalTimes.length, 2);
 assert.ok(Math.abs(softIntervalTimes[1] - softIntervalTimes[0]) >= 30);
 
+const crossEdgeStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false, coordination_level: 0, soft_interval_ms: 60 },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "cross-edge", base_url: "https://cross-edge.example/v1", api_key_encrypted: "c", models: ["cross-edge-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ],
+})]]);
+const crossEdgeCoordinator = makeDispatchNamespace();
+const crossEdgeEnvA = {
+  ADMIN_TOKEN: "admin-test-token", ...env, KV: {
+    async get(key, type) { const value = crossEdgeStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { crossEdgeStore.set(key, value); },
+    async delete(key) { crossEdgeStore.delete(key); },
+  },
+  ROUTE_COORDINATOR: crossEdgeCoordinator,
+  GLOBAL_ROUTE_COORDINATION: "true",
+  CLIENTS_JSON: JSON.stringify([{ name: "cross-edge-client", key: "sk-cross-edge", models: ["*"], upstreams: ["cross-edge"] }]),
+};
+const crossEdgeEnvB = { ...crossEdgeEnvA };
+const workerEdgeB = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?cross-edge=${Date.now()}`);
+const crossEdgeStart = crossEdgeStarts.length;
+await Promise.all([
+  worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer sk-cross-edge", "content-type": "application/json" },
+    body: JSON.stringify({ model: "cross-edge-model", messages: [] }),
+  }), crossEdgeEnvA).then((response) => response.text()),
+  workerEdgeB.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer sk-cross-edge", "content-type": "application/json" },
+    body: JSON.stringify({ model: "cross-edge-model", messages: [] }),
+  }), crossEdgeEnvB).then((response) => response.text()),
+]);
+const crossEdgeTimes = crossEdgeStarts.slice(crossEdgeStart);
+assert.equal(crossEdgeTimes.length, 2);
+assert.ok(Math.abs(crossEdgeTimes[1] - crossEdgeTimes[0]) >= 45);
+
 const spreadZeroStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false, coordination_level: 0 },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
@@ -4395,6 +4448,34 @@ function makeDoNamespace(storage) {
     idFromName() { return "llmmerge-state"; },
     get() { return { fetch: (input, init) => instance.fetch(new Request(input, init)) }; },
     _ttls: ttls,
+  };
+  return namespace;
+}
+function makeDispatchNamespace() {
+  const instances = new Map();
+  const tails = new Map();
+  const namespace = {
+    idFromName(name) { return String(name); },
+    get(id) {
+      if (!instances.has(id)) {
+        const storage = new Map();
+        instances.set(id, new worker.LlmMergeStore({
+          storage: {
+            async get(key) { return storage.get(key) ?? null; },
+            async put(key, value) { storage.set(key, value); },
+            async delete(key) { storage.delete(key); },
+          },
+        }, {}));
+      }
+      return {
+        fetch(input, init) {
+          const previous = tails.get(id) || Promise.resolve();
+          const current = previous.then(() => instances.get(id).fetch(new Request(input, init)));
+          tails.set(id, current.catch(() => {}));
+          return current;
+        },
+      };
+    },
   };
   return namespace;
 }

@@ -24,6 +24,11 @@ crons = ["0 */6 * * *"]
 # name = "llmerge"
 # class_name = "LlmMergeStore"
 
+# Optional: cross-edge upstream dispatch spacing. If omitted, routing remains isolate-local.
+# [[durable_objects.bindings]]
+# name = "ROUTE_COORDINATOR"
+# class_name = "LlmMergeStore"
+
 # [[migrations]]
 # tag = "v1"
 # new_sqlite_classes = ["LlmMergeStore"]

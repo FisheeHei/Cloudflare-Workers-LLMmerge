@@ -84,7 +84,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-02-perf-cron";
+const VERSION = "v26-09-02-model-refresh";
 
 export default {
   async fetch(request, env, ctx) {
@@ -384,6 +384,14 @@ function pickStateBackend(env) {
   return { kind: "memory", backend: null, binding: "" };
 }
 
+function pickRouteCoordinator(env) {
+  if (String(env?.GLOBAL_ROUTE_COORDINATION || "").toLowerCase() === "false") return null;
+  const configured = env?.ROUTE_COORDINATOR;
+  if (configured && typeof configured.idFromName === "function" && typeof configured.get === "function") return configured;
+  const stateBackend = pickStateBackend(env);
+  return stateBackend.kind === "do" ? stateBackend.backend : null;
+}
+
 function decodeStateValue(value, type) {
   const wantJson = type === "json" || type?.type === "json";
   return wantJson ? safeJson(value) : value;
@@ -548,6 +556,27 @@ function createDoStateStore(namespace, kv) {
   return store;
 }
 
+function createDoDispatchCoordinator(namespace) {
+  if (!namespace) return null;
+  return {
+    async reserve(upstreamName, intervalMs, client, signal) {
+      const id = namespace.idFromName(`llmmerge-dispatch:${String(upstreamName)}`);
+      const stub = namespace.get(id);
+      const response = await stub.fetch("https://llmmerge-dispatch/dispatch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          interval_ms: intervalMs,
+          client: String(client?.key || client?.id || client?.name || "gateway"),
+        }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`Route coordinator returned ${response.status}.`);
+      return response.json();
+    },
+  };
+}
+
 export class LlmMergeStore {
   constructor(state, env) {
     this.state = state;
@@ -555,6 +584,19 @@ export class LlmMergeStore {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/dispatch" && request.method === "POST") {
+      const payload = await request.json().catch(() => ({}));
+      const intervalMs = Math.max(0, Math.min(2000, Number(payload?.interval_ms) || 0));
+      const now = Date.now();
+      const previousNextAt = Number(await this.state.storage.get("dispatch:next_at")) || 0;
+      const scheduledAt = Math.max(now, previousNextAt);
+      const nextAt = scheduledAt + intervalMs;
+      await this.state.storage.put("dispatch:next_at", String(nextAt), { expirationTtl: 120 });
+      await this.state.storage.put("dispatch:last_client", String(payload?.client || "gateway"), { expirationTtl: 120 });
+      return new Response(JSON.stringify({ delay_ms: Math.max(0, scheduledAt - now), scheduled_at: scheduledAt, next_at: nextAt }), {
+        headers: JSON_HEADERS,
+      });
+    }
     const key = url.searchParams.get("key") || "";
     if (!key) return new Response("missing key", { status: 400 });
     if (request.method === "GET") {
@@ -591,6 +633,7 @@ function createApp(env) {
 
   const adminPath = normalizeAdminPath(env.ADMIN_PATH || "/llmmerge-admin");
   const appState = createStateStore(env);
+  const routeCoordinator = createDoDispatchCoordinator(pickRouteCoordinator(env));
 
   _cachedApp = {
     adminPath,
@@ -618,6 +661,7 @@ function createApp(env) {
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
     kv: env.KV || null,
     state: appState,
+    routeCoordinator,
     storage: appState.kind,
     workersDailyRequestBudget: parsePositiveInt(env.WORKERS_DAILY_REQUEST_BUDGET, DEFAULT_WORKERS_DAILY_REQUEST_BUDGET),
   };
@@ -2657,6 +2701,7 @@ async function buildRuntimeConfig(app) {
     clients: app.envClients.map(normalizeClient),
     kv: app.kv,
     state: app.state,
+    routeCoordinator: app.routeCoordinator,
     modelCacheTtl: editable.settings.model_cache_ttl,
     requestTimeoutMs: editable.settings.request_timeout_ms,
     streamIdleTimeoutMs: editable.settings.stream_idle_timeout_ms,
@@ -3066,6 +3111,7 @@ async function getFreshModels(runtime, upstream) {
     runtime.modelCache[upstream.name] = models;
     delete runtime._routeModelRows;
     delete runtime._modelRegistryRows;
+    delete runtime._sortedModelRows;
 
     return models;
   } catch {
@@ -5466,6 +5512,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       if (done) return { cancelled: true, upstream, index };
       let result = null;
       try {
+        await waitForUpstreamDispatch(runtime, upstream, client, controllers[index].signal);
         result = await fetchProxyUpstream({
           bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
           firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
@@ -5535,6 +5582,7 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
   let result = null;
   const releaseReservation = reserveUpstreams([upstream]);
   try {
+    await waitForUpstreamDispatch(runtime, upstream, client, signal);
     result = await fetchProxyUpstream({
       bodyText, client, pathname, request, runtime, search, signal, upstream,
       firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
@@ -5752,6 +5800,24 @@ async function waitForUpstreamDispatch(runtime, upstream, client, signal, contes
   const interval = upstreamSoftIntervalMs(runtime);
   const name = upstreamKey(upstream);
   if (!interval || !name) return;
+  if (runtime?.routeCoordinator) {
+    try {
+      const slot = await runtime.routeCoordinator.reserve(name, interval, client, signal);
+      const delay = Math.max(0, Number(slot?.delay_ms) || 0);
+      const now = Date.now();
+      _upstreamDispatchAt[name] = Math.max(Number(_upstreamDispatchAt[name] || 0), now + delay + interval);
+      _upstreamDispatchClients[name] = {
+        client: String(client?.key || client?.id || client?.name || "gateway"),
+        at: now,
+      };
+      if (delay > 0) await sleep(delay);
+      if (signal?.aborted) throw httpError(499, "Response cancelled.");
+      return;
+    } catch (error) {
+      if (error?.statusCode === 499 || signal?.aborted) throw httpError(499, "Response cancelled.");
+      // ponytail: coordinator is advisory; local scheduling keeps the request alive if DO is unavailable.
+    }
+  }
   const now = Date.now();
   const scheduled = contested ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
   _upstreamDispatchAt[name] = scheduled + interval;
