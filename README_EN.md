@@ -53,7 +53,9 @@ The repo includes `d1_migrations/0001_create_store.sql`; the worker also auto-cr
 
 KV-only mode still works with the binding name `KV`. Once D1/DO is enabled, KV becomes both a one-time lazy migration source and a low-frequency disaster snapshot for durable keys (gateway config, config snapshots, client keys). If D1 becomes temporarily unavailable, the gateway falls back to the KV snapshot and marks itself degraded, then writes back to D1 once it recovers; existing client keys keep working without re-export.
 
-See `wrangler.worker.toml` for the Worker Durable Object example.
+See `wrangler.worker.toml` for the Worker Durable Object configuration. `ROUTE_COORDINATOR` is enabled there and stores only short-lived cross-edge staggering state; model requests and token payloads still go directly from the serving Worker edge to the upstream.
+
+The gateway keeps Cloudflare's default edge execution behavior: users connect to a nearby edge, and that Worker edge fetches the upstream directly. Do not enable Smart Placement for this gateway, since it may move execution toward the upstream and reduce user-side edge locality. For Pages deployments, bind `ROUTE_COORDINATOR` to `LlmMergeStore` in the project settings as well.
 
 ### 3. Bind Analytics Engine
 
@@ -251,7 +253,7 @@ In short: memory is for live display, Analytics Engine is for long-term history,
 - `load_balance`: distribute by weight
 - `coordination_level` (0-5, default 3): higher values spread concurrent requests away from active or reserved upstreams, with weight treated as relative capacity
 - `soft_interval_ms` (default 50): stagger dispatches when multiple client keys select the same upstream; set it to `0` to disable, while requests already spread across upstreams are not delayed
-- For strict cross-edge staggering, bind `ROUTE_COORDINATOR` to a Durable Object; when `llmerge` already uses Durable Object storage, the gateway reuses it automatically. Without a binding, routing remains isolate-local
+- Actual model requests remain direct from each serving edge to the upstream; `ROUTE_COORDINATOR` stores only short-lived global staggering state so multiple edges do not hit the same NIM key at once
 - Successful requests and speed tests write a six-hour latency EWMA to state storage so fresh isolates can prefer recently faster upstreams
 - Streaming failover only happens before the first visible output; once bytes are visible to the client, the gateway never replays the request, avoiding duplicate Agent text or tool calls
 - An upstream `Retry-After` response becomes an upstream/model cooldown state; a healthy fallback is attempted immediately instead of waiting on the failed provider

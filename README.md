@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS llmmerge_store (
 
 如果暂时只使用 KV，绑定名必须是 `KV`。D1/DO 启用后，KV 同时承担两层角色：一次性迁移源，以及持久键（网关配置、配置快照、客户端 Key）的低频灾备快照。D1 暂时不可用时，网关会自动回退 KV 快照并标记降级状态，恢复后自动回写 D1；原有 Key 对接方式不变。
 
-Worker 部署的 Durable Object 示例见 `wrangler.worker.toml`。
+Worker 部署的 Durable Object 配置见 `wrangler.worker.toml`。其中 `ROUTE_COORDINATOR` 已启用：它只保存跨边缘节点的短期错峰状态，不代理模型请求和 token 数据。
+
+网关默认保留 Cloudflare 的边缘执行位置：用户请求由就近边缘接入，Worker 再从当前承接请求的边缘直接 `fetch` 上游。不要为此项目启用 Smart Placement，否则可能把执行位置移向上游，削弱用户侧就近接入。Pages 部署需在项目设置中同步绑定 `ROUTE_COORDINATOR` 和 `LlmMergeStore`。
 
 ### 3. 绑定 Analytics Engine
 
@@ -251,7 +253,7 @@ DeepSeek 模型经任意非官方上游（NIM、OpenRouter、自建端点等）�
 - `load_balance`：按权重做客户端 Key 亲和分配；同一个 Key 稳定优先同一上游，不同 Key 会自然分散，无需设备到账号的静态映射
 - `coordination_level`（0-5，默认 3）：按活跃/预留请求分散到负载较低的上游，并按权重折算承载能力
 - `soft_interval_ms`（默认 50）：同一上游被多个客户端 Key 同时选中时，错开发起请求；设为 `0` 可关闭，不会延迟已经分散到不同上游的请求
-- 跨边缘节点需要严格错峰时，在 Worker 配置 `ROUTE_COORDINATOR` Durable Object 绑定；若 `llmerge` 使用 Durable Object 存储，网关会自动复用它。未绑定时保持 isolate-local 调度
+- 跨边缘节点的真实请求仍在各自边缘直接访问上游；`ROUTE_COORDINATOR` 只负责短期全局错峰，避免多个边缘同时命中同一个 NIM Key
 - 活跃压力优先于 Key 亲和，延迟 EWMA 作为后续排序；同一设备瞬时并发、冷却或故障时会自动换到其他账号
 - 成功请求和后台测速会把 6 小时延迟 EWMA 写入状态存储，新 isolate 也能参考近期延迟
 - 流式请求只会在首个可见输出前故障转移；已经向客户端输出后不会重放，避免 Agent 内容或工具调用重复

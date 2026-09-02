@@ -84,7 +84,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-02-protocol-bridge";
+const VERSION = "v26-09-02-multiedge-routing";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1430,14 +1430,14 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
   const noteChunk = (chunk, now = Date.now()) => {
     const error = streamEventErrorMessage(chunk) || upstreamApplicationErrorMessage(chunk);
     if (error) failureStatus = 502;
-    const normalizedUsage = normalizeChatUsageChunk(chunk.usage, outputText, fallbackPrompt);
-    if (normalizedUsage) chunk.usage = normalizedUsage;
-    usage = chunk.usage || usage;
     finishReason = responseFinishReason(chunk) || finishReason;
     noteStreamToolCalls(chunk, toolCallKeys);
     const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || (chunk.choices || [])[0]?.text || "");
     if (delta) noteStreamToken(diag, now);
     outputText += delta;
+    const normalizedUsage = normalizeChatUsageChunk(chunk.usage, outputText, fallbackPrompt);
+    if (normalizedUsage) chunk.usage = normalizedUsage;
+    usage = chunk.usage || usage;
     return error;
   };
   const finish = () => {
@@ -1732,6 +1732,8 @@ function withFallbackChatUsage(usage, fallbackPrompt, fallbackCompletion) {
   const next = { ...usage };
   const reportedCompletion = Number(next.completion_tokens ?? next.output_tokens);
   const reportedInput = Number(next.prompt_tokens ?? next.input_tokens);
+  const reportedTotal = Number(next.total_tokens);
+  if (Number.isFinite(reportedCompletion) && reportedCompletion > 0 && Number.isFinite(reportedInput) && reportedInput > 0 && Number.isFinite(reportedTotal) && reportedTotal > 0) return usage;
   if ((!Number.isFinite(reportedCompletion) || reportedCompletion <= 0) && fallbackCompletion > 0) {
     next.completion_tokens = fallbackCompletion;
     if (next.output_tokens != null) next.output_tokens = next.completion_tokens;
@@ -1739,7 +1741,6 @@ function withFallbackChatUsage(usage, fallbackPrompt, fallbackCompletion) {
   if ((!Number.isFinite(reportedInput) || reportedInput <= 0) && fallbackPrompt > 0) {
     next.prompt_tokens = fallbackPrompt;
   }
-  const reportedTotal = Number(next.total_tokens);
   if (!Number.isFinite(reportedTotal) || reportedTotal <= 0) {
     next.total_tokens = Math.max(0, Number(next.prompt_tokens || 0) + Number(next.completion_tokens || 0));
   }
@@ -3998,13 +3999,15 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
     const processChunk = (chunk, now = Date.now()) => {
       chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
       streamError = streamEventErrorMessage(chunk) || streamError;
-      usage = normalizeChatUsageChunk(chunk.usage, outputText, seed.promptTokens) || usage;
       finishReason = responseFinishReason(chunk) || finishReason;
       const content = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
       const text = hideReasoning && stripText ? stripText(content) : content;
+      if (text) {
+        noteStreamToken(diag, now);
+        outputText += text;
+      }
+      usage = normalizeChatUsageChunk(chunk.usage, outputText, seed.promptTokens) || usage;
       if (!text) return Promise.resolve();
-      noteStreamToken(diag, now);
-      outputText += text;
       const payload = completionChunk(seed.echo && !emitted ? seed.prompt + text : text);
       emitted = true;
       return write(payload);
@@ -4203,7 +4206,13 @@ function nativeResponsesStream(body, onDone, onComplete = null) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-  const writeEvent = (event) => writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+  let sequenceNumber = 0;
+  const writeEvent = (event) => {
+    const payload = event && typeof event === "object"
+      ? { ...event, sequence_number: sequenceNumber++ }
+      : event;
+    return writer.write(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+  };
   (async () => {
     let buffer = "";
     let usage = null;
@@ -4601,14 +4610,28 @@ function isProvidedValue(value) {
   return value != null && String(value) !== "[undefined]";
 }
 
-function makeResponsesPayload(seed, { text = "", usage = null, status = "completed", toolCalls = [], reasoning = "" } = {}) {
-  const message = {
+function makeResponsesPayload(seed, { text = "", usage = null, status = "completed", toolCalls = [], reasoning = "", outputOrder = null } = {}) {
+  const message = text ? {
     id: seed.messageId,
     type: "message",
     status,
     role: "assistant",
-    content: [{ type: "output_text", text: text || "", annotations: [] }],
-  };
+    content: [{ type: "output_text", text, annotations: [] }],
+  } : null;
+  const output = [];
+  if (status === "completed") {
+    if (Array.isArray(outputOrder)) {
+      for (const entry of outputOrder) {
+        if (entry?.type === "message" && message) output.push(message);
+        else if (entry?.type === "reasoning" && reasoning) output.push(responsesReasoningItem(seed, reasoning));
+        else if (entry?.type === "function_call" && entry.call) output.push(responsesFunctionCallItem(entry.call));
+      }
+    } else {
+      if (message) output.push(message);
+      if (reasoning) output.push(responsesReasoningItem(seed, reasoning));
+      output.push(...toolCalls.map((call) => responsesFunctionCallItem(call)));
+    }
+  }
   return {
     id: seed.id,
     object: "response",
@@ -4619,7 +4642,7 @@ function makeResponsesPayload(seed, { text = "", usage = null, status = "complet
     instructions: seed.instructions,
     max_output_tokens: seed.maxOutputTokens,
     model: seed.model,
-    output: status === "completed" ? [message, ...(reasoning ? [responsesReasoningItem(seed, reasoning)] : []), ...toolCalls.map((call) => responsesFunctionCallItem(call))] : [],
+    output,
     output_text: text || "",
     parallel_tool_calls: seed.parallelToolCalls ?? true,
     previous_response_id: seed.previousResponseId || null,
@@ -4900,8 +4923,8 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-  const write = (event) => writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-  const baseMessage = { id: seed.messageId, type: "message", status: "in_progress", role: "assistant", content: [] };
+  let sequenceNumber = 0;
+  const write = (event) => writer.write(encoder.encode(`data: ${JSON.stringify({ ...event, sequence_number: sequenceNumber++ })}\n\n`));
 
   (async () => {
     let buffer = "";
@@ -4914,7 +4937,8 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     let finishReason = "";
     let sawDone = false;
     const toolCalls = new Map();
-    let nextOutputIndex = 1;
+    let nextOutputIndex = 0;
+    const outputItems = [];
     const diag = createStreamDiag(started);
     const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
     let closeReason = "done";
@@ -4930,9 +4954,19 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       try { onComplete?.(); } catch {}
       Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
     };
+    let messageOutputIndex = null;
+    const ensureMessage = () => {
+      if (messageOutputIndex != null) return;
+      messageOutputIndex = nextOutputIndex++;
+      const item = { id: seed.messageId, type: "message", status: "in_progress", role: "assistant", content: [] };
+      outputItems.push({ type: "message", outputIndex: messageOutputIndex, item });
+      writes.push(write({ type: "response.output_item.added", output_index: messageOutputIndex, item }));
+      writes.push(write({ type: "response.content_part.added", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }));
+    };
     const ensureReasoning = () => {
       if (reasoningOutputIndex != null) return;
       reasoningOutputIndex = nextOutputIndex++;
+      outputItems.push({ type: "reasoning", outputIndex: reasoningOutputIndex });
       writes.push(write({ type: "response.output_item.added", output_index: reasoningOutputIndex, item: responsesReasoningItem(seed, "", "in_progress") }));
       writes.push(write({ type: "response.reasoning_summary_part.added", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, part: { type: "summary_text", text: "" } }));
     };
@@ -4952,10 +4986,11 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       }
       const content = hideReasoning ? stripText(chatContentToText(delta.content || "")) : chatContentToText(delta.content || "");
       if (content) {
+        ensureMessage();
         noteStreamToken(diag, now);
         textParts.push(content);
         outputChars += content.length;
-        writes.push(write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: 0, content_index: 0, delta: content }));
+        writes.push(write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, delta: content }));
       }
       for (const call of (delta.tool_calls || [])) {
         const key = String(call.index ?? toolCalls.size);
@@ -4963,6 +4998,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         if (!item) {
           item = { id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`), name: String(call.function?.name || call.name || "tool"), argumentParts: [], outputIndex: nextOutputIndex++ };
           toolCalls.set(key, item);
+          outputItems.push({ type: "function_call", outputIndex: item.outputIndex, item });
           writes.push(write({ type: "response.output_item.added", output_index: item.outputIndex, item: responsesFunctionCallItem(item, "in_progress") }));
         }
         if (call.id) item.id = String(call.id);
@@ -4978,8 +5014,6 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     try {
       await write({ type: "response.created", response: makeResponsesPayload(seed, { status: "in_progress" }) });
       await write({ type: "response.in_progress", response: makeResponsesPayload(seed, { status: "in_progress" }) });
-      await write({ type: "response.output_item.added", output_index: 0, item: baseMessage });
-      await write({ type: "response.content_part.added", item_id: seed.messageId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
 
       const reader = openaiResp.body.getReader();
       upstreamReader = reader;
@@ -5022,21 +5056,30 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         return;
       }
       if (!sawDone) closeReason = "completed";
-      const donePart = { type: "output_text", text, annotations: [] };
-      await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: 0, content_index: 0, text });
-      await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: 0, content_index: 0, part: donePart });
-      await write({ type: "response.output_item.done", output_index: 0, item: { ...baseMessage, status: "completed", content: [donePart] } });
-      if (reasoningOutputIndex != null) {
-        const part = { type: "summary_text", text: reasoning };
-        await write({ type: "response.reasoning_summary_text.done", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, text: reasoning });
-        await write({ type: "response.reasoning_summary_part.done", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, part });
-        await write({ type: "response.output_item.done", output_index: reasoningOutputIndex, item: responsesReasoningItem(seed, reasoning) });
+      for (const outputItem of outputItems) {
+        if (outputItem.type === "message") {
+          const donePart = { type: "output_text", text, annotations: [] };
+          await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, text });
+          await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, part: donePart });
+          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: { ...outputItem.item, status: "completed", content: [donePart] } });
+        } else if (outputItem.type === "reasoning") {
+          const part = { type: "summary_text", text: reasoning };
+          await write({ type: "response.reasoning_summary_text.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, text: reasoning });
+          await write({ type: "response.reasoning_summary_part.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, part });
+          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesReasoningItem(seed, reasoning) });
+        } else if (outputItem.type === "function_call") {
+          await write({ type: "response.function_call_arguments.done", item_id: outputItem.item.id, output_index: outputItem.outputIndex, arguments: outputItem.item.arguments });
+          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesFunctionCallItem(outputItem.item) });
+        }
       }
-      for (const item of toolCalls.values()) {
-        await write({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: item.arguments });
-        await write({ type: "response.output_item.done", output_index: item.outputIndex, item: responsesFunctionCallItem(item) });
-      }
-      const completedResponse = makeResponsesPayload(seed, { text, usage, toolCalls: [...toolCalls.values()].map((item) => ({ id: item.id, function: { name: item.name, arguments: item.arguments } })), reasoning });
+      const completedToolCalls = [...toolCalls.values()].map((item) => ({ id: item.id, function: { name: item.name, arguments: item.arguments }, outputIndex: item.outputIndex }));
+      const completedResponse = makeResponsesPayload(seed, {
+        text,
+        usage,
+        toolCalls: completedToolCalls,
+        reasoning,
+        outputOrder: outputItems.map((item) => ({ type: item.type, call: item.type === "function_call" ? item.item : null })),
+      });
       if (onFinal) onFinal(completedResponse);
       await write({ type: "response.completed", response: completedResponse });
       await writer.write(encoder.encode("data: [DONE]\n\n"));
@@ -5225,9 +5268,10 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
   };
   try {
     const sanitizedBody = adaptUpstreamBody(bodyText, upstream, pathname);
+    const streamRequest = requestBodyStreams(bodyText);
     const init = {
       method: request.method,
-      headers: buildUpstreamHeaders(request, upstream, sanitizedBody),
+      headers: buildUpstreamHeaders(request, upstream, sanitizedBody, streamRequest),
       body: sanitizedBody,
     };
     init.signal = controller.signal;
@@ -6101,14 +6145,14 @@ function buildUpstreamUrl(baseUrl, pathname, search) {
   return `${base}${path}${search}`;
 }
 
-function buildUpstreamHeaders(request, upstream, bodyText = "") {
+function buildUpstreamHeaders(request, upstream, bodyText = "", streamRequest = null) {
   const headers = new Headers();
   headers.set("authorization", `Bearer ${upstream.api_key}`);
   headers.set(
     "content-type",
     request?.headers.get("content-type") || "application/json; charset=utf-8",
   );
-  headers.set("accept", requestBodyStreams(bodyText) ? "text/event-stream" : "application/json");
+  headers.set("accept", (streamRequest == null ? requestBodyStreams(bodyText) : streamRequest) ? "text/event-stream, application/json" : "application/json");
   headers.set("user-agent", "cf-llm-gateway/0.3");
 
   if (upstream.headers && typeof upstream.headers === "object") {

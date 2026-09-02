@@ -360,6 +360,12 @@ globalThis.fetch = async (url, init) => {
     if (body.model === "oversized-stream-model") {
       return new Response("data: " + "x".repeat(1048577), { status: 200, headers: { "content-type": "text/event-stream" } });
     }
+    if (body.model === "tool-only-stream-model") {
+      return new Response([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_tool_only","type":"function","function":{"name":"shell","arguments":"{\\"command\\":\\"pwd\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
     return new Response([
       'data: {"choices":[{"delta":{"reasoning_content":"plan "}}]}\n\n',
       'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
@@ -876,7 +882,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-protocol-bridge"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-02-multiedge-routing"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -2946,7 +2952,7 @@ responsesStore.set("gateway:config", JSON.stringify({
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "responses", base_url: "https://responses.example/v1", api_key_encrypted: "r", models: ["resp-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "responses-stream", base_url: "https://responses-stream.example/v1", api_key_encrypted: "s", models: ["stream-model", "oversized-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "responses-stream", base_url: "https://responses-stream.example/v1", api_key_encrypted: "s", models: ["stream-model", "tool-only-stream-model", "oversized-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "responses-stream-error", base_url: "https://responses-stream.example/v1", api_key_encrypted: "e", models: ["stream-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
     { name: "responses-app-error", base_url: "https://app-error.example/v1", api_key_encrypted: "a", models: ["responses-app-error-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
   ],
@@ -3080,6 +3086,30 @@ assert.equal(responsesStreamText.includes('"type":"response.reasoning_summary_te
 assert.equal(responsesStreamText.includes('"type":"response.completed"'), true);
 assert.equal(responsesStreamText.includes('"output_text":"hello"'), true);
 assert.equal(responsesStreamText.includes('"arguments":"{\\"query\\":\\"glm\\"}"'), true);
+const responseEvents = responsesStreamText.split(/\r?\n\r?\n/)
+  .map((block) => block.split(/\r?\n/).find((line) => line.startsWith("data: "))?.slice(5))
+  .map((data) => data?.trim())
+  .filter((data) => data && data !== "[DONE]")
+  .map((data) => JSON.parse(data));
+assert.deepEqual(responseEvents.map((event) => event.sequence_number), responseEvents.map((_, index) => index));
+assert.deepEqual(responseEvents.filter((event) => event.type === "response.output_item.added").map((event) => event.item.type), ["reasoning", "message", "function_call"]);
+const streamCompleted = responseEvents.find((event) => event.type === "response.completed");
+assert.deepEqual(streamCompleted.response.output.map((item) => item.type), ["reasoning", "message", "function_call"]);
+
+const toolOnlyResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "tool-only-stream-model", input: "run", stream: true }),
+}), responsesEnv);
+const toolOnlyText = await toolOnlyResp.text();
+const toolOnlyEvents = toolOnlyText.split(/\r?\n\r?\n/)
+  .map((block) => block.split(/\r?\n/).find((line) => line.startsWith("data: "))?.slice(5))
+  .map((data) => data?.trim())
+  .filter((data) => data && data !== "[DONE]")
+  .map((data) => JSON.parse(data));
+assert.equal(toolOnlyEvents.some((event) => event.type === "response.output_item.added" && event.item.type === "message"), false);
+assert.deepEqual(toolOnlyEvents.find((event) => event.type === "response.completed").response.output.map((item) => item.type), ["function_call"]);
+assert.deepEqual(toolOnlyEvents.map((event) => event.sequence_number), toolOnlyEvents.map((_, index) => index));
 const responsesStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), responsesEnv);
 const responsesStreamLogs = await responsesStreamLogsResp.json();
 const responsesStreamLog = responsesStreamLogs.logs.find((entry) => entry.model === "stream-model" && entry.path === "/v1/responses");
@@ -3201,6 +3231,12 @@ const nativeStreamText = await nativeStreamResp.text();
 assert.equal(nativeResponseStreamHits.length, 1);
 assert.equal(nativeResponseStreamHits[0].stream, true);
 assert.equal(nativeStreamText.includes('"type":"response.completed"'), true);
+const nativeStreamEvents = nativeStreamText.split(/\r?\n\r?\n/)
+  .map((block) => block.split(/\r?\n/).find((line) => line.startsWith("data: "))?.slice(5))
+  .map((data) => data?.trim())
+  .filter((data) => data && data !== "[DONE]")
+  .map((data) => JSON.parse(data));
+assert.deepEqual(nativeStreamEvents.map((event) => event.sequence_number), nativeStreamEvents.map((_, index) => index));
 
 const nimLocalStore = new Map();
 nimLocalStore.set("gateway:config", JSON.stringify({
@@ -4105,7 +4141,7 @@ assert.equal(usageStreamResp.headers.get("cache-control"), "no-cache, no-transfo
 assert.equal(usageStreamResp.headers.get("x-accel-buffering"), "no");
 await usageStreamResp.text();
 assert.equal(acceptHits.includes("application/json"), true);
-assert.equal(acceptHits.includes("text/event-stream"), true);
+assert.equal(acceptHits.some((value) => String(value || "").includes("text/event-stream")), true);
 const usageLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), usageEnv);
 const usageLogs = await usageLogsResp.json();
 assert.equal(usageLogs.logs.some((entry) => entry.model === "usage-json" && entry.prompt_tokens === 11 && entry.completion_tokens === 22), true);

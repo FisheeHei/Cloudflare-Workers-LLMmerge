@@ -24,10 +24,15 @@ crons = ["0 */6 * * *"]
 # name = "llmerge"
 # class_name = "LlmMergeStore"
 
-# Optional: cross-edge upstream dispatch spacing. If omitted, routing remains isolate-local.
-# [[durable_objects.bindings]]
-# name = "ROUTE_COORDINATOR"
-# class_name = "LlmMergeStore"
+# Cross-edge upstream dispatch coordination. The DO handles only short scheduling
+# state; model traffic still fetches directly from the serving Worker edge.
+[[durable_objects.bindings]]
+name = "ROUTE_COORDINATOR"
+class_name = "LlmMergeStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LlmMergeStore"]
 
 # [[migrations]]
 # tag = "v1"
