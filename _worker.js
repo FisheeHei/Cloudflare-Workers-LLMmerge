@@ -84,7 +84,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-02-multiedge-routing";
+const VERSION = "v26-09-03-do-binding";
 
 export default {
   async fetch(request, env, ctx) {
