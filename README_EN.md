@@ -2,44 +2,59 @@
 
 [中文 README](./README.md)
 
-LLM-merge is a single-file LLM aggregation gateway for Cloudflare Workers or Pages Advanced Mode. It combines multiple upstream model providers into one `/v1` Base URL and includes a lightweight admin panel for upstreams, client keys, models, prompts, context, routing, logs, and statistics.
+LLM-merge is a single-file LLM gateway for Cloudflare Workers and Pages Advanced Mode. It combines multiple OpenAI-compatible upstreams behind one `/v1` Base URL and provides an admin panel for upstreams, client keys, models, prompts, context, routing, logs, and statistics.
+
+## Use Cases
+
+- Build a pool of NVIDIA NIM keys and distribute requests by model and client.
+- Give OpenAI, Responses, and Anthropic-style clients one gateway URL.
+- Inject system prompts, reference material, and on-demand context for selected clients.
+- Accept users at a nearby Cloudflare edge and fetch the upstream directly from that edge.
 
 ## Features
 
-- OpenAI-compatible endpoints: `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`
-- Basic Responses API compatibility: `/v1/responses`
-- Claude / Anthropic-style endpoint: `/v1/messages`
-- Multiple upstreams with enable/disable, weight, priority, paths, and model allowlists
-- Routing: failover, load balancing, Hedged Request, Gateway Fast mode
-- Model picker with source grouping, tags, and context-length notes
-- NVIDIA NIM bridge for GLM, Qwen, MiniMax, Kimi, DeepSeek, Nemotron, Mistral, and related models
-- Prompt / Context injection scoped by client key, with keyword-based context fragments and import/export
-- Live in-memory stats + Analytics Engine history, with D1/DO or KV mirror fallback
-- Upstream import/export, health checks, model speed tests, and active-upstream display
+- OpenAI Chat, Completions, Embeddings, Responses, and Anthropic Messages compatibility.
+- Responses `store`, `previous_response_id`, response retrieval/cancel, and `/v1/responses/compact`.
+- Upstream enable/disable, model and path allowlists, priority, weight, failover, and cooldown.
+- Load balancing, client-key affinity, cross-edge staggering, Hedged Request, and Gateway Fast.
+- NIM parameter and reasoning adapters for DeepSeek, Nemotron, Qwen, GLM, MiniMax, Kimi, Mistral, and related models.
+- System prompt, global context, context fragments, keyword/model matching, client scopes, and character limits.
+- Model refresh, upstream health checks, model speed tests, client-key management, import/export, logs, and statistics.
 
 ## Deployment
 
-### 1. Create a project
+### Workers
 
-Deploy as a Worker:
+Deploy the Worker configuration with:
 
 ```bash
-wrangler deploy
+wrangler deploy --config wrangler.worker.toml
 ```
 
-For Pages, use Advanced Mode and keep `_worker.js` as the entry file. No build step is required.
+### Pages Advanced Mode
 
-### 2. Bind storage (KV / D1 / Durable Object)
+Use `_worker.js` as the Advanced Mode entry file. No build step is required. Configure production Variables, Secrets, and Bindings in the Cloudflare Pages project settings.
 
-Backends are auto-selected in this order: Durable Object `llmerge` > D1 `llmerge` > KV `KV`.
+Use the same binding names in Pages and Workers:
 
-D1 is recommended. The binding name must be:
+- `llmerge`: primary state storage; D1 is recommended.
+- `ROUTE_COORDINATOR`: Durable Object for cross-edge request staggering.
+- `KV`: optional compatibility storage and D1/DO degraded snapshot.
+- `ANALYTICS`: optional Analytics Engine write binding.
 
-```txt
-llmerge
+Do not enable Smart Placement. The gateway is designed for nearby user ingress and direct upstream fetches from the serving edge.
+
+## Storage Bindings
+
+The primary state backend is selected automatically in this order: `llmerge` Durable Object > `llmerge` D1 > `KV`.
+
+D1 is recommended and must use the binding name `llmerge`. Apply the repository migration before first use:
+
+```bash
+wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
 ```
 
-Create the table before first use (the binding name is `llmerge` for both D1 and the optional Durable Object):
+The migration file is `d1_migrations/0001_create_store.sql`. The gateway also attempts to create the table on first read/write:
 
 ```sql
 CREATE TABLE IF NOT EXISTS llmmerge_store (
@@ -49,39 +64,15 @@ CREATE TABLE IF NOT EXISTS llmmerge_store (
 );
 ```
 
-The repo includes `d1_migrations/0001_create_store.sql`; the worker also auto-creates the table on first read/write.
+`ROUTE_COORDINATOR` stores only short-lived scheduling state. It does not proxy model requests or store prompts, context, or upstream tokens. Without it, the gateway still works, but coordination is limited to per-isolate state and is not globally strict across edges.
 
-KV-only mode still works with the binding name `KV`. Once D1/DO is enabled, KV becomes both a one-time lazy migration source and a low-frequency disaster snapshot for durable keys (gateway config, config snapshots, client keys). If D1 becomes temporarily unavailable, the gateway falls back to the KV snapshot and marks itself degraded, then writes back to D1 once it recovers; existing client keys keep working without re-export.
+## Required Configuration
 
-See `wrangler.worker.toml` for the Worker Durable Object configuration. `ROUTE_COORDINATOR` is enabled there and stores only short-lived cross-edge staggering state; model requests and token payloads still go directly from the serving Worker edge to the upstream.
-
-The gateway keeps Cloudflare's default edge execution behavior: users connect to a nearby edge, and that Worker edge fetches the upstream directly. Do not enable Smart Placement for this gateway, since it may move execution toward the upstream and reduce user-side edge locality. For Pages deployments, bind `ROUTE_COORDINATOR` to `LlmMergeStore` in the project settings as well.
-
-### 3. Bind Analytics Engine
-
-Recommended binding:
+At minimum, set:
 
 ```txt
-binding: ANALYTICS
-dataset: llmmerge_requests
-```
-
-To query historical stats in the admin panel, also set:
-
-```txt
-ANALYTICS_ACCOUNT_ID = your Cloudflare Account ID
-ANALYTICS_API_TOKEN  = API token with Account Analytics Read
-```
-
-`ANALYTICS_DATASET` is optional and defaults to `llmmerge_requests`. Set it only if you use another dataset name.
-
-### 4. Set environment variables
-
-Recommended minimum:
-
-```txt
-ADMIN_TOKEN=your-admin-path
-API_KEY_CRYPT_SECRET=long-random-secret
+ADMIN_TOKEN=replace-with-a-random-value
+API_KEY_CRYPT_SECRET=replace-with-a-long-random-secret
 ```
 
 Admin panel:
@@ -90,44 +81,37 @@ Admin panel:
 https://your-domain.example/{ADMIN_TOKEN}
 ```
 
-If `ADMIN_TOKEN` is not set, the default admin path is `/llmmerge-admin`. Do not use the default in production.
+Without `ADMIN_TOKEN`, the default path is `/llmmerge-admin`; do not use the default path in production.
 
-## Variables
+Common variables:
 
-| Variable | Required | Description |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `KV` | Optional | Cloudflare KV binding; lightweight storage when D1/DO is absent |
-| `llmerge` | Optional | D1 or Durable Object binding; KV becomes a one-time migration fallback when present |
-| `ADMIN_TOKEN` | Recommended | Admin path token |
-| `API_KEY_CRYPT_SECRET` | Recommended | Secret used to encrypt upstream API keys; keep stable in production |
-| `ANALYTICS` | Optional | Analytics Engine binding for request stats |
-| `ANALYTICS_ACCOUNT_ID` | Optional | Account ID for Analytics Engine SQL queries |
-| `ANALYTICS_API_TOKEN` | Optional | Requires `Account Analytics Read` |
-| `ANALYTICS_DATASET` | Optional | Defaults to `llmmerge_requests` |
-| `REQUEST_TIMEOUT_MS` | Optional | Defaults to `180000`; non-streaming requests wait at most 90 seconds to avoid custom-domain 524s |
-| `STREAM_IDLE_TIMEOUT_MS` | Optional | Defaults to `900000` |
-| `SSE_KEEPALIVE_MS` | Optional | Defaults to `3000`; SSE heartbeat comment interval for streaming responses |
-| `UPSTREAM_COOLDOWN_TTL` | Optional | Defaults to `60` seconds |
-| `MODEL_CACHE_TTL` | Optional | Defaults to `3600` seconds |
-| `KV_FLUSH_INTERVAL_MS` | Optional | KV-only log/stats mirror flush interval; defaults to `120000` |
-| `KV_DAILY_READ_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `100000` (Free plan) |
-| `KV_DAILY_WRITE_BUDGET` | Optional | Admin KV usage-meter budget; defaults to `1000` (Free plan) |
-| `WORKERS_DAILY_REQUEST_BUDGET` | Optional | Admin Workers request-meter budget; defaults to `1000000` |
-| `UPSTREAMS_JSON` | Optional | Initial upstream seed config |
-| `CLIENTS_JSON` | Optional | Initial client-key seed config |
+| `REQUEST_TIMEOUT_MS` | `180000` | Base upstream first-byte/non-stream timeout; non-stream requests also have a 90-second response deadline |
+| `STREAM_IDLE_TIMEOUT_MS` | `900000` | Streaming idle timeout |
+| `SSE_KEEPALIVE_MS` | `5000` | SSE keepalive comment interval |
+| `UPSTREAM_COOLDOWN_TTL` | `60` | Upstream failure cooldown in seconds |
+| `MODEL_CACHE_TTL` | `3600` | Aggregated model-list cache in seconds |
+| `UPSTREAMS_JSON` | empty | Initial upstream JSON seed |
+| `CLIENTS_JSON` | empty | Initial client-key JSON seed |
+| `ANALYTICS_ACCOUNT_ID` | empty | Account ID for Analytics Engine queries |
+| `ANALYTICS_API_TOKEN` | empty | Requires Account Analytics Read |
+| `ANALYTICS_DATASET` | `llmmerge_requests` | Analytics Engine dataset name |
 
-## Upstreams
+KV-only deployments can also use `KV_FLUSH_INTERVAL_MS`, `KV_DAILY_READ_BUDGET`, `KV_DAILY_WRITE_BUDGET`, and `WORKERS_DAILY_REQUEST_BUDGET` for mirror and admin usage limits.
 
-You can add upstreams in the admin panel or seed them with `UPSTREAMS_JSON`:
+## NVIDIA NIM
+
+Add an upstream in the admin panel or seed it with `UPSTREAMS_JSON`:
 
 ```json
 [
   {
-    "name": "nim-primary",
+    "name": "nim-pool-1",
     "preset": "nvidia-nim",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key": "nvapi-...",
-    "models": ["nvidia/nemotron-3-nano-30b-a3b", "moonshotai/kimi-k2.5"],
+    "models": ["deepseek-ai/deepseek-v4-flash-0731"],
     "paths": ["/v1/chat/completions", "/v1/embeddings"],
     "priority": 1,
     "weight": 1,
@@ -136,36 +120,19 @@ You can add upstreams in the admin panel or seed them with `UPSTREAMS_JSON`:
 ]
 ```
 
-Built-in templates:
-
-- NVIDIA NIM
-- DeepInfra
-- Together AI
-- DeepSeek
-- Kimi / Moonshot AI
-- MiniMax
-- OpenRouter
-- Groq Cloud
-- GLM / Zhipu
-- Cloudflare Workers AI REST
-- Custom OpenAI-compatible upstream
-
-Cloudflare Workers AI REST uses:
+For an NIM key pool, configure each key as a separate upstream with the same `base_url` and a different `api_key`. Clients can use a public model alias such as:
 
 ```txt
-https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
+nvidia-nim/deepseek-v4-flash-0731
 ```
 
-You can verify a Cloudflare API token first:
+The gateway resolves aliases and selects an eligible upstream using client permissions, model allowlists, and path support. Hosted NIM uses the Chat Completions and Embeddings paths. Self-hosted NIM is sent natively to `/v1/responses` only when that path is explicitly enabled; otherwise Responses is translated to Chat Completions.
 
-```bash
-curl "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-  -H "Authorization: Bearer {API_TOKEN}"
-```
+Built-in templates also include DeepInfra, Together AI, DeepSeek, Kimi/Moonshot, MiniMax, OpenRouter, Groq, GLM/Zhipu, Cloudflare Workers AI REST, and custom OpenAI-compatible upstreams.
 
-## Client Keys
+## Client Keys And Injection
 
-The admin panel can generate `sk-gw-...` keys. You can also seed clients with `CLIENTS_JSON`:
+Generate client keys in the admin panel or seed them with:
 
 ```json
 [
@@ -178,27 +145,30 @@ The admin panel can generate `sk-gw-...` keys. You can also seed clients with `C
 ]
 ```
 
-- Empty `models` or `["*"]` means all models are allowed.
-- Empty `upstreams` means all upstreams are allowed.
+- Empty `models` or `*` allows all models.
+- Empty `upstreams` allows all upstreams.
+- Prompt/context scopes accept `*`, `__all__`, `__none__`, client `id`, name, or full key.
 
-Scope targets for system prompt / global context / subagent / force-all injection support:
+Gateway rules and matching reference context are rebuilt for every Chat, Messages, and Responses request. Responses receives them through `instructions`, not as a fake user message. On-demand context can match keywords, model, and client; force-all injection skips keyword filtering but still obeys the maximum character limit.
 
-- `*` or `__all__`: all clients
-- `__none__`: disabled
-- Client `id` / `name` / `key`: exact match
+`history_max_chars` defaults to `0` (no trimming). A positive value trims ordinary conversation history while retaining gateway rules, reference context, and client system/developer messages. Use `/v1/responses/compact` when a long Responses conversation needs explicit compaction.
 
-Effective-client scopes only apply to existing client keys; identifiers that do not exist in the client list never trigger injection.
+## API
 
-### Prompt And Long Conversations
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Liveness, storage, and binding status |
+| `GET` | `/v1/models` | Aggregated model list |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/completions` | Native Completions or single-prompt Chat fallback |
+| `POST` | `/v1/embeddings` | Embeddings |
+| `POST` | `/v1/responses` | Responses compatibility layer |
+| `POST` | `/v1/responses/compact` | Compact Responses history |
+| `GET` | `/v1/responses/{id}` | Read a stored response |
+| `POST` | `/v1/responses/{id}/cancel` | Cancel a streaming response |
+| `POST` | `/v1/messages` | Anthropic/Claude-style requests |
 
-- Gateway policy (system prompt) and matching reference context are rebuilt on every Chat, Messages, and Responses request. Native Responses also receives them through instructions, never as user input.
-- The admin "final injection preview" builds the effective message order locally in the gateway and never calls an upstream.
-- history_max_chars defaults to 0 (no trimming). A positive value keeps only the newest conversation turns within the budget for Chat, Messages, and translated Responses; gateway policy, reference context, and client system / developer messages are retained.
-- Native Responses history remains managed by the upstream previous_response_id chain; the gateway still reinjects policy and context every time. Use /v1/responses/compact explicitly near the model window.
-
-## Usage
-
-OpenAI SDK:
+OpenAI SDK example:
 
 ```js
 import OpenAI from "openai";
@@ -208,68 +178,50 @@ const client = new OpenAI({
   baseURL: "https://your-domain.example/v1",
 });
 
-const res = await client.chat.completions.create({
-  model: "nvidia/nemotron-3-nano-30b-a3b",
+const response = await client.chat.completions.create({
+  model: "nvidia-nim/deepseek-v4-flash-0731",
   messages: [{ role: "user", content: "hello" }],
+  stream: true,
 });
 ```
 
-Main endpoints:
+## Routing And Performance
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/health` | Health check |
-| `GET` | `/v1/models` | Aggregated model list |
-| `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
-| `POST` | `/v1/completions` | OpenAI Completions (passes through to upstreams that explicitly declare the path; otherwise falls back to Chat) |
-| `POST` | `/v1/responses` | Responses API compatibility layer (native passthrough for self-hosted NIM) |
-| `POST` | `/v1/messages` | Claude / Anthropic-style messages |
-| `POST` | `/v1/embeddings` | Embeddings |
+- `failover`: try another upstream after failure, timeout, or cooldown.
+- `load_balance`: rank by weight, active requests, client-key affinity, and recent latency.
+- `coordination_level`: controls spreading away from active/reserved requests; default is `3`.
+- `soft_interval_ms`: advisory staggering when several keys choose the same upstream; default is `50`, and `0` disables it.
+- `ROUTE_COORDINATOR`: cross-edge short reservations; model requests still go directly from each edge to NIM.
+- Streaming failover only happens before the first visible output. Once bytes reach the client, the gateway never replays the request, avoiding duplicate text or tool calls.
+- `Hedged Request` and `Gateway Fast` race multiple candidates. For an NIM key pool, they are usually best disabled because they intentionally increase concurrency.
+- SSE sends a keepalive comment every five seconds to keep proxy connections open; keepalives are not model output.
 
-Additional Responses API support:
+Health checks only verify the upstream `/models` endpoint and do not prove that a specific model is ready. Use the admin speed test for model-level verification. Long-reasoning models may have slow first bytes, so the gateway uses an appropriate first-byte timeout and can try a fallback upstream.
 
-- `GET /v1/responses/{response_id}`: retrieve a previously `store`d response
-- `POST /v1/responses/{response_id}/cancel`: cancel an in-flight streaming response
-- `previous_response_id`: chain the previous turn (messages, function calls, and results) into the current input
+## Statistics And Troubleshooting
 
-NVIDIA NIM hosted templates enable the documented Chat Completions and Embeddings paths. When a self-hosted NIM upstream includes `/v1/responses` in its paths, the gateway prefers native Responses API passthrough; otherwise it converts to Chat Completions before aggregation.
-`nvidia/nemotron-3-embed-1b` Embeddings requests must include `input_type` (`query` or `passage`); the gateway passes the field through unchanged.
+- Memory: live requests, tokens, logs, and active upstreams for the current isolate.
+- Analytics Engine: historical statistics and logs.
+- D1/DO/KV: configuration, stored responses, current telemetry mirror, and routing state.
+- Diagnostic headers include `x-llm-gateway-route-ms`, `x-llm-gateway-dispatch-ms`, `x-llm-gateway-upstream-start-ms`, `x-llm-gateway-upstream`, and `x-llm-gateway-attempts`.
+- `/health` confirms whether the request reached the gateway and which storage backend is active.
 
-DeepSeek models called through any non-official upstream (NIM, OpenRouter, self-hosted endpoints, etc.) have upstream `reasoning_content` passed through; `/v1/responses` and `/v1/messages` calls translate it into reasoning items / thinking blocks. For DeepSeek V4 on NIM (for example `deepseek-ai/deepseek-v4-flash-0731`), the gateway also injects `chat_template_kwargs.reasoning_effort` (`none` / `high` / `max`, defaulting to `high`) per the NIM documentation. Official DeepSeek endpoints keep the original reasoning-hiding behavior.
+When no first byte arrives, inspect `x-llm-gateway-upstream-start-ms`. A large value means the request reached upstream dispatch but the provider/model is slow; no upstream start usually points to DO staggering, model permissions, path matching, or timeout configuration.
 
-`/v1/completions` prefers native passthrough to upstreams that explicitly declare the path. If no such upstream exists, a single `prompt` is translated to Chat Completions and converted back to the standard `text_completion` response, for both streaming and non-streaming calls.
+## Security Notes
 
-## Statistics
+- Never commit real upstream API keys or expose them in public logs.
+- `ADMIN_TOKEN` protects the admin path; it is not a complete authentication system.
+- Keep `API_KEY_CRYPT_SECRET` stable in production. Changing it can make saved upstream keys undecryptable.
+- Upstream exports contain plaintext API keys and must be protected.
+- In-memory live statistics disappear when an isolate is recycled; use Analytics Engine for history.
 
-- Memory: live recent requests, tokens, logs, and active upstreams
-- Analytics Engine: historical logs and statistics
-- State mirror: current logs and recent hourly stats while Analytics Engine queries catch up or are unavailable
+## Files
 
-In short: memory is for live display, Analytics Engine is for long-term history, and D1/DO/KV is for configuration, current telemetry, and shared routing state. With D1/DO enabled, KV reads and writes drop to near zero, which fits the small Free-plan KV quota.
-
-## Routing
-
-- `failover`: try another upstream after failure
-- `load_balance`: distribute by weight
-- `coordination_level` (0-5, default 3): higher values spread concurrent requests away from active or reserved upstreams, with weight treated as relative capacity
-- `soft_interval_ms` (default 50): stagger dispatches when multiple client keys select the same upstream; set it to `0` to disable, while requests already spread across upstreams are not delayed
-- Actual model requests remain direct from each serving edge to the upstream; `ROUTE_COORDINATOR` stores only short-lived global staggering state so multiple edges do not hit the same NIM key at once
-- Successful requests and speed tests write a six-hour latency EWMA to state storage so fresh isolates can prefer recently faster upstreams
-- Streaming failover only happens before the first visible output; once bytes are visible to the client, the gateway never replays the request, avoiding duplicate Agent text or tool calls
-- An upstream `Retry-After` response becomes an upstream/model cooldown state; a healthy fallback is attempted immediately instead of waiting on the failed provider
-- Health checks only verify upstream `/models`; use the admin speed test to verify a chosen model without default model probes
-- Health probes, model refreshes, and speed tests use bounded concurrency so a large upstream pool does not burst through the Workers Request budget
-- `Hedged Request`: race multiple upstreams for the same model
-- `Gateway Fast mode`: speed up the first two candidates for faster first byte
-- Fast + Hedged together: Hedged decides candidate count, Fast speeds up the first two
-
-## Notes
-
-- Do not expose real upstream API keys.
-- `ADMIN_TOKEN` only hides the admin path. It is not a full login system.
-- Do not rotate `API_KEY_CRYPT_SECRET` casually after production use; saved upstream keys depend on it.
-- Upstream export files contain plaintext API keys. Store them carefully.
-- Analytics Engine SQL queries require `Account > Account Analytics > Read`.
-- In-memory live stats may be lost if the Worker isolate is recycled. Use Analytics Engine as the historical source of truth.
-- KV routing state is a short-lived hint, not a strict global lock. Use the Durable Object `llmerge` backend if strongly consistent scheduling is ever required.
-- Long-reasoning models may have slow first bytes. Use suitable timeouts, Hedged Request, or Gateway Fast mode.
+- `_worker.js`: Worker/Pages Advanced Mode entry.
+- `admin-page.js`: admin panel.
+- `provider-bridges.js`: NIM and other upstream adapters.
+- `presets.js`: upstream templates.
+- `wrangler.worker.toml`: Worker deployment configuration.
+- `wrangler.toml`: Pages/local development reference configuration.
+- `d1_migrations/0001_create_store.sql`: D1 schema migration.

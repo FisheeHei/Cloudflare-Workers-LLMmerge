@@ -739,6 +739,13 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("timeout-string.example")) {
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(init.signal?.reason || "timeout");
+      if (init.signal?.aborted) abort();
+      else init.signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
   if (String(url).includes("boom.example")) {
     throw new Error("network down");
   }
@@ -1978,6 +1985,23 @@ const slowFirstByteResp = await worker.default.fetch(new Request("https://gw.tes
   body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [] }),
 }), slowFirstByteEnv);
 assert.equal(slowFirstByteResp.status, 200);
+
+const timeoutStringEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  KV: null,
+  REQUEST_TIMEOUT_MS: "10",
+  UPSTREAMS_JSON: JSON.stringify([
+    { name: "timeout-string", base_url: "https://timeout-string.example/v1", api_key: "t", models: ["timeout-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+  ]),
+  CLIENTS_JSON: JSON.stringify([{ name: "timeout-client", key: "sk-timeout", models: ["*"], upstreams: ["timeout-string"] }]),
+};
+const timeoutStringResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-timeout", "content-type": "application/json" },
+  body: JSON.stringify({ model: "timeout-model", messages: [] }),
+}), timeoutStringEnv);
+assert.equal(timeoutStringResp.status, 504);
+assert.match((await timeoutStringResp.json()).error.message, /first byte timeout/i);
 
 const fanoutStore = new Map();
 fanoutStore.set("gateway:config", JSON.stringify({
@@ -4520,6 +4544,26 @@ function makeDispatchNamespace() {
   };
   return namespace;
 }
+
+const dispatchLimitStorage = new Map();
+const dispatchLimitStore = new worker.LlmMergeStore({
+  storage: {
+    async get(key) { return dispatchLimitStorage.get(key) ?? null; },
+    async put(key, value) { dispatchLimitStorage.set(key, value); },
+    async delete(key) { dispatchLimitStorage.delete(key); },
+  },
+}, {});
+const dispatchLimitRequest = (maxWaitMs) => new Request("https://llmmerge-dispatch/dispatch", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ interval_ms: 1000, max_wait_ms: maxWaitMs, client: "dispatch-limit" }),
+});
+const dispatchFirst = await (await dispatchLimitStore.fetch(dispatchLimitRequest(0))).json();
+assert.equal(dispatchFirst.accepted, true);
+const dispatchNextAt = dispatchLimitStorage.get("dispatch:next_at");
+const dispatchRejected = await (await dispatchLimitStore.fetch(dispatchLimitRequest(0))).json();
+assert.equal(dispatchRejected.accepted, false);
+assert.equal(dispatchLimitStorage.get("dispatch:next_at"), dispatchNextAt);
 
 const d1 = makeD1Mock();
 const d1Env = {

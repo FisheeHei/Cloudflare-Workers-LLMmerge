@@ -61,6 +61,9 @@ const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
 const SSE_KEEPALIVE_MS = 5000;
 const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
+// Keep upstream staggering advisory: a crowded account must not turn into an unbounded gateway queue.
+const MAX_UPSTREAM_DISPATCH_WAIT_MS = 1000;
+const ROUTE_COORDINATOR_TIMEOUT_MS = 1500;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
@@ -559,7 +562,7 @@ function createDoStateStore(namespace, kv) {
 function createDoDispatchCoordinator(namespace) {
   if (!namespace) return null;
   return {
-    async reserve(upstreamName, intervalMs, client, signal) {
+    async reserve(upstreamName, intervalMs, client, signal, maxWaitMs = MAX_UPSTREAM_DISPATCH_WAIT_MS) {
       const id = namespace.idFromName(`llmmerge-dispatch:${String(upstreamName)}`);
       const stub = namespace.get(id);
       const response = await stub.fetch("https://llmmerge-dispatch/dispatch", {
@@ -567,6 +570,7 @@ function createDoDispatchCoordinator(namespace) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           interval_ms: intervalMs,
+          max_wait_ms: maxWaitMs,
           client: String(client?.key || client?.id || client?.name || "gateway"),
         }),
         signal,
@@ -587,13 +591,20 @@ export class LlmMergeStore {
     if (url.pathname === "/dispatch" && request.method === "POST") {
       const payload = await request.json().catch(() => ({}));
       const intervalMs = Math.max(0, Math.min(2000, Number(payload?.interval_ms) || 0));
+      const maxWaitMs = Number(payload?.max_wait_ms);
       const now = Date.now();
       const previousNextAt = Number(await this.state.storage.get("dispatch:next_at")) || 0;
       const scheduledAt = Math.max(now, previousNextAt);
+      const delayMs = Math.max(0, scheduledAt - now);
+      if (Number.isFinite(maxWaitMs) && maxWaitMs >= 0 && delayMs > maxWaitMs) {
+        return new Response(JSON.stringify({ accepted: false, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: previousNextAt }), {
+          headers: JSON_HEADERS,
+        });
+      }
       const nextAt = scheduledAt + intervalMs;
       await this.state.storage.put("dispatch:next_at", String(nextAt), { expirationTtl: 120 });
       await this.state.storage.put("dispatch:last_client", String(payload?.client || "gateway"), { expirationTtl: 120 });
-      return new Response(JSON.stringify({ delay_ms: Math.max(0, scheduledAt - now), scheduled_at: scheduledAt, next_at: nextAt }), {
+      return new Response(JSON.stringify({ accepted: true, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: nextAt }), {
         headers: JSON_HEADERS,
       });
     }
@@ -1311,7 +1322,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
     started,
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,
-    extra: { trace_id: traceId, tools_count: toolsCount, ...extra },
+    extra: { trace_id: traceId, tools_count: toolsCount, ...proxyResponse.timing, ...extra },
   }), ctx);
 
   if (!upstreamResp.ok) {
@@ -5106,6 +5117,8 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
 }
 
 async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx, signal = null }) {
+  const routingStartedAt = Date.now();
+  const timing = { route_selected_ms: 0, dispatch_wait_ms: 0, upstream_started_ms: 0 };
   if (pathname === CHAT_PATH) {
     bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
   }
@@ -5125,7 +5138,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   let initialDispatchContested = false;
   const releaseSelection = singleUpstream
     ? () => {}
-    : await acquireRouteSelectionLock(`${pathname}\n${model}`);
+    : await acquireRouteSelectionLock(`${pathname}\n${model}`, signal);
   let selectionReleased = false;
   const releaseSelectionOnce = () => {
     if (selectionReleased) return;
@@ -5142,13 +5155,16 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
         const used = new Set(hedgedAttempts.map(upstreamKey));
         const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal });
+        timing.route_selected_ms = Date.now() - routingStartedAt;
+        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt });
         releaseSelectionOnce();
         return result;
       }
     }
     initialDispatchContested = upstreamHasCompetition(attempts[0]);
     initialReservation = reserveUpstreams([attempts[0]]);
+    timing.route_selected_ms = Date.now() - routingStartedAt;
+    releaseSelectionOnce();
   } catch (error) {
     releaseSelectionOnce();
     throw error;
@@ -5163,11 +5179,18 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const releaseReservation = index === 0 ? initialReservation : reserveUpstreams([upstream]);
 
     try {
-      await waitForUpstreamDispatch(runtime, upstream, client, signal, dispatchContested);
+      const dispatchStartedAt = Date.now();
+      const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal, dispatchContested);
+      timing.dispatch_wait_ms += Date.now() - dispatchStartedAt;
+      if (!dispatch.accepted) {
+        lastError = dispatchQueueFullError(upstream, dispatch.delayMs);
+        continue;
+      }
       const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
       });
+      timing.upstream_started_ms = Date.now() - routingStartedAt;
       releaseSelectionOnce();
       upstreamResult = await upstreamPromise;
       let response = upstreamResult.response;
@@ -5201,9 +5224,11 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
           response,
           upstream,
           abortUpstream: upstreamResult.abortUpstream,
+          timing,
         };
       }
     } catch (error) {
+      const upstreamError = normalizeThrownError(error);
       releaseSelectionOnce();
       await discardUpstreamResponse(upstreamResult, "upstream request failed");
       if (signal?.aborted) {
@@ -5211,8 +5236,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         cancelled.upstreamName = upstream.name;
         throw cancelled;
       }
-      if (error.statusCode === 499) throw error;
-      lastError = error;
+      if (upstreamError.statusCode === 499) throw upstreamError;
+      lastError = upstreamError;
       lastError.upstreamName = upstream.name;
       await markUpstreamFailure(runtime, upstream, model);
       if (isLast) {
@@ -5223,7 +5248,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     }
   }
 
-  const err = httpError(502, lastError?.message || "All upstreams failed.");
+  const err = httpError(lastError?.statusCode || 502, lastError?.message || "All upstreams failed.");
   err.upstreamName = lastError?.upstreamName || "none";
   throw err;
 }
@@ -5243,6 +5268,13 @@ function proxyCandidates(runtime, client, model, pathname) {
 function gatewayErrorResponse(error, traceId) {
   const response = withCorsResponse(json(openAiError(error.message || "Internal error.", mapErrorType(error.statusCode)), error.statusCode || 500));
   return traceResponse(response, traceId);
+}
+
+function dispatchQueueFullError(upstream, delayMs) {
+  const error = httpError(503, `Upstream dispatch queue is busy${delayMs ? ` (${delayMs}ms)` : ""}.`);
+  error.upstreamName = upstream?.name || "none";
+  error.dispatchLimited = true;
+  return error;
 }
 
 function traceResponse(response, traceId) {
@@ -5550,7 +5582,7 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null }) {
+async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now() }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
@@ -5567,11 +5599,18 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
 
   function launchLater(index) {
     const upstream = attempts[index];
-    return sleep(launchDelay(index)).then(async () => {
+    return sleep(launchDelay(index), controllers[index].signal).then(async () => {
       if (done) return { cancelled: true, upstream, index };
       let result = null;
       try {
-        await waitForUpstreamDispatch(runtime, upstream, client, controllers[index].signal);
+        const dispatchStartedAt = Date.now();
+        const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, controllers[index].signal);
+        const attemptTiming = {
+          ...timing,
+          dispatch_wait_ms: Date.now() - dispatchStartedAt,
+          upstream_started_ms: Date.now() - routingStartedAt,
+        };
+        if (!dispatch.accepted) return { limited: true, upstream, index, delayMs: dispatch.delayMs, timing: attemptTiming };
         result = await fetchProxyUpstream({
           bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
           firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
@@ -5583,7 +5622,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
           result.streamErrorKind = primed.errorKind || "";
           result.latency = Date.now() - result.startedAt;
         }
-        return { ...result, upstream, index };
+        return { ...result, upstream, index, timing: attemptTiming };
       } catch (error) {
         await discardUpstreamResponse(result, "hedged upstream request failed");
         return { error, upstream, index, latency: 0 };
@@ -5614,7 +5653,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
         await clearUpstreamFailure(runtime, result.upstream, model);
         rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
         rememberSuccessfulUpstream(result.upstream, model);
-        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream };
+        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing };
       }
       if (result.response) {
         await discardUpstreamResponse(result, "retryable hedged response");
@@ -5622,10 +5661,11 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       await markUpstreamFailure(runtime, result.upstream, model, result.response);
     }
 
-    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal });
-    if (fallbackResult) return { ...fallbackResult, attempts: attempts.length + 1 };
+    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal, timing, routingStartedAt });
+    if (fallbackResult?.response) return { ...fallbackResult, attempts: attempts.length + 1 };
+    if (fallbackResult?.limited) lastResult = fallbackResult;
 
-    const err = httpError(502, lastResult?.error?.message || "All hedged upstreams failed.");
+    const err = httpError(lastResult?.limited ? 503 : 502, lastResult?.error?.message || (lastResult?.limited ? "All eligible upstream dispatch queues are busy." : "All hedged upstreams failed."));
     err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
     throw err;
   } finally {
@@ -5635,13 +5675,20 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
   }
 }
 
-async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal = null }) {
+async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal = null, timing = {}, routingStartedAt = Date.now() }) {
   const upstream = attempts?.[0];
   if (!upstream || runtime.routing.failover === false) return null;
   let result = null;
   const releaseReservation = reserveUpstreams([upstream]);
   try {
-    await waitForUpstreamDispatch(runtime, upstream, client, signal);
+    const dispatchStartedAt = Date.now();
+    const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal);
+    const fallbackTiming = {
+      ...timing,
+      dispatch_wait_ms: Date.now() - dispatchStartedAt,
+      upstream_started_ms: Date.now() - routingStartedAt,
+    };
+    if (!dispatch.accepted) return { limited: true, upstream, delayMs: dispatch.delayMs, timing: fallbackTiming };
     result = await fetchProxyUpstream({
       bodyText, client, pathname, request, runtime, search, signal, upstream,
       firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
@@ -5662,11 +5709,12 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     await clearUpstreamFailure(runtime, upstream, model);
     rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
     rememberSuccessfulUpstream(upstream, model);
-    return { response: result.response, upstream, abortUpstream: result.abortUpstream };
+    return { response: result.response, upstream, abortUpstream: result.abortUpstream, timing: fallbackTiming };
   } catch (error) {
+    const upstreamError = normalizeThrownError(error);
     await discardUpstreamResponse(result, "hedged fallback failed");
     if (signal?.aborted) throw httpError(499, "Response cancelled.");
-    if (error.statusCode === 499) throw error;
+    if (upstreamError.statusCode === 499) throw upstreamError;
     await markUpstreamFailure(runtime, upstream, model);
     return null;
   } finally {
@@ -5674,8 +5722,26 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
   }
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal = null) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(httpError(499, "Response cancelled."));
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      signal.removeEventListener("abort", abort);
+    };
+    const abort = () => {
+      cleanup();
+      reject(httpError(499, "Response cancelled."));
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+  });
 }
 
 async function mapConcurrent(items, limit, fn) {
@@ -5858,45 +5924,66 @@ function upstreamSoftIntervalMs(runtime) {
 async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
   const interval = upstreamSoftIntervalMs(runtime);
   const name = upstreamKey(upstream);
-  if (!interval || !name) return;
+  if (!interval || !name) return { accepted: true, delayMs: 0 };
   if (runtime?.routeCoordinator) {
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason || "request aborted");
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(() => controller.abort("route coordinator timeout"), ROUTE_COORDINATOR_TIMEOUT_MS);
     try {
-      const slot = await runtime.routeCoordinator.reserve(name, interval, client, signal);
+      const slot = await runtime.routeCoordinator.reserve(name, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
       const delay = Math.max(0, Number(slot?.delay_ms) || 0);
+      if (slot?.accepted === false || delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) {
+        return { accepted: false, delayMs: delay };
+      }
       const now = Date.now();
       _upstreamDispatchAt[name] = Math.max(Number(_upstreamDispatchAt[name] || 0), now + delay + interval);
       _upstreamDispatchClients[name] = {
         client: String(client?.key || client?.id || client?.name || "gateway"),
         at: now,
       };
-      if (delay > 0) await sleep(delay);
+      if (delay > 0) await sleep(delay, signal);
       if (signal?.aborted) throw httpError(499, "Response cancelled.");
-      return;
+      return { accepted: true, delayMs: delay };
     } catch (error) {
       if (error?.statusCode === 499 || signal?.aborted) throw httpError(499, "Response cancelled.");
       // ponytail: coordinator is advisory; local scheduling keeps the request alive if DO is unavailable.
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
     }
   }
   const now = Date.now();
   const scheduled = contested ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
+  const delay = scheduled - now;
+  if (delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) return { accepted: false, delayMs: delay };
   _upstreamDispatchAt[name] = scheduled + interval;
   _upstreamDispatchClients[name] = {
     client: String(client?.key || client?.id || client?.name || "gateway"),
     at: now,
   };
-  const delay = scheduled - now;
-  if (delay > 0) await sleep(delay);
+  if (delay > 0) await sleep(delay, signal);
   if (signal?.aborted) throw httpError(499, "Response cancelled.");
+  return { accepted: true, delayMs: delay };
 }
 
-async function acquireRouteSelectionLock(key) {
+async function acquireRouteSelectionLock(key, signal = null) {
   const previous = _routeSelectionTails[key] || Promise.resolve();
   let releaseCurrent;
   const current = new Promise((resolve) => { releaseCurrent = resolve; });
   const gate = previous.then(() => undefined);
   const tail = gate.then(() => current);
   _routeSelectionTails[key] = tail;
-  await gate;
+  try {
+    await awaitWithSignal(gate, signal);
+  } catch (error) {
+    releaseCurrent();
+    void tail.then(() => {
+      if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
+    });
+    throw error;
+  }
   let released = false;
   return () => {
     if (released) return;
@@ -5904,6 +5991,26 @@ async function acquireRouteSelectionLock(key) {
     releaseCurrent();
     if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
   };
+}
+
+function awaitWithSignal(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(httpError(499, "Response cancelled."));
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    const abort = () => {
+      cleanup();
+      reject(httpError(499, "Response cancelled."));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(promise).then((value) => {
+      cleanup();
+      resolve(value);
+    }, (error) => {
+      cleanup();
+      reject(error);
+    });
+  });
 }
 
 function reserveUpstreams(upstreams) {
@@ -6732,11 +6839,11 @@ async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs,
   const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
   const controller = new AbortController();
   const upstreamSignal = init?.signal;
-  const abort = () => controller.abort(upstreamSignal?.reason || "timeout");
+  const abort = () => controller.abort(upstreamSignal?.reason || httpError(499, "Response cancelled."));
   const cleanupSignal = () => upstreamSignal?.removeEventListener("abort", abort);
   if (upstreamSignal?.aborted) abort();
   else upstreamSignal?.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(() => controller.abort("timeout"), timeout);
+  const timer = setTimeout(() => controller.abort(httpError(504, "Upstream first byte timeout.")), timeout);
 
   try {
     const response = await fetch(url, { ...init, signal: controller.signal });
@@ -6748,7 +6855,13 @@ async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs,
   } catch (error) {
     clearTimeout(timer);
     cleanupSignal();
-    throw error;
+    const reason = controller.signal.reason;
+    if (controller.signal.aborted) {
+      if (reason?.statusCode) throw reason;
+      if (upstreamSignal?.aborted) throw httpError(499, "Response cancelled.");
+      throw normalizeThrownError(reason || error, "Upstream request aborted.");
+    }
+    throw normalizeThrownError(error);
   }
 }
 
@@ -6834,6 +6947,11 @@ function proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId) {
   headers.set("x-llm-gateway-client", client.name || client.id || "client");
   headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
   headers.set("x-llm-gateway-trace-id", traceId);
+  if (proxyResponse.timing) {
+    headers.set("x-llm-gateway-route-ms", String(proxyResponse.timing.route_selected_ms || 0));
+    headers.set("x-llm-gateway-dispatch-ms", String(proxyResponse.timing.dispatch_wait_ms || 0));
+    headers.set("x-llm-gateway-upstream-start-ms", String(proxyResponse.timing.upstream_started_ms || 0));
+  }
   return headers;
 }
 
@@ -6961,6 +7079,11 @@ function withCorsResponse(response) {
     statusText: response.statusText,
     headers,
   });
+}
+
+function normalizeThrownError(error, fallback = "Upstream request failed.") {
+  if (error && typeof error === "object") return error;
+  return new Error(String(error || fallback));
 }
 
 function httpError(statusCode, message) {
