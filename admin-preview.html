@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Merge · Admin Preview</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --panel: #fff;
+      --panel-soft: #f8fafc;
+      --ink: #172033;
+      --ink-soft: #3b4659;
+      --muted: #6b778c;
+      --line: #dce3ec;
+      --line-strong: #b9c5d4;
+      --nav: #202a38;
+      --nav-hover: #2b3a4d;
+      --nav-muted: #aebbd0;
+      --blue: #2563eb;
+      --blue-soft: #eaf2ff;
+      --green: #087f5b;
+      --green-soft: #e8f7f1;
+      --amber: #a15c00;
+      --amber-soft: #fff5df;
+      --red: #bd3027;
+      --red-soft: #fff0ef;
+      --shadow: 0 8px 24px rgba(23, 32, 51, .06);
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.5 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible {
+      outline: 3px solid #9bc2ff;
+      outline-offset: 2px;
+    }
+    .app { min-height: 100vh; display: grid; grid-template-columns: 236px minmax(0, 1fr); }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 26px;
+      padding: 22px 14px 16px;
+      background: var(--nav);
+      color: #fff;
+    }
+    .brand { display: flex; align-items: center; gap: 11px; padding: 0 8px; }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 35px;
+      height: 35px;
+      border-radius: 8px;
+      background: var(--blue);
+      font-weight: 800;
+      letter-spacing: .03em;
+    }
+    .brand-name { display: block; font-weight: 750; line-height: 1.15; }
+    .brand-caption { display: block; margin-top: 3px; color: var(--nav-muted); font-size: 11px; }
+    .nav-label {
+      margin: 0 8px 8px;
+      color: #8090a8;
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .nav { display: grid; gap: 4px; }
+    .nav button {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      min-height: 40px;
+      padding: 9px 10px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--nav-muted);
+      text-align: left;
+      font-weight: 650;
+    }
+    .nav button:hover, .nav button.active { background: var(--nav-hover); border-color: #34445b; color: #fff; }
+    .nav-icon { width: 18px; color: #9ec2ff; text-align: center; font-size: 16px; }
+    .sidebar-foot { margin-top: auto; padding: 12px 8px 0; border-top: 1px solid #334158; color: #8090a8; font-size: 11px; }
+    .sidebar-foot strong { display: block; margin-top: 4px; color: var(--nav-muted); font-family: Consolas, monospace; font-weight: 500; }
+    .content { min-width: 0; min-height: 100vh; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      min-height: 68px;
+      padding: 12px clamp(18px, 3vw, 34px);
+      background: rgba(255, 255, 255, .94);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(12px);
+    }
+    .topbar-copy { min-width: 0; }
+    .eyebrow { color: var(--muted); font-size: 11px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    .topbar-title { margin-top: 2px; font-size: 17px; font-weight: 750; }
+    .topbar-actions { display: flex; align-items: center; gap: 10px; }
+    .status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--amber); }
+    .status.online::before { background: var(--green); }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-height: 35px;
+      padding: 8px 12px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: var(--blue);
+      color: #fff;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .btn:hover { background: #1d4ed8; }
+    .btn.secondary { background: var(--panel-soft); border-color: var(--line-strong); color: var(--ink-soft); }
+    .btn.secondary:hover { background: #eef3f8; }
+    .btn.good { background: var(--green); }
+    .btn.good:hover { background: #066448; }
+    .btn.danger { background: var(--red); }
+    .btn.small { min-height: 30px; padding: 6px 9px; font-size: 12px; }
+    .wrap { width: min(1480px, calc(100% - 48px)); margin: 0 auto; padding: 26px 0 48px; }
+    .view[hidden] { display: none; }
+    .page-head { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    .page-head h1 { margin: 4px 0 6px; font-size: clamp(24px, 3vw, 32px); line-height: 1.1; }
+    .page-head p { max-width: 720px; margin: 0; color: var(--muted); }
+    .head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .panel { margin-bottom: 18px; padding: 19px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 15px; }
+    .panel-head h2 { margin: 0; font-size: 17px; line-height: 1.2; }
+    .panel-head p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+    .panel-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .metric { padding: 15px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .metric-value { margin-top: 6px; font-size: 24px; font-weight: 750; letter-spacing: 0; }
+    .metric-foot { margin-top: 4px; color: var(--muted); font-size: 11px; }
+    .metric-foot.good { color: var(--green); }
+    .grid-2 { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(300px, .85fr); gap: 18px; align-items: start; }
+    .grid-2.equal { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .endpoint { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; background: var(--blue-soft); border-left: 3px solid var(--blue); }
+    .endpoint code, code, .mono { font-family: Consolas, "Cascadia Code", monospace; }
+    .endpoint code { overflow-wrap: anywhere; color: #164eaa; font-size: 13px; }
+    .copy-button { flex: 0 0 auto; }
+    .chart { display: flex; align-items: end; gap: 8px; height: 145px; padding: 14px 8px 0; border-bottom: 1px solid var(--line); }
+    .bar { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: end; gap: 7px; min-width: 20px; height: 100%; }
+    .bar span { display: block; width: 100%; max-width: 34px; height: var(--height); min-height: 9px; border-radius: 4px 4px 0 0; background: var(--blue); }
+    .bar:nth-child(3n) span { background: #4d86ef; }
+    .bar label { color: var(--muted); font-size: 10px; }
+    .legend { display: flex; gap: 14px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .legend i { display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 2px; background: var(--blue); }
+    .legend i.green { background: var(--green); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 640px; }
+    th, td { padding: 11px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+    th { color: var(--muted); font-size: 11px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+    td { color: var(--ink-soft); }
+    tr:last-child td { border-bottom: 0; }
+    .row-main { color: var(--ink); font-weight: 700; }
+    .row-sub { margin-top: 2px; color: var(--muted); font-size: 11px; }
+    .pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 999px; background: var(--panel-soft); color: var(--muted); font-size: 11px; font-weight: 700; white-space: nowrap; }
+    .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #a7b1bf; }
+    .pill.ok { background: var(--green-soft); color: var(--green); }
+    .pill.ok::before { background: var(--green); }
+    .pill.warn { background: var(--amber-soft); color: var(--amber); }
+    .pill.warn::before { background: var(--amber); }
+    .pill.fail { background: var(--red-soft); color: var(--red); }
+    .pill.fail::before { background: var(--red); }
+    .provider-list { display: grid; gap: 10px; }
+    details.provider, details.client-list { overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-soft); }
+    details.provider > summary, details.client-list > summary { display: flex; align-items: center; gap: 11px; padding: 13px 14px; cursor: pointer; list-style: none; }
+    details.provider > summary::-webkit-details-marker, details.client-list > summary::-webkit-details-marker { display: none; }
+    details.provider > summary::before, details.client-list > summary::before { content: "▶"; color: var(--muted); font-size: 10px; transition: transform .18s; }
+    details.provider[open] > summary::before, details.client-list[open] > summary::before { transform: rotate(90deg); }
+    .provider-name { flex: 1; min-width: 0; }
+    .provider-name strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .provider-name small { display: block; margin-top: 2px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .provider-body { display: grid; gap: 13px; padding: 0 14px 14px 39px; }
+    .provider-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .field label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 12px; }
+    input, select, textarea { width: 100%; border: 1px solid var(--line-strong); border-radius: 6px; background: #fff; color: var(--ink); padding: 8px 9px; }
+    input:focus, select:focus, textarea:focus { border-color: var(--blue); outline: 0; box-shadow: 0 0 0 3px #dbeafe; }
+    textarea { min-height: 112px; resize: vertical; }
+    .inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .client-head { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+    .client-head strong { white-space: nowrap; }
+    .client-summary { color: var(--muted); font-size: 12px; }
+    .key-list { padding: 0 14px 14px 39px; }
+    .key-row { display: grid; grid-template-columns: minmax(120px, .8fr) minmax(180px, 1.4fr) auto; gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid var(--line); }
+    .key-row:first-child { border-top: 0; }
+    .key-value { min-width: 0; padding: 7px 8px; overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: #fff; color: var(--ink-soft); text-overflow: ellipsis; white-space: nowrap; }
+    .key-actions { display: flex; gap: 6px; }
+    .hint { padding: 10px 12px; border: 1px solid #c8dbff; border-radius: 6px; background: var(--blue-soft); color: #24518f; font-size: 12px; }
+    .form-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 13px; }
+    .span-12 { grid-column: span 12; }
+    .span-8 { grid-column: span 8; }
+    .span-6 { grid-column: span 6; }
+    .span-4 { grid-column: span 4; }
+    .check-line { display: inline-flex; align-items: center; gap: 8px; min-height: 38px; color: var(--ink-soft); }
+    input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--blue); }
+    .preview-box { min-height: 185px; padding: 13px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: #152033; color: #d9e4f4; white-space: pre-wrap; font: 12px/1.65 Consolas, monospace; }
+    .preview-meta { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 10px; }
+    .diagnostic { display: grid; gap: 10px; }
+    .diagnostic-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-soft); }
+    .diagnostic-item strong { display: block; }
+    .diagnostic-item small { display: block; margin-top: 2px; color: var(--muted); }
+    .filters { display: grid; grid-template-columns: minmax(180px, 1.3fr) repeat(3, minmax(120px, .6fr)); gap: 9px; margin-bottom: 14px; }
+    .empty { padding: 28px 12px; color: var(--muted); text-align: center; }
+    .toast { position: fixed; right: 22px; bottom: 22px; z-index: 20; max-width: min(360px, calc(100% - 44px)); padding: 11px 14px; border: 1px solid #b7decf; border-radius: 6px; background: #f2fcf8; color: var(--green); box-shadow: var(--shadow); opacity: 0; transform: translateY(8px); pointer-events: none; transition: opacity .18s, transform .18s; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    @media (max-width: 1080px) {
+      .app { grid-template-columns: 204px minmax(0, 1fr); }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-2, .grid-2.equal { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 760px) {
+      .app { display: block; }
+      .sidebar { position: static; height: auto; padding: 13px 14px; gap: 12px; }
+      .sidebar-foot, .nav-label { display: none; }
+      .nav { display: flex; overflow-x: auto; padding-bottom: 2px; }
+      .nav button { flex: 0 0 auto; width: auto; min-height: 35px; }
+      .nav button span:last-child { display: none; }
+      .topbar { min-height: 62px; padding: 10px 16px; }
+      .topbar-actions .status { display: none; }
+      .wrap { width: min(100% - 28px, 680px); padding-top: 19px; }
+      .page-head { display: block; margin-bottom: 18px; }
+      .head-actions { margin-top: 12px; }
+      .panel { padding: 15px; }
+      .metrics { gap: 8px; }
+      .metric { padding: 12px; }
+      .metric-value { font-size: 20px; }
+      .provider-fields, .filters { grid-template-columns: 1fr; }
+      .key-row { grid-template-columns: 1fr; gap: 7px; }
+      .key-actions { justify-content: flex-start; }
+      .form-grid { grid-template-columns: 1fr; }
+      .span-12, .span-8, .span-6, .span-4 { grid-column: auto; }
+      .endpoint { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">LM</div>
+        <div><span class="brand-name">LLM Merge</span><span class="brand-caption">个人进阶控制台 · Preview</span></div>
+      </div>
+      <div>
+        <p class="nav-label">Workspace</p>
+        <nav class="nav" aria-label="主导航">
+          <button class="active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button>
+          <button data-view="providers"><span class="nav-icon">⇄</span><span>上游与客户端</span></button>
+          <button data-view="context"><span class="nav-icon">▤</span><span>Prompt / Context</span></button>
+          <button data-view="logs"><span class="nav-icon">≡</span><span>日志与诊断</span></button>
+        </nav>
+      </div>
+      <div class="sidebar-foot">运行模式<strong>Pages + Worker / DO</strong>版本<strong>v26-09-08-admin-preview-3</strong></div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div class="topbar-copy"><div class="eyebrow">Gateway Console</div><div class="topbar-title" id="topbar-title">总览</div></div>
+        <div class="topbar-actions"><span class="status online" id="gateway-status">网关在线 · 42ms</span><button class="btn secondary small" id="refresh-all" title="刷新状态"><span aria-hidden="true">↻</span>刷新状态</button></div>
+      </header>
+
+      <div class="wrap">
+        <section class="view" id="view-overview">
+          <div class="page-head"><div><div class="eyebrow">Overview</div><h1>运行概览</h1><p>把当前网关、上游连接和请求质量压缩到一个可扫描的工作面。</p></div><div class="head-actions"><button class="btn" data-go="providers">配置上游 <span aria-hidden="true">→</span></button><button class="btn secondary" data-go="context">查看注入</button></div></div>
+          <div class="endpoint"><code>https://llm-merge.example.workers.dev/v1</code><button class="btn secondary small copy-button" data-copy="https://llm-merge.example.workers.dev/v1"><span aria-hidden="true">⧉</span>复制地址</button></div>
+          <div class="metrics" style="margin-top:18px">
+            <div class="metric"><div class="metric-label">成功率 · 24h</div><div class="metric-value">99.2%</div><div class="metric-foot good">↑ 0.4% vs. 前一日</div></div>
+            <div class="metric"><div class="metric-label">平均首包</div><div class="metric-value">1.18s</div><div class="metric-foot">P95 · 2.84s</div></div>
+            <div class="metric"><div class="metric-label">活动请求</div><div class="metric-value" id="active-requests">3</div><div class="metric-foot">当前边缘节点</div></div>
+            <div class="metric"><div class="metric-label">可用模型</div><div class="metric-value">18</div><div class="metric-foot">3 个上游 · 刚刚刷新</div></div>
+          </div>
+          <div class="grid-2">
+            <section class="panel"><div class="panel-head"><div><h2>请求趋势</h2><p>最近 12 个时间片 · 模拟数据</p></div><span class="pill ok">稳定</span></div><div class="chart" aria-label="请求趋势图"><div class="bar" style="--height:32%"><span></span><label>01</label></div><div class="bar" style="--height:48%"><span></span><label>03</label></div><div class="bar" style="--height:42%"><span></span><label>05</label></div><div class="bar" style="--height:64%"><span></span><label>07</label></div><div class="bar" style="--height:53%"><span></span><label>09</label></div><div class="bar" style="--height:76%"><span></span><label>11</label></div><div class="bar" style="--height:67%"><span></span><label>13</label></div><div class="bar" style="--height:82%"><span></span><label>15</label></div><div class="bar" style="--height:60%"><span></span><label>17</label></div><div class="bar" style="--height:88%"><span></span><label>19</label></div><div class="bar" style="--height:72%"><span></span><label>21</label></div><div class="bar" style="--height:94%"><span></span><label>23</label></div></div><div class="legend"><span><i></i>请求数</span><span><i class="green"></i>成功响应</span></div></section>
+            <section class="panel"><div class="panel-head"><div><h2>上游健康度</h2><p>按当前 Worker 节点观测</p></div><button class="btn secondary small" data-go="providers">管理</button></div><div class="diagnostic"><div class="diagnostic-item"><div><strong>NVIDIA NIM</strong><small>12 models · soft interval 2s</small></div><span class="pill ok">正常</span></div><div class="diagnostic-item"><div><strong>OpenAI Compatible</strong><small>4 models · last check 38s ago</small></div><span class="pill ok">正常</span></div><div class="diagnostic-item"><div><strong>Anthropic Bridge</strong><small>2 models · last check 2m ago</small></div><span class="pill warn">降级</span></div></div></section>
+          </div>
+          <section class="panel"><div class="panel-head"><div><h2>最近请求</h2><p>仅展示摘要，完整内容进入日志与诊断。</p></div><button class="btn secondary small" data-go="logs">查看全部 <span aria-hidden="true">→</span></button></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>客户端</th><th>模型</th><th>首包</th><th>总耗时</th><th>状态</th></tr></thead><tbody><tr><td class="mono">14:32:08</td><td><div class="row-main">codex-desktop</div><div class="row-sub">key_••••91F</div></td><td class="mono">deepseek-v4-flash</td><td>0.92s</td><td>8.4s</td><td><span class="pill ok">完成</span></td></tr><tr><td class="mono">14:31:44</td><td><div class="row-main">content-agent</div><div class="row-sub">key_••••A2C</div></td><td class="mono">qwen3-235b</td><td>1.31s</td><td>14.2s</td><td><span class="pill ok">完成</span></td></tr><tr><td class="mono">14:30:17</td><td><div class="row-main">local-cli</div><div class="row-sub">key_••••4D8</div></td><td class="mono">gpt-oss-120b</td><td>2.08s</td><td>2.1s</td><td><span class="pill warn">重试后完成</span></td></tr></tbody></table></div></section>
+        </section>
+
+        <section class="view" id="view-providers" hidden>
+          <div class="page-head"><div><div class="eyebrow">Providers & Clients</div><h1>上游与客户端</h1><p>连接、模型和 Key 统一在一个视图管理。默认隐藏低频字段。</p></div><div class="head-actions"><button class="btn" id="refresh-models"><span aria-hidden="true">↻</span>刷新模型</button><button class="btn secondary" id="generate-key-top"><span aria-hidden="true">＋</span>生成 Key</button></div></div>
+          <div class="grid-2 equal">
+            <section class="panel"><div class="panel-head"><div><h2>上游连接</h2><p>DO 只协调短期错峰，请求仍从当前边缘直连。</p></div><span class="pill ok">3 enabled</span></div><div class="provider-list">
+              <details class="provider" open><summary><span class="pill ok">健康</span><div class="provider-name"><strong>NVIDIA NIM</strong><small>https://integrate.api.nvidia.com/v1</small></div><span class="client-summary">12 models</span></summary><div class="provider-body"><div class="provider-fields"><div class="field"><label>优先级</label><input value="100" aria-label="NVIDIA NIM 优先级"></div><div class="field"><label>软间隔</label><input value="2s" aria-label="NVIDIA NIM 软间隔"></div><div class="field"><label>Key 池</label><input value="6 active" aria-label="NVIDIA NIM Key 池" readonly></div></div><div class="inline"><button class="btn secondary small">连接检查</button><button class="btn secondary small">模型测试</button><span class="note">上次检查：刚刚 · 42ms</span></div></div></details>
+              <details class="provider"><summary><span class="pill ok">健康</span><div class="provider-name"><strong>OpenAI Compatible</strong><small>https://api.example.com/v1</small></div><span class="client-summary">4 models</span></summary><div class="provider-body"><div class="provider-fields"><div class="field"><label>优先级</label><input value="80" aria-label="兼容上游优先级"></div><div class="field"><label>软间隔</label><input value="3s" aria-label="兼容上游软间隔"></div><div class="field"><label>Key 池</label><input value="2 active" aria-label="兼容上游 Key 池" readonly></div></div><div class="inline"><button class="btn secondary small">连接检查</button><button class="btn secondary small">模型测试</button></div></div></details>
+              <details class="provider"><summary><span class="pill warn">降级</span><div class="provider-name"><strong>Anthropic Bridge</strong><small>https://bridge.example.com</small></div><span class="client-summary">2 models</span></summary><div class="provider-body"><div class="provider-fields"><div class="field"><label>优先级</label><input value="40" aria-label="Anthropic Bridge 优先级"></div><div class="field"><label>软间隔</label><input value="5s" aria-label="Anthropic Bridge 软间隔"></div><div class="field"><label>Key 池</label><input value="1 active" aria-label="Anthropic Bridge Key 池" readonly></div></div><div class="inline"><button class="btn secondary small">连接检查</button><button class="btn secondary small">模型测试</button></div></div></details>
+            </div></section>
+            <section class="panel"><div class="panel-head"><div><h2>Client Keys</h2><p>折叠时也能生成，并保留最近创建的 3 个 Key。</p></div><button class="btn small" id="generate-key"><span aria-hidden="true">＋</span>生成 Key</button></div><div class="hint" style="margin-bottom:12px">预览模式：复制动作不会触碰真实 Key，仅模拟成功反馈。</div><details class="client-list" id="client-list"><summary><div class="client-head"><strong>所有客户端</strong><span class="pill ok">6 active</span></div><span class="client-summary">最近 3 个已显示</span></summary><div class="key-list" id="key-list"><div class="key-row"><div><strong>codex-desktop</strong><div class="row-sub">创建于今天 14:02</div></div><div class="key-value mono">sk-llm-••••••••••91F</div><div class="key-actions"><button class="btn secondary small copy-key" data-key="sk-llm-preview-91F">复制</button></div></div><div class="key-row"><div><strong>content-agent</strong><div class="row-sub">创建于今天 12:48</div></div><div class="key-value mono">sk-llm-••••••••••A2C</div><div class="key-actions"><button class="btn secondary small copy-key" data-key="sk-llm-preview-A2C">复制</button></div></div><div class="key-row"><div><strong>local-cli</strong><div class="row-sub">创建于昨天 22:19</div></div><div class="key-value mono">sk-llm-••••••••••4D8</div><div class="key-actions"><button class="btn secondary small copy-key" data-key="sk-llm-preview-4D8">复制</button></div></div></div></details></section>
+          </div>
+          <section class="panel"><div class="panel-head"><div><h2>模型路由摘要</h2><p>模型别名解析后进入统一请求内核。</p></div><span class="note" id="model-refresh-time">刷新于刚刚</span></div><div class="table-wrap"><table><thead><tr><th>网关别名</th><th>上游模型</th><th>上游</th><th>状态</th><th>路由</th></tr></thead><tbody><tr><td class="mono">nvidia-nim/deepseek-v4-flash-0731</td><td class="mono">deepseek-ai/deepseek-v4-flash-0731</td><td>NVIDIA NIM</td><td><span class="pill ok">可用</span></td><td>近期最少使用</td></tr><tr><td class="mono">nvidia-nim/qwen3-235b</td><td class="mono">qwen/qwen3-235b-a22b</td><td>NVIDIA NIM</td><td><span class="pill ok">可用</span></td><td>近期最少使用</td></tr><tr><td class="mono">openai/gpt-oss-120b</td><td class="mono">gpt-oss-120b</td><td>OpenAI Compatible</td><td><span class="pill ok">可用</span></td><td>优先级 + 软间隔</td></tr></tbody></table></div></section>
+        </section>
+
+        <section class="view" id="view-context" hidden>
+          <div class="page-head"><div><div class="eyebrow">Prompt / Context</div><h1>注入控制</h1><p>先形成固定 snapshot，再进入不同协议的统一请求内核。</p></div><div class="head-actions"><button class="btn good" id="apply-context"><span aria-hidden="true">✓</span>应用设置</button></div></div>
+          <div class="grid-2">
+            <section class="panel"><div class="panel-head"><div><h2>注入规则</h2><p>本次只做静态预览，默认值对应当前推荐路径。</p></div><span class="pill ok">每次请求一次</span></div><div class="form-grid"><div class="field span-12"><label class="check-line"><input type="checkbox" id="system-enabled" checked>启用全局 System Prompt</label><textarea id="system-prompt" aria-label="全局 System Prompt">You are a precise assistant. Preserve the user's requested format, keep tool-facing outputs deterministic, and do not request the current time during an LLM call.</textarea></div><div class="field span-12"><label class="check-line"><input type="checkbox" id="context-enabled" checked>启用全局 Context</label><textarea id="global-context" aria-label="全局 Context">Gateway context: this is a personal advanced deployment. Prefer stable routing, concise responses, and preserve protocol semantics across model switches.</textarea></div><div class="field span-4"><label for="max-chars">最大字符数</label><input id="max-chars" value="12000" inputmode="numeric"></div><div class="field span-4"><label for="history-chars">历史保留字符</label><input id="history-chars" value="24000" inputmode="numeric"></div><div class="field span-4"><label for="model-scope">模型范围</label><select id="model-scope"><option>全部模型</option><option>NVIDIA NIM</option><option>仅创作模型</option></select></div><div class="field span-12"><label class="check-line"><input type="checkbox" checked>客户端未选择时不强制全量注入</label></div></div></section>
+            <section class="panel"><div class="panel-head"><div><h2>注入预览</h2><p>展示固定 snapshot 的摘要，不显示敏感完整内容。</p></div><span class="pill" id="snapshot-status">snapshot 未应用</span></div><div class="preview-meta"><span class="pill">model: deepseek-v4-flash</span><span class="pill">chars: <span id="preview-chars">1,084</span></span><span class="pill">hash: <span id="preview-hash">a81f2c9d</span></span></div><div class="preview-box" id="preview-box">[system]
+You are a precise assistant. Preserve the user's requested format...
+
+[global_context]
+Gateway context: this is a personal advanced deployment...
+
+[history]
+... history clipped to 24,000 chars
+
+[snapshot]
+injected_once=true
+time_lookup=false</div><div class="hint" style="margin-top:12px">模型切换、客户端范围变化或字符限制变化时，会重新生成 snapshot；同一请求链路只使用一个 snapshot。</div></section>
+          </div>
+        </section>
+
+        <section class="view" id="view-logs" hidden>
+          <div class="page-head"><div><div class="eyebrow">Logs & Diagnostics</div><h1>日志与诊断</h1><p>只显示路由、首包、收尾和注入摘要，便于定位滞留与断流。</p></div><div class="head-actions"><button class="btn secondary" id="export-logs"><span aria-hidden="true">⇩</span>导出摘要</button></div></div>
+          <section class="panel"><div class="panel-head"><div><h2>请求日志</h2><p>本地模拟数据 · 可按客户端、模型和状态筛选。</p></div><span class="pill ok">12 records</span></div><div class="filters"><input id="log-search" placeholder="搜索客户端或模型" aria-label="搜索日志"><select id="log-provider" aria-label="筛选上游"><option value="">全部上游</option><option>NVIDIA NIM</option><option>OpenAI Compatible</option></select><select id="log-status" aria-label="筛选状态"><option value="">全部状态</option><option value="完成">完成</option><option value="重试">重试</option><option value="失败">失败</option></select><select id="log-window" aria-label="筛选时间"><option>最近 24 小时</option><option>最近 7 天</option></select></div><div class="table-wrap"><table id="log-table"><thead><tr><th>时间</th><th>客户端 / 模型</th><th>上游</th><th>路由耗时</th><th>首包</th><th>收尾</th><th>状态</th></tr></thead><tbody><tr data-search="codex-desktop deepseek-v4-flash" data-provider="NVIDIA NIM" data-status="完成"><td class="mono">14:32:08</td><td><div class="row-main">codex-desktop</div><div class="row-sub mono">deepseek-v4-flash</div></td><td>NVIDIA NIM</td><td>18ms</td><td>0.92s</td><td><span class="mono">response.completed</span></td><td><span class="pill ok">完成</span></td></tr><tr data-search="content-agent qwen3-235b" data-provider="NVIDIA NIM" data-status="完成"><td class="mono">14:31:44</td><td><div class="row-main">content-agent</div><div class="row-sub mono">qwen3-235b</div></td><td>NVIDIA NIM</td><td>22ms</td><td>1.31s</td><td><span class="mono">[DONE]</span></td><td><span class="pill ok">完成</span></td></tr><tr data-search="local-cli gpt-oss-120b" data-provider="OpenAI Compatible" data-status="重试"><td class="mono">14:30:17</td><td><div class="row-main">local-cli</div><div class="row-sub mono">gpt-oss-120b</div></td><td>OpenAI Compatible</td><td>38ms</td><td>2.08s</td><td><span class="mono">response.completed</span></td><td><span class="pill warn">重试</span></td></tr><tr data-search="codex-desktop qwen3-235b" data-provider="NVIDIA NIM" data-status="失败"><td class="mono">14:28:51</td><td><div class="row-main">codex-desktop</div><div class="row-sub mono">qwen3-235b</div></td><td>NVIDIA NIM</td><td>46ms</td><td>--</td><td><span class="mono">upstream_closed</span></td><td><span class="pill fail">失败</span></td></tr></tbody></table><div class="empty" id="log-empty" hidden>没有匹配的日志。</div></div></section>
+          <div class="grid-2 equal"><section class="panel"><div class="panel-head"><div><h2>链路检查</h2><p>按阶段拆开等待时间。</p></div><button class="btn secondary small" id="run-diagnostics">重新检查</button></div><div class="diagnostic"><div class="diagnostic-item"><div><strong>用户 → 网关</strong><small>边缘接入 · keep-alive</small></div><span class="pill ok">42ms</span></div><div class="diagnostic-item"><div><strong>网关 → DO</strong><small>路由协调 · 不经过模型数据</small></div><span class="pill ok">7ms</span></div><div class="diagnostic-item"><div><strong>网关 → 上游</strong><small>NVIDIA NIM · 首包路径</small></div><span class="pill ok">920ms</span></div></div></section><section class="panel"><div class="panel-head"><div><h2>最近注入摘要</h2><p>不记录完整敏感内容。</p></div><span class="pill ok">hash only</span></div><div class="diagnostic"><div class="diagnostic-item"><div><strong>codex-desktop</strong><small>system + context · 1,084 chars</small></div><code>a81f2c9d</code></div><div class="diagnostic-item"><div><strong>content-agent</strong><small>context only · 786 chars · clipped</small></div><code>cf2191e0</code></div></div></section></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script>
+    const viewTitles = { overview: "总览", providers: "上游与客户端", context: "Prompt / Context", logs: "日志与诊断" };
+    const toast = document.getElementById("toast");
+    let toastTimer;
+    function showToast(message) {
+      toast.textContent = message;
+      toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove("show"), 2200);
+    }
+    function selectView(name) {
+      document.querySelectorAll(".view").forEach((view) => { view.hidden = view.id !== "view-" + name; });
+      document.querySelectorAll(".nav button").forEach((button) => button.classList.toggle("active", button.dataset.view === name));
+      document.getElementById("topbar-title").textContent = viewTitles[name];
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+    document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => selectView(button.dataset.view)));
+    document.querySelectorAll("[data-go]").forEach((button) => button.addEventListener("click", () => selectView(button.dataset.go)));
+    async function copyText(value) {
+      try { await navigator.clipboard.writeText(value); } catch { window.prompt("复制以下内容", value); }
+      showToast("已复制到剪贴板（预览）");
+    }
+    document.querySelectorAll("[data-copy]").forEach((button) => button.addEventListener("click", () => copyText(button.dataset.copy)));
+    document.querySelectorAll(".copy-key").forEach((button) => button.addEventListener("click", () => copyText(button.dataset.key)));
+    document.getElementById("refresh-all").addEventListener("click", () => {
+      const status = document.getElementById("gateway-status");
+      status.textContent = "网关在线 · 36ms";
+      document.getElementById("active-requests").textContent = String(2 + Math.floor(Math.random() * 3));
+      showToast("状态已刷新 · 仅预览数据");
+    });
+    function generateKey() {
+      const suffix = Math.random().toString(36).slice(2, 5).toUpperCase();
+      const row = document.createElement("div");
+      row.className = "key-row";
+      row.innerHTML = '<div><strong>new-client</strong><div class="row-sub">刚刚创建</div></div><div class="key-value mono">sk-llm-••••••••••' + suffix + '</div><div class="key-actions"><button class="btn secondary small copy-key" data-key="sk-llm-preview-' + suffix + '">复制</button></div>';
+      document.getElementById("key-list").prepend(row);
+      row.querySelector(".copy-key").addEventListener("click", () => copyText(row.querySelector(".copy-key").dataset.key));
+      document.getElementById("client-list").open = true;
+      showToast("已生成预览 Key：sk-llm-••••••••••" + suffix);
+    }
+    document.getElementById("generate-key").addEventListener("click", generateKey);
+    document.getElementById("generate-key-top").addEventListener("click", generateKey);
+    document.getElementById("refresh-models").addEventListener("click", () => {
+      document.getElementById("model-refresh-time").textContent = "刷新于刚刚";
+      showToast("模型列表已刷新 · 仅预览数据");
+    });
+    document.getElementById("apply-context").addEventListener("click", () => {
+      const system = document.getElementById("system-enabled").checked;
+      const context = document.getElementById("context-enabled").checked;
+      const text = document.getElementById("preview-box");
+      text.textContent = (system ? "[system]\\n" + document.getElementById("system-prompt").value.slice(0, 180) + "...\\n\\n" : "") + (context ? "[global_context]\\n" + document.getElementById("global-context").value.slice(0, 180) + "...\\n\\n" : "") + "[history]\\n... history clipped to " + document.getElementById("history-chars").value + " chars\\n\\n[snapshot]\\ninjected_once=true\\ntime_lookup=false";
+      document.getElementById("snapshot-status").textContent = "snapshot 已更新";
+      document.getElementById("snapshot-status").className = "pill ok";
+      document.getElementById("preview-chars").textContent = (document.getElementById("system-prompt").value.length + document.getElementById("global-context").value.length).toLocaleString();
+      document.getElementById("preview-hash").textContent = Math.random().toString(16).slice(2, 10);
+      showToast("Prompt / Context snapshot 已更新");
+    });
+    function filterLogs() {
+      const query = document.getElementById("log-search").value.trim().toLowerCase();
+      const provider = document.getElementById("log-provider").value;
+      const status = document.getElementById("log-status").value;
+      let visible = 0;
+      document.querySelectorAll("#log-table tbody tr").forEach((row) => {
+        const match = (!query || row.dataset.search.includes(query)) && (!provider || row.dataset.provider === provider) && (!status || row.dataset.status === status);
+        row.hidden = !match;
+        if (match) visible += 1;
+      });
+      document.getElementById("log-empty").hidden = visible !== 0;
+    }
+    ["log-search", "log-provider", "log-status", "log-window"].forEach((id) => document.getElementById(id).addEventListener("input", filterLogs));
+    document.getElementById("export-logs").addEventListener("click", () => showToast("已导出当前日志摘要（预览）"));
+    document.getElementById("run-diagnostics").addEventListener("click", (event) => { event.currentTarget.disabled = true; showToast("链路检查完成 · 42ms"); setTimeout(() => { event.currentTarget.disabled = false; }, 500); });
+  </script>
+</body>
+</html>

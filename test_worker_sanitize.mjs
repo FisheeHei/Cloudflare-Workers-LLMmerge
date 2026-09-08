@@ -889,7 +889,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-03-do-binding"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-admin-preview-3"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -967,6 +967,11 @@ assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
 assert.equal(adminPage.includes("setInterval(refreshLivePanels, 5000)"), true);
 assert.equal(adminPage.includes("loadKvUsage"), true);
+assert.equal(adminScript.includes('name === "settings"'), true);
+assert.equal(adminPage.includes("loadedViews"), true);
+assert.equal(adminPage.includes("\u5b9e\u9a8c\u6027\u8def\u7531"), true);
+assert.equal(adminPage.includes("setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000)"), false);
+assert.equal(adminPage.includes("setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000)"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000)"), true);
 assert.equal(adminPage.includes("if (liveRefreshRunning || document.visibilityState"), true);
 assert.equal(adminPage.includes("Configuration error"), true);
@@ -2565,6 +2570,32 @@ assert.equal(historyMessages[0].content, "Pinned gateway rule.");
 assert.equal(historyMessages[1].content.includes("Pinned story bible."), true);
 assert.equal(historyMessages.some((message) => String(message.content || "").includes("old draft")), false);
 assert.equal(historyMessages.at(-1).content, "latest draft instruction");
+const historyOnlyStore = new Map([[
+  "gateway:config",
+  JSON.stringify({
+    routing: { failover: true, load_balance: false },
+    settings: { history_max_chars: 80, upstream_cooldown_ttl: 60 },
+    upstreams: [{ name: "history-only", base_url: "https://speed-fast.example/v1", api_key_encrypted: "h", models: ["history-only-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true }],
+  }),
+]]);
+const historyOnlyEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = historyOnlyStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { historyOnlyStore.set(key, value); },
+    async delete(key) { historyOnlyStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "history-only-client", key: "sk-history-only", models: ["*"], upstreams: ["history-only"] }]),
+};
+const historyOnlyStart = speedBodies.length;
+await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-history-only", "content-type": "application/json" },
+  body: JSON.stringify({ model: "history-only-model", messages: [{ role: "user", content: "old history " + "x".repeat(200) }, { role: "user", content: "latest" }] }),
+}), historyOnlyEnv);
+assert.equal(speedBodies[historyOnlyStart].messages.some((message) => String(message.content || "").includes("old history")), false);
+assert.equal(speedBodies[historyOnlyStart].messages.at(-1).content, "latest");
 
 const noPlatformStore = new Map();
 noPlatformStore.set("gateway:config", JSON.stringify({
@@ -3231,6 +3262,16 @@ assert.equal(nativeResponseHits[nativeStart].instructions.includes("Native story
 assert.equal(nativeResponseHits[nativeStart].instructions.includes("Native model A reference."), true);
 assert.equal(nativeResponseHits[nativeStart].input, "hi");
 assert.equal((await nativeResp.json()).output_text, "native");
+const nativePreviousResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-native", "content-type": "application/json" },
+  body: JSON.stringify({ model: "native-model-b", previous_response_id: "native_resp", input: "continue" }),
+}), nativeEnv);
+assert.equal(nativePreviousResp.status, 200);
+assert.equal("previous_response_id" in nativeResponseHits.at(-1), false);
+assert.equal(Array.isArray(nativeResponseHits.at(-1).input), true);
+assert.equal(nativeResponseHits.at(-1).input.some((item) => item.role === "assistant"), true);
+assert.equal(nativeResponseHits.at(-1).input.some((item) => item === "continue"), true);
 const nativeSwitchResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
   headers: {
@@ -3400,6 +3441,29 @@ assert.equal("suffix" in nimCompletionHits[0], false);
 assert.equal("best_of" in nimCompletionHits[0], false);
 assert.equal(nimCompletionHits[0].logprobs, 2);
 assert.equal((await nimCompletionResp.json()).choices[0].text, "nim ok");
+
+const nativeCompletionConfig = JSON.parse(completionStore.get("gateway:config"));
+nativeCompletionConfig.settings.system_prompt = "Native completion rule.";
+nativeCompletionConfig.settings.global_context = "Native completion context.";
+completionStore.set("gateway:config", JSON.stringify(nativeCompletionConfig));
+const nativeCompletionEnv = { ...completionEnv };
+const nativeCompletionResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-completion", "content-type": "application/json" },
+  body: JSON.stringify({ model: "completion-model", prompt: "draft" }),
+}), nativeCompletionEnv);
+assert.equal(nativeCompletionResp.status, 200);
+assert.equal(completionHits.at(-1).prompt.includes("Native completion rule."), true);
+assert.equal(completionHits.at(-1).prompt.includes("Native completion context."), true);
+const nativeCompletionArrayResp = await worker.default.fetch(new Request("https://gw.test/v1/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-completion", "content-type": "application/json" },
+  body: JSON.stringify({ model: "completion-model", prompt: ["draft a", "draft b"] }),
+}), nativeCompletionEnv);
+assert.equal(nativeCompletionArrayResp.status, 200);
+assert.equal(Array.isArray(completionHits.at(-1).prompt), true);
+assert.equal(completionHits.at(-1).prompt[0].includes("Native completion rule."), true);
+assert.equal(completionHits.at(-1).prompt[1].includes("Native completion context."), true);
 
 const anthropicStore = new Map();
 anthropicStore.set("gateway:config", JSON.stringify({

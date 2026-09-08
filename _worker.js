@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-03-do-binding";
+const VERSION = "v26-09-08-admin-preview-3";
 
 export default {
   async fetch(request, env, ctx) {
@@ -188,16 +188,19 @@ export default {
 
         const started = Date.now();
         const pt = Math.max(1, Math.round(proxyBodyText.length / 4));
+        const prepared = pathname === CHAT_PATH
+          ? prepareGatewayChatBody(proxyBodyText, runtime.settings, client)
+          : { bodyText: proxyBodyText, injection: null };
         if (pathname !== EMBEDDINGS_PATH && payload.stream === true) {
           const headers = pendingSseHeaders(client, traceId);
           const body = streamPendingOpenAiResponse(async () => {
             let proxyResponse;
             let logged = false;
             try {
-              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: proxyBodyText, runtime, search: url.search, ctx, signal: request.signal });
+              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: prepared.bodyText, injection: prepared.injection, runtime, search: url.search, ctx, signal: request.signal });
               const upstreamResp = proxyResponse.response;
               const responseHeaders = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
-              const response = await buildLoggedProxyResponse({ app, bodyText: proxyBodyText, client, ctx, headers: responseHeaders, model, responseModel: publicModel, pathname, requestPayload: payload, proxyResponse, started, traceId, upstreamResp });
+              const response = await buildLoggedProxyResponse({ app, bodyText: prepared.bodyText, client, ctx, headers: responseHeaders, model, responseModel: publicModel, pathname, requestPayload: payload, proxyResponse, started, traceId, upstreamResp });
               if (!response.ok) {
                 logged = true;
                 throw httpError(response.status, await response.text());
@@ -214,7 +217,7 @@ export default {
                   started,
                   promptTokens: pt,
                   completionTokens: 0,
-                  extra: { trace_id: traceId, tools_count: requestToolsCount(payload) },
+                  extra: { trace_id: traceId, tools_count: requestToolsCount(payload), ...gatewayInjectionLogFields(prepared.injection) },
                 }), ctx);
               }
               throw error;
@@ -230,7 +233,8 @@ export default {
             model,
             pathname,
             request,
-            bodyText: proxyBodyText,
+            bodyText: prepared.bodyText,
+            injection: prepared.injection,
             runtime,
             search: url.search,
             ctx,
@@ -246,7 +250,7 @@ export default {
             started,
             promptTokens: pt,
             completionTokens: 0,
-            extra: { trace_id: traceId, tools_count: requestToolsCount(payload) },
+            extra: { trace_id: traceId, tools_count: requestToolsCount(payload), ...gatewayInjectionLogFields(prepared.injection) },
           }), ctx);
           return gatewayErrorResponse(error, traceId);
         }
@@ -809,6 +813,18 @@ function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path
   };
 }
 
+function gatewayInjectionLogFields(injection) {
+  if (!injection) return {};
+  return {
+    injection_applied: injection.applied === true,
+    injection_hash: injection.hash || "",
+    injection_system_chars: Number(injection.system_chars || 0),
+    injection_context_chars: Number(injection.context_chars || 0),
+    injection_item_count: Number(injection.item_count || 0),
+    injection_history_trimmed: injection.history_trimmed === true,
+  };
+}
+
 function recordClientDailyUsage(app, entry, ctx) {
   if (!app?.state || !entry?.client_id) return;
   const task = rememberPendingClientUsage(app.state, entry).catch(() => {});
@@ -1322,7 +1338,7 @@ async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, m
     started,
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,
-    extra: { trace_id: traceId, tools_count: toolsCount, ...proxyResponse.timing, ...extra },
+    extra: { trace_id: traceId, tools_count: toolsCount, ...proxyResponse.timing, ...gatewayInjectionLogFields(proxyResponse.injection), ...extra },
   }), ctx);
 
   if (!upstreamResp.ok) {
@@ -3315,6 +3331,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
   const payload = parseJsonBody(await readRequestText(request));
   const translated = translateAnthropicMessagesRequest(payload);
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
+  const prepared = prepareGatewayChatBody(translated.bodyText, runtime.settings, client);
 
   if (translated.stream) {
     const headers = new Headers(CORS_HEADERS);
@@ -3329,7 +3346,8 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
           model: translated.model,
           pathname: CHAT_PATH,
           request,
-          bodyText: translated.bodyText,
+          bodyText: prepared.bodyText,
+          injection: prepared.injection,
           runtime,
           search: url.search,
           ctx,
@@ -3340,13 +3358,13 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
           const text = await upstreamResp.text().catch(() => "");
           const payload = safeJson(text);
           const message = upstreamApplicationErrorMessage(payload || text) || payload?.error?.message || payload?.message || text || `Upstream returned HTTP ${upstreamResp.status}.`;
-          recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId);
+          recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId, gatewayInjectionLogFields(proxyResponse.injection));
           logged = true;
           const error = httpError(upstreamResp.status || 502, looksLikeHtmlDocument(text) ? `Upstream returned HTTP ${upstreamResp.status} HTML error page.` : message);
           error.upstreamName = proxyResponse.upstream.name;
           throw error;
         }
-        const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, extra);
+        const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, { ...gatewayInjectionLogFields(proxyResponse.injection), ...extra });
         return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
       } catch (error) {
         if (!logged) {
@@ -3359,7 +3377,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
             started,
             promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
             completionTokens: 0,
-            extra: { trace_id: traceId, tools_count: translated.toolsCount },
+            extra: { trace_id: traceId, tools_count: translated.toolsCount, ...gatewayInjectionLogFields(prepared.injection) },
           }), ctx);
         }
         throw error;
@@ -3374,7 +3392,8 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
       model: translated.model,
       pathname: CHAT_PATH,
       request,
-      bodyText: translated.bodyText,
+      bodyText: prepared.bodyText,
+      injection: prepared.injection,
       runtime,
       search: url.search,
       ctx,
@@ -3385,14 +3404,14 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
 
     if (!upstreamResp.ok) {
-      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId);
+      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId, gatewayInjectionLogFields(proxyResponse.injection));
       return await anthropicUpstreamErrorResponse(upstreamResp, headers);
     }
 
     const openaiText = await upstreamResp.text();
     const openaiPayload = safeJson(openaiText);
     if (!openaiPayload || looksLikeHtmlDocument(openaiText) || upstreamApplicationErrorMessage(openaiPayload)) {
-      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated, null, ctx, traceId);
+      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated, null, ctx, traceId, gatewayInjectionLogFields(proxyResponse.injection));
       return anthropicErrorResponse(upstreamApplicationErrorMessage(openaiPayload) || "Upstream returned an invalid response.", 502, headers);
     }
 
@@ -3400,6 +3419,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
     const responsePayload = openAiChatToAnthropicMessage(openaiPayload, translated.seed, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
     headers.set("content-type", "application/json; charset=utf-8");
     recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated, responsePayload.usage, ctx, traceId, {
+      ...gatewayInjectionLogFields(proxyResponse.injection),
       finish_reason: responseFinishReason(openaiPayload),
       tool_calls_count: responseToolCallsCount(openaiPayload),
     });
@@ -3414,7 +3434,7 @@ async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
       started,
       promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
       completionTokens: 0,
-      extra: { trace_id: traceId, tools_count: translated.toolsCount },
+      extra: { trace_id: traceId, tools_count: translated.toolsCount, ...gatewayInjectionLogFields(prepared.injection) },
     }), ctx);
     return anthropicGatewayErrorResponse(error, traceId);
   }
@@ -3751,19 +3771,43 @@ function nativeResponsesAvailable(runtime, client, model) {
     );
 }
 
-function responsesNativeBody(translated, payload, settings, client) {
+function responsesNativeBody(translated, payload, settings, client, previousResponse = null) {
   const body = { ...payload, model: translated.model };
-  const plan = gatewayInjectionPlan(
+  if (previousResponse) {
+    const previousRows = responsesPreviousInput(previousResponse);
+    const currentRows = Array.isArray(body.input) ? body.input : (body.input == null ? [] : [body.input]);
+    body.input = [...previousRows, ...currentRows];
+    delete body.previous_response_id;
+  }
+  const injection = gatewayInjectionSnapshot(
     { model: body.model, messages: responsesInputToMessages(body.input, body.instructions) },
     settings,
     client,
   );
   body.instructions = [
-    plan.systemText,
-    plan.contextText ? gatewayContextText(plan.contextText) : "",
+    injection.system_text,
+    injection.context_text ? gatewayContextText(injection.context_text) : "",
     body.instructions,
   ].filter(Boolean).join("\n\n");
-  return JSON.stringify(body);
+  return { bodyText: JSON.stringify(body), injection };
+}
+
+function prepareGatewayCompletionsBody(bodyText, settings, client) {
+  let payload;
+  try { payload = JSON.parse(bodyText); } catch { return { bodyText, injection: null }; }
+  const prompts = Array.isArray(payload?.prompt)
+    ? payload.prompt.map((value) => String(value == null ? "" : value))
+    : [String(payload?.prompt || "")];
+  const prompt = prompts.join("\n\n");
+  const injection = gatewayInjectionSnapshot({ model: payload?.model, messages: [{ role: "user", content: prompt }] }, settings, client);
+  if (!injection.applied) return { bodyText, injection };
+  const prefix = [
+    injection.system_text,
+    injection.context_text ? gatewayContextText(injection.context_text) : "",
+  ].filter(Boolean).join("\n\n");
+  const prepend = (value) => [prefix, value].filter(Boolean).join("\n\n");
+  payload.prompt = Array.isArray(payload.prompt) ? prompts.map(prepend) : prepend(prompts[0]);
+  return { bodyText: JSON.stringify(payload), injection };
 }
 
 async function handleResponsesRequest(request, url, app, ctx, traceId) {
@@ -3781,6 +3825,9 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
   const useNative = nativeResponsesAvailable(runtime, client, translated.model);
+  const prepared = useNative
+    ? responsesNativeBody(translated, payload, runtime.settings, client, previousResponse)
+    : prepareGatewayChatBody(translated.bodyText, runtime.settings, client);
 
   if (translated.stream) {
     const headers = pendingSseHeaders(client, traceId);
@@ -3789,15 +3836,13 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const body = streamPendingResponsesResponse(async () => {
       let proxyResponse;
       try {
-        const bodyText = useNative
-          ? responsesNativeBody(translated, payload, runtime.settings, client)
-          : translated.bodyText;
         proxyResponse = await proxyRequest({
           client,
           model: translated.model,
           pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
           request,
-          bodyText,
+          bodyText: prepared.bodyText,
+          injection: prepared.injection,
           runtime,
           search: url.search,
           ctx,
@@ -3807,7 +3852,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
         const finish = (usage, extra) => {
           _activeResponses.delete(translated.seed.id);
-          recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, extra);
+          recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, { ...gatewayInjectionLogFields(proxyResponse.injection), ...extra });
         };
         if (useNative) {
           const onDone = (usage, extra) => finish(usage, extra);
@@ -3826,7 +3871,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
           started,
           promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
           completionTokens: 0,
-          extra: { trace_id: traceId },
+           extra: { trace_id: traceId, ...gatewayInjectionLogFields(prepared.injection) },
         }), ctx);
         throw error;
       }
@@ -3835,15 +3880,13 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   }
 
   try {
-    const bodyText = useNative
-      ? responsesNativeBody(translated, payload, runtime.settings, client)
-      : translated.bodyText;
     const proxyResponse = await proxyRequest({
       client,
       model: translated.model,
       pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
       request,
-      bodyText,
+      bodyText: prepared.bodyText,
+      injection: prepared.injection,
       runtime,
       search: url.search,
       ctx,
@@ -3853,7 +3896,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
     if (!upstreamResp.ok) {
-      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId);
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId, gatewayInjectionLogFields(proxyResponse.injection));
       return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
     }
 
@@ -3861,7 +3904,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const openaiPayload = safeJson(openaiText);
     const applicationError = upstreamApplicationErrorMessage(openaiPayload || openaiText);
     if (!openaiPayload || looksLikeHtmlDocument(openaiText) || applicationError) {
-      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx, traceId);
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx, traceId, gatewayInjectionLogFields(proxyResponse.injection));
       return upstreamBadGatewayResponse(applicationError || "Upstream returned a non-JSON API response.", headers);
     }
 
@@ -3890,6 +3933,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     maybeStoreResponse(runtime, responsePayload, ctx);
     headers.set("content-type", "application/json; charset=utf-8");
     recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId, {
+      ...gatewayInjectionLogFields(proxyResponse.injection),
       finish_reason: useNative ? responsePayload.status : responseFinishReason(openaiPayload),
       tool_calls_count: useNative ? (responsePayload.output || []).filter((item) => item.type === "function_call").length : responseToolCallsCount(openaiPayload),
     });
@@ -3904,7 +3948,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
       started,
       promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
       completionTokens: 0,
-      extra: { trace_id: traceId },
+       extra: { trace_id: traceId, ...gatewayInjectionLogFields(prepared.injection) },
     }), ctx);
     return gatewayErrorResponse(error, traceId);
   }
@@ -3926,9 +3970,6 @@ function translateCompletionsRequest(payload) {
     throw httpError(400, "`prompt` is required.");
   }
   const prompts = Array.isArray(payload.prompt) ? payload.prompt : [payload.prompt];
-  if (prompts.length > 1) {
-    throw httpError(400, "Array `prompt` needs a native `/v1/completions` upstream; the chat fallback supports a single prompt.");
-  }
   const prompt = String(prompts[0] == null ? "" : prompts[0]);
   const chat = { model, messages: [{ role: "user", content: prompt }], stream: payload.stream === true };
   copyIfPresent(payload, chat, ["temperature", "top_p", "n", "stop", "seed", "frequency_penalty", "presence_penalty", "user"]);
@@ -3938,6 +3979,7 @@ function translateCompletionsRequest(payload) {
     bodyText: JSON.stringify(chat),
     model,
     stream: chat.stream,
+    promptCount: prompts.length,
     seed: {
       created: Math.floor(Date.now() / 1000),
       echo: payload.echo === true,
@@ -4116,7 +4158,13 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
   const useNative = completionsNativeAvailable(runtime, client, translated.model);
+  if (!useNative && translated.promptCount > 1) {
+    throw httpError(400, "Array `prompt` needs a native `/v1/completions` upstream; the chat fallback supports a single prompt.");
+  }
   const bodyText = useNative ? JSON.stringify({ ...payload, model: translated.model }) : translated.bodyText;
+  const prepared = useNative
+    ? prepareGatewayCompletionsBody(bodyText, runtime.settings, client)
+    : prepareGatewayChatBody(bodyText, runtime.settings, client);
   const logError = (error, upstreamName = "none") => recordRequestLog(app, makeRequestLogEntry({
     client,
     upstream: upstreamName,
@@ -4126,7 +4174,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
     started,
     promptTokens: translated.seed.promptTokens,
     completionTokens: 0,
-    extra: { trace_id: traceId },
+    extra: { trace_id: traceId, ...gatewayInjectionLogFields(prepared.injection) },
   }), ctx);
 
   if (translated.stream) {
@@ -4139,7 +4187,8 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
           model: translated.model,
           pathname: useNative ? COMPLETIONS_PATH : CHAT_PATH,
           request,
-          bodyText,
+          bodyText: prepared.bodyText,
+          injection: prepared.injection,
           runtime,
           search: url.search,
           ctx,
@@ -4147,7 +4196,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
         });
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
-        const finish = (usage, extra) => recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, usage, ctx, traceId, translated.seed.promptTokens, extra);
+        const finish = (usage, extra) => recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, usage, ctx, traceId, translated.seed.promptTokens, { ...gatewayInjectionLogFields(proxyResponse.injection), ...extra });
         if (useNative) {
           return trackOpenAiStreamUsage(upstreamResp.body, translated.seed.promptTokens, finish, started, translated.model !== translated.seed.model ? translated.seed.model : "", shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), false, () => abortUpstreamResponse(proxyResponse));
         }
@@ -4166,7 +4215,8 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
       model: translated.model,
       pathname: useNative ? COMPLETIONS_PATH : CHAT_PATH,
       request,
-      bodyText,
+      bodyText: prepared.bodyText,
+      injection: prepared.injection,
       runtime,
       search: url.search,
       ctx,
@@ -4175,7 +4225,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
     if (!upstreamResp.ok) {
-      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, null, ctx, traceId, translated.seed.promptTokens);
+      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, null, ctx, traceId, translated.seed.promptTokens, gatewayInjectionLogFields(proxyResponse.injection));
       return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
     }
 
@@ -4183,7 +4233,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
     const openaiPayload = safeJson(openaiText);
     const applicationError = upstreamApplicationErrorMessage(openaiPayload || openaiText);
     if (!openaiPayload || looksLikeHtmlDocument(openaiText) || applicationError) {
-      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, null, ctx, traceId, translated.seed.promptTokens);
+      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, null, ctx, traceId, translated.seed.promptTokens, gatewayInjectionLogFields(proxyResponse.injection));
       return upstreamBadGatewayResponse(applicationError || "Upstream returned a non-JSON API response.", headers);
     }
 
@@ -4202,6 +4252,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
     }
     const usage = responsePayload.usage || normalizeOpenAiLogUsage(openaiPayload?.usage, translated.seed.promptTokens, estimateOpenAiCompletionTokens(openaiPayload));
     recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, usage, ctx, traceId, translated.seed.promptTokens, {
+      ...gatewayInjectionLogFields(proxyResponse.injection),
       finish_reason: responseFinishReason(openaiPayload),
     });
     headers.set("content-type", "application/json; charset=utf-8");
@@ -4352,7 +4403,8 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
   };
   copyIfPresent(payload, chat, ["reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
   const bodyText = JSON.stringify(chat);
-  const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
+  const prepared = prepareGatewayChatBody(bodyText, runtime.settings, client);
+  const fallbackPrompt = Math.max(1, Math.round(prepared.bodyText.length / 4));
   let upstreamName = "none";
   const log = (status, usage, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
     client,
@@ -4363,11 +4415,11 @@ async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
     started,
     promptTokens: usage?.prompt_tokens ?? usage?.input_tokens ?? fallbackPrompt,
     completionTokens: usage?.completion_tokens ?? usage?.output_tokens ?? 0,
-    extra: { trace_id: traceId, ...extra },
+    extra: { trace_id: traceId, ...gatewayInjectionLogFields(prepared.injection), ...extra },
   }), ctx);
 
   try {
-    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText, runtime, search: url.search, ctx, signal: request.signal });
+    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText: prepared.bodyText, injection: prepared.injection, runtime, search: url.search, ctx, signal: request.signal });
     upstreamName = proxyResponse.upstream.name;
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
@@ -5116,11 +5168,13 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
   return readable;
 }
 
-async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx, signal = null }) {
+async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx, signal = null, injection = null }) {
   const routingStartedAt = Date.now();
   const timing = { route_selected_ms: 0, dispatch_wait_ms: 0, upstream_started_ms: 0 };
-  if (pathname === CHAT_PATH) {
-    bodyText = applyGatewayPromptContext(bodyText, runtime.settings, client);
+  if (pathname === CHAT_PATH && !injection) {
+    const prepared = prepareGatewayChatBody(bodyText, runtime.settings, client);
+    bodyText = prepared.bodyText;
+    injection = prepared.injection;
   }
   const streamRequest = requestBodyStreams(bodyText);
 
@@ -5156,7 +5210,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         const used = new Set(hedgedAttempts.map(upstreamKey));
         const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
         timing.route_selected_ms = Date.now() - routingStartedAt;
-        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt });
+        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection });
         releaseSelectionOnce();
         return result;
       }
@@ -5225,6 +5279,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
           upstream,
           abortUpstream: upstreamResult.abortUpstream,
           timing,
+          injection,
         };
       }
     } catch (error) {
@@ -5341,29 +5396,38 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
 }
 
 function applyGatewayPromptContext(bodyText, settings, client) {
-  if (!bodyText) return bodyText;
+  return prepareGatewayChatBody(bodyText, settings, client).bodyText;
+}
+
+function prepareGatewayChatBody(bodyText, settings, client) {
+  if (!bodyText) return { bodyText, injection: null };
   let payload;
   try {
     payload = JSON.parse(bodyText);
   } catch {
-    return bodyText;
+    return { bodyText, injection: null };
   }
 
-  if (!Array.isArray(payload.messages)) return bodyText;
-  const plan = gatewayInjectionPlan(payload, settings, client);
-  if (!plan.systemText && !plan.contextText) return bodyText;
+  if (!Array.isArray(payload.messages)) return { bodyText, injection: null };
+  const injection = gatewayInjectionSnapshot(payload, settings, client);
   const injected = [];
-  if (plan.systemText) {
-    injected.push({ role: "system", content: plan.systemText });
+  if (injection.system_text) {
+    injected.push({ role: "system", content: injection.system_text });
   }
-  if (plan.contextText) {
+  if (injection.context_text) {
     injected.push({
       role: settings?.context_role || "system",
-      content: gatewayContextText(plan.contextText),
+      content: gatewayContextText(injection.context_text),
     });
   }
-  payload.messages = injected.concat(trimGatewayHistory(payload.messages, settings?.history_max_chars));
-  return JSON.stringify(payload);
+  const originalMessages = payload.messages;
+  const trimmedMessages = trimGatewayHistory(originalMessages, settings?.history_max_chars);
+  const historyTrimmed = trimmedMessages.length < originalMessages.length;
+  if (!injection.applied && !historyTrimmed) return { bodyText, injection };
+  payload.messages = injected.concat(trimmedMessages);
+  injection.history_trimmed = historyTrimmed;
+  injection.hash = gatewayInjectionHash(injection, settings);
+  return { bodyText: JSON.stringify(payload), injection };
 }
 
 function gatewayInjectionPlan(payload, settings, client) {
@@ -5378,6 +5442,32 @@ function gatewayInjectionPlan(payload, settings, client) {
     systemText: [systemText, subagentText].filter(Boolean).join("\n\n"),
     contextText: hasContext ? selectGatewayContext(payload, settings, client, clientIds) : "",
   };
+}
+
+function gatewayInjectionSnapshot(payload, settings, client) {
+  const plan = gatewayInjectionPlan(payload, settings, client);
+  const snapshot = {
+    applied: Boolean(plan.systemText || plan.contextText),
+    model: String(payload?.model || ""),
+    system_text: plan.systemText,
+    context_text: plan.contextText,
+    system_chars: plan.systemText.length,
+    context_chars: plan.contextText.length,
+    item_count: plan.contextText ? (plan.contextText.match(/^\[[^\]]+\]/gm) || []).length : 0,
+    history_trimmed: false,
+  };
+  snapshot.hash = gatewayInjectionHash(snapshot, settings);
+  return snapshot;
+}
+
+function gatewayInjectionHash(injection, settings) {
+  return stableHash32([
+    injection.model || "",
+    injection.system_text || "",
+    injection.context_text || "",
+    settings?.context_role || "system",
+    settings?.history_max_chars || 0,
+  ].join("\n")).toString(16).padStart(8, "0");
 }
 
 function gatewayContextText(contextText) {
@@ -5582,7 +5672,7 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now() }) {
+async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), injection = null }) {
   const controllers = attempts.map(() => new AbortController());
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
@@ -5653,7 +5743,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
         await clearUpstreamFailure(runtime, result.upstream, model);
         rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
         rememberSuccessfulUpstream(result.upstream, model);
-        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing };
+        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing, injection };
       }
       if (result.response) {
         await discardUpstreamResponse(result, "retryable hedged response");
@@ -5662,7 +5752,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
     }
 
     const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal, timing, routingStartedAt });
-    if (fallbackResult?.response) return { ...fallbackResult, attempts: attempts.length + 1 };
+    if (fallbackResult?.response) return { ...fallbackResult, attempts: attempts.length + 1, injection };
     if (fallbackResult?.limited) lastResult = fallbackResult;
 
     const err = httpError(lastResult?.limited ? 503 : 502, lastResult?.error?.message || (lastResult?.limited ? "All eligible upstream dispatch queues are busy." : "All hedged upstreams failed."));

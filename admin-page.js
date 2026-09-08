@@ -273,6 +273,9 @@ function renderAdminStyle() {
     .settings-panel[open] > summary::before,
     .settings-panel details[open] > summary::before { transform: rotate(90deg); }
     .settings-panel summary h2 { margin: 0; }
+    .settings-subpanel { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+    .settings-subpanel summary { cursor: pointer; color: var(--muted); font-weight: 700; }
+    .settings-subpanel[open] summary { color: var(--ink); }
     .settings-body { padding-top: 14px; }
 
     .modal-backdrop {
@@ -491,9 +494,9 @@ function renderAdminMarkup(origin, version) {
     <span class="sidebar-label">Workspace</span>
     <nav class="sidebar-nav" aria-label="管理导航">
       <a class="nav-item active" href="#overview" data-view-target="overview"><span class="nav-icon">⌂</span><span>总览</span></a>
-      <a class="nav-item" href="#upstreams" data-view-target="upstreams"><span class="nav-icon">⇄</span><span>上游配置</span></a>
-      <a class="nav-item" href="#logs" data-view-target="logs"><span class="nav-icon">≡</span><span>调用日志</span></a>
-      <a class="nav-item" href="#settings" data-view-target="settings"><span class="nav-icon">⚙</span><span>高级设置</span></a>
+      <a class="nav-item" href="#upstreams" data-view-target="upstreams"><span class="nav-icon">⇄</span><span>上游与客户端</span></a>
+      <a class="nav-item" href="#logs" data-view-target="logs"><span class="nav-icon">≡</span><span>日志与诊断</span></a>
+      <a class="nav-item" href="#settings" data-view-target="settings"><span class="nav-icon">⚙</span><span>Prompt / Context</span></a>
     </nav>
     <div class="sidebar-footer">
       <span class="sidebar-version">${version}</span>
@@ -530,23 +533,6 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
-  <div class="panel kv-panel" id="kv-panel">
-    <div class="usage-section">
-      <div class="usage-section-head">
-        <h3>Storage Usage</h3>
-        <span class="note" id="kv-usage-updated">checking...</span>
-      </div>
-      <div class="kv-meter" id="kv-usage-meter"><div class="note">Loading storage status...</div></div>
-    </div>
-    <div class="usage-section">
-      <div class="usage-section-head">
-        <h3>Workers Requests</h3>
-        <span class="note" id="worker-usage-updated">checking...</span>
-      </div>
-      <div class="kv-meter" id="worker-usage-meter"><div class="note">Loading daily request quota...</div></div>
-    </div>
-  </div>
-
   <div class="panel" id="stats-panel">
     <div class="toolbar">
       <h2>统计</h2>
@@ -573,6 +559,8 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
+  </section>
+  <section class="page-view" id="view-upstreams" data-view="upstreams" hidden>
   <div class="panel settings-panel" id="client-panel">
     <details class="client-panel-toggle" id="client-panel-toggle" open>
       <summary><h2>\u5ba2\u6237\u7aef Keys</h2><span class="client-summary" id="client-summary">0 keys</span></summary>
@@ -581,9 +569,7 @@ function renderAdminMarkup(origin, version) {
       <div class="client-recent-head"><strong>\u6700\u8fd1\u521b\u5efa</strong><span class="note">\u6700\u591a 3 \u4e2a</span></div>
       <div id="client-recent-list"></div>
     </div>
-    <div class="settings-body" id="client-expanded-view">
-      <div id="client-list"></div>
-    </div>
+    <div class="settings-body" id="client-expanded-view"><div id="client-list"></div></div>
     <div class="client-create">
       <input id="client-name" placeholder="\u540d\u79f0 (\u53ef\u9009)">
       <button class="good" id="create-client">\u751f\u6210 Key</button>
@@ -597,9 +583,6 @@ function renderAdminMarkup(origin, version) {
       </div>
     </div>
   </div>
-
-  </section>
-  <section class="page-view" id="view-upstreams" data-view="upstreams" hidden>
   <div class="panel" id="upstream-panel">
     <div class="toolbar">
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
@@ -645,8 +628,21 @@ function renderAdminMarkup(origin, version) {
 
   </section>
   <section class="page-view" id="view-settings" data-view="settings" hidden>
+  <div class="panel kv-panel" id="kv-panel">
+    <div class="usage-section">
+      <div class="usage-section-head"><h3>Storage Usage</h3><span class="note" id="kv-usage-updated">checking...</span></div>
+      <div class="kv-meter" id="kv-usage-meter"><div class="note">\u70b9\u51fb\u5237\u65b0\u67e5\u770b</div></div>
+    </div>
+    <div class="usage-section">
+      <div class="usage-section-head"><h3>Workers Requests</h3><span class="note" id="worker-usage-updated">checking...</span></div>
+      <div class="kv-meter" id="worker-usage-meter"><div class="note">\u70b9\u51fb\u52a0\u8f7d\u7528\u91cf</div></div>
+    </div>
+    <div class="context-controls">
+      <button type="button" class="secondary small" id="refresh-workers-usage">\u52a0\u8f7d Workers \u7528\u91cf</button>
+    </div>
+  </div>
   <details class="panel settings-panel" id="settings-panel">
-    <summary><h2>\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
+    <summary><h2>Prompt / Context \u4e0e\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
     <div class="settings-body">
       <div class="row">
         <div class="field span-3"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba4180000)</label><input id="request-timeout" type="number" min="1000" placeholder="180000"></div>
@@ -661,20 +657,21 @@ function renderAdminMarkup(origin, version) {
         <div class="field span-3">
           <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb (\u9ed8\u8ba4\u5f00)</label>
         </div>
-        <div class="field span-3">
-          <label><input type="checkbox" id="routing-hedge"> Hedged Request</label>
-        </div>
-        <div class="field span-3">
-          <label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305\uff1b\u524d 2 \u4e2a\u5019\u9009\u4f18\u5148\u542f\u52a8</span></label>
-        </div>
       </div>
       <div class="row">
-        <div class="field span-3"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
         <div class="field span-3"><label>\u4e0a\u6e38\u534f\u8c03\u5f3a\u5ea6 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"><span class="note">\u8d8a\u9ad8\u8d8a\u5206\u6563\u6d3b\u8dc3\u8bf7\u6c42</span></div>
         <div class="field span-3"><label>Key \u5e76\u53d1\u8f6f\u95f4\u9694 (ms, \u9ed8\u8ba4 50)</label><input id="routing-soft-interval" type="number" min="0" max="2000" placeholder="50"><span class="note">\u4ec5\u540c\u4e00\u4e0a\u6e38\u6392\u961f\u65f6\u751f\u6548，0=\u5173\u95ed</span></div>
         <div class="field span-3"><label>\u663e\u793a\u65f6\u533a</label><select id="time-zone-preset"><option value="480" data-label="UTC+8 北京/香港/上海/乌鲁木齐">UTC+8 北京 / 香港 / 上海 / 乌鲁木齐</option><option value="0" data-label="UTC">UTC</option><option value="custom" data-label="Custom">Custom</option></select></div>
         <div class="field span-3"><label>UTC \u504f\u79fb (\u5206\u949f)</label><input id="time-zone-offset" type="number" min="-720" max="840" placeholder="480"></div>
       </div>
+      <details class="settings-subpanel">
+        <summary>\u5b9e\u9a8c\u6027\u8def\u7531\uff08\u9ed8\u8ba4\u5173\u95ed\uff09</summary>
+        <div class="row">
+          <div class="field span-4"><label><input type="checkbox" id="routing-hedge"> Hedged Request</label></div>
+          <div class="field span-4"><label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305；\u524d 2 \u4e2a\u5019\u9009\u4f18\u5148\u542f\u52a8</span></label></div>
+          <div class="field span-4"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
+        </div>
+      </details>
       <div class="row">
         <div class="field span-12">
           <label>\u5b58\u50a8\u7ed1\u5b9a\u72b6\u6001</label>
@@ -855,6 +852,20 @@ function renderAdminScript(version) {
   const text = (value) => String(value ?? "");
   let liveRefreshRunning = false;
   let runtimeRefreshRunning = false;
+  const loadedViews = {};
+
+  function loadViewData(name) {
+    if (loadedViews[name]) return Promise.resolve();
+    if (name === "logs") {
+      loadedViews[name] = true;
+      return loadLogs().catch(function(error) { loadedViews[name] = false; throw error; });
+    }
+    if (name === "settings") {
+      loadedViews[name] = true;
+      return loadKvUsage().catch(function(error) { loadedViews[name] = false; throw error; });
+    }
+    return Promise.resolve();
+  }
 
   function setupAdminNav() {
     const links = [...document.querySelectorAll("[data-view-target]")];
@@ -873,6 +884,7 @@ function renderAdminScript(version) {
       const label = activeLink?.querySelector(".nav-icon + span")?.textContent?.trim();
       if (title) title.textContent = label || activeLink?.dataset?.viewLabel || "Overview";
       if (selected === "settings") byId("settings-panel").open = true;
+      void loadViewData(selected).catch(showError);
       if (updateHash) history.replaceState(null, "", "#" + selected);
       window.scrollTo({ top: 0, behavior: "smooth" });
     };
@@ -1980,12 +1992,7 @@ function renderAdminScript(version) {
     if (liveRefreshRunning || document.visibilityState !== "visible") return;
     liveRefreshRunning = true;
     try {
-      const statsPanel = byId("stats-panel");
-      const logPanel = byId("log-panel");
-      const tasks = [loadRuntimeStatus()];
-      if (!statsPanel || statsPanel.offsetParent !== null) tasks.push(loadStats(true));
-      if (!logPanel || logPanel.offsetParent !== null) tasks.push(loadLogs());
-      await Promise.all(tasks.map((task) => task.catch(function(){})));
+      await loadRuntimeStatus().catch(function(){});
     } finally {
       liveRefreshRunning = false;
     }
@@ -3023,28 +3030,26 @@ async function loadKvUsage() {
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", loadLogs).catch(showError)
       );
 
-      // ponytail: keep slow usage queries off the critical boot path
+      // ponytail: keep slow usage and historical queries off the critical boot path
       hero = document.querySelector('.hero');
       bootSpan = document.createElement('span');
       bootSpan.className = 'note';
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
       await Promise.all([loadConfig(), loadClients()]);
-      void Promise.all([
-        loadKvUsage().catch(function(){}),
-        loadWorkersUsage().catch(function(){}),
-      ]);
       void renderCachedHealth();
       const refreshStorageBtn = byId("refresh-storage-status");
       if (refreshStorageBtn) refreshStorageBtn.addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u68c0\u67e5\u4e2d...", loadKvUsage).catch(showError)
       );
+      const refreshWorkersBtn = byId("refresh-workers-usage");
+      if (refreshWorkersBtn) refreshWorkersBtn.addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadWorkersUsage).catch(showError)
+      );
       if (bootSpan?.parentNode) bootSpan.remove();
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
       setInterval(refreshLivePanels, 5000);
-      setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000);
-      setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000);
       // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
       setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000);
     } catch (error) {

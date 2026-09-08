@@ -6,7 +6,7 @@ LLM-merge is a single-file LLM gateway for Cloudflare Workers and Pages Advanced
 
 ## Use Cases
 
-- Build a pool of NVIDIA NIM keys and distribute requests by model and client.
+- Build a pool of compatible upstream accounts and distribute requests by model and client.
 - Give OpenAI, Responses, and Anthropic-style clients one gateway URL.
 - Inject system prompts, reference material, and on-demand context for selected clients.
 - Accept users at a nearby Cloudflare edge and fetch the upstream directly from that edge.
@@ -17,7 +17,7 @@ LLM-merge is a single-file LLM gateway for Cloudflare Workers and Pages Advanced
 - Responses `store`, `previous_response_id`, response retrieval/cancel, and `/v1/responses/compact`.
 - Upstream enable/disable, model and path allowlists, priority, weight, failover, and cooldown.
 - Load balancing, client-key affinity, cross-edge staggering, Hedged Request, and Gateway Fast.
-- NIM parameter and reasoning adapters for DeepSeek, Nemotron, Qwen, GLM, MiniMax, Kimi, Mistral, and related models.
+- Upstream adapters for generic OpenAI-compatible services, including NVIDIA NIM and common reasoning fields.
 - System prompt, global context, context fragments, keyword/model matching, client scopes, and character limits.
 - Model refresh, upstream health checks, model speed tests, client-key management, import/export, logs, and statistics.
 
@@ -100,18 +100,18 @@ Common variables:
 
 KV-only deployments can also use `KV_FLUSH_INTERVAL_MS`, `KV_DAILY_READ_BUDGET`, `KV_DAILY_WRITE_BUDGET`, and `WORKERS_DAILY_REQUEST_BUDGET` for mirror and admin usage limits.
 
-## NVIDIA NIM
+## Adding Upstreams
 
-Add an upstream in the admin panel or seed it with `UPSTREAMS_JSON`:
+Add an upstream in the admin panel or seed it with `UPSTREAMS_JSON`. Most OpenAI-compatible services only need a base URL, API key, model list, and supported paths:
 
 ```json
 [
   {
-    "name": "nim-pool-1",
-    "preset": "nvidia-nim",
-    "base_url": "https://integrate.api.nvidia.com/v1",
-    "api_key": "nvapi-...",
-    "models": ["deepseek-ai/deepseek-v4-flash-0731"],
+    "name": "provider-primary",
+    "preset": "custom-openai",
+    "base_url": "https://api.example.com/v1",
+    "api_key": "your-upstream-api-key",
+    "models": ["provider/model-name"],
     "paths": ["/v1/chat/completions", "/v1/embeddings"],
     "priority": 1,
     "weight": 1,
@@ -120,15 +120,17 @@ Add an upstream in the admin panel or seed it with `UPSTREAMS_JSON`:
 ]
 ```
 
-For an NIM key pool, configure each key as a separate upstream with the same `base_url` and a different `api_key`. Clients can use a public model alias such as:
+Field notes:
 
-```txt
-nvidia-nim/deepseek-v4-flash-0731
-```
+- `base_url`: the OpenAI-compatible API root, usually ending in `/v1`.
+- `api_key`: the upstream API key; the gateway stores it encrypted.
+- `models`: models allowed on this upstream; use `*` to match all models.
+- `paths`: gateway paths actually supported by the upstream.
+- `priority` and `weight`: used for candidate ordering and load distribution.
 
-The gateway resolves aliases and selects an eligible upstream using client permissions, model allowlists, and path support. Hosted NIM uses the Chat Completions and Embeddings paths. Self-hosted NIM is sent natively to `/v1/responses` only when that path is explicitly enabled; otherwise Responses is translated to Chat Completions.
+The requested model must match both the upstream model configuration and the client permissions. Multiple accounts or same-provider endpoints can be added as separate upstreams with the same `base_url` and different `api_key` values; the gateway selects among them according to the routing policy.
 
-Built-in templates also include DeepInfra, Together AI, DeepSeek, Kimi/Moonshot, MiniMax, OpenRouter, Groq, GLM/Zhipu, Cloudflare Workers AI REST, and custom OpenAI-compatible upstreams.
+Built-in templates support NVIDIA NIM, DeepInfra, Together AI, DeepSeek, Kimi/Moonshot, MiniMax, OpenRouter, Groq, GLM/Zhipu, Cloudflare Workers AI REST, and custom OpenAI-compatible upstreams. A template only supplies provider defaults; it does not replace the provider's model and path configuration.
 
 ## Client Keys And Injection
 
@@ -179,7 +181,7 @@ const client = new OpenAI({
 });
 
 const response = await client.chat.completions.create({
-  model: "nvidia-nim/deepseek-v4-flash-0731",
+  model: "provider/model-name",
   messages: [{ role: "user", content: "hello" }],
   stream: true,
 });
@@ -191,9 +193,9 @@ const response = await client.chat.completions.create({
 - `load_balance`: rank by weight, active requests, client-key affinity, and recent latency.
 - `coordination_level`: controls spreading away from active/reserved requests; default is `3`.
 - `soft_interval_ms`: advisory staggering when several keys choose the same upstream; default is `50`, and `0` disables it.
-- `ROUTE_COORDINATOR`: cross-edge short reservations; model requests still go directly from each edge to NIM.
+- `ROUTE_COORDINATOR`: cross-edge short reservations; model requests still go directly from each edge to the upstream.
 - Streaming failover only happens before the first visible output. Once bytes reach the client, the gateway never replays the request, avoiding duplicate text or tool calls.
-- `Hedged Request` and `Gateway Fast` race multiple candidates. For an NIM key pool, they are usually best disabled because they intentionally increase concurrency.
+- `Hedged Request` and `Gateway Fast` race multiple candidates. For a multi-account pool or concurrency-limited provider, they are usually best disabled because they intentionally increase concurrency.
 - SSE sends a keepalive comment every five seconds to keep proxy connections open; keepalives are not model output.
 
 Health checks only verify the upstream `/models` endpoint and do not prove that a specific model is ready. Use the admin speed test for model-level verification. Long-reasoning models may have slow first bytes, so the gateway uses an appropriate first-byte timeout and can try a fallback upstream.
@@ -220,7 +222,7 @@ When no first byte arrives, inspect `x-llm-gateway-upstream-start-ms`. A large v
 
 - `_worker.js`: Worker/Pages Advanced Mode entry.
 - `admin-page.js`: admin panel.
-- `provider-bridges.js`: NIM and other upstream adapters.
+- `provider-bridges.js`: generic upstream and NVIDIA NIM adapters.
 - `presets.js`: upstream templates.
 - `wrangler.worker.toml`: Worker deployment configuration.
 - `wrangler.toml`: Pages/local development reference configuration.

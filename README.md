@@ -6,7 +6,7 @@ LLM-merge 是运行在 Cloudflare Workers 或 Pages Advanced Mode 上的单文�
 
 ## 适合什么场景
 
-- 用多个 NVIDIA NIM Key 组成账号池，按模型和客户端自动分流。
+- 用多个兼容上游组成账号池，按模型和客户端自动分流。
 - 让 OpenAI、Responses、Anthropic/Claude 风格客户端共用一个网关地址。
 - 给指定客户端注入系统提示词、全局资料和按需上下文。
 - 在 Cloudflare 边缘接入用户，并从承接请求的边缘直接访问上游。
@@ -17,7 +17,7 @@ LLM-merge 是运行在 Cloudflare Workers 或 Pages Advanced Mode 上的单文�
 - Responses：`store`、`previous_response_id`、响应查询/取消，以及 `/v1/responses/compact`。
 - 上游：启用/停用、模型和路径白名单、优先级、权重、故障转移和冷却。
 - 路由：负载均衡、客户端 Key 亲和、跨边缘错峰、Hedged Request、Gateway Fast。
-- NIM：对 DeepSeek、Nemotron、Qwen、GLM、MiniMax、Kimi、Mistral 等模型做参数和推理字段适配。
+- 上游适配：支持通用 OpenAI-compatible 上游，并兼容 NVIDIA NIM 等常见服务的参数和推理字段。
 - 注入：系统提示词、全局上下文、上下文片段、关键词/模型匹配、客户端范围和字符上限。
 - 管理：模型刷新、上游健康检查、指定模型测速、客户端 Key、导入/导出、实时日志和统计。
 
@@ -100,18 +100,18 @@ https://your-domain.example/{ADMIN_TOKEN}
 
 KV-only 部署还可使用 `KV_FLUSH_INTERVAL_MS`、`KV_DAILY_READ_BUDGET`、`KV_DAILY_WRITE_BUDGET` 和 `WORKERS_DAILY_REQUEST_BUDGET` 控制镜像与后台用量表。
 
-## 配置 NVIDIA NIM
+## 添加上游
 
-在管理后台新增上游，或通过 `UPSTREAMS_JSON` 初始化：
+在管理后台新增上游，或通过 `UPSTREAMS_JSON` 初始化。大多数 OpenAI-compatible 服务只需要填写基础地址、API Key、模型和支持的路径：
 
 ```json
 [
   {
-    "name": "nim-pool-1",
-    "preset": "nvidia-nim",
-    "base_url": "https://integrate.api.nvidia.com/v1",
-    "api_key": "nvapi-...",
-    "models": ["deepseek-ai/deepseek-v4-flash-0731"],
+    "name": "provider-primary",
+    "preset": "custom-openai",
+    "base_url": "https://api.example.com/v1",
+    "api_key": "your-upstream-api-key",
+    "models": ["provider/model-name"],
     "paths": ["/v1/chat/completions", "/v1/embeddings"],
     "priority": 1,
     "weight": 1,
@@ -120,15 +120,17 @@ KV-only 部署还可使用 `KV_FLUSH_INTERVAL_MS`、`KV_DAILY_READ_BUDGET`、`KV
 ]
 ```
 
-多个 NIM Key 建议分别配置成多个上游，使用相同的 `base_url`，并为每个上游填写独立的 `api_key`。客户端只请求网关公开的模型名，例如：
+字段说明：
 
-```txt
-nvidia-nim/deepseek-v4-flash-0731
-```
+- `base_url`：上游的 OpenAI-compatible API 根地址，通常以 `/v1` 结尾。
+- `api_key`：上游 API Key；网关会加密保存。
+- `models`：该上游允许转发的模型名，填写 `*` 可匹配全部模型。
+- `paths`：该上游实际支持的网关路径。
+- `priority`、`weight`：用于候选排序和负载分配。
 
-网关会把别名解析到实际模型，并根据客户端权限、模型白名单和上游路径选择可用上游。NIM 的 Chat Completions 和 Embeddings 使用对应路径；自托管 NIM 只有在上游显式加入 `/v1/responses` 时才会原生转发 Responses，否则自动转成 Chat Completions。
+客户端请求的模型名必须能匹配上游模型配置和客户端权限。多个账号或多个同类上游可以分别添加为多个上游，使用相同的 `base_url`，为每个上游填写独立的 `api_key`；网关会根据路由策略自动选择。
 
-内置模板还包括 DeepInfra、Together AI、DeepSeek、Kimi/Moonshot、MiniMax、OpenRouter、Groq、GLM/Zhipu、Cloudflare Workers AI REST 和自定义 OpenAI 兼容上游。
+内置模板支持 NVIDIA NIM、DeepInfra、Together AI、DeepSeek、Kimi/Moonshot、MiniMax、OpenRouter、Groq、GLM/Zhipu、Cloudflare Workers AI REST 和自定义 OpenAI-compatible 上游。模板只是默认参数适配，不能替代上游自身的模型和路径配置。
 
 ## 客户端 Key 与注入
 
@@ -179,7 +181,7 @@ const client = new OpenAI({
 });
 
 const response = await client.chat.completions.create({
-  model: "nvidia-nim/deepseek-v4-flash-0731",
+  model: "provider/model-name",
   messages: [{ role: "user", content: "hello" }],
   stream: true,
 });
@@ -191,9 +193,9 @@ const response = await client.chat.completions.create({
 - `load_balance`：结合权重、活跃请求、客户端 Key 亲和和近期延迟排序。
 - `coordination_level`：控制对活跃/预留请求的分散程度，默认 `3`。
 - `soft_interval_ms`：同一上游被多个 Key 同时选中时的建议错峰间隔，默认 `50`；设为 `0` 可关闭。
-- `ROUTE_COORDINATOR`：跨 Cloudflare 边缘协调短期预约，模型请求仍从各自边缘直连 NIM。
+- `ROUTE_COORDINATOR`：跨 Cloudflare 边缘协调短期预约，模型请求仍从各自边缘直连上游。
 - 流式故障转移只发生在首个可见输出前；已经输出给客户端后不会重放，避免重复文本或工具调用。
-- `Hedged Request` 和 `Gateway Fast` 会并行/竞速多个候选。NIM 多 Key 账号池通常应关闭它们，以免主动增加同一模型的并发。
+- `Hedged Request` 和 `Gateway Fast` 会并行/竞速多个候选。多账号池或并发受限的上游通常应关闭它们，以免主动增加同一模型的并发。
 - SSE 每 5 秒发送保活注释，帮助中间代理维持连接；保活不是模型输出。
 
 健康检查只验证上游 `/models`，不代表某个模型一定可用。要验证具体模型，请在管理后台执行模型测速。长推理模型可能需要较长首包时间，网关会在首包阶段使用相应超时并在失败时尝试备用上游。
@@ -220,7 +222,7 @@ const response = await client.chat.completions.create({
 
 - `_worker.js`：Worker/Pages Advanced Mode 入口。
 - `admin-page.js`：管理后台页面。
-- `provider-bridges.js`：NIM 和其他上游的协议适配。
+- `provider-bridges.js`：通用上游及 NVIDIA NIM 等服务的协议适配。
 - `presets.js`：上游模板。
 - `wrangler.worker.toml`：Worker 部署配置。
 - `wrangler.toml`：Pages/本地开发参考配置。
