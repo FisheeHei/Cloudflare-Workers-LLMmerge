@@ -889,7 +889,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-admin-preview-4"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-admin-preview-5"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -927,6 +927,12 @@ assert.equal(adminPage.includes('id="client-panel-toggle" open'), false);
 assert.equal(adminPage.includes('id="refresh-dashboard"'), true);
 assert.equal(adminPage.includes('data-open-view="upstreams"'), true);
 assert.equal(adminScript.includes("clientPanel.before(upstreamPanel)"), true);
+assert.equal(adminPage.includes('id="context-primary-panel"'), true);
+assert.equal(adminPage.includes("context-summary-grid"), true);
+assert.equal((adminPage.match(/id="open-system-prompt-modal"/g) || []).length, 1);
+assert.equal(adminPage.includes('id="kv-panel"'), true);
+assert.equal(adminPage.includes('id="kv-panel" open'), false);
+assert.equal(adminScript.includes('kvPanel?.addEventListener("toggle"'), true);
 assert.equal(adminPage.includes("document.visibilityState"), true);
 assert.equal(adminPage.includes("Gateway Fast"), true);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
@@ -974,7 +980,7 @@ assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
 assert.equal(adminPage.includes("setInterval(refreshLivePanels, 5000)"), true);
 assert.equal(adminPage.includes("loadKvUsage"), true);
-assert.equal(adminScript.includes('name === "settings"'), true);
+assert.equal(adminScript.includes('name === "settings"'), false);
 assert.equal(adminPage.includes("loadedViews"), true);
 assert.equal(adminPage.includes("\u5b9e\u9a8c\u6027\u8def\u7531"), true);
 assert.equal(adminPage.includes("setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000)"), false);

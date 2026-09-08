@@ -549,6 +549,26 @@ function renderAdminStyle() {
       .view-heading-actions button { flex: 1 1 0; }
       #client-panel-toggle > summary::after { display: none; }
     }
+
+    #context-primary-panel { display: grid; gap: 16px; }
+    #context-primary-panel .toolbar { margin: 0; }
+    .context-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .context-summary-item {
+      min-width: 0; padding: 13px; border: 1px solid var(--line); border-radius: 6px;
+      background: var(--surface-muted);
+    }
+    .context-summary-label { display: block; color: var(--muted); font-size: 12px; }
+    .context-summary-value { display: block; margin-top: 5px; color: var(--ink); font-size: 17px; font-weight: 700; }
+    .context-summary-detail { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .context-primary-note {
+      padding: 11px 12px; border-left: 3px solid var(--accent); background: var(--surface-active);
+      color: var(--ink-soft); font-size: 12px;
+    }
+    #view-settings #settings-panel > summary, #view-settings #kv-panel > summary { min-height: 34px; }
+    #view-settings #settings-panel > summary h2, #view-settings #kv-panel > summary h2 { font-size: 17px; }
+    .low-frequency-panel .settings-body { padding-top: 14px; }
+    @media (max-width: 900px) { .context-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 520px) { .context-summary-grid { grid-template-columns: 1fr; } }
   </style>`;
 }
 
@@ -710,9 +730,22 @@ function renderAdminMarkup(origin, version) {
   </section>
   <section class="page-view" id="view-settings" data-view="settings" hidden>
   <div class="view-heading">
-    <div class="view-heading-copy"><span class="view-heading-kicker">Prompt / Context</span><h2>注入与运行设置</h2><p>统一维护 Prompt、Context 与必要的路由参数。</p></div>
+    <div class="view-heading-copy"><span class="view-heading-kicker">Prompt / Context</span><h2>Prompt / Context</h2><p>在固定 snapshot 进入请求内核前，统一查看、编辑与预览注入规则。</p></div>
+    <div class="view-heading-actions"><button type="button" class="small good" id="open-system-prompt-modal">编辑 Prompt / Context</button></div>
   </div>
-  <div class="panel kv-panel" id="kv-panel">
+  <section class="panel" id="context-primary-panel">
+    <div class="toolbar"><div><h2>注入概览</h2><span class="note" id="system-prompt-status"></span></div></div>
+    <div class="context-summary-grid">
+      <div class="context-summary-item"><span class="context-summary-label">System Prompt</span><strong class="context-summary-value" id="context-system-value">未配置</strong><span class="context-summary-detail" id="context-system-detail">0 chars</span></div>
+      <div class="context-summary-item"><span class="context-summary-label">Global Context</span><strong class="context-summary-value" id="context-global-value">未配置</strong><span class="context-summary-detail" id="context-global-detail">0 chars</span></div>
+      <div class="context-summary-item"><span class="context-summary-label">Context 片段</span><strong class="context-summary-value" id="context-items-value">0</strong><span class="context-summary-detail" id="context-items-detail">按需匹配关闭</span></div>
+      <div class="context-summary-item"><span class="context-summary-label">历史裁剪</span><strong class="context-summary-value" id="context-history-value">默认</strong><span class="context-summary-detail" id="context-history-detail">不单独裁剪</span></div>
+    </div>
+    <div class="context-primary-note">一次请求只生成一个注入 snapshot；模型、客户端范围或字符限制变化时会重新生成。实际 LLM 调用不会发起当前时间请求。</div>
+  </section>
+  <details class="panel settings-panel low-frequency-panel kv-panel" id="kv-panel">
+    <summary><h2>存储与用量</h2><span class="note">按需加载</span></summary>
+    <div class="settings-body">
     <div class="usage-section">
       <div class="usage-section-head"><h3>Storage Usage</h3><span class="note" id="kv-usage-updated">checking...</span></div>
       <div class="kv-meter" id="kv-usage-meter"><div class="note">\u70b9\u51fb\u5237\u65b0\u67e5\u770b</div></div>
@@ -724,9 +757,10 @@ function renderAdminMarkup(origin, version) {
     <div class="context-controls">
       <button type="button" class="secondary small" id="refresh-workers-usage">\u52a0\u8f7d Workers \u7528\u91cf</button>
     </div>
-  </div>
+    </div>
+  </details>
   <details class="panel settings-panel" id="settings-panel">
-    <summary><h2>Prompt / Context \u4e0e\u9ad8\u7ea7\u8bbe\u7f6e</h2></summary>
+    <summary><h2>\u9ad8\u7ea7\u8fd0\u884c\u8bbe\u7f6e</h2><span class="note">\u8def\u7531\u3001\u8d85\u65f6\u4e0e\u5b58\u50a8\u7ed1\u5b9a</span></summary>
     <div class="settings-body">
       <div class="row">
         <div class="field span-3"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba4180000)</label><input id="request-timeout" type="number" min="1000" placeholder="180000"></div>
@@ -762,8 +796,6 @@ function renderAdminMarkup(origin, version) {
           <div class="context-controls"><strong id="storage-status-value">\u68c0\u67e5\u4e2d...</strong><button type="button" class="secondary small" id="refresh-storage-status">\u5237\u65b0</button></div>
           <div class="note mono" id="storage-status-detail"></div>
         </div>
-      </div>
-      <div class="row">        <div class="field span-12"><label>\u7cfb\u7edf\u63d0\u793a\u8bcd / \u5168\u5c40\u4e0a\u4e0b\u6587</label><button type="button" class="secondary small" id="open-system-prompt-modal">\u7f16\u8f91\u63d0\u793a\u8bcd\u4e0e\u4e0a\u4e0b\u6587</button><span class="note" id="system-prompt-status"></span></div>
       </div>
       <button class="good small" id="save-settings">\u4fdd\u5b58\u8bbe\u7f6e</button>
       <span class="note" id="settings-status"></span>
@@ -944,10 +976,6 @@ function renderAdminScript(version) {
       loadedViews[name] = true;
       return loadLogs().catch(function(error) { loadedViews[name] = false; throw error; });
     }
-    if (name === "settings") {
-      loadedViews[name] = true;
-      return loadKvUsage().catch(function(error) { loadedViews[name] = false; throw error; });
-    }
     return Promise.resolve();
   }
 
@@ -967,7 +995,6 @@ function renderAdminScript(version) {
       const title = byId("topbar-view-title");
       const label = activeLink?.querySelector(".nav-icon + span")?.textContent?.trim();
       if (title) title.textContent = label || activeLink?.dataset?.viewLabel || "Overview";
-      if (selected === "settings") byId("settings-panel").open = true;
       void loadViewData(selected).catch(showError);
       if (updateHash) history.replaceState(null, "", "#" + selected);
       const scrollRoot = document.querySelector(".main-shell");
@@ -1507,6 +1534,7 @@ function renderAdminScript(version) {
     renderContextItems(s.context_items || []);
     renderPromptClientScopes();
     renderPromptContextStatus();
+    renderPromptContextDashboard();
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
     byId("routing-hedge").checked = r.hedge_enabled === true;
@@ -1515,6 +1543,25 @@ function renderAdminScript(version) {
     byId("routing-coordination-level").value = r.coordination_level ?? 3;
     byId("routing-soft-interval").value = r.soft_interval_ms ?? 50;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
+  }
+
+  function renderPromptContextDashboard() {
+    const settings = state.config?.settings || {};
+    const systemPrompt = text(settings.system_prompt).trim();
+    const globalContext = text(settings.global_context).trim();
+    const items = Array.isArray(settings.context_items) ? settings.context_items : [];
+    const historyChars = Number(settings.history_max_chars || 0);
+    const scopeCount = (value) => Array.isArray(value) ? value.length : 0;
+    const set = (id, value) => { const node = byId(id); if (node) node.textContent = value; };
+
+    set("context-system-value", systemPrompt ? "\u5df2\u914d\u7f6e" : "\u672a\u914d\u7f6e");
+    set("context-system-detail", systemPrompt.length.toLocaleString() + " chars \u00b7 " + scopeCount(settings.system_prompt_clients) + " client keys");
+    set("context-global-value", globalContext ? "\u5df2\u914d\u7f6e" : "\u672a\u914d\u7f6e");
+    set("context-global-detail", globalContext.length.toLocaleString() + " chars \u00b7 " + scopeCount(settings.global_context_clients) + " client keys");
+    set("context-items-value", String(items.length));
+    set("context-items-detail", settings.context_on_demand === true ? "\u6309\u9700\u5339\u914d \u00b7 \u6700\u591a " + Number(settings.context_item_limit || 1) + " \u4e2a" : "\u6309\u987a\u5e8f\u6ce8\u5165");
+    set("context-history-value", historyChars > 0 ? historyChars.toLocaleString() + " chars" : "\u9ed8\u8ba4");
+    set("context-history-detail", historyChars > 0 ? "\u5386\u53f2\u5b57\u7b26\u4e0a\u9650" : "\u4e0d\u5355\u72ec\u88c1\u526a");
   }
 
   function selectedTimeZoneLabel() {
@@ -2953,6 +3000,10 @@ async function loadKvUsage() {
       const upstreamPanel = byId("upstream-panel");
       const clientPanel = byId("client-panel");
       if (upstreamPanel && clientPanel) clientPanel.before(upstreamPanel);
+      const kvPanel = byId("kv-panel");
+      kvPanel?.addEventListener("toggle", () => {
+        if (kvPanel.open) void loadKvUsage().catch(showError);
+      });
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
       byId("speed-picker-modal").addEventListener("click", (e) => { if (e.target === byId("speed-picker-modal")) closeSpeedPicker(); });
