@@ -889,7 +889,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-admin-preview-3"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-admin-preview-4"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -960,6 +960,9 @@ assert.equal(adminPage.includes("180000"), true);
 assert.equal(adminPage.includes("stream-idle-timeout"), true);
 assert.equal(adminPage.includes("900000"), true);
 assert.equal(adminPage.includes("@media (max-width: 700px)"), true);
+assert.equal(adminPage.includes(".page-view > .panel { grid-column: 1 / -1;"), true);
+assert.equal(adminPage.includes("#view-overview #stats-panel { grid-column: 1 / -1; grid-row: auto; }"), true);
+assert.equal(adminPage.includes("banner.className = 'boot-error'"), true);
 assert.equal(adminPage.includes("id=\"stat-tip\""), true);
 assert.equal(adminPage.includes("data-stat-kind"), true);
 assert.equal(adminPage.includes("bar-hit"), true);

@@ -346,14 +346,13 @@ function renderAdminStyle() {
       .wrap { width: min(1680px, calc(100% - 48px)); padding: 20px 0 40px; }
       .page-view { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; align-items: start; }
       .page-view > .hero { grid-column: 1 / -1; margin-bottom: 0; }
-      .page-view > .panel { margin-bottom: 0; padding: 16px; }
+      .page-view > .panel { grid-column: 1 / -1; margin-bottom: 0; padding: 16px; }
       .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
-      #view-overview #stats-panel { grid-column: 1 / span 7; grid-row: 2 / span 2; }
-      #view-overview #kv-panel { grid-column: 8 / -1; grid-row: 2; }
-      #view-overview #client-panel { grid-column: 8 / -1; grid-row: 3; }
+      #view-overview #stats-panel { grid-column: 1 / -1; grid-row: auto; }
       #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
-      #view-upstreams #upstream-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
+      #view-upstreams #client-panel, #view-upstreams #upstream-panel,
+      #view-settings #kv-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
       .upstream-card summary { padding: 11px 12px; gap: 9px; }
       .upstream-card .card-body { padding: 0 12px 12px; }
@@ -440,17 +439,19 @@ function renderAdminStyle() {
       .app-shell { display: block; height: auto; overflow: visible; }
       .main-shell { height: auto; overflow: visible; }
       .sidebar { position: static; height: auto; padding: 12px; }
+      .sidebar, .sidebar-nav, .sidebar-footer { min-width: 0; }
       .sidebar-label { display: none; }
       .sidebar-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 12px; overflow: visible; }
       .nav-item { justify-content: center; min-width: 0; min-height: 36px; padding: 7px 8px; }
+      .nav-item > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .sidebar-footer { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; margin: 10px 0 0; padding: 0 4px; line-height: 1.35; }
       .sidebar-version { word-break: normal; }
-      .sidebar-source { min-width: 0; }
+      .sidebar-source { min-width: 0; overflow-wrap: anywhere; }
       .topbar { position: static; min-height: 60px; padding: 10px 14px; }
       .topbar-badge { display: none; }
       .wrap { width: min(100%, calc(100vw - 12px)); }
       .hero { align-items: stretch; flex-direction: column; gap: 16px; }
-      .gateway-urls { flex: none; }
+      .gateway-urls { flex: none; width: 100%; min-width: 0; }
       .endpoint-block { padding-left: 12px; }
       .toolbar { align-items: stretch; }
       .toolbar h2 { flex-basis: 100%; }
@@ -477,6 +478,18 @@ function renderAdminStyle() {
       .prompt-edit-grid, .prompt-splitter-row { grid-template-columns: 1fr; }
       .picker-actions { justify-content: stretch; }
       .picker-actions button, .picker-actions label { flex: 1 1 140px; }
+    }
+
+    .boot-error {
+      grid-column: 1 / -1;
+      margin-top: 12px;
+      padding: 12px;
+      background: #fef2f2;
+      border: 1px solid #fca5a5;
+      border-radius: 8px;
+      color: #991b1b;
+      font-size: 13px;
+      overflow-wrap: anywhere;
     }
   </style>`;
 }
@@ -3064,9 +3077,9 @@ async function loadKvUsage() {
       hero = document.querySelector('.hero');
       if (hero) {
         const banner = document.createElement('div');
-        banner.style.cssText = 'margin-top:12px;padding:12px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;color:#991b1b;font-size:13px';
+        banner.className = 'boot-error';
         banner.textContent = '[Boot Error] ' + (error.message || 'Unknown') + ' — check browser console (F12)';
-        hero.appendChild(banner);
+        hero.parentElement?.insertBefore(banner, hero.nextSibling);
       }
     }
   }
