@@ -87,7 +87,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-08-admin-preview-5";
+const VERSION = "v26-09-08-nim-model-markers-1";
 
 export default {
   async fetch(request, env, ctx) {

@@ -2438,20 +2438,37 @@ async function loadKvUsage() {
     { id: "chat", label: "\u804a\u5929" },
     { id: "text", label: "\u5355\u6a21\u6001" },
     { id: "vision", label: "\u591a\u6a21\u6001" },
+    { id: "audio", label: "\u97f3\u9891" },
+    { id: "embedding", label: "Embedding" },
+    { id: "reranker", label: "Reranker" },
     { id: "tools", label: "\u5de5\u5177\u8c03\u7528" },
     { id: "thinking", label: "\u63a8\u7406" },
+    { id: "coding", label: "\u7f16\u7a0b" },
     { id: "agentic", label: "Agentic" },
   ];
   const EXCLUSIVE_MODEL_TAGS = [["text", "vision"]];
 
   function modelTags(model) {
     const value = modelDisplayName(model).toLowerCase();
-    const tags = ["chat"];
-    const vision = /(^|[\/_.-])(vl|vision|visual|image|multimodal|omni|pixtral|gemini|gpt-4o|qwen2(?:\.5)?-vl)([\/_.-]|$)/i.test(value);
-    tags.push(vision ? "vision" : "text");
-    if (/(function|tool|fc|tools?|gpt-|claude|gemini|qwen|glm|llama-3|mistral|mixtral|deepseek|codestral|coder|codegemma)/i.test(value)) tags.push("tools");
-    if (/(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3|glm|kimi-k2)([\/_.-]|$)/i.test(value)) tags.push("thinking");
-    if (/(agent|agentic|computer-use|operator|claude|gpt-|gemini|qwen.*coder|glm|coder|codegemma|codestral|deepseek-coder|devstral|swe|opus|sonnet)/i.test(value)) tags.push("agentic");
+    const tags = [];
+    const audio = /(^|[\/_.-])(audio|speech|tts|asr|whisper|parakeet|canary)([\/_.-]|$)/i.test(value);
+    const embedding = /(^|[\/_.-])(embed|embedding|e5|bge|nv-embed|nvolve)([\/_.-]|$)/i.test(value);
+    const reranker = /(^|[\/_.-])(rerank|reranker|ranker|nv-rerank)([\/_.-]|$)/i.test(value);
+    const vision = /(^|[\/_.-])(vl|vision|visual|image|multimodal|omni|pixtral|gemini|gpt-4o|qwen2(?:\.5)?-vl|nemotron-nano-vl)([\/_.-]|$)/i.test(value);
+    const thinking = /(^|[\/_.-])(r1|r1t|reason|reasoning|reasoner|think|thinking|qwq|marco|o1|o3|o4|grok-4|sonar-reasoning|deepseek-v3\.1|deepseek-v4|deepseek-r1|deepseek-reasoner|qwen3|kimi-k2)([\/_.-]|$)/i.test(value);
+    const coding = /(^|[\/_.-])(coder|codegemma|codestral|deepseek-coder|devstral|starcoder|swe)([\/_.-]|$)/i.test(value);
+    const tools = /(^|[\/_.-])(tool|tools|function|function-calling|fc)([\/_.-]|$)/i.test(value) || /(?:qwen.*coder|devstral|kimi-k2)/i.test(value);
+    const agentic = /(?:agent|agentic|computer-use|operator|devstral|swe)/i.test(value);
+    if (embedding) tags.push("embedding");
+    else if (reranker) tags.push("reranker");
+    else if (audio) tags.push("audio");
+    else {
+      tags.push("chat", vision ? "vision" : "text");
+    }
+    if (tools) tags.push("tools");
+    if (thinking) tags.push("thinking");
+    if (coding) tags.push("coding");
+    if (agentic) tags.push("agentic");
     return tags;
   }
 

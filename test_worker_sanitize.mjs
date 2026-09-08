@@ -889,7 +889,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-admin-preview-5"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-nim-model-markers-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -978,6 +978,10 @@ assert.equal(adminPage.includes("data-stat-kind"), true);
 assert.equal(adminPage.includes("bar-hit"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
+assert.equal(adminPage.includes("nv-embed"), true);
+assert.equal(adminPage.includes("nemotron-nano-vl"), true);
+assert.equal(adminPage.includes("Reranker"), true);
+assert.equal(adminPage.includes("coding"), true);
 assert.equal(adminPage.includes("setInterval(refreshLivePanels, 5000)"), true);
 assert.equal(adminPage.includes("loadKvUsage"), true);
 assert.equal(adminScript.includes('name === "settings"'), false);
