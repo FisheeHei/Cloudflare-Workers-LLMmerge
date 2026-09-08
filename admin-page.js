@@ -491,6 +491,64 @@ function renderAdminStyle() {
       font-size: 13px;
       overflow-wrap: anywhere;
     }
+
+    .page-view > .view-heading { grid-column: 1 / -1; }
+    .view-heading {
+      display: flex; align-items: end; justify-content: space-between; gap: 18px;
+      margin: 2px 0 2px; padding: 2px 0 4px;
+    }
+    .view-heading-copy { min-width: 0; }
+    .view-heading-kicker {
+      display: block; color: var(--accent); font-size: 11px; font-weight: 700;
+      letter-spacing: .08em; text-transform: uppercase;
+    }
+    .view-heading h2 { margin: 3px 0 4px; font-size: 25px; line-height: 1.12; }
+    .view-heading p { max-width: 720px; margin: 0; color: var(--muted); }
+    .view-heading-actions { display: flex; flex-wrap: wrap; gap: 8px; flex: 0 0 auto; }
+    .view-heading-actions button { min-height: 34px; }
+    .topbar-actions { min-width: 0; }
+    #refresh-dashboard { flex: 0 0 auto; }
+
+    #view-upstreams #upstream-panel { order: 1; }
+    #view-upstreams #client-panel { order: 2; }
+    #view-upstreams #upstream-panel > .toolbar { margin-bottom: 16px; }
+    #view-upstreams #client-panel { background: var(--panel); }
+    #client-panel-toggle > summary {
+      min-height: 34px; justify-content: flex-start; padding: 0;
+    }
+    #client-panel-toggle > summary h2 { font-size: 17px; }
+    #client-panel-toggle > summary::after {
+      content: "\\5c55\\5f00"; margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 600;
+    }
+    #client-panel-toggle[open] > summary::after { content: "\\6536\\8d77"; }
+    #client-panel .client-create {
+      margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line);
+    }
+    #client-panel .client-recent-view {
+      padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-muted);
+    }
+    #client-panel .client-item { background: var(--panel); }
+    #client-panel .client-item:last-child { margin-bottom: 0; }
+
+    #stats-panel { display: grid; gap: 14px; }
+    #stats-panel .toolbar { margin: 0; }
+    #stats-panel .chart-label { margin: 0; }
+    #stats-panel .chart-bar { margin: 0; }
+    #stats-panel .stats-grid { margin: 0; }
+    .stat-box { min-height: 82px; display: grid; align-content: center; gap: 2px; }
+    .stat-num { font-variant-numeric: tabular-nums; }
+
+    @media (max-width: 979px) {
+      #view-upstreams { display: flex; flex-direction: column; gap: 16px; }
+      #view-upstreams > .panel { margin-bottom: 0; }
+    }
+    @media (max-width: 700px) {
+      .view-heading { align-items: stretch; flex-direction: column; gap: 12px; }
+      .view-heading h2 { font-size: 22px; }
+      .view-heading-actions { width: 100%; }
+      .view-heading-actions button { flex: 1 1 0; }
+      #client-panel-toggle > summary::after { display: none; }
+    }
   </style>`;
 }
 
@@ -523,11 +581,15 @@ function renderAdminMarkup(origin, version) {
         <span class="topbar-eyebrow">LLM MERGE / ADMIN</span>
         <span class="topbar-title" id="topbar-view-title">Overview</span>
       </div>
-      <div class="topbar-actions"><span class="topbar-badge" id="topbar-status">Connecting</span></div>
+      <div class="topbar-actions"><span class="topbar-badge" id="topbar-status">Connecting</span><button type="button" class="small secondary" id="refresh-dashboard">刷新状态</button></div>
     </header>
 
 <div class="wrap">
   <section class="page-view" id="view-overview" data-view="overview">
+  <div class="view-heading">
+    <div class="view-heading-copy"><span class="view-heading-kicker">Overview</span><h2>运行概览</h2><p>集中查看网关、上游连接与请求质量。</p></div>
+    <div class="view-heading-actions"><button type="button" class="small secondary" data-open-view="upstreams">配置上游</button><button type="button" class="small secondary" data-open-view="settings">查看注入</button></div>
+  </div>
   <div class="hero" id="gateway-overview">
     <div class="hero-copy">
       <span class="hero-kicker">Control plane</span>
@@ -574,8 +636,11 @@ function renderAdminMarkup(origin, version) {
 
   </section>
   <section class="page-view" id="view-upstreams" data-view="upstreams" hidden>
+  <div class="view-heading">
+    <div class="view-heading-copy"><span class="view-heading-kicker">Providers &amp; Clients</span><h2>上游与客户端</h2><p>先配置上游路由，再管理给客户端和 Agent 使用的 Key。</p></div>
+  </div>
   <div class="panel settings-panel" id="client-panel">
-    <details class="client-panel-toggle" id="client-panel-toggle" open>
+    <details class="client-panel-toggle" id="client-panel-toggle">
       <summary><h2>\u5ba2\u6237\u7aef Keys</h2><span class="client-summary" id="client-summary">0 keys</span></summary>
     </details>
     <div class="client-recent-view" id="client-recent-view" hidden>
@@ -622,6 +687,9 @@ function renderAdminMarkup(origin, version) {
 
   </section>
   <section class="page-view" id="view-activity" data-view="logs" hidden>
+  <div class="view-heading">
+    <div class="view-heading-copy"><span class="view-heading-kicker">Logs &amp; Diagnostics</span><h2>日志与诊断</h2><p>按需加载历史记录，聚焦路由、首包和流式收尾。</p></div>
+  </div>
   <div class="panel" id="log-panel">
     <div class="toolbar">
       <h2>\u8c03\u7528\u65e5\u5fd7</h2>
@@ -641,6 +709,9 @@ function renderAdminMarkup(origin, version) {
 
   </section>
   <section class="page-view" id="view-settings" data-view="settings" hidden>
+  <div class="view-heading">
+    <div class="view-heading-copy"><span class="view-heading-kicker">Prompt / Context</span><h2>注入与运行设置</h2><p>统一维护 Prompt、Context 与必要的路由参数。</p></div>
+  </div>
   <div class="panel kv-panel" id="kv-panel">
     <div class="usage-section">
       <div class="usage-section-head"><h3>Storage Usage</h3><span class="note" id="kv-usage-updated">checking...</span></div>
@@ -899,12 +970,15 @@ function renderAdminScript(version) {
       if (selected === "settings") byId("settings-panel").open = true;
       void loadViewData(selected).catch(showError);
       if (updateHash) history.replaceState(null, "", "#" + selected);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      const scrollRoot = document.querySelector(".main-shell");
+      if (scrollRoot) scrollRoot.scrollTo({ top: 0, behavior: "smooth" });
+      else window.scrollTo({ top: 0, behavior: "smooth" });
     };
     links.forEach((link) => link.addEventListener("click", (event) => {
       event.preventDefault();
       showView(link.dataset.viewTarget, true);
     }));
+    document.querySelectorAll("[data-open-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.openView, true)));
     window.addEventListener("hashchange", () => showView(location.hash.slice(1), false));
     showView(location.hash.slice(1), false);
   }
@@ -1465,6 +1539,14 @@ function renderAdminScript(version) {
     state.gateway = payload.gateway || {};
     renderSettings();
     renderUpstreams();
+  }
+
+  async function refreshDashboard() {
+    await Promise.all([loadConfig(), loadClients()]);
+    await Promise.all([renderCachedHealth(), loadRuntimeStatus()]);
+    if (loadedViews.logs) await loadLogs();
+    if (loadedViews.settings) await loadKvUsage();
+    showToast("运行状态已刷新");
   }
 
   async function saveConfig() {
@@ -2868,6 +2950,9 @@ async function loadKvUsage() {
     let hero = null;
     let bootSpan = null;
     try {
+      const upstreamPanel = byId("upstream-panel");
+      const clientPanel = byId("client-panel");
+      if (upstreamPanel && clientPanel) clientPanel.before(upstreamPanel);
       byId("vendor-modal").addEventListener("click", (e) => { if (e.target === byId("vendor-modal")) closeVendorModal(); });
       byId("model-picker-modal").addEventListener("click", (e) => { if (e.target === byId("model-picker-modal")) closeModelPicker(); });
       byId("speed-picker-modal").addEventListener("click", (e) => { if (e.target === byId("speed-picker-modal")) closeSpeedPicker(); });
@@ -2882,6 +2967,9 @@ async function loadKvUsage() {
         else closeVendorModal();
       });
       byId("open-vendor-modal").addEventListener("click", openVendorModal);
+      byId("refresh-dashboard").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "刷新中...", refreshDashboard).catch(showError)
+      );
       byId("open-system-prompt-modal").addEventListener("click", openSystemPromptModal);
       byId("close-system-prompt-modal").addEventListener("click", closeSystemPromptModal);
       byId("split-prompt-context").addEventListener("click", splitPromptContextDraft);
