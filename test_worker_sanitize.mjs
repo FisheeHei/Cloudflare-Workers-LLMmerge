@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
+import { classifyGatewayFailure, createGatewayTrace, gatewayTraceFields, markGatewayTrace } from "./gateway-observability.js";
 
 const worker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?t=${Date.now()}`);
+assert.equal(classifyGatewayFailure({ status: 200 }), "ok");
+assert.equal(classifyGatewayFailure({ status: 503 }), "upstream_unavailable");
+assert.equal(classifyGatewayFailure({ status: 200, closeReason: "eof" }), "upstream_stream_eof");
+assert.equal(classifyGatewayFailure({ status: 503, dispatchLimited: true }), "dispatch_busy");
+const sameTickTrace = createGatewayTrace({ id: "same-tick" });
+markGatewayTrace(sameTickTrace, "upstream_fetch_called");
+assert.equal(gatewayTraceFields(sameTickTrace).trace_upstream_called, true);
 const keepaliveEncoder = new TextEncoder();
 const keepaliveText = await new Response(worker.withSseKeepAlive(new ReadableStream({
   start(controller) {
@@ -889,7 +897,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-08-nim-model-markers-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-15-workers-limits-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -939,7 +947,7 @@ assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("live-upstream-count"), true);
 assert.equal(adminPage.includes("run-cloudflare-self-check"), true);
-assert.equal(adminPage.includes("\u68c0\u67e5\u8fde\u901a\u6027"), true);
+assert.equal(adminPage.includes("\u68c0\u67e5\u6a21\u578b\u5217\u8868"), true);
 assert.equal(adminPage.includes("\u6a21\u578b\u5217\u8868\u53ef\u8bbf\u95ee"), true);
 assert.equal(adminPage.includes("release-active-upstreams"), true);
 assert.equal(adminPage.includes("getSelfCheckClient"), true);
@@ -978,6 +986,9 @@ assert.equal(adminPage.includes("data-stat-kind"), true);
 assert.equal(adminPage.includes("bar-hit"), true);
 assert.equal(adminPage.includes("model-tag-filter"), true);
 assert.equal(adminPage.includes("renderModelTags"), true);
+assert.equal(adminPage.includes("function logFailureReason(log)"), true);
+assert.equal(adminPage.includes("上游提前断流"), true);
+assert.equal(adminPage.includes("上游限流"), true);
 assert.equal(adminPage.includes("nv-embed"), true);
 assert.equal(adminPage.includes("nemotron-nano-vl"), true);
 assert.equal(adminPage.includes("Reranker"), true);
@@ -989,7 +1000,8 @@ assert.equal(adminPage.includes("loadedViews"), true);
 assert.equal(adminPage.includes("\u5b9e\u9a8c\u6027\u8def\u7531"), true);
 assert.equal(adminPage.includes("setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000)"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000)"), false);
-assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000)"), true);
+assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000)"), true);
+assert.equal(adminPage.includes("Promise.allSettled(tasks)"), true);
 assert.equal(adminPage.includes("if (liveRefreshRunning || document.visibilityState"), true);
 assert.equal(adminPage.includes("Configuration error"), true);
 assert.equal(adminPage.includes("width: min(1216px"), true);
@@ -2370,7 +2382,7 @@ assert.equal(workersUsage.usage.requests, 5555);
 assert.equal(workersUsage.usage.errors, 10);
 assert.equal(workersUsage.sources.workers.requests, 1234);
 assert.equal(workersUsage.sources.pages.requests, 4321);
-assert.equal(workersUsage.quota, 1000000);
+assert.equal(workersUsage.quota, 10000000);
 const budgetWorker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?budget=${Date.now()}`);
 const budgetEnv = {
   ...analyticsQueryEnv,
@@ -4500,7 +4512,7 @@ assert.equal((await adminAbortRequest).status, 499);
 
 const failStore = new Map();
 failStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, load_balance: false },
+  routing: { failover: true, load_balance: false, soft_interval_ms: 0 },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "boom", base_url: "https://boom.example/v1", api_key_encrypted: "b", models: ["boom-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
@@ -4527,10 +4539,18 @@ const failResp = await worker.default.fetch(new Request("https://gw.test/v1/chat
 assert.equal(failResp.status, 502);
 assert.equal(failResp.headers.get("retry-after"), "1");
 assert.equal(failResp.headers.get("x-llm-gateway-trace-id"), "trace-fail");
+assert.equal(failResp.headers.get("x-llm-gateway-trace-stage"), "request_failed");
+assert.equal(failResp.headers.get("x-llm-gateway-upstream-called"), "true");
+assert.equal(failResp.headers.get("x-llm-gateway-upstream-headers"), "false");
 const failLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), failEnv);
 const failLogs = await failLogsResp.json();
-assert.equal(failLogs.logs.some((entry) => entry.upstream === "boom" && entry.status === 502), true);
-assert.equal(failLogs.logs.some((entry) => entry.trace_id === "trace-fail"), true);
+const failLog = failLogs.logs.find((entry) => entry.trace_id === "trace-fail");
+assert.equal(failLog?.upstream, "boom");
+assert.equal(failLog?.status, 502);
+assert.equal(failLog?.failure_code, "upstream_unavailable");
+assert.equal(failLog?.trace_stage, "request_failed");
+assert.equal(failLog?.trace_upstream_called, true);
+assert.equal(failLog?.trace_upstream_headers, false);
 
 function makeD1Mock() {
   const rows = new Map();

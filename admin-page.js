@@ -686,7 +686,7 @@ function renderAdminMarkup(origin, version) {
       <h2>\u4e0a\u6e38\u914d\u7f6e</h2>
       <button id="open-vendor-modal">+ \u6dfb\u52a0\u4e0a\u6e38</button>
       <button class="good" id="save-config">\u4fdd\u5b58\u914d\u7f6e</button>
-      <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u8fde\u901a\u6027</button>
+      <button type="button" class="secondary" id="check-health">\u68c0\u67e5\u6a21\u578b\u5217\u8868</button>
       <span class="toolbar-spacer"></span>
       <div class="menu-wrap" id="upstream-actions">
         <button type="button" class="secondary" id="upstream-actions-toggle">\u66f4\u591a\u64cd\u4f5c</button>
@@ -694,7 +694,7 @@ function renderAdminMarkup(origin, version) {
           <button type="button" class="secondary small" id="import-upstreams">\u5bfc\u5165\u914d\u7f6e</button>
           <button type="button" class="secondary small" id="export-upstreams">\u5bfc\u51fa\u914d\u7f6e</button>
           <button type="button" class="secondary small" id="refresh-models">\u5237\u65b0\u6a21\u578b\u7f13\u5b58</button>
-          <button type="button" class="secondary small" id="speed-test">\u6a21\u578b\u6d4b\u901f</button>
+          <button type="button" class="secondary small" id="speed-test">\u6d4b\u8bd5\u6307\u5b9a\u6a21\u578b</button>
           <button type="button" class="secondary small" id="run-cloudflare-self-check">Cloudflare \u81ea\u68c0</button>
           <button type="button" class="secondary small" id="release-active-upstreams">\u7ec8\u6b62\u6d3b\u8dc3\u8bf7\u6c42</button>
         </div>
@@ -1589,11 +1589,13 @@ function renderAdminScript(version) {
   }
 
   async function refreshDashboard() {
-    await Promise.all([loadConfig(), loadClients()]);
-    await Promise.all([renderCachedHealth(), loadRuntimeStatus()]);
-    if (loadedViews.logs) await loadLogs();
-    if (loadedViews.settings) await loadKvUsage();
-    showToast("运行状态已刷新");
+    const tasks = [loadConfig(), loadClients(), renderCachedHealth(), loadRuntimeStatus()];
+    if (loadedViews.logs) tasks.push(loadLogs());
+    if (loadedViews.settings) tasks.push(loadKvUsage());
+    const results = await Promise.allSettled(tasks);
+    const failed = results.filter((result) => result.status === "rejected");
+    if (failed.length === results.length) throw failed[0].reason;
+    showToast(failed.length ? "\u8fd0\u884c\u72b6\u6001\u5df2\u90e8\u5206\u5237\u65b0" : "运行状态已刷新");
   }
 
   async function saveConfig() {
@@ -2215,8 +2217,8 @@ async function loadKvUsage() {
     const quota = Number(payload.quota || 0);
     const pct = quota > 0 ? Math.min(100, used / quota * 100) : 0;
     meter.innerHTML =
-      '<div class="kv-row"><span>Daily requests</span><div class="kv-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div><span class="mono">' + used.toLocaleString() + ' / ' + quota.toLocaleString() + '</span></div>' +
-      '<div class="note">Resets at 00:00 UTC · Errors ' + Number(payload.usage?.errors || 0).toLocaleString() +
+      '<div class="kv-row"><span>Requests today / reference</span><div class="kv-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div><span class="mono">' + used.toLocaleString() + ' / ' + quota.toLocaleString() + '</span></div>' +
+      '<div class="note">Reference only; Cloudflare plan limits apply · Errors ' + Number(payload.usage?.errors || 0).toLocaleString() +
       ' · Workers ' + Number(payload.sources?.workers?.requests || 0).toLocaleString() +
       ' · Pages ' + Number(payload.sources?.pages?.requests || 0).toLocaleString() + '</div>';
     if (stamp) stamp.textContent = formatGatewayTime(payload.updated_at);
@@ -2801,6 +2803,7 @@ async function loadKvUsage() {
             '<span class="note">' + esc(l.model) + '</span>' +
             '<span class="note">' + esc(formatGatewayTime(l.ts).slice(11, 19)) + '</span>' +
             '<span class="note">' + esc(l.latency_ms + "ms") + '</span>' +
+            '<span class="note">' + esc(logFailureReason(l)) + '</span>' +
             '<span class="note">' + esc((l.prompt_tokens || 0) + (l.completion_tokens || 0) + " tk") + '</span>' +
             '</div>'
         ).join("")
@@ -2817,6 +2820,40 @@ async function loadKvUsage() {
 
   function toolDiag(l) {
     return (Number(l?.tools_count || 0)) + "/" + (Number(l?.tool_calls_count || 0));
+  }
+
+  function logFailureReason(log) {
+    const failureLabels = {
+      ok: "正常",
+      dispatch_busy: "网关排队繁忙",
+      client_cancelled: "客户端断开",
+      auth_or_permission: "Key / 权限",
+      model_or_route_not_found: "模型或路由不存在",
+      upstream_timeout: "上游超时",
+      upstream_rate_limit: "上游限流",
+      upstream_stream_eof: "上游提前断流",
+      stream_finalize_error: "流式收尾异常",
+      upstream_unavailable: "上游不可用",
+      gateway_or_upstream_error: "网关 / 上游错误",
+      request_rejected: "请求被拒绝",
+      upstream_error: "上游错误",
+      unknown: "未知",
+    };
+    if (failureLabels[log?.failure_code]) return failureLabels[log.failure_code];
+    const status = Number(log?.status || 0);
+    const close = String(log?.close_reason || "").toLowerCase();
+    if (status >= 200 && status < 400 && !["error", "eof", "finish_grace"].includes(close)) return "正常";
+    if (status === 401 || status === 403) return "Key / 权限";
+    if (status === 404) return "模型或路由不存在";
+    if (status === 408 || status === 504) return "上游超时";
+    if (status === 429) return "上游限流";
+    if (status === 499 || close === "client_abort" || close === "cancelled") return "客户端断开";
+    if (close === "eof") return "上游提前断流";
+    if (close === "error" || close === "finish_grace") return "流式收尾异常";
+    if (status === 502 || status === 503) return "上游不可用";
+    if (status >= 500) return "网关 / 上游错误";
+    if (status >= 400) return "请求被拒绝";
+    return close || "未知";
   }
 
   function filterLogs(logs) {
@@ -2849,7 +2886,7 @@ async function loadKvUsage() {
     ].map((item) => '<button type="button" class="small secondary log-filter' + (state.logFilter === item[0] ? ' active' : '') + '" data-log-filter="' + item[0] + '">' + item[1] + '</button>').join("");
     byId("log-list").innerHTML = '<div class="log-tools">' + filters + '<span class="note">' + filtered.length + '/' + logs.length + '</span>' + toggle + '</div>' +
     (filtered.length ? '<table class="log-table"><thead><tr>' +
-      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tools</th><th>Tokens</th>' +
+      '<th>\u65f6\u95f4</th><th>\u5ba2\u6237\u7aef</th><th>\u4e0a\u6e38</th><th>\u6a21\u578b</th><th>\u63a5\u53e3</th><th>\u72b6\u6001</th><th>\u539f\u56e0</th><th>\u5ef6\u8fdf</th><th>Stream</th><th>Tools</th><th>Tokens</th>' +
     '</tr></thead><tbody>' +
     visibleLogs.map((l) => '<tr>' +
       '<td>' + esc(formatGatewayTime(l.ts)) + '</td>' +
@@ -2858,6 +2895,7 @@ async function loadKvUsage() {
       '<td class="mono">' + esc(l.model || "") + '</td>' +
       '<td class="mono">' + esc((l.path || "").replace("/v1/", "")) + '</td>' +
       '<td class="' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</td>' +
+      '<td class="' + (l.status < 400 && logFailureReason(l) === "正常" ? 'ok' : 'err') + '">' + esc(logFailureReason(l)) + '</td>' +
       '<td>' + esc(l.latency_ms) + 'ms</td>' +
       '<td class="mono">' + esc(streamDiag(l)) + '</td>' +
       '<td class="mono">' + esc(toolDiag(l)) + '</td>' +
@@ -3220,7 +3258,7 @@ async function loadKvUsage() {
       // ponytail: one guarded poll prevents slow AE queries from piling up.
       setInterval(refreshLivePanels, 5000);
       // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
-      setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 1000);
+      setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000);
     } catch (error) {
       if (bootSpan?.parentNode) bootSpan.remove();
       const topbarStatus = byId("topbar-status");

@@ -1,0 +1,7025 @@
+import { renderAdminPage } from "./admin-page.js";
+import { PRESET_TEMPLATES, inferPresetId, presetById } from "./presets.js";
+import {
+  adaptUpstreamBody,
+  isGlmModel,
+  isMiniMaxM3Model,
+  isNvidiaNimUpstream,
+  providerCapabilities,
+  sanitizeProxyBody,
+} from "./provider-bridges.js";
+import {
+  classifyGatewayFailure,
+  createGatewayTrace,
+  gatewayErrorLogFields,
+  gatewayTraceFields,
+  gatewayTraceLogFields,
+  markGatewayTrace,
+} from "./gateway-observability.js";
+import {
+  gatewayContextText,
+  gatewayInjectionPlan,
+  gatewayInjectionSnapshot,
+  normalizeContextItems,
+  prepareGatewayChatBody,
+  prepareGatewayCompletionsBody,
+} from "./gateway-context.js";
+import {
+  chatContentToText,
+  modelSuffix,
+  modelsMatch,
+  normalizeStringArray,
+  parseNonNegativeInt,
+  stableHash32,
+} from "./gateway-primitives.js";
+
+const JSON_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+};
+
+const HTML_HEADERS = {
+  "content-type": "text/html; charset=utf-8",
+};
+
+// ponytail: add max-age so browsers cache preflight for 1h (fewer round-trips)
+const CORS_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
+  "access-control-allow-headers": "authorization,content-type,x-admin-token,x-api-key,anthropic-version,anthropic-beta,session-id,thread-id,turn-id,x-turn-id,x-client-request-id,x-session-id,x-conversation-id,x-codex-turn-metadata,x-request-id,x-trace-id",
+  "access-control-max-age": "3600",
+};
+
+const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529]);
+const MODEL_PATH = "/v1/models";
+const COMPLETIONS_PATH = "/v1/completions";
+const CHAT_PATH = "/v1/chat/completions";
+const RESPONSES_PATH = "/v1/responses";
+const RESPONSES_COMPACT_PATH = "/v1/responses/compact";
+const EMBEDDINGS_PATH = "/v1/embeddings";
+const MESSAGES_PATH = "/v1/messages";
+const RESPONSE_STORE_PREFIX = "responses:store:";
+const RESPONSE_STORE_TTL_SECONDS = 7 * 24 * 3600;
+const GATEWAY_CONFIG_KEY = "gateway:config";
+const CONFIG_SNAPSHOTS_KEY = "gateway:config:snapshots";
+const CONFIG_SNAPSHOT_LIMIT = 5;
+const LOG_KEY = "gateway:logs";
+const STATS_PREFIX = "gateway:stats:";
+const STATS_WINDOW_HOURS = 24;
+const CLIENT_DAILY_USAGE_TTL_SECONDS = 35 * 24 * 3600;
+const DEFAULT_TIMEOUT_MS = 180000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
+const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
+const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
+const DEFAULT_MODEL_CACHE_TTL = 3600;
+const DEFAULT_COOLDOWN_TTL = 60;
+const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
+const MAX_RETRY_AFTER_COOLDOWN_SECONDS = 10 * 60;
+const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
+const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 30 * 1000;
+const HEALTH_PROBE_KEY = "health:probe:last";
+const HEALTH_PROBE_TTL_SECONDS = 24 * 3600;
+const D1_STORE_TABLE = "llmmerge_store";
+const UPSTREAM_PROBE_CONCURRENCY = 4;
+const API_TIME_ZONE_LABEL = "UTC";
+const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
+// Keep the SSE connection visibly active through an additional proxy layer.
+const SSE_KEEPALIVE_MS = 5000;
+const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
+// Keep upstream staggering advisory: a crowded account must not turn into an unbounded gateway queue.
+const MAX_UPSTREAM_DISPATCH_WAIT_MS = 1000;
+const ROUTE_COORDINATOR_TIMEOUT_MS = 1500;
+const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
+const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
+const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
+const COMPACTION_PROMPT = "Compress the conversation for continued agent work. Preserve user requirements, decisions, file paths, commands, errors, tool results, unresolved tasks, and current state. Do not solve the task, call tools, change models, or add commentary. Output only a concise self-contained summary.";
+const ANALYTICS_LIVE_PENDING_MS = 120000;
+const ANALYTICS_QUERY_CACHE_MS = 2000;
+const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
+const MAX_SSE_EVENT_CHARS = 1024 * 1024;
+const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
+const ACTIVE_UPSTREAM_ABORT_REASON = "admin released active upstreams";
+const MAX_CLIENT_KEY_LENGTH = 512;
+const MAX_REQUEST_BODY_CHARS = 2 * 1024 * 1024;
+const ADMIN_SESSION_COOKIE = "llmmerge_admin";
+const ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 3600;
+const KV_HOT_READ_CACHE_TTL_SECONDS = 300;
+const KV_HOT_JSON_READ = { type: "json", cacheTtl: KV_HOT_READ_CACHE_TTL_SECONDS };
+const KV_USAGE_CACHE_MS = 60000;
+const WORKERS_USAGE_CACHE_MS = 60000;
+// Dashboard reference only; Cloudflare account billing/limits remain authoritative.
+const DEFAULT_WORKERS_DAILY_REQUEST_BUDGET = 10_000_000;
+const DEFAULT_KV_DAILY_BUDGET = {
+  reads: 100_000,
+  writes: 1_000,
+};
+const VERSION = "v26-09-15-workers-limits-1";
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      const url = new URL(request.url);
+      const pathname = normalizePathname(url.pathname);
+      const pathnameLower = pathname.toLowerCase();
+
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: CORS_HEADERS,
+        });
+      }
+
+      if (pathname === "/health") {
+        const storage = pickStateBackend(env);
+        return withCorsResponse(
+          json(
+            {
+              ok: true,
+              mode: "openai-compatible-gateway",
+              has_kv: Boolean(env.KV),
+              has_d1: storage.kind === "d1",
+              has_do: storage.kind === "do",
+              storage: storage.kind,
+              admin_configured: Boolean(pickAdminToken(env)),
+              now: utcNowIso(),
+              time_zone: API_TIME_ZONE_LABEL,
+            },
+            200,
+          ),
+        );
+      }
+
+      if (env.ASSETS && request.method === "GET" && pathname !== "/" && pathname !== MODEL_PATH && !looksLikeAdminPath(pathnameLower, env)) {
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) return assetResponse;
+      }
+
+      const app = createApp(env);
+      const adminRoute = matchAdminRoute(pathnameLower, app);
+      const adminAuth = adminRoute && authorizeAdminRequest(request, url, app, adminRoute);
+
+      if (request.method === "GET" && adminRoute?.kind === "page") {
+        if (!adminAuth?.ok) return adminUnauthorizedResponse(false);
+        const pageHdrs = new Headers(HTML_HEADERS);
+        pageHdrs.set("cache-control", "private, max-age=300, must-revalidate");
+        pageHdrs.set("etag", `"llmmerge-${VERSION}"`);
+        pageHdrs.set("x-frame-options", "DENY");
+        pageHdrs.set("referrer-policy", "no-referrer");
+        if (adminAuth.setCookie) pageHdrs.set("set-cookie", adminAuth.setCookie);
+        if (request.headers.get("if-none-match") === pageHdrs.get("etag")) {
+          return new Response(null, { status: 304, headers: pageHdrs });
+        }
+        const pageBody = renderAdminPage(url.origin, VERSION);
+        return new Response(pageBody, { status: 200, headers: pageHdrs });
+      }
+
+      if (adminRoute?.kind === "api") {
+        if (!adminAuth?.ok) return adminUnauthorizedResponse(true);
+        const response = await handleAdminApi(request, url, pathnameLower, app, adminRoute.basePath);
+        return privateAdminResponse(response, adminAuth.setCookie);
+      }
+
+      if (pathname === MODEL_PATH && request.method === "GET") {
+        const runtime = await loadRuntimeConfig(app);
+        const client = await requireClient(request, runtime);
+        const res = await listModels(client, runtime);
+        const hdrs = new Headers(res.headers);
+        hdrs.set("cache-control", "private, max-age=30");
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers: hdrs });
+      }
+
+      if (pathname === COMPLETIONS_PATH && request.method === "POST") {
+        return await handleCompletionsRequest(request, url, app, ctx, requestTraceId(request));
+      }
+
+      if (
+        (pathname === CHAT_PATH || pathname === EMBEDDINGS_PATH) &&
+        request.method === "POST"
+      ) {
+        const traceId = requestTraceId(request);
+        const runtime = await loadRuntimeConfig(app);
+        const client = await requireClient(request, runtime);
+        const bodyText = await readRequestText(request);
+        const payload = parseJsonBody(bodyText);
+        const requestedModel = payload.model;
+
+        if (!requestedModel || typeof requestedModel !== "string") {
+          return withCorsResponse(
+            json(openAiError("`model` is required.", "invalid_request_error"), 400),
+          );
+        }
+        const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+        const publicModel = publicModelId(client, runtime, requestedModel, model);
+        const proxyBodyText = model === requestedModel ? bodyText : JSON.stringify({ ...payload, model });
+
+        const started = Date.now();
+        const pt = Math.max(1, Math.round(proxyBodyText.length / 4));
+        const prepared = pathname === CHAT_PATH
+          ? prepareGatewayChatBody(proxyBodyText, runtime.settings, client)
+          : { bodyText: proxyBodyText, injection: null };
+        if (pathname !== EMBEDDINGS_PATH && payload.stream === true) {
+          const headers = pendingSseHeaders(client, traceId);
+          const body = streamPendingOpenAiResponse(async () => {
+            let proxyResponse;
+            let logged = false;
+            try {
+              proxyResponse = await proxyRequest({ client, model, pathname, request, bodyText: prepared.bodyText, injection: prepared.injection, runtime, search: url.search, ctx, signal: request.signal, traceId });
+              const upstreamResp = proxyResponse.response;
+              const responseHeaders = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+              const response = await buildLoggedProxyResponse({ app, bodyText: prepared.bodyText, client, ctx, headers: responseHeaders, model, responseModel: publicModel, pathname, requestPayload: payload, proxyResponse, started, traceId, upstreamResp });
+              if (!response.ok) {
+                logged = true;
+                throw httpError(response.status, await response.text());
+              }
+              return response.body;
+            } catch (error) {
+              if (!logged) {
+                recordRequestLog(app, makeRequestLogEntry({
+                  client,
+                  upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
+                  model,
+                  path: pathname,
+                  status: error.statusCode || 502,
+                  started,
+                  promptTokens: pt,
+                  completionTokens: 0,
+                  extra: { ...gatewayRequestTraceLogFields({ trace: proxyResponse?.trace, error, traceId }), tools_count: requestToolsCount(payload), ...gatewayInjectionLogFields(prepared.injection) },
+                }), ctx);
+              }
+              throw error;
+            }
+          });
+          return new Response(body, { status: 200, headers });
+        }
+
+        let proxyResponse;
+        try {
+          proxyResponse = await proxyRequest({
+            client,
+            model,
+            pathname,
+            request,
+            bodyText: prepared.bodyText,
+            injection: prepared.injection,
+            runtime,
+            search: url.search,
+            ctx,
+            signal: request.signal,
+            traceId,
+          });
+        } catch (error) {
+          recordRequestLog(app, makeRequestLogEntry({
+            client,
+            upstream: error.upstreamName || "none",
+            model,
+            path: pathname,
+            status: error.statusCode || 502,
+            started,
+            promptTokens: pt,
+            completionTokens: 0,
+            extra: { ...gatewayRequestTraceLogFields({ trace: proxyResponse?.trace, error, traceId }), tools_count: requestToolsCount(payload), ...gatewayInjectionLogFields(prepared.injection) },
+          }), ctx);
+          return gatewayErrorResponse(error, traceId);
+        }
+
+        const upstreamResp = proxyResponse.response;
+        const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+
+        return await buildLoggedProxyResponse({
+          app,
+          bodyText: proxyBodyText,
+          client,
+          ctx,
+          headers,
+          model,
+          responseModel: publicModel,
+          pathname,
+          requestPayload: payload,
+          proxyResponse,
+          started,
+          traceId,
+          upstreamResp,
+        });
+      }
+
+      const responseIdMatch = pathname.startsWith(`${RESPONSES_PATH}/`) &&
+        pathname !== RESPONSES_COMPACT_PATH &&
+        !pathname.startsWith(`${RESPONSES_COMPACT_PATH}/`);
+      if (responseIdMatch && request.method === "GET") {
+        const responseId = decodeURIComponent(pathname.slice(RESPONSES_PATH.length + 1));
+        return await handleResponsesRetrieve(request, app, ctx, responseId);
+      }
+
+      if (responseIdMatch && request.method === "POST" && pathname.endsWith("/cancel")) {
+        const responseId = decodeURIComponent(pathname.slice(RESPONSES_PATH.length + 1, -"/cancel".length));
+        return await handleResponsesCancel(request, app, ctx, responseId);
+      }
+
+      if (pathname === RESPONSES_PATH && request.method === "POST") {
+        return await handleResponsesRequest(request, url, app, ctx, requestTraceId(request));
+      }
+
+      if (pathname === RESPONSES_COMPACT_PATH && request.method === "POST") {
+        return await handleResponsesCompactRequest(request, url, app, ctx, requestTraceId(request));
+      }
+
+      if (pathname === MESSAGES_PATH && request.method === "POST") {
+        const traceId = requestTraceId(request);
+        try {
+          return await handleAnthropicMessagesRequest(request, url, app, ctx, traceId);
+        } catch (error) {
+          return anthropicGatewayErrorResponse(error, traceId);
+        }
+      }
+
+      return withCorsResponse(json(openAiError("Not found.", "not_found_error"), 404));
+    } catch (error) {
+      return withCorsResponse(
+        json(
+          openAiError(error.message || "Internal error.", mapErrorType(error.statusCode)),
+          error.statusCode || 500,
+        ),
+      );
+    }
+  },
+
+  // ponytail: cron health probe — checks each enabled upstream /v1/models and
+  // stores the snapshot so the admin panel shows it without a manual click.
+  async scheduled(event, env, ctx) {
+    try {
+      const app = createApp(env);
+      const upstreams = await loadHealthUpstreams(app);
+      if (!upstreams.length || !app.state) return;
+      const results = await mapConcurrent(upstreams, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkUpstreamHealth(upstream, 10000));
+      const snapshot = JSON.stringify({ ts: utcNowIso(), results });
+      const task = app.state.put(HEALTH_PROBE_KEY, snapshot, { expirationTtl: HEALTH_PROBE_TTL_SECONDS })
+        .catch(() => {});
+      if (typeof ctx?.waitUntil === "function") ctx.waitUntil(task);
+      else await task;
+    } catch {
+      // cron must never crash the isolate; the next run retries.
+    }
+  },
+};
+
+// ponytail: cache createApp result per-isolate since env is stable across requests
+let _cachedApp = null;
+let _cachedEnvRef = null;
+let _sseKeepaliveMs = SSE_KEEPALIVE_MS;
+// ponytail: per-isolate EWMA; state storage shares route scores across fresh isolates.
+const _upstreamLatency = {};
+const _upstreamLatencyUpdatedAt = {};
+const _upstreamLatencyPersistedAt = {};
+const _upstreamCooldowns = {};
+const _upstreamStateHydratedAt = {};
+// ponytail: per-isolate and per-model; DO if strict global rotation ever matters
+const _lastSuccessfulUpstreamName = {};
+let _activeUpstreams = {};
+let _activeUpstreamClients = {};
+let _activeUpstreamEpoch = 0;
+const _activeUpstreamControllers = new Set();
+// ponytail: isolate-local soft reservations; DO only if cross-edge fairness ever matters
+let _upstreamReservations = {};
+// ponytail: stagger same-upstream dispatches without delaying already-spread requests.
+let _upstreamDispatchAt = {};
+let _upstreamDispatchClients = {};
+const _routeSelectionTails = {};
+// ponytail: per-isolate active Responses streams, keyed by response id for cancel support
+const _activeResponses = new Map();
+// ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
+let _runtimeCache = null;
+let _runtimeCacheTs = 0;
+const RUNTIME_CACHE_TTL_MS = 600000;
+let _runtimeLoading = null;
+// ponytail: encryption secret changes only on redeploy; reuse its imported CryptoKey per isolate.
+let _aesKeySecret = "";
+let _aesKeyPromise = null;
+let _d1SchemaReady = null;
+const _analyticsQueryCache = {};
+let _kvUsageCache = null;
+let _workersUsageCache = null;
+// ponytail: local copies avoid repeated state reads; state is the cross-isolate session source of truth.
+const _sessionModelLocks = {};
+const _sessionCurrentModels = {};
+
+function pickStateBackend(env) {
+  const llmerge = env?.llmerge;
+  if (llmerge && typeof llmerge.idFromName === "function" && typeof llmerge.get === "function") {
+    return { kind: "do", backend: llmerge, binding: "llmerge" };
+  }
+  if (llmerge && typeof llmerge.prepare === "function") {
+    return { kind: "d1", backend: llmerge, binding: "llmerge" };
+  }
+  const d1 = env?.D1 || env?.DB;
+  if (d1 && typeof d1.prepare === "function") {
+    return { kind: "d1", backend: d1, binding: "D1/DB" };
+  }
+  if (env?.KV) return { kind: "kv", backend: env.KV, binding: "KV" };
+  return { kind: "memory", backend: null, binding: "" };
+}
+
+function pickRouteCoordinator(env) {
+  if (String(env?.GLOBAL_ROUTE_COORDINATION || "").toLowerCase() === "false") return null;
+  const configured = env?.ROUTE_COORDINATOR;
+  if (configured && typeof configured.idFromName === "function" && typeof configured.get === "function") return configured;
+  const stateBackend = pickStateBackend(env);
+  return stateBackend.kind === "do" ? stateBackend.backend : null;
+}
+
+function decodeStateValue(value, type) {
+  const wantJson = type === "json" || type?.type === "json";
+  return wantJson ? safeJson(value) : value;
+}
+
+// ponytail: only durable records are written through during lazy KV migration;
+// ephemeral routing/telemetry keys rebuild themselves with their own TTLs.
+function isDurableStateKey(key) {
+  return key === GATEWAY_CONFIG_KEY ||
+    key === CONFIG_SNAPSHOTS_KEY ||
+    key === clientIndexKey() ||
+    key.startsWith("client:id:") ||
+    key.startsWith("client:token:");
+}
+
+function createStateStore(env) {
+  const backend = pickStateBackend(env);
+  if (backend.kind === "d1") return createD1StateStore(backend.backend, env?.KV || null);
+  if (backend.kind === "do") return createDoStateStore(backend.backend, env?.KV || null);
+  if (backend.kind === "kv") return createKvStateStore(backend.backend);
+  return createMemoryStateStore();
+}
+
+// ponytail: one generic key/value table keeps migration and admin code trivial.
+function ensureD1Schema(d1) {
+  _d1SchemaReady ||= d1.prepare(`CREATE TABLE IF NOT EXISTS ${D1_STORE_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)`).run().then(() => true).catch((error) => {
+    _d1SchemaReady = null;
+    throw error;
+  });
+  return _d1SchemaReady;
+}
+
+// ponytail: D1/DO are authoritative; KV is only a lazy migration source so an
+// existing KV deployment keeps its config and client keys on the first switch.
+// Durable keys are also mirrored to KV as a low-frequency snapshot; if D1 is
+// unavailable the gateway falls back to that snapshot and marks itself degraded.
+function createD1StateStore(d1, kv) {
+  const store = {
+    kind: "d1",
+    binding: "llmerge",
+    degraded: false,
+    async get(key, type) {
+      try {
+        await ensureD1Schema(d1);
+        const row = await d1.prepare(`SELECT value FROM ${D1_STORE_TABLE} WHERE key = ?1 AND (expires_at IS NULL OR expires_at > ?2)`).bind(key, Date.now()).first();
+        store.degraded = false;
+        const value = row?.value ?? null;
+        if (value !== null) return decodeStateValue(value, type);
+        if (!kv) return null;
+        const legacy = await kv.get(key, type).catch(() => null);
+        if (legacy === null || legacy === undefined) return null;
+        if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
+        return legacy;
+      } catch (error) {
+        if (!kv || !isDurableStateKey(key)) throw error;
+        store.degraded = true;
+        const legacy = await kv.get(key, type).catch(() => null);
+        if (legacy === null || legacy === undefined) return null;
+        try { await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)); } catch {}
+        return legacy;
+      }
+    },
+    async put(key, value, options = {}) {
+      try {
+        await ensureD1Schema(d1);
+        const expiresAt = Number(options?.expirationTtl) > 0 ? Math.round(Date.now() + Number(options.expirationTtl) * 1000) : null;
+        await d1.prepare(`INSERT INTO ${D1_STORE_TABLE} (key, value, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`).bind(key, String(value), expiresAt).run();
+        store.degraded = false;
+        if (kv && isDurableStateKey(key)) await kv.put(key, String(value), options).catch(() => {});
+      } catch (error) {
+        if (!kv || !isDurableStateKey(key)) throw error;
+        store.degraded = true;
+        // Best effort: drop the stale D1 row so a later healthy read does not
+        // resurrect the old value; the KV fallback in get() migrates it back.
+        try {
+          await d1.prepare(`DELETE FROM ${D1_STORE_TABLE} WHERE key = ?1`).bind(key).run();
+        } catch {}
+        await kv.put(key, String(value), options).catch(() => {});
+      }
+    },
+    async delete(key) {
+      try {
+        await ensureD1Schema(d1);
+        await d1.prepare(`DELETE FROM ${D1_STORE_TABLE} WHERE key = ?1`).bind(key).run();
+        store.degraded = false;
+        if (kv) await kv.delete(key).catch(() => {});
+      } catch (error) {
+        if (!kv || !isDurableStateKey(key)) throw error;
+        store.degraded = true;
+        throw error;
+      }
+    },
+  };
+  return store;
+}
+
+function createKvStateStore(kv) {
+  return {
+    kind: "kv",
+    binding: "KV",
+    get: (key, type) => kv.get(key, type),
+    put: (key, value, options = {}) => kv.put(key, value, options),
+    delete: (key) => kv.delete(key),
+  };
+}
+
+function createMemoryStateStore() {
+  const map = new Map();
+  return {
+    kind: "memory",
+    binding: "",
+    async get(key, type) {
+      const entry = map.get(key);
+      if (!entry) return null;
+      if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+        map.delete(key);
+        return null;
+      }
+      return decodeStateValue(entry.value, type);
+    },
+    async put(key, value, options = {}) {
+      const expiresAt = Number(options?.expirationTtl) > 0 ? Date.now() + Number(options.expirationTtl) * 1000 : null;
+      map.set(key, { value: String(value), expiresAt });
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+  };
+}
+
+// ponytail: optional Durable Object backend for Worker deployments; the same
+// `llmerge` binding name is shared by D1 and DO so only one needs to exist.
+function createDoStateStore(namespace, kv) {
+  const stub = namespace.get(namespace.idFromName("llmmerge-state"));
+  const store = {
+    kind: "do",
+    binding: "llmerge",
+    async get(key, type) {
+      const response = await stub.fetch(`https://llmmerge-state/state?key=${encodeURIComponent(key)}`);
+      const payload = response.ok ? await response.json() : null;
+      const value = payload?.value ?? null;
+      if (value !== null) return decodeStateValue(value, type);
+      if (!kv) return null;
+      const legacy = await kv.get(key, type).catch(() => null);
+      if (legacy === null || legacy === undefined) return null;
+      if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
+      return legacy;
+    },
+    async put(key, value, options = {}) {
+      const expirationTtl = Number(options?.expirationTtl) > 0 ? Math.max(30, Number(options.expirationTtl)) : null;
+      await stub.fetch(`https://llmmerge-state/state?key=${encodeURIComponent(key)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value: String(value), expirationTtl }),
+      });
+    },
+    async delete(key) {
+      await stub.fetch(`https://llmmerge-state/state?key=${encodeURIComponent(key)}`, { method: "DELETE" });
+      if (kv) await kv.delete(key).catch(() => {});
+    },
+  };
+  return store;
+}
+
+function createDoDispatchCoordinator(namespace) {
+  if (!namespace) return null;
+  return {
+    async reserve(upstreamName, intervalMs, client, signal, maxWaitMs = MAX_UPSTREAM_DISPATCH_WAIT_MS) {
+      const id = namespace.idFromName(`llmmerge-dispatch:${String(upstreamName)}`);
+      const stub = namespace.get(id);
+      const response = await stub.fetch("https://llmmerge-dispatch/dispatch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          interval_ms: intervalMs,
+          max_wait_ms: maxWaitMs,
+          client: String(client?.key || client?.id || client?.name || "gateway"),
+        }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`Route coordinator returned ${response.status}.`);
+      return response.json();
+    },
+  };
+}
+
+export class LlmMergeStore {
+  constructor(state, env) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/dispatch" && request.method === "POST") {
+      const payload = await request.json().catch(() => ({}));
+      const intervalMs = Math.max(0, Math.min(2000, Number(payload?.interval_ms) || 0));
+      const maxWaitMs = Number(payload?.max_wait_ms);
+      const now = Date.now();
+      const previousNextAt = Number(await this.state.storage.get("dispatch:next_at")) || 0;
+      const scheduledAt = Math.max(now, previousNextAt);
+      const delayMs = Math.max(0, scheduledAt - now);
+      if (Number.isFinite(maxWaitMs) && maxWaitMs >= 0 && delayMs > maxWaitMs) {
+        return new Response(JSON.stringify({ accepted: false, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: previousNextAt }), {
+          headers: JSON_HEADERS,
+        });
+      }
+      const nextAt = scheduledAt + intervalMs;
+      await this.state.storage.put("dispatch:next_at", String(nextAt), { expirationTtl: 120 });
+      await this.state.storage.put("dispatch:last_client", String(payload?.client || "gateway"), { expirationTtl: 120 });
+      return new Response(JSON.stringify({ accepted: true, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: nextAt }), {
+        headers: JSON_HEADERS,
+      });
+    }
+    const key = url.searchParams.get("key") || "";
+    if (!key) return new Response("missing key", { status: 400 });
+    if (request.method === "GET") {
+      const value = await this.state.storage.get(key);
+      return Response.json({ value: value === undefined ? null : value });
+    }
+    if (request.method === "PUT") {
+      const payload = await request.json();
+      const value = String(payload?.value ?? "");
+      const rawTtl = Number(payload?.expirationTtl);
+      const ttl = Number.isFinite(rawTtl) && rawTtl > 0 ? Math.max(30, rawTtl) : 0;
+      await this.state.storage.put(key, value, ttl > 0 ? { expirationTtl: ttl } : undefined);
+      return new Response("ok");
+    }
+    if (request.method === "DELETE") {
+      await this.state.storage.delete(key);
+      return new Response("ok");
+    }
+    return new Response("method not allowed", { status: 405 });
+  }
+}
+
+function createApp(env) {
+  if (_cachedApp && _cachedEnvRef === env) return _cachedApp;
+  _sseKeepaliveMs = parsePositiveInt(env.SSE_KEEPALIVE_MS, SSE_KEEPALIVE_MS);
+  const adminToken = pickAdminToken(env);
+
+  if (!adminToken) {
+    throw badConfig("ADMIN_TOKEN is required.");
+  }
+  if (!/^[A-Za-z0-9._~-]+$/.test(adminToken)) {
+    throw badConfig("ADMIN_TOKEN may only contain URL-safe characters.");
+  }
+
+  const adminPath = normalizeAdminPath(env.ADMIN_PATH || "/llmmerge-admin");
+  const appState = createStateStore(env);
+  const routeCoordinator = createDoDispatchCoordinator(pickRouteCoordinator(env));
+
+  _cachedApp = {
+    adminPath,
+    adminPaths: [
+      adminPath,
+      ...buildAdminPathAliases(adminToken),
+    ].filter((value, index, values) => values.indexOf(value) === index),
+    adminToken,
+    analytics: env.ANALYTICS || env.LLM_ANALYTICS || env.LLM_GATEWAY_ANALYTICS || null,
+    analyticsAccountId: String(env.ANALYTICS_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID || "").trim(),
+    analyticsApiToken: String(env.ANALYTICS_API_TOKEN || env.CLOUDFLARE_API_TOKEN || "").trim(),
+    analyticsDataset: String(env.ANALYTICS_DATASET || "llmmerge_requests").trim(),
+    defaultCooldownTtl: parsePositiveInt(env.UPSTREAM_COOLDOWN_TTL, DEFAULT_COOLDOWN_TTL),
+    kvDailyBudget: {
+      reads: parsePositiveInt(env.KV_DAILY_READ_BUDGET, DEFAULT_KV_DAILY_BUDGET.reads),
+      writes: parsePositiveInt(env.KV_DAILY_WRITE_BUDGET, DEFAULT_KV_DAILY_BUDGET.writes),
+    },
+    kvFlushIntervalMs: parsePositiveInt(env.KV_FLUSH_INTERVAL_MS, DEFAULT_KV_FLUSH_INTERVAL_MS),
+    defaultModelCacheTtl: parsePositiveInt(env.MODEL_CACHE_TTL, DEFAULT_MODEL_CACHE_TTL),
+    defaultStreamIdleTimeoutMs: parsePositiveInt(env.STREAM_IDLE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+    defaultTimeoutMs: parsePositiveInt(env.REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+    encryptionSecret: String(env.API_KEY_CRYPT_SECRET || adminToken || ""),
+    env,
+    envClients: parseJsonEnvArray(env.CLIENTS_JSON, "CLIENTS_JSON"),
+    envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
+    kv: env.KV || null,
+    state: appState,
+    routeCoordinator,
+    storage: appState.kind,
+    workersDailyRequestBudget: parsePositiveInt(env.WORKERS_DAILY_REQUEST_BUDGET, DEFAULT_WORKERS_DAILY_REQUEST_BUDGET),
+  };
+  _cachedEnvRef = env;
+  return _cachedApp;
+}
+
+function utcNowIso(ms = Date.now()) {
+  return new Date(ms).toISOString();
+}
+
+function parseGatewayTime(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  const raw = String(value || "").trim();
+  if (!raw) return NaN;
+  const legacyHour = raw.match(/^(\d{4}-\d{2}-\d{2}):(\d{2})$/);
+  const normalized = legacyHour
+    ? legacyHour[1] + "T" + legacyHour[2] + ":00:00+08:00"
+    : (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw) ? raw.replace(" ", "T") + "Z" : raw);
+  const ms = Date.parse(normalized);
+  return ms;
+}
+
+function timestampMs(value) {
+  const ms = parseGatewayTime(value);
+  return Number.isFinite(ms) ? ms : Date.now();
+}
+
+function utcTimestamp(value) {
+  const ms = parseGatewayTime(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : String(value || "");
+}
+
+function utcHourKey(value) {
+  return new Date(timestampMs(value)).toISOString().slice(0, 13) + ":00:00.000Z";
+}
+
+function legacyStatsHourKey(value) {
+  const d = new Date(timestampMs(value) + LEGACY_STATS_UTC_OFFSET_MS);
+  return d.getUTCFullYear() + "-" +
+    String(d.getUTCMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getUTCDate()).padStart(2, "0") + ":" +
+    String(d.getUTCHours()).padStart(2, "0");
+}
+
+function legacyStatsDayKey(value) {
+  const d = new Date(timestampMs(value) + LEGACY_STATS_UTC_OFFSET_MS);
+  return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
+}
+
+async function clientDailyUsageStorageKey(clientId, day) {
+  return "usage:client-day:" + await storageKeyHash(`${clientId}\n${day}`);
+}
+
+// State storage mirrors request logs and hourly stats in batched writes; Analytics Engine remains the long-term store.
+const _pendingLogs = [];
+const _pendingStats = {}; // hourKey -> bucket
+const _pendingClientUsage = {}; // storageKey -> delta
+let _lastFlush = Date.now();
+const DEFAULT_KV_FLUSH_INTERVAL_MS = 120 * 1000;
+const FLUSH_PENDING_LIMIT = 200;
+let _flushPromise = null;
+
+// ponytail: appendLog just pushes; caller calls flushBatch after log+stats
+function appendLog(app, entry) {
+  _pendingLogs.push(entry);
+  if (_pendingLogs.length > 200) _pendingLogs.splice(0, _pendingLogs.length - 200);
+}
+
+function recordStats(app, entry) {
+  const hour = legacyStatsHourKey(entry.ts);
+  if (!_pendingStats[hour]) {
+    _pendingStats[hour] = emptyStatsBucket();
+  }
+  addStatsEntry(_pendingStats[hour], entry);
+}
+
+function recordRequestLog(app, entry, ctx) {
+  appendLog(app, entry);
+  recordStats(app, entry);
+  recordClientDailyUsage(app, entry, ctx);
+  recordAnalyticsPoint(app, entry, ctx);
+  scheduleLogFlush(app, ctx);
+}
+
+function hasAnalyticsEngine(app) {
+  return app?.analytics && typeof app.analytics.writeDataPoint === "function";
+}
+
+function recordAnalyticsPoint(app, entry, ctx) {
+  if (!hasAnalyticsEngine(app)) return;
+  const task = Promise.resolve().then(() => app.analytics.writeDataPoint({
+    blobs: [
+      entry.ts || "",
+      entry.client || "",
+      entry.upstream || "",
+      entry.model || "",
+      entry.path || "",
+      String(entry.status || ""),
+      String(entry.tools_count || 0),
+      entry.trace_id || "",
+      entry.close_reason || "",
+      entry.finish_reason || "",
+      entry.failure_code || "",
+      entry.trace_stage || "",
+    ],
+    doubles: [
+      Number(entry.status || 0),
+      Number(entry.latency_ms || 0),
+      Number(entry.prompt_tokens || 0),
+      Number(entry.completion_tokens || 0),
+      Number(entry.time_to_first_byte_ms || 0),
+      Number(entry.time_to_first_token_ms || 0),
+      Number(entry.max_stream_gap_ms || 0),
+      entry.status >= 200 && entry.status < 400 ? 1 : 0,
+      Number(entry.tool_calls_count || 0),
+      Number(entry.trace_route_ms || 0),
+      Number(entry.trace_upstream_start_ms || 0),
+      Number(entry.trace_upstream_headers_ms || 0),
+      Number(entry.trace_attempts || 0),
+    ],
+    indexes: [entry.client || "client"],
+  })).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+}
+
+function makeRequestLogEntry({ client, completionTokens, extra = {}, model, path, promptTokens, started, status, upstream }) {
+  const failureCode = extra.failure_code || classifyGatewayFailure({
+    status,
+    closeReason: extra.close_reason,
+    dispatchLimited: extra.dispatch_limited === true,
+    errorMessage: extra.error_message || extra.error,
+  });
+  return {
+    ts: utcNowIso(),
+    client: client?.name || client?.id || "client",
+    client_id: client?.id || client?.name || "client",
+    upstream: upstream || "unknown",
+    model,
+    path,
+    status: status || 200,
+    latency_ms: Date.now() - started,
+    prompt_tokens: promptTokens || 0,
+    completion_tokens: completionTokens || 0,
+    ...extra,
+    failure_code: failureCode,
+  };
+}
+
+function gatewayInjectionLogFields(injection) {
+  if (!injection) return {};
+  return {
+    injection_applied: injection.applied === true,
+    injection_hash: injection.hash || "",
+    injection_system_chars: Number(injection.system_chars || 0),
+    injection_context_chars: Number(injection.context_chars || 0),
+    injection_item_count: Number(injection.item_count || 0),
+    injection_history_trimmed: injection.history_trimmed === true,
+  };
+}
+
+function gatewayRequestTraceLogFields({ trace = null, error = null, traceId = "" } = {}) {
+  return {
+    ...gatewayTraceLogFields(trace, traceId),
+    ...(error ? gatewayErrorLogFields(error, traceId) : {}),
+  };
+}
+
+function recordClientDailyUsage(app, entry, ctx) {
+  if (!app?.state || !entry?.client_id) return;
+  const task = rememberPendingClientUsage(app.state, entry).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+}
+
+async function rememberPendingClientUsage(store, entry) {
+  const day = legacyStatsDayKey(entry.ts);
+  const key = await clientDailyUsageStorageKey(entry.client_id, day);
+  _pendingClientUsage[key] = mergeClientDailyUsage(_pendingClientUsage[key], entry, day);
+}
+
+function mergeClientUsageSnapshot(existing, delta) {
+  if (!delta) return existing || null;
+  const usage = { ...emptyClientDailyUsage(delta.day, delta.client), ...(existing || {}) };
+  usage.requests += delta.requests || 0;
+  usage.success += delta.success || 0;
+  usage.fail += delta.fail || 0;
+  usage.prompt_tokens += delta.prompt_tokens || 0;
+  usage.completion_tokens += delta.completion_tokens || 0;
+  usage.updated_at = delta.updated_at || usage.updated_at;
+  return usage;
+}
+
+function emptyClientDailyUsage(day, client) {
+  return {
+    day,
+    client: client || "client",
+    requests: 0,
+    success: 0,
+    fail: 0,
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    updated_at: "",
+  };
+}
+
+function mergeClientDailyUsage(existing, entry, day) {
+  const usage = { ...emptyClientDailyUsage(day, entry.client), ...(existing || {}) };
+  usage.requests += 1;
+  if (entry.status >= 200 && entry.status < 400) usage.success += 1;
+  else usage.fail += 1;
+  usage.prompt_tokens += Number(entry.prompt_tokens || 0);
+  usage.completion_tokens += Number(entry.completion_tokens || 0);
+  usage.updated_at = entry.ts || utcNowIso();
+  return usage;
+}
+
+function scheduleLogFlush(app, ctx) {
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(flushBatch(app));
+  } else {
+    flushBatch(app);
+  }
+}
+
+async function flushBatch(app, force = false) {
+  if (!app.state) return;
+  const now = Date.now();
+  if (!force && now - _lastFlush < app.kvFlushIntervalMs && _pendingLogs.length < FLUSH_PENDING_LIMIT) return;
+  if (_flushPromise) return _flushPromise;
+  _lastFlush = now;
+  _flushPromise = _doFlush(app).catch(() => {}).finally(() => { _flushPromise = null; });
+  return _flushPromise;
+}
+
+// ponytail: parallel log+stats flush instead of sequential blocks
+async function _doFlush(app) {
+  let logPromise = Promise.resolve();
+  if (_pendingLogs.length > 0) {
+    const logsToFlush = _pendingLogs.splice(0);
+    logPromise = (async () => {
+      try {
+        const raw = await app.state.get(LOG_KEY, "json");
+        const existing = Array.isArray(raw) ? raw : [];
+        existing.push(...logsToFlush);
+        if (existing.length > 50) existing.splice(0, existing.length - 50);
+        await app.state.put(LOG_KEY, JSON.stringify(existing));
+      } catch {
+        _pendingLogs.unshift(...logsToFlush);
+        _lastFlush = 0;
+      }
+    })();
+  }
+  let statsPromise = Promise.resolve();
+  const keys = Object.keys(_pendingStats);
+  if (keys.length > 0) {
+    const deltas = {};
+    for (const k of keys) { deltas[k] = _pendingStats[k]; delete _pendingStats[k]; }
+    statsPromise = Promise.all(keys.map(async function(hourKey) {
+      const delta = deltas[hourKey];
+      try {
+        const raw = await app.state.get(STATS_PREFIX + hourKey, "json");
+        const bucket = mergeStatsBucket(raw, delta);
+        await app.state.put(STATS_PREFIX + hourKey, JSON.stringify(bucket), { expirationTtl: STATS_WINDOW_HOURS * 3600 + 3600 });
+      } catch {
+        _pendingStats[hourKey] = mergeStatsBucket(_pendingStats[hourKey], delta);
+        _lastFlush = 0;
+      }
+    }));
+  }
+  let usagePromise = Promise.resolve();
+  const usageKeys = Object.keys(_pendingClientUsage);
+  if (usageKeys.length > 0) {
+    const usageDeltas = {};
+    for (const usageKey of usageKeys) { usageDeltas[usageKey] = _pendingClientUsage[usageKey]; delete _pendingClientUsage[usageKey]; }
+    usagePromise = Promise.all(usageKeys.map(async function(storageKey) {
+      const delta = usageDeltas[storageKey];
+      try {
+        const existing = await app.state.get(storageKey, "json");
+        await app.state.put(storageKey, JSON.stringify(mergeClientUsageSnapshot(existing, delta)), { expirationTtl: CLIENT_DAILY_USAGE_TTL_SECONDS });
+      } catch {
+        _pendingClientUsage[storageKey] = mergeClientUsageSnapshot(_pendingClientUsage[storageKey], delta);
+        _lastFlush = 0;
+      }
+    }));
+  }
+  await Promise.all([logPromise, statsPromise, usagePromise]);
+}
+
+function emptyStatsBucket() {
+  return { total: 0, success: 0, fail: 0, prompt_tokens: 0, completion_tokens: 0, upstreams: {}, models: {}, model_statuses: {} };
+}
+
+function addStatsEntry(bucket, entry) {
+  bucket.total += 1;
+  if (entry.status >= 200 && entry.status < 400) bucket.success += 1;
+  else bucket.fail += 1;
+  bucket.prompt_tokens += entry.prompt_tokens || 0;
+  bucket.completion_tokens += entry.completion_tokens || 0;
+  const up = entry.upstream || "unknown";
+  bucket.upstreams[up] = (bucket.upstreams[up] || 0) + 1;
+  const mdl = entry.model || "unknown";
+  bucket.models[mdl] = (bucket.models[mdl] || 0) + 1;
+  if (!bucket.model_statuses) bucket.model_statuses = {};
+  const status = entry.status >= 200 && entry.status < 400 ? "success" : "fail";
+  const modelStatus = bucket.model_statuses[mdl] || { success: 0, fail: 0 };
+  modelStatus[status] += 1;
+  bucket.model_statuses[mdl] = modelStatus;
+}
+
+function mergeStatsBucket(base, delta) {
+  const bucket = (base && typeof base === "object") ? {
+    total: base.total || 0,
+    success: base.success || 0,
+    fail: base.fail || 0,
+    prompt_tokens: base.prompt_tokens || 0,
+    completion_tokens: base.completion_tokens || 0,
+    upstreams: { ...(base.upstreams || {}) },
+    models: { ...(base.models || {}) },
+    model_statuses: { ...(base.model_statuses || {}) },
+  } : emptyStatsBucket();
+  if (!delta || typeof delta !== "object") return bucket;
+  bucket.total += delta.total || 0;
+  bucket.success += delta.success || 0;
+  bucket.fail += delta.fail || 0;
+  bucket.prompt_tokens += delta.prompt_tokens || 0;
+  bucket.completion_tokens += delta.completion_tokens || 0;
+  for (const u in (delta.upstreams || {})) bucket.upstreams[u] = (bucket.upstreams[u] || 0) + delta.upstreams[u];
+  for (const m in (delta.models || {})) bucket.models[m] = (bucket.models[m] || 0) + delta.models[m];
+  for (const sm in (delta.model_statuses || {})) {
+    const next = delta.model_statuses[sm] || {};
+    const prev = bucket.model_statuses[sm] || { success: 0, fail: 0 };
+    bucket.model_statuses[sm] = {
+      success: (prev.success || 0) + (next.success || 0),
+      fail: (prev.fail || 0) + (next.fail || 0),
+    };
+  }
+  return bucket;
+}
+
+async function getMergedLogs(app) {
+  const raw = app.state ? await app.state.get(LOG_KEY, "json") : [];
+  return (Array.isArray(raw) ? raw : []).concat(_pendingLogs).slice(-50).reverse().map(publicRequestLogEntry);
+}
+
+async function getBestLogs(app) {
+  const [analyticsLogs, kvLogs] = await Promise.all([
+    getAnalyticsLogs(app).catch(() => null),
+    getMergedLogs(app),
+  ]);
+  return analyticsLogs ? mergeRecentLogs(analyticsLogs, kvLogs) : kvLogs;
+}
+
+function mergeRecentLogs(persisted, recent) {
+  const seen = new Set();
+  return [...(recent || []), ...(persisted || [])]
+    .sort((a, b) => parseGatewayTime(b.ts) - parseGatewayTime(a.ts))
+    .filter((entry) => {
+      const key = entry.trace_id || [entry.ts, entry.client, entry.upstream, entry.model, entry.status].join("|");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 50)
+    .map(publicRequestLogEntry);
+}
+
+function publicRequestLogEntry(entry) {
+  return { ...entry, ts: utcTimestamp(entry?.ts) };
+}
+
+function recentPendingStats(maxAgeMs = ANALYTICS_LIVE_PENDING_MS) {
+  const buckets = {};
+  for (const entry of _pendingLogs) {
+    if (parseGatewayTime(entry.ts) < Date.now() - maxAgeMs) continue;
+    const hour = legacyStatsHourKey(entry.ts);
+    if (!buckets[hour]) buckets[hour] = emptyStatsBucket();
+    addStatsEntry(buckets[hour], entry);
+  }
+  return buckets;
+}
+
+function canQueryAnalytics(app) {
+  return Boolean(app?.analyticsAccountId && app?.analyticsApiToken && /^[A-Za-z0-9_]+$/.test(app?.analyticsDataset || ""));
+}
+
+async function queryAnalyticsEngine(app, sql) {
+  if (!canQueryAnalytics(app)) return null;
+  const cacheKey = app.analyticsAccountId + ":" + app.analyticsDataset + ":" + sql;
+  const cached = _analyticsQueryCache[cacheKey];
+  const now = Date.now();
+  if (cached && now - cached.ts < ANALYTICS_QUERY_CACHE_MS) return cached.data;
+  const resp = await fetch(`https://api.cloudflare.com/client/v4/accounts/${app.analyticsAccountId}/analytics_engine/sql`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${app.analyticsApiToken}`,
+      "content-type": "text/plain; charset=utf-8",
+    },
+    body: sql,
+  });
+  if (!resp.ok) return null;
+  const payload = await resp.json();
+  const data = Array.isArray(payload) ? payload : (Array.isArray(payload.data) ? payload.data : []);
+  _analyticsQueryCache[cacheKey] = { ts: now, data };
+  return data;
+}
+
+async function getAnalyticsLogs(app) {
+  const rows = await queryAnalyticsEngine(app, `
+SELECT
+  timestamp,
+  blob2 AS client,
+  blob3 AS upstream,
+  blob4 AS model,
+  blob5 AS path,
+  double1 AS status,
+  double2 AS latency_ms,
+  double3 AS prompt_tokens,
+  double4 AS completion_tokens,
+  double5 AS time_to_first_byte_ms,
+  double6 AS time_to_first_token_ms,
+  double7 AS max_stream_gap_ms,
+  blob7 AS raw_blob7,
+  blob8 AS raw_blob8,
+  blob9 AS raw_blob9,
+  blob10 AS finish_reason,
+  blob11 AS failure_code,
+  blob12 AS trace_stage,
+  double9 AS tool_calls_count,
+  double10 AS trace_route_ms,
+  double11 AS trace_upstream_start_ms,
+  double12 AS trace_upstream_headers_ms,
+  double13 AS trace_attempts
+FROM ${app.analyticsDataset}
+WHERE timestamp >= NOW() - INTERVAL '24' HOUR
+ORDER BY timestamp DESC
+LIMIT 50
+`);
+  if (!rows) return null;
+  return rows.map((row) => {
+    const hasToolBlob = isIntegerString(row.raw_blob7);
+    return {
+      ts: row.timestamp || row.ts || "",
+      client: row.client || "",
+      upstream: row.upstream || "",
+      model: row.model || "",
+      path: row.path || "",
+      status: Number(row.status || 0),
+      latency_ms: Number(row.latency_ms || 0),
+      prompt_tokens: Number(row.prompt_tokens || 0),
+      completion_tokens: Number(row.completion_tokens || 0),
+      time_to_first_byte_ms: Number(row.time_to_first_byte_ms || 0),
+      time_to_first_token_ms: Number(row.time_to_first_token_ms || 0),
+      max_stream_gap_ms: Number(row.max_stream_gap_ms || 0),
+      tools_count: hasToolBlob ? Number(row.raw_blob7 || 0) : 0,
+      tool_calls_count: Number(row.tool_calls_count || 0),
+      trace_id: hasToolBlob ? (row.raw_blob8 || "") : (row.raw_blob7 || ""),
+      close_reason: hasToolBlob ? (row.raw_blob9 || "") : (row.raw_blob8 || ""),
+      finish_reason: row.finish_reason || "",
+      failure_code: row.failure_code || "",
+      trace_stage: row.trace_stage || "",
+      trace_route_ms: Number(row.trace_route_ms || 0),
+      trace_upstream_start_ms: Number(row.trace_upstream_start_ms || 0),
+      trace_upstream_headers_ms: Number(row.trace_upstream_headers_ms || 0),
+      trace_attempts: Number(row.trace_attempts || 0),
+    };
+  });
+}
+
+async function getAnalyticsStats(app, hourKeys) {
+  const rows = await queryAnalyticsEngine(app, `
+SELECT
+  formatDateTime(toStartOfHour(timestamp), '%Y-%m-%d:%H', 'Asia/Hong_Kong') AS hour,
+  blob3 AS upstream,
+  blob4 AS model,
+  sum(_sample_interval) AS total,
+  sum(if(double8 = 1, _sample_interval, 0)) AS success,
+  sum(if(double8 = 1, 0, _sample_interval)) AS fail,
+  sum(double3 * _sample_interval) AS prompt_tokens,
+  sum(double4 * _sample_interval) AS completion_tokens
+FROM ${app.analyticsDataset}
+WHERE timestamp >= NOW() - INTERVAL '24' HOUR
+GROUP BY hour, upstream, model
+ORDER BY hour ASC
+`);
+  if (!rows) return null;
+  const buckets = {};
+  const wanted = new Set(hourKeys);
+  for (const row of rows) {
+    const hour = String(row.hour || "");
+    if (!wanted.has(hour)) continue;
+    const bucket = buckets[hour] || emptyStatsBucket();
+    const entry = {
+      upstream: row.upstream || "unknown",
+      model: row.model || "unknown",
+      status: Number(row.success || 0) > 0 ? 200 : 500,
+      prompt_tokens: Number(row.prompt_tokens || 0),
+      completion_tokens: Number(row.completion_tokens || 0),
+    };
+    bucket.total += Number(row.total || 0);
+    bucket.success += Number(row.success || 0);
+    bucket.fail += Number(row.fail || 0);
+    bucket.prompt_tokens += entry.prompt_tokens;
+    bucket.completion_tokens += entry.completion_tokens;
+    bucket.upstreams[entry.upstream] = (bucket.upstreams[entry.upstream] || 0) + Number(row.total || 0);
+    bucket.models[entry.model] = (bucket.models[entry.model] || 0) + Number(row.total || 0);
+    const ms = bucket.model_statuses[entry.model] || { success: 0, fail: 0 };
+    ms.success += Number(row.success || 0);
+    ms.fail += Number(row.fail || 0);
+    bucket.model_statuses[entry.model] = ms;
+    buckets[hour] = bucket;
+  }
+  return buckets;
+}
+
+function storageDiagnostics(app) {
+  const state = app.state;
+  const kind = state?.kind || "memory";
+  const degraded = state?.degraded === true;
+  return {
+    storage: kind,
+    binding: state?.binding || "",
+    has_kv: Boolean(app.kv),
+    has_d1: kind === "d1",
+    has_do: kind === "do",
+    migration_source: app.kv && kind !== "kv" ? "KV" : null,
+    kv_mirror: Boolean(app.kv && kind === "d1"),
+    degraded,
+    fallback: degraded ? "KV" : null,
+  };
+}
+async function kvUsageResponse(app) {
+  if (app.state && app.state.kind !== "kv") {
+    return withCorsResponse(json({
+      ok: true,
+      available: true,
+      active: false,
+      ...storageDiagnostics(app),
+      message: app.state.degraded
+        ? "D1 unavailable; falling back to KV snapshot for durable keys."
+        : `KV is bypassed; state is stored in ${app.state.kind.toUpperCase()}.`,
+      updated_at: utcNowIso(),
+      operations: { reads: 0, writes: 0 },
+      quotas: { reads: 0, writes: 0 },
+    }, 200));
+  }
+  if (!app.analyticsAccountId || !app.analyticsApiToken) {
+    return withCorsResponse(json({ ok: true, available: false, ...storageDiagnostics(app), message: "ANALYTICS_ACCOUNT_ID / ANALYTICS_API_TOKEN is not configured." }, 200));
+  }
+  const now = Date.now();
+  const cacheKey = [app.analyticsAccountId, app.analyticsApiToken, app.kvDailyBudget.reads, app.kvDailyBudget.writes].join("\n");
+  if (_kvUsageCache?.key === cacheKey && now - _kvUsageCache.ts < KV_USAGE_CACHE_MS) {
+    return withCorsResponse(json(_kvUsageCache.payload, 200));
+  }
+  try {
+    const payload = await fetchKvUsage(app);
+    _kvUsageCache = { key: cacheKey, ts: now, payload };
+    return withCorsResponse(json(payload, 200));
+  } catch (error) {
+    return withCorsResponse(json({ ok: true, available: false, ...storageDiagnostics(app), message: String(error?.message || error || "Unable to read KV analytics.") }, 200));
+  }
+}
+
+async function fetchKvUsage(app) {
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(start.getTime() + 24 * 3600 * 1000);
+  const query = `query KvUsage($accountTag: string!, $start: Date!, $end: Date!) {
+    viewer {
+      accounts(filter: {accountTag: $accountTag}) {
+        kvOperationsAdaptiveGroups(limit: 1000, filter: {date_geq: $start, date_lt: $end}) {
+          dimensions { actionType }
+          sum { requests }
+        }
+      }
+    }
+  }`;
+  const account = await queryCloudflareGraphql(app, query, {
+    accountTag: app.analyticsAccountId,
+    start: start.toISOString().slice(0, 10),
+    end: end.toISOString().slice(0, 10),
+  });
+  const operations = { reads: 0, writes: 0 };
+  for (const row of account.kvOperationsAdaptiveGroups || []) {
+    const bucket = kvActionBucket(row?.dimensions?.actionType);
+    if (bucket) operations[bucket] += Number(row?.sum?.requests || 0);
+  }
+  return {
+    ok: true,
+    available: true,
+    active: true,
+    storage: "kv",
+    binding: "KV",
+    has_kv: true,
+    has_d1: false,
+    has_do: false,
+    migration_source: null,
+    updated_at: utcNowIso(),
+    period: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10), timezone: "UTC" },
+    quotas: app.kvDailyBudget,
+    operations,
+  };
+}
+
+async function workersUsageResponse(app) {
+  if (!app.analyticsAccountId || !app.analyticsApiToken) {
+    return withCorsResponse(json({ ok: true, available: false, message: "Workers Requests requires ANALYTICS_API_TOKEN with Account Analytics > Read." }, 200));
+  }
+  const now = Date.now();
+  const cacheKey = [app.analyticsAccountId, app.analyticsApiToken, app.workersDailyRequestBudget].join("\n");
+  if (_workersUsageCache?.key === cacheKey && now - _workersUsageCache.ts < WORKERS_USAGE_CACHE_MS) {
+    return withCorsResponse(json(_workersUsageCache.payload, 200));
+  }
+  try {
+    const payload = await fetchWorkersUsage(app);
+    _workersUsageCache = { key: cacheKey, ts: now, payload };
+    return withCorsResponse(json(payload, 200));
+  } catch (error) {
+    return withCorsResponse(json({ ok: true, available: false, message: "Workers Requests requires Account Analytics > Read: " + String(error?.message || error || "unavailable") }, 200));
+  }
+}
+
+async function fetchWorkersUsage(app) {
+  const now = new Date();
+  const start = new Date(now);
+  start.setUTCHours(0, 0, 0, 0);
+  const query = `query WorkersUsage($accountTag: string!) {
+    viewer {
+      accounts(filter: {accountTag: $accountTag}) {
+        workersInvocationsAdaptive(
+          limit: 10000
+          filter: {datetime_geq: "${start.toISOString()}", datetime_leq: "${now.toISOString()}"}
+        ) {
+          sum { requests errors subrequests }
+        }
+        pagesFunctionsInvocationsAdaptiveGroups(
+          limit: 10000
+          filter: {datetime_geq: "${start.toISOString()}", datetime_leq: "${now.toISOString()}"}
+        ) {
+          sum { requests errors subrequests }
+        }
+      }
+    }
+  }`;
+  const account = await queryCloudflareGraphql(app, query, { accountTag: app.analyticsAccountId });
+  const workers = sumInvocationRows(account.workersInvocationsAdaptive);
+  const pages = sumInvocationRows(account.pagesFunctionsInvocationsAdaptiveGroups);
+  const usage = {
+    requests: workers.requests + pages.requests,
+    errors: workers.errors + pages.errors,
+    subrequests: workers.subrequests + pages.subrequests,
+  };
+  return {
+    ok: true,
+    available: true,
+    updated_at: utcNowIso(),
+    period: {
+      start: start.toISOString(),
+      end: now.toISOString(),
+      timezone: "UTC",
+      reset: "00:00 UTC",
+    },
+    quota: app.workersDailyRequestBudget,
+    usage,
+    sources: { workers, pages },
+  };
+}
+
+function sumInvocationRows(rows) {
+  return (rows || []).reduce((acc, row) => ({
+    requests: acc.requests + Number(row?.sum?.requests || 0),
+    errors: acc.errors + Number(row?.sum?.errors || 0),
+    subrequests: acc.subrequests + Number(row?.sum?.subrequests || 0),
+  }), { requests: 0, errors: 0, subrequests: 0 });
+}
+
+function kvActionBucket(actionType) {
+  const action = String(actionType || "").toLowerCase();
+  if (action.includes("read")) return "reads";
+  if (action.includes("write")) return "writes";
+  return "";
+}
+
+async function buildLoggedProxyResponse({ app, bodyText, client, ctx, headers, model, responseModel = model, pathname, requestPayload, proxyResponse, started, traceId, upstreamResp }) {
+  const fallbackPrompt = Math.max(1, Math.round(bodyText.length / 4));
+  const toolsCount = requestToolsCount(requestPayload);
+  const hideReasoning = shouldHideDeepSeekReasoning(model, responseModel, proxyResponse.upstream);
+  const log = (usage, statusOverride, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: proxyResponse.upstream.name,
+    model,
+    path: pathname,
+    status: statusOverride || (upstreamResp.status || 502),
+    started,
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    extra: { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), tools_count: toolsCount, ...proxyResponse.timing, ...gatewayInjectionLogFields(proxyResponse.injection), ...extra },
+  }), ctx);
+
+  if (!upstreamResp.ok) {
+    log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 });
+    if (looksLikeHtmlResponse(upstreamResp)) {
+      return upstreamBadGatewayResponse(`Upstream returned HTTP ${upstreamResp.status} HTML error page.`, headers);
+    }
+    return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+  }
+
+  const contentType = upstreamResp.headers.get("content-type") || "";
+  if (looksLikeHtmlResponse(upstreamResp)) {
+    log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
+    return upstreamBadGatewayResponse("Upstream returned an HTML page instead of an API response.", headers);
+  }
+  if (pathname === CHAT_PATH && requestPayload.stream === true && upstreamResp.body) {
+    setSseHeaders(headers);
+    const body = withSseKeepAlive(trackOpenAiStreamUsage(upstreamResp.body, fallbackPrompt, log, started, responseModel !== model ? responseModel : "", hideReasoning, isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse)));
+    return new Response(body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+  }
+
+  if (contentType.includes("application/json")) {
+    const textBody = await upstreamResp.text();
+    const payload = safeJson(textBody);
+    if (!payload || looksLikeHtmlDocument(textBody)) {
+      log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
+      return upstreamBadGatewayResponse("Upstream returned a non-JSON API response.", headers);
+    }
+    if (upstreamApplicationErrorMessage(payload || textBody)) {
+      log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 }, 502);
+      return upstreamBadGatewayResponse(upstreamApplicationErrorMessage(payload || textBody), headers);
+    }
+    const usage = normalizeOpenAiLogUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
+    log(usage, 0, { finish_reason: responseFinishReason(payload), tool_calls_count: responseToolCallsCount(payload) });
+    // ponytail: passthrough when the upstream JSON needs no rewriting — the
+    // model field already matches the public alias, usage is complete, and
+    // there is no NIM normalize or reasoning cleanup. Return textBody verbatim
+    // instead of a JSON.parse + JSON.stringify round-trip.
+    const usageComplete = Boolean(
+      payload?.usage &&
+      Number(payload.usage.prompt_tokens ?? payload.usage.input_tokens) > 0 &&
+      Number(payload.usage.completion_tokens ?? payload.usage.output_tokens) > 0,
+    );
+    if (
+      !hideReasoning &&
+      !isNvidiaNimUpstream(proxyResponse.upstream) &&
+      String(payload?.model || "") === String(responseModel || "") &&
+      usageComplete
+    ) {
+      return new Response(textBody, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
+    normalizeNimChatPayload(payload, proxyResponse.upstream);
+    sanitizeOpenAiPayload(payload, hideReasoning);
+    const normalizedUsage = withFallbackChatUsage(payload?.usage, fallbackPrompt, estimateOpenAiCompletionTokens(payload));
+    if (normalizedUsage) payload.usage = normalizedUsage;
+    payload.model = responseModel;
+    return new Response(JSON.stringify(payload), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+  }
+
+  log({ prompt_tokens: fallbackPrompt, completion_tokens: 0 });
+  return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+}
+
+function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now(), responseModel = "", hideReasoning = false, normalizeNimReasoning = false, onComplete = null) {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const doneChunk = encoder.encode("data: [DONE]\n\n");
+  const errorEvent = (message) => "data: " + JSON.stringify(openAiError(message, "server_error")) + "\n\n";
+  const errorChunk = (message) => encoder.encode(errorEvent(message));
+  let buffer = "";
+  let usage = null;
+  let outputText = "";
+  let streamError = "";
+  let logged = false;
+  let failureStatus = 0;
+  const toolCallKeys = new Set();
+  const diag = createStreamDiag(started);
+  let closeReason = "done";
+  let finishReason = "";
+  let sawDone = false;
+  let completionPending = false;
+  let upstreamStopped = false;
+  let upstreamReader = null;
+  const markUpstreamComplete = () => { completionPending = true; };
+  const stopUpstream = () => {
+    if (!completionPending || upstreamStopped) return;
+    upstreamStopped = true;
+    try { onComplete?.(); } catch {}
+    Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+  };
+  const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
+  const transformChunk = Boolean(responseModel || hideReasoning || normalizeNimReasoning);
+  const stripChoiceText = createChoiceThinkTagStripper();
+  const emitTransformed = (controller, now = Date.now()) => {
+    let output = "";
+    buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
+      const out = normalizeNimChatStreamChunk(
+        sanitizeOpenAiStreamChunk(chunk, { responseModel, hideReasoning, stripChoiceText }),
+        splitChoiceText,
+      );
+      const error = noteChunk(out, now);
+      if (error) {
+        streamError = streamError || error;
+        sawDone = true;
+        output += errorEvent(error);
+      } else {
+        output += "data: " + JSON.stringify(out) + "\n\n";
+      }
+    }, () => {
+      sawDone = true;
+      markUpstreamComplete();
+      output += "data: [DONE]\n\n";
+    });
+    if (output) controller.enqueue(encoder.encode(output));
+  };
+  const noteChunk = (chunk, now = Date.now()) => {
+    const error = streamEventErrorMessage(chunk) || upstreamApplicationErrorMessage(chunk);
+    if (error) failureStatus = 502;
+    finishReason = responseFinishReason(chunk) || finishReason;
+    noteStreamToolCalls(chunk, toolCallKeys);
+    const delta = chatContentToText((chunk.choices || [])[0]?.delta?.content || (chunk.choices || [])[0]?.text || "");
+    if (delta) noteStreamToken(diag, now);
+    outputText += delta;
+    const normalizedUsage = normalizeChatUsageChunk(chunk.usage, outputText, fallbackPrompt);
+    if (normalizedUsage) chunk.usage = normalizedUsage;
+    usage = chunk.usage || usage;
+    return error;
+  };
+  const finish = () => {
+    if (logged) return;
+    logged = true;
+    stopUpstream();
+    onDone(normalizeOpenAiLogUsage(usage, fallbackPrompt, estimateTokens(outputText)), failureStatus || 0, {
+      close_reason: closeReason,
+      finish_reason: finishReason,
+      tool_calls_count: toolCallKeys.size,
+      ...streamDiagExtra(diag),
+    });
+  };
+
+  return new ReadableStream({
+    async start(controller) {
+      const reader = body.getReader();
+      upstreamReader = reader;
+      try {
+        for (;;) {
+          const result = await readSseChunk(reader, finishReason);
+          if (result.completed) {
+            closeReason = "completed";
+            markUpstreamComplete();
+            controller.enqueue(doneChunk);
+            sawDone = true;
+            break;
+          }
+          const { done, value } = result;
+          if (done) break;
+          const now = Date.now();
+          noteStreamByte(diag, now);
+          buffer += decoder.decode(value, { stream: true });
+          if (transformChunk) {
+            emitTransformed(controller, now);
+          } else {
+            let parsedOutput = "";
+            buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => {
+              const error = noteChunk(chunk, now);
+              if (error) {
+                streamError = streamError || error;
+                parsedOutput += errorEvent(error);
+              } else {
+                parsedOutput += "data: " + JSON.stringify(chunk) + "\n\n";
+              }
+            }, () => {
+              sawDone = true;
+              markUpstreamComplete();
+              parsedOutput += "data: [DONE]\n\n";
+            });
+            if (parsedOutput) controller.enqueue(encoder.encode(parsedOutput));
+            if (streamError) sawDone = true;
+          }
+          if (sawDone) {
+            break;
+          }
+        }
+        buffer += decoder.decode();
+        if (!sawDone && buffer) {
+          buffer += "\n\n";
+          if (transformChunk) emitTransformed(controller);
+          else {
+            let parsedOutput = "";
+            consumeOpenAiStreamBuffer(buffer, (chunk) => {
+              const error = noteChunk(chunk);
+              if (error) {
+                streamError = streamError || error;
+                parsedOutput += errorEvent(error);
+              } else {
+                parsedOutput += "data: " + JSON.stringify(chunk) + "\n\n";
+              }
+            }, () => { sawDone = true; markUpstreamComplete(); });
+            if (parsedOutput) controller.enqueue(encoder.encode(parsedOutput));
+            if (streamError && !sawDone) {
+              sawDone = true;
+            }
+          }
+        }
+        if (!sawDone && closeReason === "done") {
+          if (finishReason) {
+            closeReason = "completed";
+            controller.enqueue(doneChunk);
+          } else {
+            closeReason = "eof";
+            failureStatus = failureStatus || 502;
+            controller.enqueue(errorChunk("Upstream stream ended without [DONE]."));
+          }
+        }
+        finish();
+        controller.close();
+      } catch (error) {
+        closeReason = "error";
+        failureStatus = failureStatus || 502;
+        finish();
+        controller.error(error);
+      }
+    },
+  });
+}
+
+export function withSseKeepAlive(body, intervalMs = _sseKeepaliveMs) {
+  if (!body) return body;
+  const encoder = new TextEncoder();
+  const ping = encoder.encode(": keepalive\n\n");
+  const errorChunk = (error) => encoder.encode("data: " + JSON.stringify(openAiError(error?.message || "Stream error.", "server_error")) + "\n\n");
+  const interval = Math.max(1, Number(intervalMs) || _sseKeepaliveMs);
+  let reader = null;
+  let timer = null;
+  let closed = false;
+  const cleanup = () => {
+    closed = true;
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+  const safeEnqueue = (controller, chunk) => {
+    if (closed) return false;
+    try {
+      controller.enqueue(chunk);
+      return true;
+    } catch {
+      cleanup();
+      return false;
+    }
+  };
+  const safeClose = (controller) => {
+    cleanup();
+    try { controller.close(); } catch {}
+  };
+  return new ReadableStream({
+    async start(controller) {
+      reader = body.getReader();
+      timer = setInterval(() => {
+        if (!closed && controller.desiredSize > 0) safeEnqueue(controller, ping);
+      }, interval);
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!safeEnqueue(controller, value)) {
+            try { await reader.cancel("client closed"); } catch {}
+            return;
+          }
+        }
+        if (!closed) {
+          safeClose(controller);
+        }
+      } catch (error) {
+        if (!closed) {
+          if (safeEnqueue(controller, errorChunk(error))) safeClose(controller);
+        }
+      }
+    },
+    async cancel(reason) {
+      cleanup();
+      try { await reader?.cancel(reason); } catch {}
+    },
+  });
+}
+
+function streamPendingAnthropicResponse(open) {
+  // ponytail: padded SSE crosses buffering proxies that otherwise hold tiny first chunks.
+  const ping = `: ${" ".repeat(2048)}\nevent: ping\ndata: {"type":"ping"}\n\n`;
+  return streamPendingSseResponse(open, ping, ping, (error) => {
+    const status = error.statusCode || 502;
+    const payload = { type: "error", error: { type: anthropicErrorType(status), message: error.message || "Upstream request failed." } };
+    return `event: error\ndata: ${JSON.stringify(payload)}\n\n`;
+  });
+}
+
+function streamPendingSseResponse(open, initial, heartbeat, errorEvent) {
+  const encoder = new TextEncoder();
+  const initialChunk = encoder.encode(initial);
+  const heartbeatChunk = encoder.encode(heartbeat);
+  let reader = null;
+  let timer = null;
+  let closed = false;
+  const cleanup = () => {
+    closed = true;
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+  return new ReadableStream({
+    start(controller) {
+      const send = (chunk) => {
+        if (closed) return false;
+        try {
+          controller.enqueue(chunk);
+          return true;
+        } catch {
+          cleanup();
+          return false;
+        }
+      };
+      send(initialChunk);
+      timer = setInterval(() => { if (controller.desiredSize > 0) send(heartbeatChunk); }, _sseKeepaliveMs);
+      (async () => {
+        try {
+          const body = await open();
+          reader = body?.getReader();
+          if (!reader) throw new Error("Upstream returned an empty response.");
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!send(value)) {
+              try { await reader.cancel("client closed"); } catch {}
+              return;
+            }
+          }
+        } catch (error) {
+          send(encoder.encode(errorEvent(error)));
+        } finally {
+          cleanup();
+          try { controller.close(); } catch {}
+        }
+      })();
+    },
+    async cancel(reason) {
+      cleanup();
+      try { await reader?.cancel(reason); } catch {}
+    },
+  });
+}
+
+function consumeOpenAiStreamBuffer(text, onChunk, onDone = null) {
+  const blocks = text.split(/\r?\n\r?\n/);
+  const rest = blocks.pop() || "";
+  if (rest.length > MAX_SSE_EVENT_CHARS) throw new Error("Upstream SSE event exceeds 1 MiB.");
+  for (const block of blocks) {
+    const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+    if (!data) continue;
+    if (data === "[DONE]") {
+      if (onDone) onDone();
+      break;
+    }
+    const chunk = safeJson(data);
+    if (!chunk) continue;
+    onChunk(chunk);
+    if (isCompletedSseChunk(chunk)) break;
+  }
+  return rest;
+}
+
+function isCompletedSseChunk(chunk) {
+  if (!chunk || typeof chunk !== "object") return false;
+  if (chunk.type === "response.completed") return true;
+  return (chunk.choices || []).some((choice) => {
+    const reason = String(choice?.finish_reason || "").trim().toLowerCase();
+    return reason && reason !== "tool_calls";
+  });
+}
+
+function createStreamDiag(started = Date.now()) {
+  return { firstByteMs: 0, firstTokenMs: 0, lastChunkAt: started, maxStreamGapMs: 0, started };
+}
+
+function noteStreamByte(diag, now = Date.now()) {
+  if (!diag.firstByteMs) diag.firstByteMs = now - diag.started;
+  diag.maxStreamGapMs = Math.max(diag.maxStreamGapMs, now - diag.lastChunkAt);
+  diag.lastChunkAt = now;
+}
+
+function noteStreamToken(diag, now = Date.now()) {
+  if (!diag.firstTokenMs) diag.firstTokenMs = now - diag.started;
+}
+
+function streamDiagExtra(diag) {
+  return {
+    max_stream_gap_ms: diag.maxStreamGapMs,
+    time_to_first_byte_ms: diag.firstByteMs,
+    time_to_first_token_ms: diag.firstTokenMs,
+  };
+}
+
+function safeJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function normalizeOpenAiLogUsage(usage, fallbackPrompt, fallbackCompletion) {
+  const reportedCompletion = Number(usage?.completion_tokens ?? usage?.output_tokens);
+  return {
+    prompt_tokens: Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? fallbackPrompt) || 0),
+    completion_tokens: Math.max(0, Number.isFinite(reportedCompletion) && reportedCompletion > 0 ? reportedCompletion : fallbackCompletion),
+  };
+}
+
+function normalizeChatUsageChunk(usage, outputText = "", fallbackPrompt = 0) {
+  return withFallbackChatUsage(usage, fallbackPrompt, outputText ? estimateTokens(outputText) : 0);
+}
+
+function withFallbackChatUsage(usage, fallbackPrompt, fallbackCompletion) {
+  if (!usage || typeof usage !== "object") return null;
+  const next = { ...usage };
+  const reportedCompletion = Number(next.completion_tokens ?? next.output_tokens);
+  const reportedInput = Number(next.prompt_tokens ?? next.input_tokens);
+  const reportedTotal = Number(next.total_tokens);
+  if (Number.isFinite(reportedCompletion) && reportedCompletion > 0 && Number.isFinite(reportedInput) && reportedInput > 0 && Number.isFinite(reportedTotal) && reportedTotal > 0) return usage;
+  if ((!Number.isFinite(reportedCompletion) || reportedCompletion <= 0) && fallbackCompletion > 0) {
+    next.completion_tokens = fallbackCompletion;
+    if (next.output_tokens != null) next.output_tokens = next.completion_tokens;
+  }
+  if ((!Number.isFinite(reportedInput) || reportedInput <= 0) && fallbackPrompt > 0) {
+    next.prompt_tokens = fallbackPrompt;
+  }
+  if (!Number.isFinite(reportedTotal) || reportedTotal <= 0) {
+    next.total_tokens = Math.max(0, Number(next.prompt_tokens || 0) + Number(next.completion_tokens || 0));
+  }
+  return next;
+}
+
+function estimateOpenAiCompletionTokens(payload) {
+  const text = (payload?.choices || []).map((choice) => chatContentToText(choice?.message?.content || choice?.text || "")).join("");
+  return estimateTokens(text);
+}
+
+function estimateTokens(text) {
+  return Math.max(0, Math.round(String(text || "").length / 4));
+}
+
+function isIntegerString(value) {
+  return /^\d+$/.test(String(value || ""));
+}
+
+function requestToolsCount(payload) {
+  if (!payload || typeof payload !== "object") return 0;
+  return (Array.isArray(payload.tools) ? payload.tools.length : 0) + (Array.isArray(payload.functions) ? payload.functions.length : 0);
+}
+
+function shouldHideDeepSeekReasoning(model, responseModel = "", upstream = null) {
+  const preset = String(upstream?.preset || "").trim();
+  const official = preset === "deepseek" || inferPresetId(upstream?.base_url) === "deepseek";
+  return official && (isDeepSeekModelName(model) || isDeepSeekModelName(responseModel));
+}
+
+function isDeepSeekModelName(value) {
+  return /(^|[\/_.-])deepseek([\/_.-]|$)/i.test(String(value || ""));
+}
+
+function stripThinkTags(value) {
+  return String(value || "")
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
+    .replace(/^[\s\S]*?<\/think>/i, "")
+    .replace(/<think\b[^>]*>[\s\S]*$/i, "");
+}
+
+function trailingThinkMarker(text) {
+  const lower = String(text || "").toLowerCase();
+  const tags = ["<think", "</think>"];
+  for (let length = Math.min(7, lower.length); length > 0; length -= 1) {
+    const suffix = lower.slice(-length);
+    if (tags.some((tag) => tag.startsWith(suffix))) return length;
+  }
+  return 0;
+}
+
+function createThinkTagStripper() {
+  let inThink = false;
+  let pending = "";
+  return (value) => {
+    let text = pending + String(value || "");
+    pending = "";
+    const pendingLength = trailingThinkMarker(text);
+    if (pendingLength) {
+      pending = text.slice(-pendingLength);
+      text = text.slice(0, -pendingLength);
+    }
+    let out = "";
+    for (;;) {
+      const lower = text.toLowerCase();
+      if (inThink) {
+        const close = lower.indexOf("</think>");
+        if (close < 0) return out;
+        text = text.slice(close + 8);
+        inThink = false;
+        continue;
+      }
+      const open = lower.indexOf("<think");
+      const close = lower.indexOf("</think>");
+      if (close >= 0 && (open < 0 || close < open)) {
+        text = text.slice(close + 8);
+        continue;
+      }
+      if (open < 0) return out + text;
+      out += text.slice(0, open);
+      const end = text.indexOf(">", open);
+      if (end < 0) {
+        pending = text.slice(open);
+        return out;
+      }
+      text = text.slice(end + 1);
+      inThink = true;
+    }
+  };
+}
+
+function createThinkContentSplitter() {
+  let inThink = false;
+  let pending = "";
+  return (value) => {
+    let text = pending + String(value || "");
+    pending = "";
+    let reasoning = "";
+    let content = "";
+    for (;;) {
+      const lower = text.toLowerCase();
+      if (inThink) {
+        const close = lower.indexOf("</think>");
+        if (close < 0) {
+          const tail = trailingThinkMarker(text);
+          reasoning += tail ? text.slice(0, -tail) : text;
+          if (tail) pending = text.slice(-tail);
+          return { reasoning, content };
+        }
+        reasoning += text.slice(0, close);
+        text = text.slice(close + 8);
+        inThink = false;
+        continue;
+      }
+      const open = lower.indexOf("<think");
+      const close = lower.indexOf("</think>");
+      if (close >= 0 && (open < 0 || close < open)) {
+        content += text.slice(0, close);
+        text = text.slice(close + 8);
+        continue;
+      }
+      if (open < 0) {
+        const tail = trailingThinkMarker(text);
+        content += tail ? text.slice(0, -tail) : text;
+        if (tail) pending = text.slice(-tail);
+        return { reasoning, content };
+      }
+      content += text.slice(0, open);
+      const end = text.indexOf(">", open);
+      if (end < 0) {
+        pending = text.slice(open);
+        return { reasoning, content };
+      }
+      text = text.slice(end + 1);
+      inThink = true;
+    }
+  };
+}
+
+function appendReasoningContent(target, value) {
+  const text = String(value || "");
+  if (!text) return;
+  const current = reasoningText(target.reasoning_content ?? target.reasoning ?? target.thinking);
+  target.reasoning_content = current + text;
+}
+
+function normalizeNimChatMessage(message) {
+  if (!message || typeof message.content !== "string" || !/<\/?think\b/i.test(message.content)) return false;
+  const split = createThinkContentSplitter()(message.content);
+  if (!split.reasoning && split.content === message.content) return false;
+  appendReasoningContent(message, split.reasoning);
+  message.content = split.content;
+  return true;
+}
+
+function normalizeNimChatPayload(payload, upstream) {
+  if (!isNvidiaNimUpstream(upstream) || !payload || !Array.isArray(payload.choices)) return payload;
+  for (const choice of payload.choices) normalizeNimChatMessage(choice?.message);
+  return payload;
+}
+
+function createChoiceThinkContentSplitter() {
+  const splitters = new Map();
+  return (key, value) => {
+    const id = String(key ?? 0);
+    if (!splitters.has(id)) splitters.set(id, createThinkContentSplitter());
+    return splitters.get(id)(value);
+  };
+}
+
+function normalizeNimChatStreamChunk(chunk, splitChoiceText) {
+  if (!splitChoiceText || !chunk || !Array.isArray(chunk.choices)) return chunk;
+  let changed = false;
+  const choices = chunk.choices.map((choice, index) => {
+    if (typeof choice?.delta?.content !== "string") return choice;
+    const split = splitChoiceText(choice.index ?? index, choice.delta.content);
+    if (!split.reasoning && split.content === choice.delta.content) return choice;
+    changed = true;
+    const delta = { ...choice.delta };
+    if (split.content) delta.content = split.content;
+    else delete delta.content;
+    if (split.reasoning) appendReasoningContent(delta, split.reasoning);
+    return { ...choice, delta };
+  });
+  return changed ? { ...chunk, choices } : chunk;
+}
+
+function createChoiceThinkTagStripper() {
+  const strippers = new Map();
+  return (key, value) => {
+    const id = String(key ?? 0);
+    if (!strippers.has(id)) strippers.set(id, createThinkTagStripper());
+    return strippers.get(id)(value);
+  };
+}
+
+function sanitizeTextContent(content, stripText = stripThinkTags) {
+  if (typeof content === "string") return stripText(content);
+  if (!Array.isArray(content)) return content;
+  return content.map((part) => {
+    if (typeof part === "string") return stripText(part);
+    if (!part || typeof part !== "object") return part;
+    const out = { ...part };
+    if (typeof out.text === "string") out.text = stripText(out.text);
+    if (typeof out.content === "string") out.content = stripText(out.content);
+    return out;
+  });
+}
+
+function sanitizeOpenAiMessage(message, stripText = stripThinkTags) {
+  if (!message || typeof message !== "object") return message;
+  delete message.reasoning_content;
+  delete message.reasoning;
+  delete message.thinking;
+  if ("content" in message) message.content = sanitizeTextContent(message.content, stripText);
+  return message;
+}
+
+function sanitizeOpenAiPayload(payload, hideReasoning) {
+  if (!hideReasoning || !payload || typeof payload !== "object") return payload;
+  for (const choice of payload.choices || []) {
+    sanitizeOpenAiMessage(choice?.message);
+    sanitizeOpenAiMessage(choice?.delta);
+    if (typeof choice?.text === "string") choice.text = stripThinkTags(choice.text);
+  }
+  return payload;
+}
+
+function sanitizeOpenAiStreamChunk(chunk, { responseModel = "", hideReasoning = false, stripChoiceText = null } = {}) {
+  const out = responseModel ? { ...chunk, model: responseModel } : { ...chunk };
+  if (!hideReasoning) return out;
+  if (!Array.isArray(chunk.choices)) return out;
+  out.choices = chunk.choices.map((choice, index) => {
+    const key = choice?.index ?? index;
+    const stripText = stripChoiceText ? (text) => stripChoiceText(key, text) : stripThinkTags;
+    const next = { ...choice };
+    if (choice?.message) next.message = sanitizeOpenAiMessage({ ...choice.message }, stripText);
+    if (choice?.delta) next.delta = sanitizeOpenAiMessage({ ...choice.delta }, stripText);
+    if (typeof choice?.text === "string") next.text = stripText(choice.text);
+    return next;
+  });
+  return out;
+}
+
+function responseToolCallsCount(payload) {
+  return (payload?.choices || []).reduce((count, choice) => count + (Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls.length : 0), 0);
+}
+
+function responseFinishReason(payload) {
+  const reasons = new Set();
+  for (const choice of (payload?.choices || [])) {
+    if (choice?.finish_reason) reasons.add(String(choice.finish_reason));
+  }
+  return [...reasons].join(",");
+}
+
+async function readSseChunk(reader, finishReason = "") {
+  if (String(finishReason || "").trim()) return { completed: true };
+  return reader.read();
+}
+
+function noteStreamToolCalls(chunk, seen) {
+  const calls = (chunk?.choices || []).flatMap((choice) => Array.isArray(choice?.delta?.tool_calls) ? choice.delta.tool_calls : []);
+  for (let index = 0; index < calls.length; index += 1) {
+    const call = calls[index] || {};
+    seen.add(String(call.id ?? call.index ?? index));
+  }
+}
+
+async function handleAdminApi(request, url, pathname, app, adminBasePath) {
+  if (!app.state || app.state.kind === "memory") {
+    throw badConfig("A KV (`KV`), D1 (`llmerge`) or Durable Object (`llmerge`) binding is required for the admin page.");
+  }
+
+  const apiPath = pathname.slice(adminBasePath.length);
+
+  if (apiPath === "/api/config" && request.method === "GET") {
+    return adminConfigResponse(url, app);
+  }
+
+  if (apiPath === "/api/config" && request.method === "PUT") {
+    return saveAdminConfig(request, app);
+  }
+
+  if (apiPath === "/api/injection-preview" && request.method === "POST") {
+    return previewGatewayInjection(request, app);
+  }
+
+  if (apiPath === "/api/config/snapshots" && request.method === "GET") {
+    const snapshots = await listConfigSnapshots(app.state);
+    return withCorsResponse(json({ ok: true, snapshots: snapshots.map(publicConfigSnapshot) }, 200));
+  }
+
+  const snapshotRestoreMatch = apiPath.match(/^\/api\/config\/snapshots\/([^/]+)\/restore$/);
+  if (snapshotRestoreMatch && request.method === "POST") {
+    return restoreConfigSnapshot(app, decodeURIComponent(snapshotRestoreMatch[1]));
+  }
+
+  if (apiPath === "/api/refresh" && request.method === "POST") {
+    const runtime = await loadRuntimeConfig(app);
+    const result = await refreshModelCache(runtime);
+    return withCorsResponse(json({ ok: true, result }, 200));
+  }
+
+  if (apiPath === "/api/clients" && request.method === "GET") {
+    return withCorsResponse(json(await listClientIndexWithUsage(app), 200));
+  }
+
+  if (apiPath === "/api/clients" && request.method === "POST") {
+    const payload = parseJsonBody(await readRequestText(request));
+    const record = buildClientRecord(payload);
+    await saveClientRecord(app.state, record);
+
+    return withCorsResponse(
+      json(
+        {
+          ok: true,
+          client: {
+            ...publicClientRecord(record),
+            api_key: record.key,
+            base_url: `${url.origin}/v1`,
+            setup: clientSetupPayload(record, `${url.origin}/v1`),
+          },
+        },
+        201,
+      ),
+    );
+  }
+
+  const clientMatch = apiPath.match(/^\/api\/clients\/([^/]+)$/);
+  if (clientMatch && request.method === "GET") {
+    const id = decodeURIComponent(clientMatch[1]);
+    const existing = await resolveClientRecord(app.state, id);
+    if (!existing?.key) throw httpError(404, "Client not found.");
+    const baseUrl = `${url.origin}/v1`;
+    const response = withCorsResponse(json({
+      ...publicClientRecord(existing),
+      api_key: existing.key,
+      base_url: baseUrl,
+      today_usage: await readClientDailyUsage(app.state, existing),
+      setup: clientSetupPayload(existing, baseUrl),
+    }, 200));
+    const headers = new Headers(response.headers);
+    headers.set("cache-control", "private, no-store");
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  }
+
+  if (clientMatch && request.method === "PUT") {
+    const id = decodeURIComponent(clientMatch[1]);
+    const existing = await resolveClientRecord(app.state, id);
+    if (!existing?.key) throw httpError(404, "Client not found.");
+    const payload = parseJsonBody(await readRequestText(request));
+    const record = buildClientRecord({
+      ...existing,
+      ...payload,
+      id: existing.id,
+      key: existing.key,
+      created_at: existing.created_at,
+    });
+    await saveClientRecord(app.state, record);
+    return withCorsResponse(json({ ok: true, client: publicClientRecord(record) }, 200));
+  }
+
+  if (clientMatch && request.method === "DELETE") {
+    const id = decodeURIComponent(clientMatch[1]);
+    await deleteClientRecord(app.state, id);
+    return withCorsResponse(json({ ok: true, id }, 200));
+  }
+
+  if (apiPath === "/api/logs" && request.method === "GET") {
+    const logs = await getBestLogs(app);
+    return withCorsResponse(json({ ok: true, logs }, 200));
+  }
+
+  // Keep the current two hours in state storage while Analytics Engine catches up.
+  if (apiPath === "/api/stats" && request.method === "GET") {
+    const now = Date.now();
+    const hourKeys = [];
+    for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
+      hourKeys.push(legacyStatsHourKey(now - h * 3600000));
+    }
+    const [analyticsBuckets, raws, logs] = await Promise.all([
+      getAnalyticsStats(app, hourKeys).catch(() => null),
+      app.state ? Promise.all(hourKeys.map((key) => app.state.get(STATS_PREFIX + key, "json"))) : Promise.resolve(hourKeys.map(() => null)),
+      getBestLogs(app),
+    ]);
+    const analyticsPending = analyticsBuckets ? recentPendingStats() : {};
+    const recentKvStart = Math.max(0, hourKeys.length - 2);
+    const buckets = hourKeys.map((storageHour, i) => {
+      const useKv = i >= recentKvStart && raws?.[i];
+      const raw = useKv ? raws[i] : (analyticsBuckets?.[storageHour] || raws?.[i]);
+      const live = useKv || !analyticsBuckets ? _pendingStats : analyticsPending;
+      return { hour: utcHourKey(now - (STATS_WINDOW_HOURS - 1 - i) * 3600000), ...mergeStatsBucket(raw, live[storageHour]) };
+    });
+    return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: utcNowIso(), time_zone: API_TIME_ZONE_LABEL }, 200));
+  }
+
+  if (apiPath === "/api/kv-usage" && request.method === "GET") {
+    return kvUsageResponse(app);
+  }
+
+  if (apiPath === "/api/workers-usage" && request.method === "GET") {
+    return workersUsageResponse(app);
+  }
+
+  if (apiPath === "/api/runtime" && request.method === "GET") {
+    return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), active_upstream_clients: getActiveUpstreamClientSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName }, 200));
+  }
+
+  if (apiPath === "/api/runtime/release" && request.method === "POST") {
+    return withCorsResponse(json({ ok: true, released: clearActiveUpstreamState() }, 200));
+  }
+
+      // ponytail: fetch model list from a saved or draft upstream for picker
+  if (apiPath === "/api/fetch-models" && request.method === "POST") {
+    return fetchAdminModels(request, app);
+  }
+
+  if (apiPath === "/api/upstreams/export" && request.method === "GET") {
+    const exported = await exportUpstreamGroup(app);
+    return withCorsResponse(json({ ok: true, ...exported }, 200));
+  }
+
+// ponytail: health checks only verify the upstream model endpoint; speed tests verify a chosen model
+  if (apiPath === "/api/health" && request.method === "GET") {
+    const snapshot = app.state ? await app.state.get(HEALTH_PROBE_KEY, "json") : null;
+    return withCorsResponse(json({ ok: true, ts: snapshot?.ts || "", results: snapshot?.results || [] }, 200));
+  }
+  if (apiPath === "/api/health" && request.method === "POST") {
+    const upstreams = await loadHealthUpstreams(app);
+    const results = await mapConcurrent(upstreams, UPSTREAM_PROBE_CONCURRENCY, (upstream) => checkUpstreamHealth(upstream, 10000));
+    if (app.state) {
+      await app.state.put(HEALTH_PROBE_KEY, JSON.stringify({ ts: utcNowIso(), results }), { expirationTtl: HEALTH_PROBE_TTL_SECONDS }).catch(() => {});
+    }
+    return withCorsResponse(json({ ok: true, results }, 200));
+  }
+
+  if (apiPath === "/api/speed-test" && request.method === "POST") {
+    return speedTestAdminUpstreams(request, app);
+  }
+
+// ponytail: detect uses single getEditableConfig call, not loadRuntimeConfig + getEditableConfig
+  const detectMatch = apiPath.match(/^\/api\/upstreams\/([^/]+)\/detect$/);
+  if (detectMatch && request.method === "POST") {
+    return detectAdminUpstream(app, decodeURIComponent(detectMatch[1]));
+  }
+
+  return withCorsResponse(json(openAiError("Admin route not found.", "not_found_error"), 404));
+}
+
+async function adminConfigResponse(url, app) {
+  const stored = await getEditableConfig(app);
+  return withCorsResponse(json({
+    ok: true,
+    gateway: { base_url: `${url.origin}/v1` },
+    presets: PRESET_TEMPLATES,
+    config: toPublicGatewayConfig(stored),
+  }, 200));
+}
+
+async function previewGatewayInjection(request, app) {
+  const payload = parseJsonBody(await readRequestText(request));
+  const clientId = String(payload.client_id || "").trim();
+  const model = String(payload.model || "").trim();
+  if (!clientId || !model) {
+    return withCorsResponse(json(openAiError("Client and model are required for injection preview.", "invalid_request_error"), 400));
+  }
+
+  const runtime = await loadRuntimeConfig(app);
+  let client = runtime.clients.find((item) => [item.id, item.name, item.key].includes(clientId));
+  if (!client) {
+    const stored = await app.state.get(clientIdKey(clientId), "json");
+    if (stored?.key) client = normalizeClient(stored);
+  }
+  if (!client) {
+    return withCorsResponse(json(openAiError("Client not found.", "not_found_error"), 404));
+  }
+
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const source = { model, messages };
+  const plan = gatewayInjectionPlan(source, runtime.settings, client);
+  const effective = safeJson(applyGatewayPromptContext(JSON.stringify(source), runtime.settings, client)) || source;
+  return withCorsResponse(json({
+    ok: true,
+    policy_chars: plan.systemText.length,
+    context_chars: plan.contextText.length,
+    history_max_chars: runtime.settings.history_max_chars,
+    messages: effective.messages || [],
+  }, 200));
+}
+
+async function saveAdminConfig(request, app) {
+  const payload = parseJsonBody(await readRequestText(request));
+  // ponytail: merge into existing so a partial payload never wipes upstreams
+  const existing = await getEditableConfig(app);
+  const hasUpstreams = Object.prototype.hasOwnProperty.call(payload, "upstreams");
+  const merged = {
+    settings: { ...existing.settings, ...(payload.settings || {}) },
+    routing: { ...existing.routing, ...(payload.routing || {}) },
+    upstreams: hasUpstreams && Array.isArray(payload.upstreams) ? payload.upstreams : (existing.upstreams || []),
+  };
+  const normalized = await normalizeGatewayConfigPayload(merged, app);
+  await saveConfigSnapshot(app.state, existing);
+  await app.state.put(GATEWAY_CONFIG_KEY, JSON.stringify(normalized));
+  invalidateRuntimeCache();
+  return withCorsResponse(json({
+    ok: true,
+    message: "Configuration saved.",
+    config: toPublicGatewayConfig(normalized),
+  }, 200));
+}
+
+async function fetchAdminModels(request, app) {
+  const payload = parseJsonBody(await readRequestText(request));
+  const upstream = await resolveModelFetchUpstream(payload, app);
+  if (upstream.response) return upstream.response;
+  try {
+    const models = await fetchUpstreamModelIds(upstream, 15000);
+    return withCorsResponse(json({ ok: true, models }, 200));
+  } catch (err) {
+    const status = err.status && err.status < 500 ? err.status : 502;
+    return withCorsResponse(json({ ok: false, status: err.status || status, error: err.message }, status));
+  }
+}
+
+async function resolveModelFetchUpstream(payload, app) {
+  const uName = payload.name || "";
+  if (uName) {
+    const runtime = await loadRuntimeConfig(app);
+    const saved = runtime.upstreams.find((u) => u.name === uName);
+    if (!saved) return { response: withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404)) };
+    return {
+      ...saved,
+      account_id: String(payload.account_id || saved.account_id || "").trim(),
+      api_key: String(payload.api_key || payload.api_key_value || saved.api_key || "").trim(),
+      base_url: String(payload.base_url || saved.base_url || "").trim(),
+      headers: { ...normalizeHeaders(saved.headers), ...normalizeHeaders(payload.headers) },
+      preset: String(payload.preset || saved.preset || inferPresetId(payload.base_url || saved.base_url)).trim(),
+    };
+  }
+
+  const baseUrl = String(payload.base_url || "").trim();
+  const apiKey = String(payload.api_key || payload.api_key_value || "").trim();
+  if (!baseUrl || !apiKey) return { response: withCorsResponse(json({ ok: false, error: "Base URL and API Key are required" }, 400)) };
+  return {
+    name: "draft",
+    account_id: String(payload.account_id || "").trim(),
+    base_url: baseUrl,
+    api_key: apiKey,
+    headers: normalizeHeaders(payload.headers),
+    preset: String(payload.preset || inferPresetId(baseUrl)).trim(),
+  };
+}
+
+async function speedTestAdminUpstreams(request, app) {
+  const runtime = await loadRuntimeConfig(app);
+  const payload = parseJsonBody(await readRequestText(request));
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    return withCorsResponse(json(openAiError("Model is required for speed test.", "invalid_request_error"), 400));
+  }
+  const upstreamNames = new Set(normalizeStringArray(payload.upstreams));
+  const targets = runtime.upstreams.filter((upstream) =>
+    upstream.enabled !== false &&
+    (!upstreamNames.size || upstreamNames.has(upstream.name)) &&
+    upstreamSupportsModel(upstream, model) &&
+    upstreamSupportsPath(upstream, CHAT_PATH)
+  );
+  if (!targets.length) {
+    return withCorsResponse(json(openAiError("No enabled upstream provides this model.", "not_found_error"), 404));
+  }
+  const results = await mapConcurrent(targets, UPSTREAM_PROBE_CONCURRENCY, (upstream) => speedTestUpstream(runtime, upstream, model));
+  return withCorsResponse(json({ ok: true, results }, 200));
+}
+
+async function detectAdminUpstream(app, upstreamName) {
+  const config = await getEditableConfig(app);
+  const upstream = config.upstreams.find((u) => u.name === upstreamName);
+  if (!upstream) {
+    return withCorsResponse(json(openAiError("Upstream not found.", "not_found_error"), 404));
+  }
+  const apiKey = await decryptValue(upstream.api_key_encrypted, app.encryptionSecret);
+  const started = Date.now();
+  try {
+    const resp = await fetchWithTimeout(
+      buildUpstreamUrl(upstream.base_url, EMBEDDINGS_PATH, ""),
+      {
+        method: "POST",
+        headers: { "authorization": "Bearer " + apiKey, "content-type": "application/json", "accept": "application/json", "user-agent": "cf-llm-gateway/0.3" },
+        body: JSON.stringify({ model: "detect", input: "test" }),
+      },
+      10000,
+    );
+    const latency = Date.now() - started;
+    const ok = resp.ok || resp.status === 400;
+    const capability = ok ? "openai" : "claude";
+    const paths = ok ? [CHAT_PATH, EMBEDDINGS_PATH] : [CHAT_PATH];
+    const target = config.upstreams.find((u) => u.name === upstreamName);
+    if (target) {
+      target.capability = capability;
+      target.paths = paths;
+      await app.state.put(GATEWAY_CONFIG_KEY, JSON.stringify(config));
+      invalidateRuntimeCache();
+    }
+    return withCorsResponse(json({ ok: true, capability, paths, latency_ms: latency }, 200));
+  } catch (err) {
+    return withCorsResponse(json({ ok: true, capability: "claude", paths: [CHAT_PATH], latency_ms: Date.now() - started }, 200));
+  }
+}
+
+async function getEditableConfig(app) {
+  const stored = app.state ? await app.state.get(GATEWAY_CONFIG_KEY, "json") : null;
+  const config = unwrapGatewayConfig(stored);
+  if (config) {
+    return repairStoredGatewayConfig(config, app);
+  }
+
+  return buildGatewayConfigFromEnv(app);
+}
+
+function unwrapGatewayConfig(value) {
+  if (typeof value === "string") return unwrapGatewayConfig(safeJson(value));
+  if (Array.isArray(value)) return { upstreams: value };
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value.upstreams)) return value;
+  return unwrapGatewayConfig(value.config || value.gateway_config || value.gatewayConfig);
+}
+
+function normalizeGatewayRouting(routing = {}) {
+  const rawCoordination = routing.coordination_level;
+  const coordination = rawCoordination === undefined || rawCoordination === null || rawCoordination === ""
+    ? 3
+    : Number(rawCoordination);
+  return {
+    coordination_level: Number.isFinite(coordination) ? Math.max(0, Math.min(5, Math.floor(coordination))) : 3,
+    failover: routing.failover !== false,
+    fast_routing: routing.fast_routing === true,
+    hedge_enabled: routing.hedge_enabled === true,
+    hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
+    soft_interval_ms: parseNonNegativeInt(routing.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000),
+    load_balance: routing.load_balance !== false,
+  };
+}
+
+function normalizeGatewaySettings(settings = {}, app) {
+  return {
+    model_cache_ttl: parsePositiveInt(settings.model_cache_ttl, app.defaultModelCacheTtl),
+    request_timeout_ms: parsePositiveInt(settings.request_timeout_ms, app.defaultTimeoutMs),
+    stream_idle_timeout_ms: parsePositiveInt(settings.stream_idle_timeout_ms, app.defaultStreamIdleTimeoutMs),
+    system_prompt: String(settings.system_prompt || ""),
+    system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
+    subagent_prompt_clients: normalizeStringArray(settings.subagent_prompt_clients),
+    global_context: String(settings.global_context || settings.context_prompt || ""),
+    global_context_clients: normalizeStringArray(settings.global_context_clients),
+    context_always_clients: normalizeStringArray(settings.context_always_clients),
+    context_on_demand: settings.context_on_demand === true,
+    context_item_limit: Math.max(1, Math.min(3, parsePositiveInt(settings.context_item_limit, 1))),
+    context_max_chars: Math.max(500, Math.min(20000, parsePositiveInt(settings.context_max_chars, 800))),
+    context_role: String(settings?.context_role || "").toLowerCase() === "developer" ? "developer" : "system",
+    history_max_chars: parseNonNegativeInt(settings.history_max_chars, 0, 2_000_000),
+    context_items: normalizeContextItems(settings.context_items),
+    time_zone_offset_minutes: normalizeTimeZoneOffset(settings.time_zone_offset_minutes),
+    time_zone_label: String(settings.time_zone_label || "UTC+8 北京/香港/上海/乌鲁木齐").trim(),
+    upstream_cooldown_ttl: parsePositiveInt(settings.upstream_cooldown_ttl, app.defaultCooldownTtl),
+  };
+}
+
+function buildUpstreamConfigRecord(item, index, options) {
+  const preset = options.preset;
+  const defaults = presetById(preset) || presetById("custom");
+  const models = options.models || normalizeStringArray(item?.models);
+  const paths = normalizeStringArray(item?.paths);
+  return {
+    api_key_encrypted: options.apiKeyEncrypted,
+    base_url: String(options.baseUrl || "").trim(),
+    account_id: String(options.accountId || "").trim(),
+    enabled: item?.enabled !== false,
+    headers: { ...presetDefaultHeaders(preset), ...normalizeHeaders(item?.headers) },
+    id: String(item?.id || crypto.randomUUID()),
+    models,
+    model_contexts: normalizeModelContexts(item?.model_contexts, models),
+    name: String(options.name || item?.name || `upstream-${index + 1}`).trim(),
+    note: String(options.note ?? item?.note ?? "").trim(),
+    paths: paths.length ? paths : [...defaults.paths],
+    preset,
+    priority: parsePriority(item?.priority, index + 1),
+    weight: parsePositiveInt(item?.weight, 1),
+    capability: item?.capability || null,
+  };
+}
+
+async function repairStoredGatewayConfig(config, app) {
+  const settings = config.settings && typeof config.settings === "object" ? config.settings : {};
+  const routing = config.routing && typeof config.routing === "object" ? config.routing : {};
+  const upstreamEntries = Array.isArray(config.upstreams) ? config.upstreams : [];
+  const upstreams = await Promise.all(upstreamEntries.map(async (item, index) => {
+    const preset = presetById(item?.preset) ? item.preset : "custom";
+    const defaults = presetById(preset) || presetById("custom");
+    const accountId = String(item?.account_id || "").trim();
+    const models = normalizeStringArray(item?.models);
+    const apiKeyValue = String(item?.api_key_encrypted || item?.api_key_value || item?.api_key || "").trim();
+    return buildUpstreamConfigRecord(item, index, {
+      accountId,
+      apiKeyEncrypted: apiKeyValue ? await ensureEncryptedValue(apiKeyValue, app.encryptionSecret) : "",
+      baseUrl: item?.base_url || resolveBaseUrl(preset, "", defaults.base_url, accountId),
+      models,
+      name: String(item?.name || `upstream-${index + 1}`).trim(),
+      note: String(item?.note || "").trim(),
+      preset,
+    });
+  }));
+  const validUpstreams = uniqueValidUpstreams(upstreams);
+
+  return {
+    routing: normalizeGatewayRouting(routing),
+    settings: normalizeGatewaySettings(settings, app),
+    upstreams: validUpstreams,
+    version: config.version || 1,
+  };
+}
+
+async function buildGatewayConfigFromEnv(app) {
+  const upstreams = [];
+
+  for (let index = 0; index < app.envUpstreams.length; index += 1) {
+    const upstream = app.envUpstreams[index];
+    const presetId = String(upstream.preset || inferPresetId(upstream.base_url)).trim() || "custom";
+    const plaintextKey = upstream.api_key || app.env[upstream.api_key_env] || "";
+    const accountId = String(upstream.account_id || "").trim();
+
+    const models = normalizeStringArray(upstream.models);
+    upstreams.push(buildUpstreamConfigRecord(upstream, index, {
+      accountId,
+      apiKeyEncrypted: plaintextKey ? await ensureEncryptedValue(plaintextKey, app.encryptionSecret) : "",
+      baseUrl: resolveBaseUrl(
+        presetId,
+        upstream.base_url,
+        presetById(presetId)?.base_url,
+        accountId,
+      ),
+      models,
+      name: String(upstream.name || `upstream-${index + 1}`),
+      note: String(upstream.note || upstream.name || ""),
+      preset: presetId,
+    }));
+  }
+
+  return {
+    routing: normalizeGatewayRouting(),
+    settings: normalizeGatewaySettings({
+      system_prompt: String(app.env.SYSTEM_PROMPT || app.env.GLOBAL_SYSTEM_PROMPT || ""),
+      global_context: String(app.env.GLOBAL_CONTEXT || app.env.GLOBAL_SYSTEM_CONTEXT || ""),
+    }, app),
+    upstreams: uniqueValidUpstreams(upstreams),
+    version: 1,
+  };
+}
+
+async function normalizeGatewayConfigPayload(payload, app) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Gateway config payload must be a JSON object.");
+  }
+
+  const settings = payload.settings && typeof payload.settings === "object" ? payload.settings : {};
+  const routing = payload.routing && typeof payload.routing === "object" ? payload.routing : {};
+  const upstreamEntries = Array.isArray(payload.upstreams) ? payload.upstreams : [];
+  const upstreams = [];
+  const names = new Set();
+
+  for (let index = 0; index < upstreamEntries.length; index += 1) {
+    const item = upstreamEntries[index];
+    if (!item || typeof item !== "object") continue;
+
+    const preset = presetById(item.preset) ? item.preset : "custom";
+    const defaults = presetById(preset) || presetById("custom");
+    const apiKeyValue = String(item.api_key_value || item.api_key_encrypted || item.api_key || "").trim();
+    const accountId = String(item.account_id || "").trim();
+    const name = String(item.name || `upstream-${index + 1}`).trim();
+    const baseUrl = resolveBaseUrl(preset, item.base_url, defaults.base_url, accountId);
+
+    if (!name) throw httpError(400, "Each upstream needs a name.");
+    if (!baseUrl) throw httpError(400, `Upstream ${name} is missing base_url.`);
+    if (!isAllowedUpstreamUrl(baseUrl)) throw httpError(400, `Upstream ${name} must use an HTTP(S) base_url without embedded credentials.`);
+    if (!apiKeyValue) throw httpError(400, `Upstream ${name} is missing api_key.`);
+    if (presetById(preset)?.requires_account_id && !accountId && !String(item.base_url || "").trim()) {
+      throw httpError(400, `Upstream ${name} is missing account_id.`);
+    }
+    const nameKey = name.toLowerCase();
+    if (names.has(nameKey)) throw httpError(400, `Upstream names must be unique: ${name}`);
+    names.add(nameKey);
+
+    const models = normalizeStringArray(item.models);
+    upstreams.push(buildUpstreamConfigRecord(item, index, {
+      accountId,
+      apiKeyEncrypted: await ensureEncryptedValue(apiKeyValue, app.encryptionSecret),
+      baseUrl,
+      models,
+      name,
+      preset,
+    }));
+  }
+
+  return {
+    routing: normalizeGatewayRouting(routing),
+    settings: normalizeGatewaySettings(settings, app),
+    upstreams,
+    version: 1,
+  };
+}
+
+function toPublicGatewayConfig(config) {
+  return {
+    routing: config.routing,
+    settings: config.settings,
+    upstreams: config.upstreams.map((upstream) => ({
+      ...upstream,
+      capability: upstream.capability || null,
+      api_key_value: upstream.api_key_encrypted || "",
+    })),
+    version: config.version || 1,
+  };
+}
+
+function uniqueValidUpstreams(upstreams) {
+  const seenNames = new Set();
+  return upstreams.filter((item) => {
+    const name = String(item?.name || "").toLowerCase();
+    if (!name || !item.base_url || !item.api_key_encrypted || !isAllowedUpstreamUrl(item.base_url) || seenNames.has(name)) return false;
+    seenNames.add(name);
+    return true;
+  });
+}
+
+async function listConfigSnapshots(store) {
+  const snapshots = await store.get(CONFIG_SNAPSHOTS_KEY, "json");
+  return Array.isArray(snapshots) ? snapshots : [];
+}
+
+function publicConfigSnapshot(snapshot) {
+  return {
+    id: snapshot.id,
+    created_at: utcTimestamp(snapshot.created_at),
+    upstream_count: snapshot.upstream_count || 0,
+    client_note: snapshot.client_note || "",
+  };
+}
+
+async function saveConfigSnapshot(store, config, clientNote = "before-save") {
+  if (!config || !Array.isArray(config.upstreams)) return;
+  const snapshots = await listConfigSnapshots(store);
+  snapshots.unshift({
+    id: `cfg_${Date.now()}_${randomString(6).toLowerCase()}`,
+    created_at: utcNowIso(),
+    upstream_count: config.upstreams.length,
+    client_note: clientNote,
+    config,
+  });
+  await store.put(CONFIG_SNAPSHOTS_KEY, JSON.stringify(snapshots.slice(0, CONFIG_SNAPSHOT_LIMIT)));
+}
+
+async function restoreConfigSnapshot(app, snapshotId) {
+  const snapshots = await listConfigSnapshots(app.state);
+  const snapshot = snapshots.find((item) => String(item.id || "").toLowerCase() === String(snapshotId || "").toLowerCase());
+  if (!snapshot?.config) {
+    return withCorsResponse(json(openAiError("Config snapshot not found.", "not_found_error"), 404));
+  }
+  const current = await getEditableConfig(app);
+  await saveConfigSnapshot(app.state, current, "before-restore");
+  const restored = await repairStoredGatewayConfig(snapshot.config, app);
+  await app.state.put(GATEWAY_CONFIG_KEY, JSON.stringify(restored));
+  invalidateRuntimeCache();
+  return withCorsResponse(json({ ok: true, config: toPublicGatewayConfig(restored) }, 200));
+}
+
+async function exportUpstreamGroup(app) {
+  const editable = await getEditableConfig(app);
+  const aesKey = await deriveAesKey(app.encryptionSecret);
+  const upstreams = await Promise.all(
+    editable.upstreams.map(async (upstream) => ({
+      account_id: String(upstream.account_id || "").trim(),
+      api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
+      base_url: upstream.base_url,
+      capability: upstream.capability || null,
+      enabled: upstream.enabled !== false,
+      headers: normalizeHeaders(upstream.headers),
+      models: normalizeStringArray(upstream.models),
+      model_contexts: normalizeModelContexts(upstream.model_contexts, upstream.models),
+      name: upstream.name,
+      note: String(upstream.note || "").trim(),
+      paths: normalizeStringArray(upstream.paths),
+      preset: upstream.preset || "custom",
+      priority: parsePriority(upstream.priority, 1),
+      weight: parsePositiveInt(upstream.weight, 1),
+    }))
+  );
+
+  return {
+    exported_at: utcNowIso(),
+    upstreams,
+    version: editable.version || 1,
+  };
+}
+
+// ponytail: derive AES key once, decrypt all upstream keys in parallel
+async function loadRuntimeConfig(app) {
+  const now = Date.now();
+  if (_runtimeCache && _runtimeCache.app === app && now - _runtimeCacheTs < RUNTIME_CACHE_TTL_MS) {
+    return _runtimeCache.runtime;
+  }
+  if (_runtimeLoading?.app === app) return _runtimeLoading.promise;
+
+  const promise = buildRuntimeConfig(app);
+  _runtimeLoading = { app, promise };
+  try {
+    return await promise;
+  } finally {
+    if (_runtimeLoading?.promise === promise) _runtimeLoading = null;
+  }
+}
+
+async function buildRuntimeConfig(app) {
+  const now = Date.now();
+  const editable = await getEditableConfig(app);
+  const upstreams = editable.upstreams.filter((upstream) => upstream.enabled !== false);
+  const [aesKey, modelCache] = await Promise.all([
+    deriveAesKey(app.encryptionSecret),
+    loadCachedModelMap(app.state, upstreams),
+  ]);
+
+  const decrypted = await Promise.all(
+    upstreams.map(async (upstream) => ({
+        ...upstream,
+        api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
+      }))
+  );
+
+  const runtime = {
+    clients: app.envClients.map(normalizeClient),
+    kv: app.kv,
+    state: app.state,
+    routeCoordinator: app.routeCoordinator,
+    modelCacheTtl: editable.settings.model_cache_ttl,
+    requestTimeoutMs: editable.settings.request_timeout_ms,
+    streamIdleTimeoutMs: editable.settings.stream_idle_timeout_ms,
+    routing: editable.routing,
+    settings: editable.settings,
+    upstreamCooldownTtl: editable.settings.upstream_cooldown_ttl,
+    upstreams: decrypted,
+    modelCache,
+  };
+  runtime.routeIndex = buildRouteIndex(decrypted);
+  _runtimeCache = { app, runtime };
+  _runtimeCacheTs = now;
+  return runtime;
+}
+
+function buildRouteIndex(upstreams) {
+  const index = {};
+  for (const upstream of upstreams || []) {
+    for (const path of normalizeStringArray(upstream.paths)) {
+      if (!index[path]) index[path] = { wildcard: [], models: {} };
+      const models = configuredUpstreamModels(upstream);
+      if (!models.length || models.includes("*")) {
+        index[path].wildcard.push(upstream);
+        continue;
+      }
+      for (const model of models) {
+        if (!index[path].models[model]) index[path].models[model] = [];
+        index[path].models[model].push(upstream);
+      }
+    }
+  }
+  return index;
+}
+
+async function loadHealthUpstreams(app) {
+  const editable = await getEditableConfig(app);
+  const aesKey = await deriveAesKey(app.encryptionSecret);
+  return Promise.all(editable.upstreams.map(async (upstream) => ({
+    ...upstream,
+    api_key: await decryptValue(upstream.api_key_encrypted, app.encryptionSecret, aesKey),
+  })));
+}
+
+function invalidateRuntimeCache() {
+  _runtimeCache = null;
+  _runtimeCacheTs = 0;
+  _runtimeLoading = null;
+}
+
+// ponytail: LRU cache per-isolate for client tokens, saves a state read per request.
+const _clientCache = {};
+const _clientCacheTs = {};
+const _clientLoading = {};
+const CLIENT_CACHE_TTL_MS = 300000;
+
+async function requireClient(request, runtime) {
+  const token = getBearerToken(request);
+  if (!token) {
+    throw httpError(401, "Missing API key.");
+  }
+
+  // ponytail: hit in-memory cache if fresh
+  const cached = _clientCache[token];
+  if (cached && (Date.now() - (_clientCacheTs[token] || 0)) < CLIENT_CACHE_TTL_MS) {
+    return cached;
+  }
+
+  if (runtime.state) {
+    const load = _clientLoading[token] || runtime.state.get(clientTokenKey(token), KV_HOT_JSON_READ);
+    _clientLoading[token] = load;
+    let storedClient;
+    try {
+      storedClient = await load;
+    } finally {
+      if (_clientLoading[token] === load) delete _clientLoading[token];
+    }
+    if (storedClient?.key) {
+      const nc = normalizeClient(storedClient);
+      _clientCache[token] = nc;
+      _clientCacheTs[token] = Date.now();
+      // ponytail: keep cache small, max 50 entries
+      const keys = Object.keys(_clientCache);
+      if (keys.length > 50) {
+        const oldest = keys.reduce(function(a, b) { return _clientCacheTs[a] < _clientCacheTs[b] ? a : b; });
+        delete _clientCache[oldest];
+        delete _clientCacheTs[oldest];
+      }
+      return nc;
+    }
+  }
+
+  const staticClient = runtime.clients.find((item) => item.key === token);
+  if (staticClient) {
+    _clientCache[token] = staticClient;
+    _clientCacheTs[token] = Date.now();
+    return staticClient;
+  }
+
+  throw httpError(401, "Invalid bearer token.");
+}
+
+async function listModels(client, runtime) {
+  // ponytail: sorted model rows are client-independent, cache per-runtime;
+  // filter keeps the sort order so per-request work is O(n), not O(n log n).
+  if (!runtime._sortedModelRows) {
+    runtime._sortedModelRows = modelRegistryRows(runtime)
+      .slice()
+      .sort((a, b) => a.alias.localeCompare(b.alias));
+  }
+  const rows = runtime._sortedModelRows
+    .filter((row) => clientAllowsUpstream(client, row.upstream.name))
+    .filter((row) => clientAllowsModelSelection(client, row.alias, row.model))
+    .map((row) => ({
+      id: row.alias,
+      object: "model",
+      owned_by: row.upstream.note || row.upstream.name || "gateway",
+    }));
+
+  return json(
+    {
+      object: "list",
+      data: rows,
+    },
+    200,
+  );
+}
+
+async function resolveClientModelAlias(client, runtime, model) {
+  const value = String(model || "").trim();
+  if (!value || value.includes("@cf/")) return value;
+  const rows = modelRegistryRows(runtime).filter((row) => clientAllowsUpstream(client, row.upstream.name));
+  const hit = rows.find((row) => row.alias === value || row.model === value);
+  if (hit) return hit.model;
+  const fuzzy = rows.filter((row) =>
+    modelsMatch(value, row.alias) || modelsMatch(value, row.model) ||
+    (!value.includes("/") && modelSuffix(value).toLowerCase() === modelSuffix(row.alias).toLowerCase())
+  );
+  if (fuzzy.length === 1) return fuzzy[0].model;
+  return value;
+}
+
+function publicModelId(client, runtime, requestedModel, resolvedModel = requestedModel) {
+  const value = String(requestedModel || "").trim();
+  const rows = modelRegistryRows(runtime).filter((row) => clientAllowsUpstream(client, row.upstream.name));
+  const hit = rows.find((row) => row.alias === value) || rows.find((row) => row.model === resolvedModel);
+  return hit?.alias || value;
+}
+
+async function resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload) {
+  const model = await resolveClientModelAlias(client, runtime, requestedModel);
+  if (!clientAllowsModelSelection(client, requestedModel, model)) {
+    throw httpError(403, `Model is not allowed for this client key: ${requestedModel}`);
+  }
+  await enforceSessionModelLock(client, runtime, request, payload, model);
+  rememberSessionCurrentModel(client, request, payload, model);
+  return model;
+}
+
+async function enforceSessionModelLock(client, runtime, request, payload, model) {
+  const scopeId = requestModelLockScope(request, payload);
+  if (!scopeId) return;
+
+  const cacheKey = `${client.id}\n${scopeId}`;
+  const now = Date.now();
+  let lock = _sessionModelLocks[cacheKey];
+  if (!lock && runtime.state) {
+    try {
+      const stored = await runtime.state.get(await sessionModelLockStorageKey(cacheKey), "json");
+      if (stored?.model && Number(stored.expires) > now) lock = stored;
+    } catch {}
+  }
+  if (lock?.expires > now) {
+    _sessionModelLocks[cacheKey] = lock;
+    if (lock.model !== model) throw httpError(403, `This session is locked to model: ${lock.model}`);
+    return;
+  }
+
+  lock = { model, expires: now + SESSION_MODEL_LOCK_TTL_SECONDS * 1000 };
+  _sessionModelLocks[cacheKey] = lock;
+  if (runtime.state) {
+    try {
+      await runtime.state.put(await sessionModelLockStorageKey(cacheKey), JSON.stringify(lock), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS });
+    } catch {}
+  }
+  const lockKeys = Object.keys(_sessionModelLocks);
+  if (lockKeys.length > 500) delete _sessionModelLocks[lockKeys[0]];
+}
+
+async function queryCloudflareGraphql(app, query, variables) {
+  const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${app.analyticsApiToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body || body.errors) {
+    throw new Error(body?.errors?.[0]?.message || `Cloudflare GraphQL HTTP ${response.status}`);
+  }
+  const account = body?.data?.viewer?.accounts?.[0];
+  if (!account) throw new Error("Cloudflare account analytics is not available.");
+  return account;
+}
+
+function sessionCurrentModelKey(client, request, payload) {
+  const scopeId = requestModelLockScope(request, payload);
+  const sessionScope = scopeId.split("\nturn:")[0];
+  return sessionScope ? `${client.id}\n${sessionScope}` : "";
+}
+
+function rememberSessionCurrentModel(client, request, payload, model) {
+  const key = sessionCurrentModelKey(client, request, payload);
+  if (!key) return;
+  const previous = _sessionCurrentModels[key];
+  _sessionCurrentModels[key] = {
+    ...previous,
+    model,
+    expires: Date.now() + SESSION_MODEL_LOCK_TTL_SECONDS * 1000,
+    ...(previous?.model === model ? {} : { persistedModel: "" }),
+  };
+  const keys = Object.keys(_sessionCurrentModels);
+  if (keys.length > 500) delete _sessionCurrentModels[keys[0]];
+}
+
+async function persistSessionCurrentModel(runtime, client, request, payload, ctx) {
+  const key = sessionCurrentModelKey(client, request, payload);
+  const item = key && _sessionCurrentModels[key];
+  if (!runtime.state || !item?.model || item.persistedModel === item.model) return;
+  item.persistedModel = item.model;
+  const task = sessionCurrentModelStorageKey(key)
+    .then((storageKey) => runtime.state.put(storageKey, JSON.stringify({ model: item.model, expires: item.expires }), { expirationTtl: SESSION_MODEL_LOCK_TTL_SECONDS }))
+    .catch(() => { if (_sessionCurrentModels[key]?.model === item.model) _sessionCurrentModels[key].persistedModel = ""; });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+  else await task;
+}
+
+async function currentSessionModel(client, runtime, request, payload) {
+  const key = sessionCurrentModelKey(client, request, payload);
+  const item = key && _sessionCurrentModels[key];
+  if (item?.expires > Date.now()) return item.model;
+  if (key) delete _sessionCurrentModels[key];
+  if (!key || !runtime.state) return "";
+  try {
+    const stored = await runtime.state.get(await sessionCurrentModelStorageKey(key), "json");
+    if (stored?.model && stored.expires > Date.now()) {
+      _sessionCurrentModels[key] = { ...stored, persistedModel: stored.model };
+      return stored.model;
+    }
+  } catch {}
+  return "";
+}
+
+async function sessionCurrentModelStorageKey(value) {
+  return "session:current-model:" + await storageKeyHash(value);
+}
+
+async function sessionModelLockStorageKey(value) {
+  return "session:model-lock:" + await storageKeyHash(value);
+}
+
+async function storageKeyHash(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function requestModelLockScope(request, payload) {
+  const metadata = safeJson(request?.headers.get("x-codex-turn-metadata") || "") || {};
+  const bodyMetadata = payload?.metadata && typeof payload.metadata === "object" ? payload.metadata : {};
+  const session = request?.headers.get("session-id") || request?.headers.get("x-session-id") ||
+    metadata.session_id || bodyMetadata.session_id || request?.headers.get("thread-id") ||
+    request?.headers.get("x-client-request-id") || request?.headers.get("x-conversation-id") ||
+    metadata.thread_id || bodyMetadata.thread_id || bodyMetadata.conversation_id;
+  const turn = request?.headers.get("turn-id") || request?.headers.get("x-turn-id") ||
+    metadata.turn_id || bodyMetadata.turn_id;
+  const sessionId = String(session || "").trim();
+  const turnId = String(turn || "").trim();
+  if (turnId && turnId.length <= 256) return `${sessionId.slice(0, 256)}\nturn:${turnId}`;
+  return sessionId && sessionId.length <= 256 ? sessionId : "";
+}
+
+function routeModelRows(runtime) {
+  if (runtime._routeModelRows) return runtime._routeModelRows;
+  runtime._routeModelRows = runtime.upstreams.flatMap((upstream) =>
+    registryModelsForUpstream(runtime, upstream)
+      .map((model) => ({ model, upstream }))
+  );
+  return runtime._routeModelRows;
+}
+
+function registryModelsForUpstream(runtime, upstream) {
+  const configured = configuredUpstreamModels(upstream).filter((model) => model && model !== "*");
+  return configured.length ? configured : normalizeStringArray(runtime.modelCache?.[upstream.name]);
+}
+
+function modelRegistryRows(runtime) {
+  if (runtime._modelRegistryRows) return runtime._modelRegistryRows;
+  runtime._modelRegistryRows = aliasRowsForModels(routeModelRows(runtime));
+  return runtime._modelRegistryRows;
+}
+
+function aliasRowsForModels(items) {
+  const seenPairs = new Set();
+  const normalized = items.filter((item) => {
+    const key = aliasPresetId(item.upstream) + "\n" + item.model;
+    if (seenPairs.has(key)) return false;
+    seenPairs.add(key);
+    return true;
+  });
+  const baseCounts = {};
+  normalized.forEach((item) => {
+    const base = modelAliasBase(item.upstream, item.model);
+    baseCounts[base] = (baseCounts[base] || 0) + 1;
+  });
+  return normalized.map((item) => {
+    const base = modelAliasBase(item.upstream, item.model);
+    return {
+      ...item,
+      alias: baseCounts[base] > 1 ? modelAliasWithSource(item.upstream, item.model) : base,
+    };
+  });
+}
+
+function aliasPresetId(upstream) {
+  return String(upstream?.preset || inferPresetId(upstream?.base_url) || "custom").trim() || "custom";
+}
+
+function modelAliasBase(upstream, model) {
+  return aliasPresetId(upstream) + "/" + modelSuffix(model);
+}
+
+function modelAliasWithSource(upstream, model) {
+  const clean = String(model || "").replace(/^@cf\//, "");
+  const parts = clean.split("/").filter(Boolean);
+  return aliasPresetId(upstream) + "/" + (parts.length > 1 ? parts.slice(-2).join("/") : modelSuffix(model));
+}
+
+function configuredUpstreamModels(upstream) {
+  return Array.isArray(upstream.models) ? upstream.models : [];
+}
+
+async function loadCachedModelMap(kv, upstreams) {
+  if (!kv) return {};
+  const entries = await Promise.all((upstreams || []).filter((upstream) =>
+    !configuredUpstreamModels(upstream).some((model) => model && model !== "*")
+  ).map(async (upstream) => {
+    try {
+      const cached = await kv.get(modelsCacheKey(upstream.name), "json");
+      return [upstream.name, normalizeStringArray(cached?.models)];
+    } catch {
+      return [upstream.name, []];
+    }
+  }));
+  return Object.fromEntries(entries);
+}
+
+async function refreshModelCache(runtime) {
+  return mapConcurrent(runtime.upstreams, UPSTREAM_PROBE_CONCURRENCY, async (upstream) => {
+    const models = await getFreshModels(runtime, upstream);
+    return { model_count: models.length, name: upstream.name };
+  });
+}
+
+async function getFreshModels(runtime, upstream) {
+  if (!runtime.state) {
+    return Array.isArray(upstream.models) ? upstream.models : [];
+  }
+
+  try {
+    const models = await fetchUpstreamModelIds(upstream, runtime.requestTimeoutMs);
+
+    await runtime.state.put(
+      modelsCacheKey(upstream.name),
+      JSON.stringify({
+        fetched_at: utcNowIso(),
+        models,
+      }),
+      { expirationTtl: runtime.modelCacheTtl },
+    );
+    runtime.modelCache ||= {};
+    runtime.modelCache[upstream.name] = models;
+    delete runtime._routeModelRows;
+    delete runtime._modelRegistryRows;
+    delete runtime._sortedModelRows;
+
+    return models;
+  } catch {
+    return [];
+  }
+}
+
+async function fetchUpstreamModelIds(upstream, timeoutMs) {
+  const workersAi = isWorkersAiUpstream(upstream);
+  if (workersAi) {
+    return fetchWorkersAiModelIds(upstream, timeoutMs);
+  }
+  const url = buildUpstreamUrl(upstream.base_url, MODEL_PATH, "");
+  const response = await fetchWithTimeout(
+    url,
+    { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+    timeoutMs,
+  );
+  if (!response.ok) {
+    throw await responseError(response, "OpenAI model list");
+  }
+  const payload = await response.json();
+  return extractOpenAiModelIds(payload);
+}
+
+async function fetchWorkersAiModelIds(upstream, timeoutMs) {
+  const seen = new Set();
+  for (let page = 1; page <= CLOUDFLARE_MODEL_SEARCH_MAX_PAGES; page += 1) {
+    const payload = await fetchWorkersAiModelPage(upstream, timeoutMs, page, CLOUDFLARE_MODEL_SEARCH_PER_PAGE);
+    const rows = Array.isArray(payload?.result) ? payload.result : [];
+    extractWorkersAiModelIds(payload).forEach((model) => seen.add(model));
+    const totalPages = Number(payload?.result_info?.total_pages || 0);
+    if (rows.length < CLOUDFLARE_MODEL_SEARCH_PER_PAGE || (totalPages && page >= totalPages)) {
+      break;
+    }
+  }
+  return Array.from(seen).sort();
+}
+
+async function fetchWorkersAiModelPage(upstream, timeoutMs, page, perPage) {
+  const response = await fetchWithTimeout(
+    buildWorkersAiModelSearchUrl(upstream, page, perPage),
+    { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+    timeoutMs,
+  );
+  if (!response.ok) {
+    throw await responseError(response, "Cloudflare Workers AI model search");
+  }
+  return response.json();
+}
+
+async function checkUpstreamHealth(upstream, timeoutMs) {
+  const started = Date.now();
+  try {
+    if (isWorkersAiUpstream(upstream)) {
+      const payload = await fetchWorkersAiModelPage(upstream, timeoutMs, 1, CLOUDFLARE_MODEL_SEARCH_PER_PAGE);
+      const rows = Array.isArray(payload?.result) ? payload.result : [];
+      const total = Number(payload?.result_info?.total_count || payload?.result_info?.count || rows.length);
+      return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: total, capabilities: { models: true, chat: null } };
+    }
+
+    const response = await fetchWithTimeout(
+      buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
+      { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+      timeoutMs,
+    );
+    const ok = response.ok;
+    const error = ok ? "" : await responseErrorMessage(response);
+    try { await response.body?.cancel("health check complete"); } catch {}
+    return { name: upstream.name, ok, status: response.status, ...(error ? { error } : {}), latency_ms: Date.now() - started, capabilities: { models: ok, chat: null } };
+  } catch (err) {
+    return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started, capabilities: { models: false, chat: false } };
+  }
+}
+
+async function speedTestUpstream(runtime, upstream, model) {
+  const started = Date.now();
+  let resp = null;
+  let release = null;
+  try {
+    const bodyText = JSON.stringify({ model, messages: [{ role: "user", content: "Reply with OK." }], max_tokens: 8, stream: true });
+    const probeRequest = new Request("https://llmmerge.local/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "text/event-stream, application/json" },
+      body: bodyText,
+    });
+    const result = await fetchProxyUpstream({ bodyText, pathname: CHAT_PATH, request: probeRequest, runtime, search: "", upstream });
+    release = result.release;
+    resp = result.response;
+    if (!resp.ok) {
+      const error = await responseErrorMessage(resp);
+      return { name: upstream.name, ok: false, status: resp.status, ...(error ? { error } : {}), latency_ms: Date.now() - started };
+    }
+
+    const streaming = (resp.headers.get("content-type") || "").includes("text/event-stream");
+    if (streaming) {
+      const primed = await primeSseResponse(resp, shouldHideDeepSeekReasoning(model, model, upstream));
+      resp = primed.response;
+      const latency = Date.now() - started;
+      if (primed.error) return { name: upstream.name, ok: false, status: 502, error: primed.error, latency_ms: latency };
+      await rememberUpstreamLatency(runtime, upstream, model, latency);
+      return { name: upstream.name, ok: true, status: 200, latency_ms: latency, metric: "first_output" };
+    }
+
+    const text = await resp.text();
+    const payload = safeJson(text);
+    const error = upstreamApplicationErrorMessage(payload || text);
+    const valid = payload && Array.isArray(payload.choices) && payload.choices.length > 0 && !looksLikeHtmlDocument(text) && !error;
+    const latency = Date.now() - started;
+    if (!valid) return { name: upstream.name, ok: false, status: 502, error: error || "Upstream returned no valid model output.", latency_ms: latency };
+    await rememberUpstreamLatency(runtime, upstream, model, latency);
+    return { name: upstream.name, ok: true, status: 200, latency_ms: latency, metric: "complete" };
+  } catch (err) {
+    return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started };
+  } finally {
+    try { await resp?.body?.cancel("speed test complete"); } catch {}
+    release?.();
+  }
+}
+
+async function responseError(response, label) {
+  const message = await responseErrorMessage(response);
+  const suffix = response.status === 401 || response.status === 403
+    ? " Check the API token permissions."
+    : "";
+  const err = new Error(`${label} HTTP ${response.status}${message ? `: ${message}` : ""}.${suffix}`);
+  err.status = response.status;
+  return err;
+}
+
+async function responseErrorMessage(response) {
+  try {
+    const payload = await response.clone().json();
+    if (Array.isArray(payload?.errors) && payload.errors.length) {
+      return payload.errors.map((item) => item?.message || item).filter(Boolean).join("; ");
+    }
+    return payload?.error?.message || payload?.message || "";
+  } catch {
+    return "";
+  }
+}
+
+function isWorkersAiUpstream(upstream) {
+  return String(upstream?.preset || "") === "workers-ai" || inferPresetId(upstream?.base_url) === "workers-ai";
+}
+
+function buildWorkersAiModelSearchUrl(upstream, page = 1, perPage = CLOUDFLARE_MODEL_SEARCH_PER_PAGE) {
+  const accountId = String(upstream.account_id || accountIdFromCloudflareBaseUrl(upstream.base_url) || "").trim();
+  if (!accountId) {
+    throw httpError(400, "Cloudflare Account ID is required to fetch Workers AI models.");
+  }
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=${perPage}&page=${page}`;
+}
+
+function accountIdFromCloudflareBaseUrl(baseUrl) {
+  const match = String(baseUrl || "").match(/\/accounts\/([^/]+)\/ai(?:\/|$)/i);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function extractOpenAiModelIds(payload) {
+  return Array.isArray(payload?.data)
+    ? Array.from(new Set(payload.data.map((item) => String(item?.id || "").trim()).filter(Boolean))).sort()
+    : [];
+}
+
+function extractWorkersAiModelIds(payload) {
+  const rows = Array.isArray(payload?.result) ? payload.result : [];
+  const models = rows
+    .map((item) => {
+      if (typeof item === "string") return normalizeWorkersAiModelId(item);
+      return normalizeWorkersAiModelId(item?.id || item?.name || item?.model || item?.model_id);
+    })
+    .filter(Boolean);
+  return Array.from(new Set(models)).sort();
+}
+
+function normalizeWorkersAiModelId(value) {
+  const raw = String(value || "").trim().replace(/^\/+/, "");
+  if (!raw) return "";
+  if (raw.startsWith("@cf/")) return raw;
+  if (raw.startsWith("cf/")) return `@${raw}`;
+  return raw.includes("/") ? `@cf/${raw}` : "";
+}
+
+async function handleAnthropicMessagesRequest(request, url, app, ctx, traceId) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await readRequestText(request));
+  const translated = translateAnthropicMessagesRequest(payload);
+  await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
+  const prepared = prepareGatewayChatBody(translated.bodyText, runtime.settings, client);
+
+  if (translated.stream) {
+    const headers = new Headers(CORS_HEADERS);
+    setSseHeaders(headers);
+    headers.set("x-llm-gateway-client", client.name || client.id || "client");
+    headers.set("x-llm-gateway-trace-id", traceId);
+    const body = streamPendingAnthropicResponse(async () => {
+      let logged = false;
+      let proxyResponse;
+      try {
+        proxyResponse = await proxyRequest({
+          client,
+          model: translated.model,
+          pathname: CHAT_PATH,
+          request,
+          bodyText: prepared.bodyText,
+          injection: prepared.injection,
+           runtime,
+           search: url.search,
+           ctx,
+           signal: request.signal,
+           traceId,
+         });
+        const upstreamResp = proxyResponse.response;
+        if (!upstreamResp.ok) {
+          const text = await upstreamResp.text().catch(() => "");
+          const payload = safeJson(text);
+          const message = upstreamApplicationErrorMessage(payload || text) || payload?.error?.message || payload?.message || text || `Upstream returned HTTP ${upstreamResp.status}.`;
+          recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection) });
+          logged = true;
+          const error = httpError(upstreamResp.status || 502, looksLikeHtmlDocument(text) ? `Upstream returned HTTP ${upstreamResp.status} HTML error page.` : message);
+          error.upstreamName = proxyResponse.upstream.name;
+          throw error;
+        }
+        const onDone = (usage, extra) => recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, usage, ctx, traceId, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection), ...extra });
+        return streamAnthropicMessagesFromChat(upstreamResp, translated.seed, onDone, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
+      } catch (error) {
+        if (!logged) {
+          recordRequestLog(app, makeRequestLogEntry({
+            client,
+            upstream: error.upstreamName || "none",
+            model: translated.model,
+            path: MESSAGES_PATH,
+            status: error.statusCode || 502,
+            started,
+            promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+            completionTokens: 0,
+            extra: { ...gatewayRequestTraceLogFields({ trace: proxyResponse?.trace, error, traceId }), tools_count: translated.toolsCount, ...gatewayInjectionLogFields(prepared.injection) },
+          }), ctx);
+        }
+        throw error;
+      }
+    });
+    return new Response(body, { status: 200, headers });
+  }
+
+  let proxyResponse;
+  try {
+    proxyResponse = await proxyRequest({
+      client,
+      model: translated.model,
+      pathname: CHAT_PATH,
+      request,
+      bodyText: prepared.bodyText,
+      injection: prepared.injection,
+       runtime,
+       search: url.search,
+       ctx,
+       signal: request.signal,
+       traceId,
+     });
+
+    const upstreamResp = proxyResponse.response;
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+
+    if (!upstreamResp.ok) {
+      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated, null, ctx, traceId, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection) });
+      return await anthropicUpstreamErrorResponse(upstreamResp, headers);
+    }
+
+    const openaiText = await upstreamResp.text();
+    const openaiPayload = safeJson(openaiText);
+    if (!openaiPayload || looksLikeHtmlDocument(openaiText) || upstreamApplicationErrorMessage(openaiPayload)) {
+      recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated, null, ctx, traceId, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection) });
+      return anthropicErrorResponse(upstreamApplicationErrorMessage(openaiPayload) || "Upstream returned an invalid response.", 502, headers);
+    }
+
+    normalizeNimChatPayload(openaiPayload, proxyResponse.upstream);
+    const responsePayload = openAiChatToAnthropicMessage(openaiPayload, translated.seed, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream));
+    headers.set("content-type", "application/json; charset=utf-8");
+    recordAnthropicLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated, responsePayload.usage, ctx, traceId, {
+      ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }),
+      ...gatewayInjectionLogFields(proxyResponse.injection),
+      finish_reason: responseFinishReason(openaiPayload),
+      tool_calls_count: responseToolCallsCount(openaiPayload),
+    });
+    return new Response(JSON.stringify(responsePayload), { status: 200, headers });
+  } catch (error) {
+    recordRequestLog(app, makeRequestLogEntry({
+      client,
+      upstream: error.upstreamName || "none",
+      model: translated.model,
+      path: MESSAGES_PATH,
+      status: error.statusCode || 502,
+      started,
+      promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+      completionTokens: 0,
+      extra: { ...gatewayRequestTraceLogFields({ trace: proxyResponse?.trace, error, traceId }), tools_count: translated.toolsCount, ...gatewayInjectionLogFields(prepared.injection) },
+    }), ctx);
+    return anthropicGatewayErrorResponse(error, traceId);
+  }
+}
+
+async function resolveTranslatedRequestModel(client, runtime, translated, request, payload) {
+  const requestedModel = translated.model;
+  const resolvedModel = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+  translated.seed.model = publicModelId(client, runtime, requestedModel, resolvedModel);
+  translated.model = resolvedModel;
+  if (resolvedModel !== requestedModel) {
+    translated.bodyText = JSON.stringify({ ...parseJsonBody(translated.bodyText), model: resolvedModel });
+  }
+}
+
+function translateAnthropicMessagesRequest(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Request body must be a JSON object.");
+  }
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    throw httpError(400, "`model` is required.");
+  }
+  const messages = anthropicMessagesToOpenAiMessages(payload.system, payload.messages);
+  if (!messages.length) {
+    throw httpError(400, "`messages` is required.");
+  }
+
+  const chat = { model, messages, stream: payload.stream === true };
+  copyIfPresent(payload, chat, ["temperature", "top_p", "thinking", "reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
+  if (isProvidedValue(payload.max_tokens)) chat.max_tokens = payload.max_tokens;
+  if (isProvidedValue(payload.stop_sequences)) chat.stop = payload.stop_sequences;
+  if (isProvidedValue(payload.metadata?.user_id)) chat.user = String(payload.metadata.user_id);
+  const tools = anthropicToolsToOpenAiTools(payload.tools);
+  if (tools.length) chat.tools = tools;
+  const toolChoice = anthropicToolChoiceToOpenAi(payload.tool_choice);
+  if (toolChoice != null) chat.tool_choice = toolChoice;
+
+  return {
+    bodyText: JSON.stringify(chat),
+    model,
+    stream: chat.stream,
+    toolsCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
+    seed: {
+      id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+      createdAt: Math.floor(Date.now() / 1000),
+      model,
+    },
+  };
+}
+
+function anthropicMessagesToOpenAiMessages(system, messages) {
+  const out = [];
+  const systemText = anthropicBlocksToText(system);
+  if (systemText) out.push({ role: "system", content: systemText });
+  const rows = Array.isArray(messages) ? messages : [];
+  for (const msg of rows) out.push(...anthropicMessageToOpenAiMessages(msg));
+  return out.filter((msg) => msg && (msg.tool_call_id || msg.tool_calls?.length || msg.content !== ""));
+}
+
+function anthropicMessageToOpenAiMessages(msg) {
+  if (!msg || typeof msg !== "object") return [];
+  const role = String(msg.role || "user") === "assistant" ? "assistant" : "user";
+  if (typeof msg.content === "string") return [{ role, content: msg.content }];
+  if (!Array.isArray(msg.content)) return [];
+  return role === "assistant"
+    ? anthropicAssistantBlocksToOpenAiMessages(msg.content)
+    : anthropicUserBlocksToOpenAiMessages(msg.content);
+}
+
+function anthropicAssistantBlocksToOpenAiMessages(blocks) {
+  const text = [];
+  const toolCalls = [];
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "thinking" || block.type === "redacted_thinking") continue;
+    if (block.type === "tool_use") {
+      toolCalls.push({
+        id: String(block.id || `call_${crypto.randomUUID().replace(/-/g, "")}`),
+        type: "function",
+        function: {
+          name: String(block.name || "tool"),
+          arguments: JSON.stringify(block.input && typeof block.input === "object" ? block.input : {}),
+        },
+      });
+      continue;
+    }
+    const blockText = anthropicBlockToText(block);
+    if (blockText) text.push(blockText);
+  }
+  const message = { role: "assistant", content: text.join("") };
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  return [message];
+}
+
+function anthropicUserBlocksToOpenAiMessages(blocks) {
+  const out = [];
+  let pending = [];
+  const flush = () => {
+    if (!pending.length) return;
+    const hasMedia = pending.some((part) => typeof part === "object" && part.type !== "text");
+    out.push({ role: "user", content: hasMedia ? pending : pending.map((part) => typeof part === "string" ? part : part.text || "").join("") });
+    pending = [];
+  };
+
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "tool_result") {
+      flush();
+      out.push({
+        role: "tool",
+        tool_call_id: String(block.tool_use_id || ""),
+        content: anthropicBlocksToText(block.content) || (block.is_error ? "Tool returned an error." : ""),
+      });
+      continue;
+    }
+    const part = anthropicBlockToOpenAiContentPart(block);
+    if (part != null) pending.push(part);
+  }
+  flush();
+  return out;
+}
+
+function anthropicBlockToOpenAiContentPart(block) {
+  if (!block || typeof block !== "object") return null;
+  if (block.type === "text") return { type: "text", text: String(block.text || "") };
+  if (block.type === "image") {
+    const url = anthropicImageSourceToUrl(block.source);
+    return url ? { type: "image_url", image_url: { url } } : { type: "text", text: "[image omitted]" };
+  }
+  const text = anthropicBlockToText(block);
+  return text ? { type: "text", text } : null;
+}
+
+function anthropicImageSourceToUrl(source) {
+  if (!source || typeof source !== "object") return "";
+  if (source.type === "url" && source.url) return String(source.url);
+  if (source.type === "base64" && source.media_type && source.data) {
+    return `data:${source.media_type};base64,${source.data}`;
+  }
+  return "";
+}
+
+function anthropicToolsToOpenAiTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: String(tool?.name || "tool"),
+      description: String(tool?.description || ""),
+      parameters: tool?.input_schema && typeof tool.input_schema === "object" ? tool.input_schema : { type: "object", properties: {} },
+    },
+  }));
+}
+
+function anthropicToolChoiceToOpenAi(choice) {
+  if (!isProvidedValue(choice)) return null;
+  if (typeof choice === "string") return choice === "any" ? "required" : choice;
+  if (choice.type === "auto") return "auto";
+  if (choice.type === "any") return "required";
+  if (choice.type === "none") return "none";
+  if (choice.type === "tool" && choice.name) return { type: "function", function: { name: String(choice.name) } };
+  return null;
+}
+
+function openAiChatToAnthropicMessage(openaiPayload, seed, hideReasoning = false) {
+  const choice = (openaiPayload?.choices || [])[0] || {};
+  const message = choice.message || {};
+  const content = openAiMessageToAnthropicContent(message, hideReasoning);
+  return {
+    id: seed.id,
+    type: "message",
+    role: "assistant",
+    model: seed.model,
+    content,
+    stop_reason: openAiFinishToAnthropicStop(choice.finish_reason),
+    stop_sequence: null,
+    usage: normalizeAnthropicUsage(openaiPayload?.usage, content),
+  };
+}
+
+function openAiMessageToAnthropicContent(message, hideReasoning = false) {
+  const content = [];
+  const thinking = reasoningText(message?.reasoning_content ?? message?.reasoning ?? message?.thinking);
+  if (thinking && !hideReasoning) content.push({ type: "thinking", thinking });
+  const text = hideReasoning ? stripThinkTags(chatContentToText(message?.content || "")) : chatContentToText(message?.content || "");
+  if (text) content.push({ type: "text", text });
+  for (const call of (message?.tool_calls || [])) {
+    content.push({
+      type: "tool_use",
+      id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`),
+      name: String(call.function?.name || call.name || "tool"),
+      input: parseToolArguments(call.function?.arguments),
+    });
+  }
+  return content.length ? content : [{ type: "text", text: "" }];
+}
+
+function parseToolArguments(value) {
+  if (value && typeof value === "object") return value;
+  const parsed = safeJson(String(value || "{}"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  return {};
+}
+
+function openAiFinishToAnthropicStop(reason) {
+  if (reason === "tool_calls" || reason === "function_call") return "tool_use";
+  if (reason === "length") return "max_tokens";
+  if (reason === "stop" || !reason) return "end_turn";
+  return String(reason);
+}
+
+function normalizeAnthropicUsage(usage, content = []) {
+  const input = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
+  const outputFallback = estimateTokens((content || []).map((block) => block.text || JSON.stringify(block.input || "")).join(""));
+  const reportedOutput = Number(usage?.completion_tokens ?? usage?.output_tokens);
+  const output = Math.max(0, Number.isFinite(reportedOutput) && reportedOutput > 0 ? reportedOutput : outputFallback);
+  return { input_tokens: input, output_tokens: output };
+}
+
+function anthropicBlocksToText(value) {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value.map(anthropicBlockToText).filter(Boolean).join("");
+}
+
+function anthropicBlockToText(block) {
+  if (typeof block === "string") return block;
+  if (!block || typeof block !== "object") return "";
+  if (block.type === "text") return String(block.text || "");
+  if (block.type === "thinking") return String(block.thinking || "");
+  if (block.text != null) return String(block.text);
+  if (block.content != null) return anthropicBlocksToText(block.content);
+  return "";
+}
+
+function anthropicErrorResponse(message, status = 500, headers = new Headers()) {
+  const out = responseBodyHeaders(headers);
+  out.set("content-type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify({ type: "error", error: { type: anthropicErrorType(status), message: message || "Internal error." } }), {
+    status,
+    headers: out,
+  });
+}
+
+function anthropicGatewayErrorResponse(error, traceId) {
+  const headers = new Headers(CORS_HEADERS);
+  if (traceId) headers.set("x-llm-gateway-trace-id", traceId);
+  return anthropicErrorResponse(error?.message || "Internal error.", error?.statusCode || 500, headers);
+}
+
+async function anthropicUpstreamErrorResponse(upstreamResp, headers) {
+  const text = await upstreamResp.text().catch(() => "");
+  const payload = safeJson(text);
+  const message = upstreamApplicationErrorMessage(payload || text) || payload?.error?.message || payload?.message || text || `Upstream returned HTTP ${upstreamResp.status}.`;
+  return anthropicErrorResponse(looksLikeHtmlDocument(text) ? `Upstream returned HTTP ${upstreamResp.status} HTML error page.` : message, upstreamResp.status || 502, headers);
+}
+
+function anthropicErrorType(status) {
+  if (status === 400) return "invalid_request_error";
+  if (status === 401) return "authentication_error";
+  if (status === 403) return "permission_error";
+  if (status === 404) return "not_found_error";
+  if (status === 429) return "rate_limit_error";
+  return "api_error";
+}
+
+function recordAnthropicLog(app, client, upstreamName, model, started, status, translated, usage, ctx, traceId, extra = {}) {
+  recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model,
+    path: MESSAGES_PATH,
+    status: status || 200,
+    started,
+    promptTokens: usage?.input_tokens || Math.max(1, Math.round(translated.bodyText.length / 4)),
+    completionTokens: usage?.output_tokens || 0,
+    extra: { trace_id: traceId, tools_count: translated.toolsCount || 0, ...extra },
+  }), ctx);
+}
+
+function responseStoreKey(id) {
+  return `${RESPONSE_STORE_PREFIX}${String(id || "")}`;
+}
+
+function maybeStoreResponse(runtime, responsePayload, ctx) {
+  if (!runtime?.state || !responsePayload?.id || responsePayload.store !== true) return;
+  const task = runtime.state.put(
+    responseStoreKey(responsePayload.id),
+    JSON.stringify(responsePayload),
+    { expirationTtl: RESPONSE_STORE_TTL_SECONDS },
+  ).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+  else void task;
+}
+
+async function readStoredResponse(runtime, id) {
+  if (!runtime?.state || !id) return null;
+  try {
+    return await runtime.state.get(responseStoreKey(id), "json");
+  } catch {
+    return null;
+  }
+}
+
+async function handleResponsesRetrieve(request, app, ctx, responseId) {
+  const runtime = await loadRuntimeConfig(app);
+  await requireClient(request, runtime);
+  const stored = await readStoredResponse(runtime, responseId);
+  if (!stored) return withCorsResponse(json(openAiError(`Response ${responseId} not found.`, "not_found_error"), 404));
+  return withCorsResponse(json(stored, 200));
+}
+
+async function handleResponsesCancel(request, app, ctx, responseId) {
+  const runtime = await loadRuntimeConfig(app);
+  await requireClient(request, runtime);
+  const active = _activeResponses.get(responseId);
+  if (active) {
+    active.abort("response cancelled");
+    _activeResponses.delete(responseId);
+    return withCorsResponse(json({ id: responseId, object: "response", status: "cancelled", output: [], usage: null }, 200));
+  }
+  const stored = await readStoredResponse(runtime, responseId);
+  if (!stored) return withCorsResponse(json(openAiError(`Response ${responseId} not found.`, "not_found_error"), 404));
+  return withCorsResponse(json({ ...stored, status: stored.status === "completed" ? "completed" : "cancelled" }, 200));
+}
+
+function nativeResponsesAvailable(runtime, client, model) {
+  return proxyCandidates(runtime, client, model, RESPONSES_PATH).length > 0 &&
+    runtime.upstreams.some((upstream) =>
+      clientAllowsUpstream(client, upstream.name) &&
+      upstreamSupportsPath(upstream, RESPONSES_PATH) &&
+      providerCapabilities(upstream).native_responses
+    );
+}
+
+function responsesNativeBody(translated, payload, settings, client, previousResponse = null) {
+  const body = { ...payload, model: translated.model };
+  if (previousResponse) {
+    const previousRows = responsesPreviousInput(previousResponse);
+    const currentRows = Array.isArray(body.input) ? body.input : (body.input == null ? [] : [body.input]);
+    body.input = [...previousRows, ...currentRows];
+    delete body.previous_response_id;
+  }
+  const injection = gatewayInjectionSnapshot(
+    { model: body.model, messages: responsesInputToMessages(body.input, body.instructions) },
+    settings,
+    client,
+  );
+  body.instructions = [
+    injection.system_text,
+    injection.context_text ? gatewayContextText(injection.context_text) : "",
+    body.instructions,
+  ].filter(Boolean).join("\n\n");
+  return { bodyText: JSON.stringify(body), injection };
+}
+
+async function handleResponsesRequest(request, url, app, ctx, traceId) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await readRequestText(request));
+  const previousResponse = payload?.previous_response_id
+    ? await readStoredResponse(runtime, payload.previous_response_id)
+    : null;
+  if (payload?.previous_response_id && !previousResponse) {
+    throw httpError(404, `Response ${payload.previous_response_id} not found.`);
+  }
+  const translated = translateResponsesRequest(payload, { previousResponse });
+  await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
+  await persistSessionCurrentModel(runtime, client, request, payload, ctx);
+  const useNative = nativeResponsesAvailable(runtime, client, translated.model);
+  const prepared = useNative
+    ? responsesNativeBody(translated, payload, runtime.settings, client, previousResponse)
+    : prepareGatewayChatBody(translated.bodyText, runtime.settings, client);
+
+  if (translated.stream) {
+    const headers = pendingSseHeaders(client, traceId);
+    const controller = new AbortController();
+    _activeResponses.set(translated.seed.id, controller);
+    const body = streamPendingResponsesResponse(async () => {
+      let proxyResponse;
+      try {
+        proxyResponse = await proxyRequest({
+          client,
+          model: translated.model,
+          pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
+          request,
+          bodyText: prepared.bodyText,
+          injection: prepared.injection,
+           runtime,
+           search: url.search,
+           ctx,
+           signal: mergeAbortSignals(request.signal, controller.signal),
+           traceId,
+         });
+        const upstreamResp = proxyResponse.response;
+        if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
+        const finish = (usage, extra) => {
+          _activeResponses.delete(translated.seed.id);
+          recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, usage, ctx, traceId, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection), ...extra });
+        };
+        if (useNative) {
+          const onDone = (usage, extra) => finish(usage, extra);
+          return nativeResponsesStream(upstreamResp.body, onDone, () => abortUpstreamResponse(proxyResponse));
+        }
+        const onFinal = (responsePayload) => maybeStoreResponse(runtime, responsePayload, ctx);
+        return streamResponsesFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), onFinal, isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
+      } catch (error) {
+        _activeResponses.delete(translated.seed.id);
+        recordRequestLog(app, makeRequestLogEntry({
+          client,
+          upstream: error.upstreamName || proxyResponse?.upstream?.name || "none",
+          model: translated.model,
+          path: RESPONSES_PATH,
+          status: error.statusCode || 502,
+          started,
+          promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+          completionTokens: 0,
+            extra: { ...gatewayRequestTraceLogFields({ trace: proxyResponse?.trace, error, traceId }), ...gatewayInjectionLogFields(prepared.injection) },
+        }), ctx);
+        throw error;
+      }
+    }, translated.seed);
+    return new Response(body, { status: 200, headers });
+  }
+
+  let proxyResponse;
+  try {
+    proxyResponse = await proxyRequest({
+      client,
+      model: translated.model,
+      pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
+      request,
+      bodyText: prepared.bodyText,
+      injection: prepared.injection,
+       runtime,
+       search: url.search,
+       ctx,
+       signal: request.signal,
+       traceId,
+     });
+
+    const upstreamResp = proxyResponse.response;
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+    if (!upstreamResp.ok) {
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, translated.bodyText, null, ctx, traceId, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection) });
+      return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
+
+    const openaiText = await upstreamResp.text();
+    const openaiPayload = safeJson(openaiText);
+    const applicationError = upstreamApplicationErrorMessage(openaiPayload || openaiText);
+    if (!openaiPayload || looksLikeHtmlDocument(openaiText) || applicationError) {
+      recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, translated.bodyText, null, ctx, traceId, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection) });
+      return upstreamBadGatewayResponse(applicationError || "Upstream returned a non-JSON API response.", headers);
+    }
+
+    let responsePayload;
+    if (useNative) {
+      responsePayload = {
+        ...openaiPayload,
+        id: String(openaiPayload.id || translated.seed.id),
+        model: translated.seed.model,
+        previous_response_id: translated.seed.previousResponseId || null,
+        store: translated.seed.store === true,
+        output_text: openaiPayload.output_text ?? chatContentToText((openaiPayload.output || []).filter((item) => item.type === "message").flatMap((item) => item.content || []).map((part) => part.text || "").join("")),
+      };
+      if (responsePayload.usage) {
+        responsePayload.usage = normalizeResponsesUsage(responsePayload.usage, estimateTokens(responsePayload.output_text || ""));
+      }
+    } else {
+      normalizeNimChatPayload(openaiPayload, proxyResponse.upstream);
+      const choice = (openaiPayload.choices || [])[0] || {};
+      const message = choice.message || {};
+      const hideReasoning = shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream);
+      const text = hideReasoning ? stripThinkTags(chatContentToText(message.content || "")) : chatContentToText(message.content || "");
+      const reasoning = hideReasoning ? "" : reasoningText(message.reasoning_content ?? message.reasoning ?? message.thinking);
+      responsePayload = makeResponsesPayload(translated.seed, { text, usage: openaiPayload.usage, toolCalls: message.tool_calls || [], reasoning });
+    }
+    maybeStoreResponse(runtime, responsePayload, ctx);
+    headers.set("content-type", "application/json; charset=utf-8");
+    recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId, {
+      ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }),
+      ...gatewayInjectionLogFields(proxyResponse.injection),
+      finish_reason: useNative ? responsePayload.status : responseFinishReason(openaiPayload),
+      tool_calls_count: useNative ? (responsePayload.output || []).filter((item) => item.type === "function_call").length : responseToolCallsCount(openaiPayload),
+    });
+    return new Response(JSON.stringify(responsePayload), { status: 200, headers });
+  } catch (error) {
+    recordRequestLog(app, makeRequestLogEntry({
+      client,
+      upstream: error.upstreamName || "none",
+      model: translated.model,
+      path: RESPONSES_PATH,
+      status: error.statusCode || 502,
+      started,
+      promptTokens: Math.max(1, Math.round(translated.bodyText.length / 4)),
+      completionTokens: 0,
+       extra: { ...gatewayRequestTraceLogFields({ trace: proxyResponse?.trace, error, traceId }), ...gatewayInjectionLogFields(prepared.injection) },
+    }), ctx);
+    return gatewayErrorResponse(error, traceId);
+  }
+}
+
+function completionsNativeAvailable(runtime, client, model) {
+  return proxyCandidates(runtime, client, model, COMPLETIONS_PATH).length > 0;
+}
+
+function translateCompletionsRequest(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Request body must be a JSON object.");
+  }
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    throw httpError(400, "`model` is required.");
+  }
+  if (payload.prompt == null || (Array.isArray(payload.prompt) && payload.prompt.length === 0)) {
+    throw httpError(400, "`prompt` is required.");
+  }
+  const prompts = Array.isArray(payload.prompt) ? payload.prompt : [payload.prompt];
+  const prompt = String(prompts[0] == null ? "" : prompts[0]);
+  const chat = { model, messages: [{ role: "user", content: prompt }], stream: payload.stream === true };
+  copyIfPresent(payload, chat, ["temperature", "top_p", "n", "stop", "seed", "frequency_penalty", "presence_penalty", "user"]);
+  if (payload.max_tokens != null) chat.max_tokens = payload.max_tokens;
+  const promptText = prompts.map((item) => String(item == null ? "" : item)).join("");
+  return {
+    bodyText: JSON.stringify(chat),
+    model,
+    stream: chat.stream,
+    promptCount: prompts.length,
+    seed: {
+      created: Math.floor(Date.now() / 1000),
+      echo: payload.echo === true,
+      id: `cmpl_${crypto.randomUUID().replace(/-/g, "")}`,
+      model,
+      prompt,
+      promptTokens: Math.max(1, Math.round(promptText.length / 4)),
+    },
+  };
+}
+
+function chatToCompletionsPayload(chatPayload, seed, hideReasoning = false) {
+  const choices = (Array.isArray(chatPayload?.choices) ? chatPayload.choices : []).map((choice, index) => {
+    const raw = chatContentToText(choice?.message?.content || "");
+    const text = hideReasoning ? stripThinkTags(raw) : raw;
+    return {
+      text: seed.echo ? `${seed.prompt}${text}` : text,
+      index: Number(choice?.index ?? index),
+      logprobs: choice?.logprobs ?? null,
+      finish_reason: choice?.finish_reason ?? null,
+    };
+  });
+  return {
+    id: seed.id,
+    object: "text_completion",
+    created: seed.created,
+    model: seed.model,
+    choices,
+    usage: normalizeOpenAiLogUsage(chatPayload?.usage, seed.promptTokens, estimateTokens(choices.map((choice) => choice.text).join(""))),
+  };
+}
+
+function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false, onComplete = null) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const completionChunk = (text, finishReason = null, usage = null) => ({
+    id: seed.id,
+    object: "text_completion",
+    created: seed.created,
+    model: seed.model,
+    choices: [{ index: 0, text, logprobs: null, finish_reason: finishReason }],
+    ...(usage ? { usage } : {}),
+  });
+  const write = (chunk) => writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
+  (async () => {
+    let buffer = "";
+    let usage = null;
+    let finishReason = "";
+    let streamError = "";
+    let closeReason = "done";
+    let sawDone = false;
+    let outputText = "";
+    let emitted = false;
+    let completionPending = false;
+    let upstreamStopped = false;
+    let upstreamReader = null;
+    const markUpstreamComplete = () => { completionPending = true; };
+    const stopUpstream = () => {
+      if (!completionPending || upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+    };
+    const diag = createStreamDiag(started);
+    const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
+    const stripText = hideReasoning ? createThinkTagStripper() : null;
+    const processChunk = (chunk, now = Date.now()) => {
+      chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
+      streamError = streamEventErrorMessage(chunk) || streamError;
+      finishReason = responseFinishReason(chunk) || finishReason;
+      const content = chatContentToText((chunk.choices || [])[0]?.delta?.content || "");
+      const text = hideReasoning && stripText ? stripText(content) : content;
+      if (text) {
+        noteStreamToken(diag, now);
+        outputText += text;
+      }
+      usage = normalizeChatUsageChunk(chunk.usage, outputText, seed.promptTokens) || usage;
+      if (!text) return Promise.resolve();
+      const payload = completionChunk(seed.echo && !emitted ? seed.prompt + text : text);
+      emitted = true;
+      return write(payload);
+    };
+
+    try {
+      const reader = openaiResp.body.getReader();
+      upstreamReader = reader;
+      for (;;) {
+        const result = await readSseChunk(reader, finishReason);
+        if (result.completed) {
+          closeReason = "completed";
+          markUpstreamComplete();
+          sawDone = true;
+          break;
+        }
+        const { done, value } = result;
+        if (done) break;
+        const now = Date.now();
+        noteStreamByte(diag, now);
+        buffer += decoder.decode(value, { stream: true });
+        const writes = [];
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; markUpstreamComplete(); });
+        await Promise.all(writes);
+        if (streamError) throw new Error(streamError);
+        if (sawDone) {
+          break;
+        }
+      }
+      buffer += decoder.decode();
+      if (!sawDone && buffer) {
+        const writes = [];
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; markUpstreamComplete(); });
+        await Promise.all(writes);
+        if (streamError) throw new Error(streamError);
+      }
+      if (!sawDone && !finishReason) {
+        closeReason = "eof";
+        await write({ error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+        if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
+          status: 502,
+          close_reason: closeReason,
+          finish_reason: finishReason,
+          ...streamDiagExtra(diag),
+        });
+      } else {
+        if (!sawDone) closeReason = "completed";
+        if (seed.echo && !emitted) await write(completionChunk(seed.prompt));
+        await write(completionChunk("", finishReason || "stop", usage || undefined));
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
+        if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
+          close_reason: closeReason,
+          finish_reason: finishReason,
+          ...streamDiagExtra(diag),
+        });
+      }
+    } catch (error) {
+      closeReason = "error";
+      if (onDone) onDone(normalizeOpenAiLogUsage(usage, seed.promptTokens, estimateTokens(outputText)), {
+        status: 502,
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        ...streamDiagExtra(diag),
+      });
+      await write({ error: { message: error.message || "Stream error.", type: "server_error" } });
+    } finally {
+      stopUpstream();
+      await writer.close();
+    }
+  })();
+
+  return readable;
+}
+
+function recordCompletionsLog(app, client, upstreamName, model, started, status, usage, ctx, traceId, fallbackPrompt, extra = {}) {
+  recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model,
+    path: COMPLETIONS_PATH,
+    status: status || 200,
+    started,
+    promptTokens: usage?.prompt_tokens || fallbackPrompt || 1,
+    completionTokens: usage?.completion_tokens || 0,
+    extra: { trace_id: traceId, ...extra },
+  }), ctx);
+}
+
+async function handleCompletionsRequest(request, url, app, ctx, traceId) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await readRequestText(request));
+  const translated = translateCompletionsRequest(payload);
+  await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
+  await persistSessionCurrentModel(runtime, client, request, payload, ctx);
+  const useNative = completionsNativeAvailable(runtime, client, translated.model);
+  if (!useNative && translated.promptCount > 1) {
+    throw httpError(400, "Array `prompt` needs a native `/v1/completions` upstream; the chat fallback supports a single prompt.");
+  }
+  const bodyText = useNative ? JSON.stringify({ ...payload, model: translated.model }) : translated.bodyText;
+  const prepared = useNative
+    ? prepareGatewayCompletionsBody(bodyText, runtime.settings, client)
+    : prepareGatewayChatBody(bodyText, runtime.settings, client);
+  const logError = (error, upstreamName = "none", trace = null) => recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model: translated.model,
+    path: COMPLETIONS_PATH,
+    status: error.statusCode || 502,
+    started,
+    promptTokens: translated.seed.promptTokens,
+    completionTokens: 0,
+    extra: { ...gatewayRequestTraceLogFields({ trace, error, traceId }), ...gatewayInjectionLogFields(prepared.injection) },
+  }), ctx);
+
+  if (translated.stream) {
+    const headers = pendingSseHeaders(client, traceId);
+    const body = streamPendingOpenAiResponse(async () => {
+      let proxyResponse;
+      try {
+        proxyResponse = await proxyRequest({
+          client,
+          model: translated.model,
+          pathname: useNative ? COMPLETIONS_PATH : CHAT_PATH,
+          request,
+          bodyText: prepared.bodyText,
+          injection: prepared.injection,
+          runtime,
+          search: url.search,
+          ctx,
+          signal: request.signal,
+          traceId,
+        });
+        const upstreamResp = proxyResponse.response;
+        if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
+        const finish = (usage, extra) => recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, usage, ctx, traceId, translated.seed.promptTokens, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection), ...extra });
+        if (useNative) {
+          return trackOpenAiStreamUsage(upstreamResp.body, translated.seed.promptTokens, finish, started, translated.model !== translated.seed.model ? translated.seed.model : "", shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), false, () => abortUpstreamResponse(proxyResponse));
+        }
+        return streamCompletionsFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
+      } catch (error) {
+        logError(error, error.upstreamName || proxyResponse?.upstream?.name || "none", proxyResponse?.trace);
+        throw error;
+      }
+    });
+    return new Response(body, { status: 200, headers });
+  }
+
+  let proxyResponse;
+  try {
+    proxyResponse = await proxyRequest({
+      client,
+      model: translated.model,
+      pathname: useNative ? COMPLETIONS_PATH : CHAT_PATH,
+      request,
+      bodyText: prepared.bodyText,
+      injection: prepared.injection,
+       runtime,
+       search: url.search,
+       ctx,
+       signal: request.signal,
+       traceId,
+     });
+    const upstreamResp = proxyResponse.response;
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+    if (!upstreamResp.ok) {
+      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, upstreamResp.status, null, ctx, traceId, translated.seed.promptTokens, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection) });
+      return new Response(await upstreamResp.text(), { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
+
+    const openaiText = await upstreamResp.text();
+    const openaiPayload = safeJson(openaiText);
+    const applicationError = upstreamApplicationErrorMessage(openaiPayload || openaiText);
+    if (!openaiPayload || looksLikeHtmlDocument(openaiText) || applicationError) {
+      recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, 502, null, ctx, traceId, translated.seed.promptTokens, { ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }), ...gatewayInjectionLogFields(proxyResponse.injection) });
+      return upstreamBadGatewayResponse(applicationError || "Upstream returned a non-JSON API response.", headers);
+    }
+
+    const hideReasoning = shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream);
+    let responsePayload;
+    if (useNative) {
+      sanitizeOpenAiPayload(openaiPayload, hideReasoning);
+      responsePayload = {
+        ...openaiPayload,
+        id: openaiPayload.id || translated.seed.id,
+        model: translated.seed.model,
+      };
+    } else {
+      normalizeNimChatPayload(openaiPayload, proxyResponse.upstream);
+      responsePayload = chatToCompletionsPayload(openaiPayload, translated.seed, hideReasoning);
+    }
+    const usage = responsePayload.usage || normalizeOpenAiLogUsage(openaiPayload?.usage, translated.seed.promptTokens, estimateOpenAiCompletionTokens(openaiPayload));
+    recordCompletionsLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, usage, ctx, traceId, translated.seed.promptTokens, {
+      ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }),
+      ...gatewayInjectionLogFields(proxyResponse.injection),
+      finish_reason: responseFinishReason(openaiPayload),
+    });
+    headers.set("content-type", "application/json; charset=utf-8");
+    return new Response(JSON.stringify(responsePayload), { status: 200, headers });
+  } catch (error) {
+    logError(error, error.upstreamName || "none", proxyResponse?.trace);
+    return gatewayErrorResponse(error, traceId);
+  }
+}
+
+function nativeResponsesStream(body, onDone, onComplete = null) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let sequenceNumber = 0;
+  const writeEvent = (event) => {
+    const payload = event && typeof event === "object"
+      ? { ...event, sequence_number: sequenceNumber++ }
+      : event;
+    return writer.write(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+  };
+  (async () => {
+    let buffer = "";
+    let usage = null;
+    let finishReason = "";
+    let sawDone = false;
+    let completed = false;
+    let outputChars = 0;
+    let closeReason = "done";
+    let completionPending = false;
+    let upstreamStopped = false;
+    let upstreamReader = null;
+    const markUpstreamComplete = () => { completionPending = true; };
+    const stopUpstream = () => {
+      if (!completionPending || upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+    };
+    const reader = body.getReader();
+    upstreamReader = reader;
+    const processChunk = (chunk) => {
+      if (chunk.usage) usage = chunk.usage;
+      if (chunk.type === "response.completed") {
+        completed = true;
+        markUpstreamComplete();
+        finishReason = "stop";
+        const response = chunk.response || {};
+        const normalizedUsage = normalizeResponsesUsage(response.usage, Math.round(outputChars / 4));
+        if ((!response.usage || (Number(response.usage.output_tokens ?? response.usage.completion_tokens) || 0) <= 0) && outputChars > 0) {
+          return { ...chunk, response: { ...response, usage: normalizedUsage } };
+        }
+      }
+      if (chunk.type === "response.output_text.delta") outputChars += String(chunk.delta || "").length;
+      if (chunk.type === "response.function_call_arguments.delta") outputChars += String(chunk.delta || "").length;
+      return chunk;
+    };
+    for (;;) {
+      const result = await readSseChunk(reader, finishReason);
+      if (result.completed) {
+        closeReason = "completed";
+        markUpstreamComplete();
+        sawDone = true;
+        break;
+      }
+      const { done, value } = result;
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = [];
+      buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; markUpstreamComplete(); });
+      for (const event of events) await writeEvent(event);
+      if (sawDone || completed) {
+        break;
+      }
+    }
+    buffer += decoder.decode();
+    if (!sawDone && !completed && buffer) {
+      const events = [];
+      consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; markUpstreamComplete(); });
+      for (const event of events) await writeEvent(event);
+    }
+    if (!sawDone && !completed) {
+      closeReason = "eof";
+      await writeEvent({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+    } else {
+      if (!sawDone) {
+        closeReason = "completed";
+      }
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+    }
+    stopUpstream();
+    onDone?.(normalizeResponsesUsage(usage, Math.round(outputChars / 4)), {
+      close_reason: closeReason,
+      finish_reason: finishReason,
+      ...(closeReason === "eof" ? { status: 502 } : {}),
+    });
+    await writer.close();
+  })().catch(async (error) => {
+    stopUpstream();
+    onDone?.(null, { close_reason: "error", finish_reason: "error", status: 502, error: error.message });
+    try { await writer.abort(error); } catch {}
+  });
+  return readable;
+}
+
+// ponytail: Codex's internal compaction models (gpt-5.6-terra etc.) aren't in
+//  any upstream catalog; compaction just needs *a* model, so fall back to the
+//  session model or the first client-allowed model with upstream candidates.
+async function resolveCompactionModel(client, runtime, requestedModel, request, payload) {
+  const sessionModel = await currentSessionModel(client, runtime, request, payload);
+  if (sessionModel && clientAllowsModelSelection(client, sessionModel, sessionModel) && proxyCandidates(runtime, client, sessionModel, CHAT_PATH).length) return sessionModel;
+  try {
+    const model = await resolveAuthorizedClientModel(client, runtime, requestedModel, request, payload);
+    if (proxyCandidates(runtime, client, model, CHAT_PATH).length) return model;
+  } catch (err) {
+    if (err?.statusCode !== 403) throw err;
+  }
+  const rows = modelRegistryRows(runtime)
+    .filter((row) => clientAllowsUpstream(client, row.upstream.name))
+    .filter((row) => clientAllowsModelSelection(client, row.alias, row.model));
+  for (const row of rows) {
+    if (proxyCandidates(runtime, client, row.model, CHAT_PATH).length) return row.model;
+  }
+  throw httpError(403, `No compaction-capable model available for client: ${client.id}`);
+}
+
+async function handleResponsesCompactRequest(request, url, app, ctx, traceId) {
+  const started = Date.now();
+  const runtime = await loadRuntimeConfig(app);
+  const client = await requireClient(request, runtime);
+  const payload = parseJsonBody(await readRequestText(request));
+  const requestedModel = String(payload?.model || "").trim();
+  if (!requestedModel) throw httpError(400, "`model` is required.");
+
+  const model = await resolveCompactionModel(client, runtime, requestedModel, request, payload);
+  const transcript = compactTranscript(payload.input, payload.instructions);
+  if (!transcript) throw httpError(400, "`input` is required.");
+
+  const chat = {
+    model,
+    messages: [
+      { role: "system", content: COMPACTION_PROMPT },
+      { role: "user", content: transcript },
+    ],
+    max_tokens: 4096,
+    stream: false,
+  };
+  copyIfPresent(payload, chat, ["reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
+  const bodyText = JSON.stringify(chat);
+  const prepared = prepareGatewayChatBody(bodyText, runtime.settings, client);
+  const fallbackPrompt = Math.max(1, Math.round(prepared.bodyText.length / 4));
+  let upstreamName = "none";
+  let proxyTrace = null;
+  const log = (status, usage, extra = {}) => recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model,
+    path: RESPONSES_COMPACT_PATH,
+    status,
+    started,
+    promptTokens: usage?.prompt_tokens ?? usage?.input_tokens ?? fallbackPrompt,
+    completionTokens: usage?.completion_tokens ?? usage?.output_tokens ?? 0,
+    extra: { ...gatewayRequestTraceLogFields({ trace: proxyTrace, traceId }), ...gatewayInjectionLogFields(prepared.injection), ...extra },
+  }), ctx);
+
+  try {
+    const proxyResponse = await proxyRequest({ client, model, pathname: CHAT_PATH, request, bodyText: prepared.bodyText, injection: prepared.injection, runtime, search: url.search, ctx, signal: request.signal, traceId });
+    proxyTrace = proxyResponse.trace;
+    upstreamName = proxyResponse.upstream.name;
+    const upstreamResp = proxyResponse.response;
+    const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
+    if (!upstreamResp.ok) {
+      log(upstreamResp.status);
+      return new Response(upstreamResp.body, { status: upstreamResp.status, statusText: upstreamResp.statusText, headers });
+    }
+
+    const text = await upstreamResp.text();
+    const result = safeJson(text);
+    const applicationError = upstreamApplicationErrorMessage(result || text);
+    const summary = chatContentToText(result?.choices?.[0]?.message?.content || "").trim();
+    if (!result || looksLikeHtmlDocument(text) || applicationError || !summary) {
+      log(502);
+      return upstreamBadGatewayResponse(applicationError || "Upstream returned no compaction summary.", headers);
+    }
+
+    log(200, result.usage, { finish_reason: result.choices?.[0]?.finish_reason || "stop" });
+    headers.set("content-type", "application/json; charset=utf-8");
+    return new Response(JSON.stringify({
+      output: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `Conversation summary:\n${summary}` }],
+      }],
+    }), { status: 200, headers });
+  } catch (error) {
+    upstreamName = error.upstreamName || upstreamName;
+    log(error.statusCode || 502, null, gatewayRequestTraceLogFields({ error, traceId }));
+    return gatewayErrorResponse(error, traceId);
+  }
+}
+
+function compactTranscript(input, instructions) {
+  const messages = responsesInputToMessages(input, instructions);
+  return messages.map((message) => {
+    const toolCalls = (message.tool_calls || []).map((call) => `${call.function?.name || "tool"}(${call.function?.arguments || ""})`).join("\n");
+    return `[${message.role}]\n${chatContentToText(message.content)}${toolCalls ? `\n${toolCalls}` : ""}`.trim();
+  }).filter(Boolean).join("\n\n");
+}
+
+function translateResponsesRequest(payload, { previousResponse = null } = {}) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Request body must be a JSON object.");
+  }
+  const model = String(payload.model || "").trim();
+  if (!model) {
+    throw httpError(400, "`model` is required.");
+  }
+  if (payload.background === true) {
+    throw httpError(400, "`background` is not supported by this gateway.");
+  }
+  const previousRows = previousResponse ? responsesPreviousInput(previousResponse) : [];
+  const currentRows = Array.isArray(payload.input) ? payload.input : (payload.input == null ? [] : [payload.input]);
+  const messages = responsesInputToMessages([...previousRows, ...currentRows], payload.instructions);
+  if (messages.length === 0) {
+    throw httpError(400, "`input` is required.");
+  }
+
+  const chat = { model, messages, stream: payload.stream === true };
+  copyIfPresent(payload, chat, ["temperature", "top_p", "presence_penalty", "frequency_penalty", "stop", "seed", "user"]);
+  copyIfPresent(payload, chat, ["reasoning", "reasoning_effort", "reasoningEffort", "reasoningSummary", "providerOptions", "provider_options"]);
+  copyIfPresent(payload, chat, ["parallel_tool_calls"]);
+  const maxTokens = payload.max_output_tokens ?? payload.max_tokens;
+  if (maxTokens != null) chat.max_tokens = maxTokens;
+  const responseFormat = responsesTextFormatToChatResponseFormat(payload.text?.format);
+  if (responseFormat) chat.response_format = responseFormat;
+  const tools = responsesToolsToChatTools(payload.tools);
+  if (tools.length) chat.tools = tools;
+  const toolChoice = responsesToolChoiceToChat(payload.tool_choice);
+  if (toolChoice != null) chat.tool_choice = toolChoice;
+
+  const responseId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
+  const messageId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
+  return {
+    bodyText: JSON.stringify(chat),
+    model,
+    stream: chat.stream,
+    seed: {
+      createdAt: Math.floor(Date.now() / 1000),
+      id: responseId,
+      instructions: typeof payload.instructions === "string" ? payload.instructions : null,
+      maxOutputTokens: maxTokens ?? null,
+      messageId,
+      metadata: payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {},
+      model,
+      parallelToolCalls: payload.parallel_tool_calls ?? true,
+      previousResponseId: payload.previous_response_id || null,
+      reasoningId: `rs_${crypto.randomUUID().replace(/-/g, "")}`,
+      reasoningEffort: payload.reasoning?.effort ?? payload.reasoning_effort ?? payload.reasoningEffort ?? null,
+      reasoningSummary: payload.reasoning?.summary ?? payload.reasoningSummary ?? null,
+      store: payload.store === true,
+      temperature: payload.temperature ?? null,
+      textFormat: payload.text?.format && typeof payload.text.format === "object" ? payload.text.format : { type: "text" },
+      toolChoice: payload.tool_choice ?? "auto",
+      tools: Array.isArray(payload.tools) ? payload.tools : [],
+      topP: payload.top_p ?? null,
+      truncation: payload.truncation ?? "disabled",
+    },
+  };
+}
+
+function responsesPreviousInput(previousResponse) {
+  const rows = [];
+  for (const item of Array.isArray(previousResponse?.output) ? previousResponse.output : []) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "function_call") {
+      rows.push({
+        type: "function_call",
+        call_id: String(item.call_id || item.id || ""),
+        name: String(item.name || "tool"),
+        arguments: String(item.arguments || "{}"),
+      });
+    } else if (item.type === "function_call_output") {
+      rows.push(item);
+    } else if (item.type === "message" && String(item.role || "") === "assistant") {
+      const content = Array.isArray(item.content)
+        ? item.content.map((part) => part && part.type === "output_text"
+          ? { type: "input_text", text: String(part.text || "") }
+          : part)
+        : item.content;
+      rows.push({ role: "assistant", content });
+    }
+  }
+  return rows;
+}
+
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (typeof instructions === "string" && instructions.trim()) {
+    messages.push({ role: "system", content: instructions });
+  }
+
+  const rows = Array.isArray(input) ? input : (input == null ? [] : [input]);
+  for (const item of rows) {
+    if (typeof item === "string") {
+      messages.push({ role: "user", content: item });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: String(item.call_id || item.id || `call_${crypto.randomUUID().replace(/-/g, "")}`),
+          type: "function",
+          function: { name: String(item.name || "tool"), arguments: String(item.arguments || "{}") },
+        }],
+      });
+      continue;
+    }
+    if (item.type === "function_call_output") {
+      messages.push({ role: "tool", tool_call_id: String(item.call_id || ""), content: responsesToolOutputText(item.output) });
+      continue;
+    }
+    if (item.role || item.type === "message") {
+      messages.push({
+        role: normalizeChatRole(item.role || "user"),
+        content: responsesContentToChatContent(item.content),
+      });
+      continue;
+    }
+    if (item.type === "input_text" || typeof item.text === "string") {
+      messages.push({ role: "user", content: String(item.text || "") });
+    }
+  }
+
+  return messages.filter((msg) => msg.tool_call_id || msg.tool_calls?.length || (msg.content !== "" && msg.content != null));
+}
+
+function responsesToolsToChatTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  return tools.map((tool) => tool?.function || tool).filter((tool) => tool?.name).map((tool) => ({
+    type: "function",
+    function: {
+      name: String(tool.name),
+      description: String(tool.description || ""),
+      parameters: tool.parameters && typeof tool.parameters === "object" ? tool.parameters : { type: "object", properties: {} },
+      ...(typeof tool.strict === "boolean" ? { strict: tool.strict } : {}),
+    },
+  }));
+}
+
+function responsesTextFormatToChatResponseFormat(format) {
+  if (!format || typeof format !== "object" || format.type === "text") return null;
+  if (format.type !== "json_schema") return { ...format };
+
+  const source = format.json_schema && typeof format.json_schema === "object" ? format.json_schema : format;
+  return {
+    type: "json_schema",
+    json_schema: {
+      name: String(source.name || "response"),
+      ...(source.description != null ? { description: String(source.description) } : {}),
+      schema: source.schema && typeof source.schema === "object" ? source.schema : {},
+      ...(source.strict != null ? { strict: Boolean(source.strict) } : {}),
+    },
+  };
+}
+
+function responsesToolChoiceToChat(choice) {
+  if (!isProvidedValue(choice)) return null;
+  if (typeof choice === "string") return choice;
+  const name = choice.name || choice.function?.name;
+  if (choice.type === "function" && name) return { type: "function", function: { name: String(name) } };
+  return null;
+}
+
+function responsesToolOutputText(output) {
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) return output.map((part) => String(part?.text ?? part?.content ?? "")).join("");
+  return output == null ? "" : JSON.stringify(output);
+}
+
+function responsesContentToChatContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  const parts = [];
+  let hasMedia = false;
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const type = String(part.type || "");
+    if (type === "input_image" || part.image_url) {
+      const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+      if (url) {
+        hasMedia = true;
+        parts.push({ type: "image_url", image_url: { url } });
+      }
+      continue;
+    }
+    const text = part.text ?? part.content;
+    if (text != null) parts.push({ type: "text", text: String(text) });
+  }
+
+  return hasMedia ? parts : parts.map((part) => part.text || "").join("");
+}
+
+function normalizeChatRole(role) {
+  const value = String(role || "user");
+  return value === "developer" ? "system" : value;
+}
+
+function copyIfPresent(from, to, keys) {
+  for (const key of keys) {
+    if (isProvidedValue(from[key])) to[key] = from[key];
+  }
+}
+
+function isProvidedValue(value) {
+  return value != null && String(value) !== "[undefined]";
+}
+
+function makeResponsesPayload(seed, { text = "", usage = null, status = "completed", toolCalls = [], reasoning = "", outputOrder = null } = {}) {
+  const message = text ? {
+    id: seed.messageId,
+    type: "message",
+    status,
+    role: "assistant",
+    content: [{ type: "output_text", text, annotations: [] }],
+  } : null;
+  const output = [];
+  if (status === "completed") {
+    if (Array.isArray(outputOrder)) {
+      for (const entry of outputOrder) {
+        if (entry?.type === "message" && message) output.push(message);
+        else if (entry?.type === "reasoning" && reasoning) output.push(responsesReasoningItem(seed, reasoning));
+        else if (entry?.type === "function_call" && entry.call) output.push(responsesFunctionCallItem(entry.call));
+      }
+    } else {
+      if (message) output.push(message);
+      if (reasoning) output.push(responsesReasoningItem(seed, reasoning));
+      output.push(...toolCalls.map((call) => responsesFunctionCallItem(call)));
+    }
+  }
+  return {
+    id: seed.id,
+    object: "response",
+    created_at: seed.createdAt,
+    status,
+    error: null,
+    incomplete_details: null,
+    instructions: seed.instructions,
+    max_output_tokens: seed.maxOutputTokens,
+    model: seed.model,
+    output,
+    output_text: text || "",
+    parallel_tool_calls: seed.parallelToolCalls ?? true,
+    previous_response_id: seed.previousResponseId || null,
+    reasoning: { effort: seed.reasoningEffort ?? null, summary: seed.reasoningSummary ?? null },
+    store: seed.store === true,
+    temperature: seed.temperature,
+    text: { format: seed.textFormat || { type: "text" } },
+    tool_choice: seed.toolChoice,
+    tools: seed.tools,
+    top_p: seed.topP,
+    truncation: seed.truncation ?? "disabled",
+    usage: normalizeResponsesUsage(usage, estimateTokens([text, reasoning, ...toolCalls.map((call) => call?.function?.arguments || "")].join(""))),
+    metadata: seed.metadata || {},
+  };
+}
+
+function normalizeResponsesUsage(usage, fallbackOutput = 0) {
+  const input = Math.max(0, Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0);
+  const reportedOutput = Number(usage?.completion_tokens ?? usage?.output_tokens);
+  const output = Math.max(0, Number.isFinite(reportedOutput) && reportedOutput > 0 ? reportedOutput : fallbackOutput);
+  return {
+    input_tokens: input,
+    input_tokens_details: { cached_tokens: Number(usage?.prompt_tokens_details?.cached_tokens || usage?.input_tokens_details?.cached_tokens || 0) || 0 },
+    output_tokens: output,
+    output_tokens_details: { reasoning_tokens: Number(usage?.completion_tokens_details?.reasoning_tokens || usage?.output_tokens_details?.reasoning_tokens || 0) || 0 },
+    total_tokens: Math.max(0, Number(usage?.total_tokens || input + output) || 0),
+  };
+}
+
+function responsesReasoningItem(seed, text, status = "completed") {
+  return { id: seed.reasoningId, type: "reasoning", status, summary: [{ type: "summary_text", text }] };
+}
+
+function responsesFunctionCallItem(call, status = "completed") {
+  return {
+    id: String(call.id || `fc_${crypto.randomUUID().replace(/-/g, "")}`),
+    call_id: String(call.id || ""),
+    type: "function_call",
+    status,
+    name: String(call.function?.name || call.name || "tool"),
+    arguments: String(call.function?.arguments || call.arguments || ""),
+  };
+}
+
+function reasoningText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return chatContentToText(value);
+  if (!value || typeof value !== "object") return "";
+  return String(value.text ?? value.content ?? value.reasoning ?? value.thinking ?? value.summary ?? "");
+}
+
+function recordResponsesLog(app, client, upstreamName, model, started, status, bodyText, usage, ctx, traceId, extra = {}) {
+  recordRequestLog(app, makeRequestLogEntry({
+    client,
+    upstream: upstreamName,
+    model,
+    path: RESPONSES_PATH,
+    status: status || 200,
+    started,
+    promptTokens: usage?.input_tokens || Math.max(1, Math.round(bodyText.length / 4)),
+    completionTokens: usage?.output_tokens || 0,
+    extra: { trace_id: traceId, ...extra },
+  }), ctx);
+}
+
+function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, normalizeNimReasoning = false, onComplete = null) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const write = (eventName, payload) => writer.write(encoder.encode(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`));
+
+  (async () => {
+    let buffer = "";
+    let usage = null;
+    let finishReason = "";
+    let outputText = "";
+    let sawDone = false;
+    let closeReason = "done";
+    let textIndex = null;
+    let thinkingIndex = null;
+    let nextIndex = 0;
+    const toolBlocks = new Map();
+    let completionPending = false;
+    let upstreamStopped = false;
+    let upstreamReader = null;
+    const markUpstreamComplete = () => { completionPending = true; };
+    const stopUpstream = () => {
+      if (!completionPending || upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+    };
+    const diag = createStreamDiag(started);
+    const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
+    const stripText = createThinkTagStripper();
+    const closeText = async () => {
+      if (textIndex == null) return;
+      await write("content_block_stop", { type: "content_block_stop", index: textIndex });
+      textIndex = null;
+    };
+    const closeThinking = async () => {
+      if (thinkingIndex == null) return;
+      await write("content_block_stop", { type: "content_block_stop", index: thinkingIndex });
+      thinkingIndex = null;
+    };
+    const ensureThinking = async () => {
+      await closeText();
+      if (thinkingIndex != null) return thinkingIndex;
+      thinkingIndex = nextIndex++;
+      await write("content_block_start", { type: "content_block_start", index: thinkingIndex, content_block: { type: "thinking", thinking: "" } });
+      return thinkingIndex;
+    };
+    const ensureText = async () => {
+      await closeThinking();
+      if (textIndex != null) return textIndex;
+      textIndex = nextIndex++;
+      await write("content_block_start", { type: "content_block_start", index: textIndex, content_block: { type: "text", text: "" } });
+      return textIndex;
+    };
+    const ensureTool = async (call) => {
+      await closeText();
+      await closeThinking();
+      const key = String(call.index ?? toolBlocks.size);
+      let block = toolBlocks.get(key);
+      if (block) {
+        if (call.id) block.id = String(call.id);
+        if (call.function?.name) block.name = String(call.function.name);
+        return block;
+      }
+      block = {
+        index: nextIndex++,
+        id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`),
+        name: String(call.function?.name || call.name || "tool"),
+        args: "",
+        stopped: false,
+      };
+      toolBlocks.set(key, block);
+      await write("content_block_start", {
+        type: "content_block_start",
+        index: block.index,
+        content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+      });
+      return block;
+    };
+    const stopOpenBlocks = async () => {
+      await closeText();
+      await closeThinking();
+      for (const block of toolBlocks.values()) {
+        if (block.stopped) continue;
+        block.stopped = true;
+        await write("content_block_stop", { type: "content_block_stop", index: block.index });
+      }
+    };
+    const processChunk = async (chunk, now = Date.now()) => {
+      chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
+      const streamError = streamEventErrorMessage(chunk);
+      if (streamError) throw new Error(streamError);
+      usage = chunk.usage || usage;
+      const choice = (chunk.choices || [])[0] || {};
+      finishReason = choice.finish_reason || finishReason;
+      const delta = choice.delta || {};
+      const thinking = hideReasoning ? "" : reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
+      if (thinking) {
+        outputText += thinking;
+        const index = await ensureThinking();
+        noteStreamToken(diag, now);
+        await write("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } });
+      }
+      const text = hideReasoning ? stripText(chatContentToText(delta.content || "")) : chatContentToText(delta.content || "");
+      if (text) {
+        outputText += text;
+        const index = await ensureText();
+        noteStreamToken(diag, now);
+        await write("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text } });
+      }
+      for (const call of (delta.tool_calls || [])) {
+        const block = await ensureTool(call);
+        const args = String(call.function?.arguments || "");
+        if (args) {
+          block.args += args;
+          outputText += args;
+          await write("content_block_delta", { type: "content_block_delta", index: block.index, delta: { type: "input_json_delta", partial_json: args } });
+        }
+      }
+    };
+
+    try {
+      await write("message_start", {
+        type: "message_start",
+        message: { id: seed.id, type: "message", role: "assistant", model: seed.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
+      });
+      await write("ping", { type: "ping" });
+
+      const reader = openaiResp.body.getReader();
+      upstreamReader = reader;
+      for (;;) {
+        const result = await readSseChunk(reader, finishReason);
+        if (result.completed) {
+          closeReason = "completed";
+          markUpstreamComplete();
+          sawDone = true;
+          break;
+        }
+        const { done, value } = result;
+        if (done) break;
+        const now = Date.now();
+        noteStreamByte(diag, now);
+        buffer += decoder.decode(value, { stream: true });
+        const writes = [];
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => writes.push(processChunk(chunk, now)), () => { sawDone = true; markUpstreamComplete(); });
+        await Promise.all(writes);
+        if (sawDone) {
+          break;
+        }
+      }
+      buffer += decoder.decode();
+      if (!sawDone && buffer) {
+        const writes = [];
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => writes.push(processChunk(chunk)), () => { sawDone = true; markUpstreamComplete(); });
+        await Promise.all(writes);
+      }
+      if (!sawDone && !finishReason) {
+        closeReason = "eof";
+        try { await stopOpenBlocks(); } catch {}
+        await write("error", { type: "error", error: { type: "api_error", message: "Upstream stream ended without [DONE]." } });
+        if (onDone) onDone(normalizeAnthropicUsage(usage, [{ text: outputText }]), {
+          status: 502,
+          close_reason: closeReason,
+          finish_reason: finishReason,
+          tool_calls_count: toolBlocks.size,
+          ...streamDiagExtra(diag),
+        });
+        return;
+      }
+      if (!sawDone) closeReason = "completed";
+      await stopOpenBlocks();
+      const stopReason = openAiFinishToAnthropicStop(finishReason);
+      const finalUsage = normalizeAnthropicUsage(usage, [{ text: outputText }]);
+      await write("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: finalUsage.output_tokens } });
+      await write("message_stop", { type: "message_stop" });
+      if (onDone) onDone(finalUsage, {
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        tool_calls_count: toolBlocks.size,
+        ...streamDiagExtra(diag),
+      });
+    } catch (error) {
+      closeReason = "error";
+      // Never expose a provider reset as a raw errored response body. Outer
+      // Cloudflare proxies can otherwise replace the stream with HTTP 502.
+      try { await stopOpenBlocks(); } catch {}
+      await write("error", { type: "error", error: { type: "api_error", message: error.message || "Stream error." } });
+      if (onDone) onDone(normalizeAnthropicUsage(usage, [{ text: outputText }]), {
+        status: 502,
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        tool_calls_count: toolBlocks.size,
+        ...streamDiagExtra(diag),
+      });
+    } finally {
+      stopUpstream();
+      await writer.close();
+    }
+  })();
+
+  return readable;
+}
+
+function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date.now(), hideReasoning = false, onFinal = null, normalizeNimReasoning = false, onComplete = null) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let sequenceNumber = 0;
+  const write = (event) => writer.write(encoder.encode(`data: ${JSON.stringify({ ...event, sequence_number: sequenceNumber++ })}\n\n`));
+
+  (async () => {
+    let buffer = "";
+    const textParts = [];
+    const reasoningParts = [];
+    let outputChars = 0;
+    let reasoningOutputIndex = null;
+    let usage = null;
+    let streamError = "";
+    let finishReason = "";
+    let sawDone = false;
+    const toolCalls = new Map();
+    let nextOutputIndex = 0;
+    const outputItems = [];
+    const diag = createStreamDiag(started);
+    const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
+    let closeReason = "done";
+    const writes = [];
+    const stripText = createThinkTagStripper();
+    let completionPending = false;
+    let upstreamStopped = false;
+    let upstreamReader = null;
+    const markUpstreamComplete = () => { completionPending = true; };
+    const stopUpstream = () => {
+      if (!completionPending || upstreamStopped) return;
+      upstreamStopped = true;
+      try { onComplete?.(); } catch {}
+      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+    };
+    let messageOutputIndex = null;
+    const ensureMessage = () => {
+      if (messageOutputIndex != null) return;
+      messageOutputIndex = nextOutputIndex++;
+      const item = { id: seed.messageId, type: "message", status: "in_progress", role: "assistant", content: [] };
+      outputItems.push({ type: "message", outputIndex: messageOutputIndex, item });
+      writes.push(write({ type: "response.output_item.added", output_index: messageOutputIndex, item }));
+      writes.push(write({ type: "response.content_part.added", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }));
+    };
+    const ensureReasoning = () => {
+      if (reasoningOutputIndex != null) return;
+      reasoningOutputIndex = nextOutputIndex++;
+      outputItems.push({ type: "reasoning", outputIndex: reasoningOutputIndex });
+      writes.push(write({ type: "response.output_item.added", output_index: reasoningOutputIndex, item: responsesReasoningItem(seed, "", "in_progress") }));
+      writes.push(write({ type: "response.reasoning_summary_part.added", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, part: { type: "summary_text", text: "" } }));
+    };
+    const processChunk = (chunk, now = Date.now()) => {
+      chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
+      streamError = streamEventErrorMessage(chunk) || streamError;
+      usage = withFallbackChatUsage(chunk.usage, 0, Math.round(outputChars / 4)) || usage;
+      finishReason = responseFinishReason(chunk) || finishReason;
+      const delta = (chunk.choices || [])[0]?.delta || {};
+      const reasoningDelta = hideReasoning ? "" : reasoningText(delta.reasoning_content ?? delta.reasoning ?? delta.thinking);
+      if (reasoningDelta) {
+        ensureReasoning();
+        noteStreamToken(diag, now);
+        reasoningParts.push(reasoningDelta);
+        outputChars += reasoningDelta.length;
+        writes.push(write({ type: "response.reasoning_summary_text.delta", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, delta: reasoningDelta }));
+      }
+      const content = hideReasoning ? stripText(chatContentToText(delta.content || "")) : chatContentToText(delta.content || "");
+      if (content) {
+        ensureMessage();
+        noteStreamToken(diag, now);
+        textParts.push(content);
+        outputChars += content.length;
+        writes.push(write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, delta: content }));
+      }
+      for (const call of (delta.tool_calls || [])) {
+        const key = String(call.index ?? toolCalls.size);
+        let item = toolCalls.get(key);
+        if (!item) {
+          item = { id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`), name: String(call.function?.name || call.name || "tool"), argumentParts: [], outputIndex: nextOutputIndex++ };
+          toolCalls.set(key, item);
+          outputItems.push({ type: "function_call", outputIndex: item.outputIndex, item });
+          writes.push(write({ type: "response.output_item.added", output_index: item.outputIndex, item: responsesFunctionCallItem(item, "in_progress") }));
+        }
+        if (call.id) item.id = String(call.id);
+        if (call.function?.name) item.name = String(call.function.name);
+        const args = String(call.function?.arguments || "");
+        if (args) {
+          item.argumentParts.push(args);
+          outputChars += args.length;
+          writes.push(write({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: args }));
+        }
+      }
+    };
+    try {
+      await write({ type: "response.created", response: makeResponsesPayload(seed, { status: "in_progress" }) });
+      await write({ type: "response.in_progress", response: makeResponsesPayload(seed, { status: "in_progress" }) });
+
+      const reader = openaiResp.body.getReader();
+      upstreamReader = reader;
+      for (;;) {
+        const result = await readSseChunk(reader, finishReason);
+        if (result.completed) {
+          closeReason = "completed";
+          markUpstreamComplete();
+          sawDone = true;
+          break;
+        }
+        const { done, value } = result;
+        if (done) break;
+        const now = Date.now();
+        noteStreamByte(diag, now);
+        buffer += decoder.decode(value, { stream: true });
+        buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => processChunk(chunk, now), () => { sawDone = true; markUpstreamComplete(); });
+        await Promise.all(writes.splice(0));
+        if (streamError) throw new Error(streamError);
+        if (sawDone) {
+          break;
+        }
+      }
+      buffer += decoder.decode();
+      if (!sawDone && buffer) {
+        consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => processChunk(chunk), () => { sawDone = true; markUpstreamComplete(); });
+        await Promise.all(writes.splice(0));
+        if (streamError) throw new Error(streamError);
+      }
+
+      const text = textParts.join("");
+      const reasoning = reasoningParts.join("");
+      for (const item of toolCalls.values()) item.arguments = item.argumentParts.join("");
+      if (!sawDone && !finishReason) {
+        closeReason = "eof";
+        const failedResponse = { ...makeResponsesPayload(seed, { text, reasoning, usage, status: "failed" }), error: { message: "Upstream stream ended without [DONE].", type: "server_error" } };
+        if (onFinal) onFinal(failedResponse);
+        await write({ type: "response.failed", response: failedResponse });
+        await write({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+        return;
+      }
+      if (!sawDone) closeReason = "completed";
+      for (const outputItem of outputItems) {
+        if (outputItem.type === "message") {
+          const donePart = { type: "output_text", text, annotations: [] };
+          await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, text });
+          await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, part: donePart });
+          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: { ...outputItem.item, status: "completed", content: [donePart] } });
+        } else if (outputItem.type === "reasoning") {
+          const part = { type: "summary_text", text: reasoning };
+          await write({ type: "response.reasoning_summary_text.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, text: reasoning });
+          await write({ type: "response.reasoning_summary_part.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, part });
+          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesReasoningItem(seed, reasoning) });
+        } else if (outputItem.type === "function_call") {
+          await write({ type: "response.function_call_arguments.done", item_id: outputItem.item.id, output_index: outputItem.outputIndex, arguments: outputItem.item.arguments });
+          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesFunctionCallItem(outputItem.item) });
+        }
+      }
+      const completedToolCalls = [...toolCalls.values()].map((item) => ({ id: item.id, function: { name: item.name, arguments: item.arguments }, outputIndex: item.outputIndex }));
+      const completedResponse = makeResponsesPayload(seed, {
+        text,
+        usage,
+        toolCalls: completedToolCalls,
+        reasoning,
+        outputOrder: outputItems.map((item) => ({ type: item.type, call: item.type === "function_call" ? item.item : null })),
+      });
+      if (onFinal) onFinal(completedResponse);
+      await write({ type: "response.completed", response: completedResponse });
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+    } catch (error) {
+      closeReason = "error";
+      const failedResponse = { ...makeResponsesPayload(seed, { text: textParts.join(""), reasoning: reasoningParts.join(""), usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } };
+      if (onFinal) onFinal(failedResponse);
+      await write({ type: "response.failed", response: failedResponse });
+      await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
+    } finally {
+      stopUpstream();
+      if (onDone) onDone(normalizeResponsesUsage(usage, Math.round(outputChars / 4)), {
+        ...(closeReason === "eof" || closeReason === "error" ? { status: 502 } : {}),
+        close_reason: closeReason,
+        finish_reason: finishReason,
+        tool_calls_count: toolCalls.size,
+        ...streamDiagExtra(diag),
+      });
+      await writer.close();
+    }
+  })();
+
+  return readable;
+}
+
+async function proxyRequest({ client, model, pathname, request, bodyText, runtime, search, ctx, signal = null, injection = null, traceId = "" }) {
+  const routingStartedAt = Date.now();
+  const trace = createGatewayTrace({ id: traceId || requestTraceId(request), protocol: pathname, model });
+  markGatewayTrace(trace, "routing_started");
+  const timing = { route_selected_ms: 0, dispatch_wait_ms: 0, upstream_started_ms: 0 };
+  if (pathname === CHAT_PATH && !injection) {
+    const prepared = prepareGatewayChatBody(bodyText, runtime.settings, client);
+    bodyText = prepared.bodyText;
+    injection = prepared.injection;
+  }
+  const streamRequest = requestBodyStreams(bodyText);
+
+  const candidates = proxyCandidates(runtime, client, model, pathname);
+
+  if (candidates.length === 0) {
+    const error = httpError(404, `No upstream available for model: ${model}`);
+    error.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "route_failed"));
+    throw error;
+  }
+
+  const singleUpstream = candidates.length === 1;
+  if (!singleUpstream) await hydrateUpstreamState(runtime, candidates, model);
+  let attempts = singleUpstream ? candidates : null;
+  let maxAttempts = singleUpstream ? 1 : 0;
+  let initialReservation = null;
+  let initialDispatchContested = false;
+  const releaseSelection = singleUpstream
+    ? () => {}
+    : await acquireRouteSelectionLock(`${pathname}\n${model}`, signal);
+  let selectionReleased = false;
+  const releaseSelectionOnce = () => {
+    if (selectionReleased) return;
+    selectionReleased = true;
+    releaseSelection();
+  };
+  try {
+    if (!singleUpstream) {
+      attempts = orderUpstreams(runtime, candidates, model, client);
+      maxAttempts = runtime.routing.failover === false
+        ? 1
+        : Math.min(attempts.length, runtime.routing.hedge_max || 2);
+      if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
+        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
+        const used = new Set(hedgedAttempts.map(upstreamKey));
+        const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
+        timing.route_selected_ms = Date.now() - routingStartedAt;
+        markGatewayTrace(trace, "route_selected");
+        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
+        releaseSelectionOnce();
+        return result;
+      }
+    }
+    initialDispatchContested = upstreamHasCompetition(attempts[0]);
+    initialReservation = reserveUpstreams([attempts[0]]);
+    timing.route_selected_ms = Date.now() - routingStartedAt;
+    markGatewayTrace(trace, "route_selected");
+    releaseSelectionOnce();
+  } catch (error) {
+    releaseSelectionOnce();
+    const routeError = normalizeThrownError(error);
+    routeError.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "route_failed"));
+    throw routeError;
+  }
+  let lastError = null;
+
+  for (let index = 0; index < maxAttempts; index += 1) {
+    const upstream = attempts[index];
+    const isLast = index === maxAttempts - 1;
+    let upstreamResult = null;
+    const dispatchContested = index === 0 ? initialDispatchContested : upstreamHasCompetition(upstream);
+    const releaseReservation = index === 0 ? initialReservation : reserveUpstreams([upstream]);
+
+    try {
+      const dispatchStartedAt = Date.now();
+      markGatewayTrace(trace, "dispatch_wait_started", { attempt: index + 1, upstream: upstream.name });
+      const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal, dispatchContested);
+      timing.dispatch_wait_ms += Date.now() - dispatchStartedAt;
+      if (!dispatch.accepted) {
+        lastError = dispatchQueueFullError(upstream, dispatch.delayMs);
+        markGatewayTrace(trace, "dispatch_limited", { attempt: index + 1, upstream: upstream.name });
+        continue;
+      }
+      markGatewayTrace(trace, "dispatch_accepted", { attempt: index + 1, upstream: upstream.name });
+      const upstreamPromise = fetchProxyUpstream({
+        bodyText, client, pathname, request, runtime, search, signal, upstream,
+        trace, attempt: index + 1,
+        firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
+      });
+      timing.upstream_started_ms = Date.now() - routingStartedAt;
+      releaseSelectionOnce();
+      upstreamResult = await upstreamPromise;
+      let response = upstreamResult.response;
+
+      if (response.ok && streamRequest) {
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream));
+        response = primed.response;
+        upstreamResult.response = response;
+        upstreamResult.streamError = primed.error;
+        upstreamResult.streamErrorKind = primed.errorKind || "";
+        upstreamResult.latency = Date.now() - upstreamResult.startedAt;
+      }
+
+      const shouldRetry = runtime.routing.failover !== false && (Boolean(upstreamResult.streamError) || await isRetryableUpstreamResponse(response));
+      if (shouldRetry) {
+        if (!isLast) {
+          await discardUpstreamResponse(upstreamResult, "retryable upstream response");
+        }
+        lastError = new Error(upstreamResult.streamError || `HTTP ${response.status}`);
+        lastError.upstreamName = upstream.name;
+        markGatewayTrace(trace, "retrying_upstream", { attempt: index + 1, upstream: upstream.name, status: response.status });
+        await markUpstreamFailure(runtime, upstream, model, response);
+      } else {
+        await clearUpstreamFailure(runtime, upstream, model);
+        rememberUpstreamLatency(runtime, upstream, model, upstreamResult.latency, ctx);
+        rememberSuccessfulUpstream(upstream, model);
+      }
+
+      if (!shouldRetry || (isLast && (!upstreamResult.streamError || upstreamResult.streamErrorKind === "event"))) {
+        markGatewayTrace(trace, response.ok ? "response_ready" : "upstream_response_error", { attempt: index + 1, upstream: upstream.name, status: response.status });
+        return {
+          attempts: index + 1,
+          response,
+          upstream,
+          abortUpstream: upstreamResult.abortUpstream,
+          timing,
+          injection,
+          trace: gatewayTraceFields(trace),
+        };
+      }
+    } catch (error) {
+      const upstreamError = normalizeThrownError(error);
+      releaseSelectionOnce();
+      await discardUpstreamResponse(upstreamResult, "upstream request failed");
+      if (signal?.aborted) {
+        const cancelled = httpError(499, "Response cancelled.");
+        cancelled.upstreamName = upstream.name;
+        cancelled.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "client_cancelled", { attempt: index + 1, upstream: upstream.name }));
+        throw cancelled;
+      }
+      if (upstreamError.statusCode === 499) {
+        upstreamError.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "client_cancelled", { attempt: index + 1, upstream: upstream.name }));
+        throw upstreamError;
+      }
+      lastError = upstreamError;
+      lastError.upstreamName = upstream.name;
+      markGatewayTrace(trace, "upstream_attempt_failed", { attempt: index + 1, upstream: upstream.name, status: upstreamError.statusCode || 0 });
+      await markUpstreamFailure(runtime, upstream, model);
+      if (isLast) {
+        break;
+      }
+    } finally {
+      releaseReservation();
+    }
+  }
+
+  const err = httpError(lastError?.statusCode || 502, lastError?.message || "All upstreams failed.");
+  err.upstreamName = lastError?.upstreamName || "none";
+  err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed"));
+  throw err;
+}
+
+function proxyCandidates(runtime, client, model, pathname) {
+  const indexed = runtime.routeIndex?.[pathname];
+  const indexedPool = indexed
+    ? [...(indexed.models[model] || []), ...indexed.wildcard]
+    : null;
+  const pool = indexedPool && indexedPool.length ? indexedPool : runtime.upstreams;
+  return pool.filter((upstream) =>
+    clientAllowsUpstream(client, upstream.name) &&
+    (indexedPool?.length || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
+  );
+}
+
+function gatewayErrorResponse(error, traceId) {
+  const response = withCorsResponse(json(openAiError(error.message || "Internal error.", mapErrorType(error.statusCode)), error.statusCode || 500));
+  return traceResponse(response, traceId, error?.gatewayTrace);
+}
+
+function dispatchQueueFullError(upstream, delayMs) {
+  const error = httpError(503, `Upstream dispatch queue is busy${delayMs ? ` (${delayMs}ms)` : ""}.`);
+  error.upstreamName = upstream?.name || "none";
+  error.dispatchLimited = true;
+  return error;
+}
+
+function traceResponse(response, traceId, trace = null) {
+  if (!traceId && !trace) return response;
+  const headers = new Headers(response.headers);
+  const fields = gatewayTraceLogFields(trace, traceId);
+  if (fields.trace_id) headers.set("x-llm-gateway-trace-id", fields.trace_id);
+  if (fields.trace_stage) headers.set("x-llm-gateway-trace-stage", fields.trace_stage);
+  if (fields.trace_upstream_start_ms != null) headers.set("x-llm-gateway-upstream-start-ms", String(fields.trace_upstream_start_ms));
+  if (fields.trace_upstream_headers_ms != null) headers.set("x-llm-gateway-upstream-headers-ms", String(fields.trace_upstream_headers_ms));
+  if (fields.trace_upstream_called != null) headers.set("x-llm-gateway-upstream-called", String(fields.trace_upstream_called));
+  if (fields.trace_upstream_headers != null) headers.set("x-llm-gateway-upstream-headers", String(fields.trace_upstream_headers));
+  if (fields.trace_attempts != null) headers.set("x-llm-gateway-trace-attempts", String(fields.trace_attempts));
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime, search, signal, upstream, firstByteTimeoutMs, trace = null, attempt = 0 }) {
+  const started = Date.now();
+  const controller = new AbortController();
+  const abortRequest = () => controller.abort(signal?.reason || "request aborted");
+  const abortUpstream = (reason = "response completed") => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
+  if (signal?.aborted) abortRequest();
+  else signal?.addEventListener("abort", abortRequest, { once: true });
+  const activeRelease = trackActiveUpstream(upstream, client, controller);
+  const release = () => {
+    signal?.removeEventListener("abort", abortRequest);
+    activeRelease();
+  };
+  try {
+    markGatewayTrace(trace, "upstream_fetch_called", { attempt, upstream: upstream.name });
+    const sanitizedBody = adaptUpstreamBody(bodyText, upstream, pathname);
+    const streamRequest = requestBodyStreams(bodyText);
+    const init = {
+      method: request.method,
+      headers: buildUpstreamHeaders(request, upstream, sanitizedBody, streamRequest),
+      body: sanitizedBody,
+    };
+    init.signal = controller.signal;
+    const response = await fetchWithTimeout(
+      buildUpstreamUrl(upstream.base_url, pathname, search),
+      init,
+      firstByteTimeoutMs || proxyFirstByteTimeoutMs(runtime, upstream, sanitizedBody),
+      runtime.streamIdleTimeoutMs,
+      release,
+    );
+    markGatewayTrace(trace, "upstream_headers_received", { attempt, upstream: upstream.name, status: response.status });
+    return { response, release, abortUpstream, latency: Date.now() - started, startedAt: started };
+  } catch (error) {
+    markGatewayTrace(trace, "upstream_fetch_failed", { attempt, upstream: upstream.name, status: error?.statusCode || 0 });
+    release();
+    if (controller.signal.aborted && controller.signal.reason === ACTIVE_UPSTREAM_ABORT_REASON) {
+      const cancelled = httpError(499, "Request stopped by gateway administrator.");
+      cancelled.upstreamName = upstream.name;
+      throw cancelled;
+    }
+    throw error;
+  }
+}
+
+function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
+  const base = runtime.requestTimeoutMs;
+  if (!isNvidiaNimUpstream(upstream)) return base;
+  try {
+    const modelName = String(JSON.parse(bodyText || "{}").model || "").toLowerCase();
+    // ponytail: GLM/MiniMax on NIM can spend minutes before first byte; streaming idle timeout still guards after headers.
+    return (isGlmModel(modelName) || isMiniMaxM3Model(modelName))
+      ? Math.max(base, NIM_SLOW_FIRST_BYTE_TIMEOUT_MS)
+      : base;
+  } catch {
+    return base;
+  }
+}
+
+function applyGatewayPromptContext(bodyText, settings, client) {
+  return prepareGatewayChatBody(bodyText, settings, client).bodyText;
+}
+
+async function isRetryableUpstreamResponse(response) {
+  if (RETRYABLE_STATUSES.has(response.status)) return true;
+  const contentType = response.headers.get("content-type") || "";
+  if (looksLikeHtmlResponse(response)) return true;
+  if (response.ok && !contentType.includes("application/json")) return false;
+  try {
+    const body = await response.clone().text();
+    if (looksLikeHtmlDocument(body)) return true;
+    return upstreamApplicationErrorMessage(safeJson(body) || body) ||
+      body.includes("DEGRADED function cannot be invoked") ||
+      /Function id ['"][^'"]+['"].*Specified function .* is not found/i.test(body);
+  } catch {
+    return false;
+  }
+}
+
+function retryAfterCooldownSeconds(response, fallbackSeconds) {
+  const ms = retryAfterMs(response?.headers?.get("retry-after"));
+  return Math.max(1, Math.min(MAX_RETRY_AFTER_COOLDOWN_SECONDS, Math.ceil((ms || fallbackSeconds * 1000) / 1000)));
+}
+
+function retryAfterMs(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(raw);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : 0;
+}
+
+function upstreamApplicationErrorMessage(value) {
+  if (!value) return "";
+  if (typeof value === "string") {
+    return /internal server error|server_error|resourceexhausted|resource exhausted/i.test(value) ? value : "";
+  }
+  if (typeof value !== "object") return "";
+  const message = value.error?.message || value.error || value.message || value.detail || value.details || "";
+  if (typeof message === "string") return upstreamApplicationErrorMessage(message);
+  if (Array.isArray(message)) return message.map(upstreamApplicationErrorMessage).find(Boolean) || "";
+  return "";
+}
+
+function streamEventErrorMessage(value) {
+  if (!value || typeof value !== "object") return "";
+  if (value.type === "error" || value.error) {
+    const message = value.error?.message || value.message || value.error;
+    return typeof message === "string" ? message : JSON.stringify(message || "Upstream stream error.");
+  }
+  return upstreamApplicationErrorMessage(value);
+}
+
+function looksLikeHtmlResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  return /text\/html|application\/xhtml\+xml/i.test(contentType);
+}
+
+function looksLikeHtmlDocument(text) {
+  return /^\s*(?:<!doctype\s+html|<html[\s>]|<!--\[if\s+|<head[\s>]|<body[\s>])/i.test(String(text || ""));
+}
+
+function upstreamBadGatewayResponse(message, headers) {
+  const out = responseBodyHeaders(headers || new Headers());
+  out.set("content-type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify(openAiError(message || "Upstream returned an invalid response.", "server_error")), {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: out,
+  });
+}
+
+async function discardUpstreamResponse(result, reason) {
+  try { result?.abortUpstream?.(reason); } catch {}
+  try { await result?.response?.body?.cancel(reason); } catch {}
+  result?.release?.();
+}
+
+function abortUpstreamResponse(result, reason = "response completed") {
+  try { result?.abortUpstream?.(reason); } catch {}
+}
+
+function stopHedgeLosers(pending, controllers, winnerIndex) {
+  controllers.forEach((controller, index) => {
+    if (index !== winnerIndex) controller.abort("hedged upstream lost");
+  });
+  pending.forEach(({ promise }) => {
+    void promise.then((result) => discardUpstreamResponse(result, "hedged upstream lost")).catch(() => {});
+  });
+}
+
+async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), injection = null, trace = null }) {
+  const controllers = attempts.map(() => new AbortController());
+  const streamRequest = requestBodyStreams(bodyText);
+  const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
+  const knownTtft = upstreamLatencyScore(attempts[0], model);
+  const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
+  const launchDelay = (index) => runtime.routing.fast_routing === true && index < 2
+    ? index * fastDelayMs
+    : index * hedgeDelayMs;
+  let done = false;
+  const releaseReservation = reserveUpstreams(attempts);
+  const abortHedge = () => controllers.forEach((controller) => controller.abort(signal?.reason || "hedged request cancelled"));
+  if (signal?.aborted) abortHedge();
+  else signal?.addEventListener("abort", abortHedge, { once: true });
+
+  function launchLater(index) {
+    const upstream = attempts[index];
+    return sleep(launchDelay(index), controllers[index].signal).then(async () => {
+      if (done) return { cancelled: true, upstream, index };
+      let result = null;
+      try {
+        const dispatchStartedAt = Date.now();
+        const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, controllers[index].signal);
+        const attemptTiming = {
+          ...timing,
+          dispatch_wait_ms: Date.now() - dispatchStartedAt,
+          upstream_started_ms: Date.now() - routingStartedAt,
+        };
+        if (!dispatch.accepted) return { limited: true, upstream, index, delayMs: dispatch.delayMs, timing: attemptTiming };
+        result = await fetchProxyUpstream({
+          bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
+          trace, attempt: index + 1,
+          firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+        });
+        if (result.response.ok && streamRequest) {
+          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
+          result.response = primed.response;
+          result.streamError = primed.error;
+          result.streamErrorKind = primed.errorKind || "";
+          result.latency = Date.now() - result.startedAt;
+        }
+        return { ...result, upstream, index, timing: attemptTiming };
+      } catch (error) {
+        await discardUpstreamResponse(result, "hedged upstream request failed");
+        return { error, upstream, index, latency: 0 };
+      }
+    });
+  }
+
+  try {
+    const pending = attempts.map((_, index) => ({ index, promise: launchLater(index) }));
+    let lastResult = null;
+    while (pending.length) {
+      const raced = await Promise.race(pending.map((entry) => entry.promise.then((result) => ({ entry, result }))));
+      if (signal?.aborted) throw httpError(499, "Response cancelled.");
+      pending.splice(pending.indexOf(raced.entry), 1);
+      const result = raced.result;
+      if (result.cancelled) continue;
+      lastResult = result;
+      if (result.error?.statusCode === 499) {
+        done = true;
+        stopHedgeLosers(pending, controllers, -1);
+        throw result.error;
+      }
+      if (result.limited) continue;
+      const retryable = Boolean(result.streamError) || (result.response && await isRetryableUpstreamResponse(result.response));
+      if (result.response && !retryable) {
+        done = true;
+        stopHedgeLosers(pending, controllers, result.index);
+        await clearUpstreamFailure(runtime, result.upstream, model);
+        rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
+        rememberSuccessfulUpstream(result.upstream, model);
+        markGatewayTrace(trace, "response_ready", { attempt: result.index + 1, upstream: result.upstream.name, status: result.response.status });
+        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing, injection, trace: gatewayTraceFields(trace) };
+      }
+      if (result.response) {
+        await discardUpstreamResponse(result, "retryable hedged response");
+      }
+      await markUpstreamFailure(runtime, result.upstream, model, result.response);
+    }
+
+    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal, timing, routingStartedAt, trace });
+    if (fallbackResult?.response) return { ...fallbackResult, attempts: attempts.length + 1, injection };
+    if (fallbackResult?.limited) lastResult = fallbackResult;
+
+    const err = httpError(lastResult?.limited ? 503 : 502, lastResult?.error?.message || (lastResult?.limited ? "All eligible upstream dispatch queues are busy." : "All hedged upstreams failed."));
+    err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
+    err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed"));
+    throw err;
+  } finally {
+    done = true;
+    signal?.removeEventListener("abort", abortHedge);
+    releaseReservation();
+  }
+}
+
+async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), trace = null }) {
+  const upstream = attempts?.[0];
+  if (!upstream || runtime.routing.failover === false) return null;
+  let result = null;
+  const releaseReservation = reserveUpstreams([upstream]);
+  try {
+    const dispatchStartedAt = Date.now();
+    const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal);
+    const fallbackTiming = {
+      ...timing,
+      dispatch_wait_ms: Date.now() - dispatchStartedAt,
+      upstream_started_ms: Date.now() - routingStartedAt,
+    };
+    if (!dispatch.accepted) return { limited: true, upstream, delayMs: dispatch.delayMs, timing: fallbackTiming };
+    result = await fetchProxyUpstream({
+      bodyText, client, pathname, request, runtime, search, signal, upstream,
+      trace, attempt: 1,
+      firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+    });
+    if (result.response.ok && streamRequest) {
+      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
+      result.response = primed.response;
+      result.streamError = primed.error;
+      result.streamErrorKind = primed.errorKind || "";
+      result.latency = Date.now() - result.startedAt;
+    }
+    const retryable = Boolean(result.streamError) || await isRetryableUpstreamResponse(result.response);
+    if (retryable) {
+      await discardUpstreamResponse(result, "retryable hedged fallback response");
+      await markUpstreamFailure(runtime, upstream, model, result.response);
+      return null;
+    }
+    await clearUpstreamFailure(runtime, upstream, model);
+    rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
+    rememberSuccessfulUpstream(upstream, model);
+    markGatewayTrace(trace, "response_ready", { attempt: 1, upstream: upstream.name, status: result.response.status });
+    return { response: result.response, upstream, abortUpstream: result.abortUpstream, timing: fallbackTiming, trace: gatewayTraceFields(trace) };
+  } catch (error) {
+    const upstreamError = normalizeThrownError(error);
+    await discardUpstreamResponse(result, "hedged fallback failed");
+    if (signal?.aborted) throw httpError(499, "Response cancelled.");
+    if (upstreamError.statusCode === 499) throw upstreamError;
+    await markUpstreamFailure(runtime, upstream, model);
+    return null;
+  } finally {
+    releaseReservation();
+  }
+}
+
+function sleep(ms, signal = null) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(httpError(499, "Response cancelled."));
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      signal.removeEventListener("abort", abort);
+    };
+    const abort = () => {
+      cleanup();
+      reject(httpError(499, "Response cancelled."));
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function mapConcurrent(items, limit, fn) {
+  const list = Array.from(items || []);
+  const results = new Array(list.length);
+  let index = 0;
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit || 1), list.length) }, async () => {
+    for (;;) {
+      const current = index;
+      index += 1;
+      if (current >= list.length) return;
+      results[current] = await fn(list[current], current);
+    }
+  }));
+  return results;
+}
+
+function requestBodyStreams(bodyText) {
+  try { return JSON.parse(bodyText || "{}").stream === true; } catch { return false; }
+}
+
+async function primeSseResponse(response, hideReasoning = false) {
+  if (!response.body || !(response.headers.get("content-type") || "").includes("text/event-stream")) {
+    return { response, error: "" };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let text = "";
+  let error = "";
+  let bufferedBytes = 0;
+  const stripText = hideReasoning ? createThinkTagStripper() : null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bufferedBytes += value.byteLength;
+    if (bufferedBytes > MAX_SSE_PRIME_BYTES) {
+      try { await reader.cancel("SSE priming limit"); } catch {}
+      throw new Error("Upstream SSE did not produce output within 2 MiB.");
+    }
+    chunks.push(value);
+    text += decoder.decode(value, { stream: true });
+    const events = text.split(/\r?\n\r?\n/);
+    text = events.pop() || "";
+    if (text.length > MAX_SSE_EVENT_CHARS) {
+      try { await reader.cancel("SSE event limit"); } catch {}
+      throw new Error("Upstream SSE event exceeds 1 MiB.");
+    }
+    for (const event of events) {
+      const data = event.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      if (!data || data === "[DONE]") continue;
+      const payload = safeJson(data);
+      error = streamEventErrorMessage(payload) || upstreamApplicationErrorMessage(data);
+      if (error || ssePayloadHasOutput(payload, hideReasoning, stripText)) {
+        return { response: prependResponseChunks(response, reader, chunks), error, errorKind: error ? "event" : "" };
+      }
+    }
+  }
+  return { response: prependResponseChunks(response, reader, chunks), error: error || "Upstream stream ended before producing output.", errorKind: "empty" };
+}
+
+function ssePayloadHasOutput(payload, hideReasoning = false, stripText = null) {
+  if (!payload || typeof payload !== "object") return false;
+  if (String(payload.type || "").includes("delta")) return !hideReasoning || !String(payload.type || "").includes("reasoning");
+  const delta = payload.choices?.[0]?.delta || {};
+  const text = chatContentToText(delta.content || "") || String(payload.choices?.[0]?.text || "");
+  const visible = hideReasoning && stripText ? stripText(text) : text;
+  return Boolean(visible || (!hideReasoning && (delta.reasoning_content || delta.reasoning || delta.thinking)) || delta.tool_calls?.length);
+}
+
+function prependResponseChunks(response, reader, chunks) {
+  return new Response(new ReadableStream({
+    async start(controller) {
+      try {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } catch {}
+    },
+  }), { status: response.status, statusText: response.statusText, headers: responseBodyHeaders(response.headers) });
+}
+
+function orderUpstreams(runtime, candidates, model, client) {
+  if (candidates.length <= 1) {
+    return candidates;
+  }
+
+  const now = Date.now();
+  const healthy = [];
+  const cooling = [];
+
+  candidates.forEach((upstream) => {
+    const status = _upstreamCooldowns[upstreamModelKey(upstream, model)];
+    if (status && Number(status.until) > now) {
+      cooling.push(upstream);
+      return;
+    }
+    if (status) delete _upstreamCooldowns[upstreamModelKey(upstream, model)];
+    healthy.push(upstream);
+  });
+
+  const orderedHealthy = coordinationSort(runtime, healthy, model, client);
+  const orderedCooling = coordinationSort(runtime, cooling, model, client);
+
+  const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
+  if (runtime.routing.failover === false) {
+    return preferred.length > 0 ? preferred : candidates;
+  }
+
+  const fallback = orderedHealthy.length > 0 ? orderedCooling : [];
+  return preferred.concat(fallback);
+}
+
+function prioritySort(items) {
+  return [...items].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name));
+}
+
+function coordinationSort(runtime, items, model, client) {
+  const loadBalance = runtime.routing.load_balance !== false;
+  const base = loadBalance ? weightedAffinitySort(items, client) : prioritySort(items);
+  return base
+    .map((item, index) => ({ item, index, specificity: upstreamModelSpecificity(item, model), pressure: upstreamCoordinationPressure(runtime, item, client), latency: upstreamLatencySortScore(item, model) }))
+    .sort((a, b) => a.specificity - b.specificity || a.pressure - b.pressure || (loadBalance ? a.index - b.index || a.latency - b.latency : a.latency - b.latency || a.index - b.index))
+    .map((entry) => entry.item);
+}
+
+function upstreamModelSpecificity(upstream, model) {
+  const models = configuredUpstreamModels(upstream);
+  return !models.length || models.includes("*") ? 1 : 0;
+}
+
+function activeUpstreamCount(upstream) {
+  return Number(_activeUpstreams[upstreamKey(upstream)] || 0) || 0;
+}
+
+function upstreamReservationCount(upstream) {
+  return Number(_upstreamReservations[upstreamKey(upstream)] || 0) || 0;
+}
+
+function upstreamHasCompetition(upstream) {
+  return activeUpstreamCount(upstream) > 0 || upstreamReservationCount(upstream) > 0;
+}
+
+function upstreamCoordinationPressure(runtime, upstream, client) {
+  const level = upstreamCoordinationPressureMs(runtime);
+  if (level <= 0) return 0;
+  const capacity = Math.max(1, Number(upstream?.weight) || 1);
+  const pressure = ((activeUpstreamCount(upstream) + upstreamReservationCount(upstream) * 1.5) / capacity) * level;
+  const interval = upstreamSoftIntervalMs(runtime);
+  const recent = _upstreamDispatchClients[upstreamKey(upstream)];
+  const currentClient = String(client?.key || client?.id || client?.name || "gateway");
+  const busy = upstreamHasCompetition(upstream);
+  const crossClient = busy && recent && recent.client !== currentClient && Date.now() - Number(recent.at || 0) < interval;
+  return pressure + (crossClient ? level : 0);
+}
+
+function upstreamLatencySortScore(upstream, model) {
+  const latency = upstreamLatencyScore(upstream, model);
+  return Number.isFinite(latency) ? latency : Number.MAX_SAFE_INTEGER;
+}
+
+function upstreamCoordinationPressureMs(runtime) {
+  const level = Number(runtime?.routing?.coordination_level ?? 3);
+  return Math.max(0, Math.min(5, Number.isFinite(level) ? Math.floor(level) : 3)) * 500;
+}
+
+function upstreamSoftIntervalMs(runtime) {
+  return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000);
+}
+
+async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
+  const interval = upstreamSoftIntervalMs(runtime);
+  const name = upstreamKey(upstream);
+  if (!interval || !name) return { accepted: true, delayMs: 0 };
+  if (runtime?.routeCoordinator) {
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason || "request aborted");
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(() => controller.abort("route coordinator timeout"), ROUTE_COORDINATOR_TIMEOUT_MS);
+    try {
+      const slot = await runtime.routeCoordinator.reserve(name, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
+      const delay = Math.max(0, Number(slot?.delay_ms) || 0);
+      if (slot?.accepted === false || delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) {
+        return { accepted: false, delayMs: delay };
+      }
+      const now = Date.now();
+      _upstreamDispatchAt[name] = Math.max(Number(_upstreamDispatchAt[name] || 0), now + delay + interval);
+      _upstreamDispatchClients[name] = {
+        client: String(client?.key || client?.id || client?.name || "gateway"),
+        at: now,
+      };
+      if (delay > 0) await sleep(delay, signal);
+      if (signal?.aborted) throw httpError(499, "Response cancelled.");
+      return { accepted: true, delayMs: delay };
+    } catch (error) {
+      if (error?.statusCode === 499 || signal?.aborted) throw httpError(499, "Response cancelled.");
+      // ponytail: coordinator is advisory; local scheduling keeps the request alive if DO is unavailable.
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+    }
+  }
+  const now = Date.now();
+  const scheduled = contested ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
+  const delay = scheduled - now;
+  if (delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) return { accepted: false, delayMs: delay };
+  _upstreamDispatchAt[name] = scheduled + interval;
+  _upstreamDispatchClients[name] = {
+    client: String(client?.key || client?.id || client?.name || "gateway"),
+    at: now,
+  };
+  if (delay > 0) await sleep(delay, signal);
+  if (signal?.aborted) throw httpError(499, "Response cancelled.");
+  return { accepted: true, delayMs: delay };
+}
+
+async function acquireRouteSelectionLock(key, signal = null) {
+  const previous = _routeSelectionTails[key] || Promise.resolve();
+  let releaseCurrent;
+  const current = new Promise((resolve) => { releaseCurrent = resolve; });
+  const gate = previous.then(() => undefined);
+  const tail = gate.then(() => current);
+  _routeSelectionTails[key] = tail;
+  try {
+    await awaitWithSignal(gate, signal);
+  } catch (error) {
+    releaseCurrent();
+    void tail.then(() => {
+      if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
+    });
+    throw error;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseCurrent();
+    if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
+  };
+}
+
+function awaitWithSignal(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(httpError(499, "Response cancelled."));
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    const abort = () => {
+      cleanup();
+      reject(httpError(499, "Response cancelled."));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(promise).then((value) => {
+      cleanup();
+      resolve(value);
+    }, (error) => {
+      cleanup();
+      reject(error);
+    });
+  });
+}
+
+function reserveUpstreams(upstreams) {
+  const names = (upstreams || []).map(upstreamKey).filter(Boolean);
+  names.forEach((name) => { _upstreamReservations[name] = Number(_upstreamReservations[name] || 0) + 1; });
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    names.forEach((name) => {
+      const next = Math.max(0, Number(_upstreamReservations[name] || 0) - 1);
+      if (next) _upstreamReservations[name] = next;
+      else delete _upstreamReservations[name];
+    });
+  };
+}
+
+function upstreamKey(upstream) {
+  return String(upstream?.name || "").trim();
+}
+
+function upstreamLatencyScore(upstream, model) {
+  const score = Number(_upstreamLatency[upstreamModelKey(upstream, model)]);
+  return Number.isFinite(score) && score > 0 ? score : Number.POSITIVE_INFINITY;
+}
+
+function avoidLastSuccessfulUpstream(items, model) {
+  const last = _lastSuccessfulUpstreamName[String(model || "*")];
+  if (items.length <= 1 || !last || items[0]?.name !== last) return items;
+  return items.slice(1).concat(items[0]);
+}
+
+function rememberSuccessfulUpstream(upstream, model) {
+  _lastSuccessfulUpstreamName[String(model || "*")] = String(upstream?.name || "").trim();
+}
+
+function noteActiveUpstream(upstream, client, delta) {
+  const name = String(upstream?.name || "").trim();
+  if (!name) return;
+  const next = Math.max(0, Number(_activeUpstreams[name] || 0) + delta);
+  if (next) _activeUpstreams[name] = next;
+  else delete _activeUpstreams[name];
+  const label = String(client?.name || client?.id || "admin").trim() || "admin";
+  const clients = _activeUpstreamClients[name] || {};
+  const clientNext = Math.max(0, Number(clients[label] || 0) + delta);
+  if (clientNext) clients[label] = clientNext;
+  else delete clients[label];
+  if (Object.keys(clients).length) _activeUpstreamClients[name] = clients;
+  else delete _activeUpstreamClients[name];
+}
+
+function streamPendingOpenAiResponse(open) {
+  return streamPendingSseResponse(
+    open,
+    `: ${" ".repeat(2048)}\n\n`,
+    ": keepalive\n\n",
+    (error) => {
+      const status = error.statusCode || 502;
+      return `data: ${JSON.stringify({ error: { message: error.message || "Upstream request failed.", type: mapErrorType(status) } })}\n\ndata: [DONE]\n\n`;
+    },
+  );
+}
+
+function streamPendingResponsesResponse(open, seed) {
+  return streamPendingSseResponse(
+    open,
+    `: ${" ".repeat(2048)}\n\n`,
+    ": keepalive\n\n",
+    (error) => {
+      const status = error.statusCode || 502;
+      const message = error.message || "Upstream request failed.";
+      const type = mapErrorType(status);
+      if (status === 499) {
+        const cancelled = makeResponsesPayload(seed, { status: "cancelled" });
+        return `data: ${JSON.stringify({ type: "response.cancelled", response: cancelled })}\n\n`;
+      }
+      const failed = { ...makeResponsesPayload(seed, { status: "failed" }), error: { message, type } };
+      return `data: ${JSON.stringify({ type: "response.failed", response: failed })}\n\ndata: ${JSON.stringify({ type: "error", error: { message, type } })}\n\n`;
+    },
+  );
+}
+
+function trackActiveUpstream(upstream, client, controller) {
+  const epoch = _activeUpstreamEpoch;
+  if (controller) _activeUpstreamControllers.add(controller);
+  noteActiveUpstream(upstream, client, 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (controller) _activeUpstreamControllers.delete(controller);
+    if (epoch !== _activeUpstreamEpoch) return;
+    noteActiveUpstream(upstream, client, -1);
+  };
+}
+
+function getActiveUpstreamSnapshot() {
+  return { ..._activeUpstreams };
+}
+
+function getActiveUpstreamClientSnapshot() {
+  return Object.fromEntries(Object.entries(_activeUpstreamClients).map(([name, clients]) => [name, { ...clients }]));
+}
+
+function clearActiveUpstreamState() {
+  const released = _activeUpstreamControllers.size;
+  _activeUpstreamEpoch += 1;
+  _activeUpstreamControllers.forEach((controller) => controller.abort(ACTIVE_UPSTREAM_ABORT_REASON));
+  _activeUpstreamControllers.clear();
+  _activeUpstreams = {};
+  _activeUpstreamClients = {};
+  _upstreamReservations = {};
+  _upstreamDispatchAt = {};
+  _upstreamDispatchClients = {};
+  Object.keys(_routeSelectionTails).forEach((key) => delete _routeSelectionTails[key]);
+  return released;
+}
+
+function rememberUpstreamLatency(runtime, upstream, model, latencyMs, ctx) {
+  const name = upstreamModelKey(upstream, model);
+  const latency = Number(latencyMs);
+  if (!name || !Number.isFinite(latency) || latency < 0) return Promise.resolve();
+  const previous = Number(_upstreamLatency[name]);
+  const score = Number.isFinite(previous)
+    ? Math.round(previous * 0.7 + latency * 0.3)
+    : Math.max(1, Math.round(latency));
+  const updatedAt = Date.now();
+  _upstreamLatency[name] = score;
+  _upstreamLatencyUpdatedAt[name] = updatedAt;
+  if (!runtime?.state) return Promise.resolve();
+  if (Number(_upstreamLatencyPersistedAt[name] || 0) > 0 && updatedAt - Number(_upstreamLatencyPersistedAt[name] || 0) < UPSTREAM_LATENCY_PERSIST_INTERVAL_MS) return Promise.resolve();
+  _upstreamLatencyPersistedAt[name] = updatedAt;
+  const task = persistUpstreamLatency(runtime, name, score, updatedAt);
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
+  return task;
+}
+
+function weightedAffinitySort(items, client) {
+  const clientKey = String(client?.key || client?.id || client?.name || "gateway").trim();
+  return [...items]
+    .map((item) => ({
+      item,
+      sortKey: Math.pow((stableHash32(`${clientKey}\n${upstreamKey(item)}`) + 1) / 4294967297, 1 / Math.max(1, Number(item.weight) || 1)),
+    }))
+    .sort((a, b) => b.sortKey - a.sortKey || a.item.name.localeCompare(b.item.name))
+    .map((entry) => entry.item);
+}
+
+async function hydrateUpstreamState(runtime, upstreams, model) {
+  if (!runtime?.state || !upstreams?.length) return;
+  const hydrateKey = `${String(model || "*")}\n${upstreams.map(upstreamKey).join("|")}`;
+  const hydratedAt = Date.now();
+  if (hydratedAt - Number(_upstreamStateHydratedAt[hydrateKey] || 0) < UPSTREAM_STATE_HYDRATE_INTERVAL_MS) return;
+  _upstreamStateHydratedAt[hydrateKey] = hydratedAt;
+  await Promise.all(upstreams.map(async (upstream) => {
+    const key = upstreamModelKey(upstream, model);
+    try {
+      const [cooldownKey, latencyKey] = await Promise.all([
+        upstreamCooldownStorageKey(key),
+        upstreamLatencyStorageKey(key),
+      ]);
+      const [cooldown, latency] = await Promise.all([
+        runtime.state.get(cooldownKey, "json"),
+        runtime.state.get(latencyKey, "json"),
+      ]);
+      if (cooldown?.until && Number(cooldown.until) > Date.now()) _upstreamCooldowns[key] = cooldown;
+      else delete _upstreamCooldowns[key];
+      const score = Number(latency?.latency_ms);
+      const updatedAt = Number(latency?.updated_at);
+      const localUpdatedAt = Number(_upstreamLatencyUpdatedAt[key] || 0);
+      if (Number.isFinite(score) && score > 0 && Number.isFinite(updatedAt) && updatedAt >= localUpdatedAt && Date.now() - updatedAt <= UPSTREAM_LATENCY_TTL_SECONDS * 1000) {
+        _upstreamLatency[key] = score;
+        _upstreamLatencyUpdatedAt[key] = updatedAt;
+      }
+    } catch {}
+  }));
+}
+
+async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
+  try {
+    await runtime.state.put(
+      await upstreamLatencyStorageKey(key),
+      JSON.stringify({ latency_ms: latency, updated_at: updatedAt }),
+      { expirationTtl: UPSTREAM_LATENCY_TTL_SECONDS },
+    );
+  } catch {}
+}
+
+async function markUpstreamFailure(runtime, upstream, model, response = null) {
+  if (runtime.routing.failover === false) return;
+  const key = upstreamModelKey(upstream, model);
+  const ttl = retryAfterCooldownSeconds(response, runtime.upstreamCooldownTtl);
+  const status = { until: Date.now() + ttl * 1000 };
+  _upstreamCooldowns[key] = status;
+  if (runtime.state) {
+    try {
+      await runtime.state.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: ttl });
+    } catch {}
+  }
+}
+
+async function clearUpstreamFailure(runtime, upstream, model) {
+  const key = upstreamModelKey(upstream, model);
+  const hadCooldown = Boolean(_upstreamCooldowns[key]);
+  delete _upstreamCooldowns[key];
+  if (hadCooldown && runtime.state) {
+    try { await runtime.state.delete(await upstreamCooldownStorageKey(key)); } catch {}
+  }
+}
+
+async function upstreamCooldownStorageKey(value) {
+  return "state:cooldown:" + await storageKeyHash(value);
+}
+
+async function upstreamLatencyStorageKey(value) {
+  return "state:latency:" + await storageKeyHash(value);
+}
+
+function upstreamModelKey(upstream, model) {
+  return `${String(upstream?.name || "").trim()}\n${String(model || "*").trim().toLowerCase()}`;
+}
+
+function buildUpstreamUrl(baseUrl, pathname, search) {
+  const base = String(baseUrl).replace(/\/+$/, "");
+  let path = pathname;
+
+  if ((base.endsWith("/v1") || base.endsWith("/v4")) && path.startsWith("/v1/")) {
+    path = path.slice(3);
+  }
+
+  return `${base}${path}${search}`;
+}
+
+function buildUpstreamHeaders(request, upstream, bodyText = "", streamRequest = null) {
+  const headers = new Headers();
+  headers.set("authorization", `Bearer ${upstream.api_key}`);
+  headers.set(
+    "content-type",
+    request?.headers.get("content-type") || "application/json; charset=utf-8",
+  );
+  headers.set("accept", (streamRequest == null ? requestBodyStreams(bodyText) : streamRequest) ? "text/event-stream, application/json" : "application/json");
+  headers.set("user-agent", "cf-llm-gateway/0.3");
+
+  if (upstream.headers && typeof upstream.headers === "object") {
+    for (const [key, value] of Object.entries(upstream.headers)) {
+      headers.set(key, String(value));
+    }
+  }
+
+  return headers;
+}
+
+function clientAllowsUpstream(client, upstreamName) {
+  if (!Array.isArray(client.upstreams) || client.upstreams.length === 0) {
+    return true;
+  }
+  return client.upstreams.includes(upstreamName);
+}
+
+function clientAllowsModelSelection(client, requestedModel, resolvedModel = requestedModel) {
+  if (!Array.isArray(client.models) || client.models.length === 0 || client.models.includes("*")) {
+    return true;
+  }
+  return client.models.some((allowed) =>
+    modelsMatch(allowed, requestedModel) || modelsMatch(allowed, resolvedModel)
+  );
+}
+
+function upstreamSupportsModel(upstream, model) {
+  if (!Array.isArray(upstream.models) || upstream.models.length === 0) {
+    return true;
+  }
+  return upstream.models.includes("*") || upstream.models.includes(model);
+}
+
+function upstreamSupportsPath(upstream, pathname) {
+  if (!Array.isArray(upstream.paths) || upstream.paths.length === 0) {
+    return true;
+  }
+  return upstream.paths.includes(pathname);
+}
+
+function normalizeClient(client) {
+  const key = String(client?.key || "").trim();
+  if (!client || typeof client !== "object" || !key) {
+    throw badConfig("Each client needs `key`.");
+  }
+
+  return {
+    id: client.id || client.name || client.key,
+    metadata: client.metadata || {},
+    models: normalizeStringArray(client.models),
+    name: client.name || client.id || "client",
+    key,
+    upstreams: normalizeStringArray(client.upstreams),
+    created_at: client.created_at || utcNowIso(),
+    updated_at: client.updated_at || utcNowIso(),
+  };
+}
+
+function buildClientRecord(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw httpError(400, "Client payload must be a JSON object.");
+  }
+
+  const key = payload.key || generateClientKey();
+  if (!key.startsWith("sk-")) {
+    throw httpError(400, "Client key must start with `sk-`.");
+  }
+  if (key.length > MAX_CLIENT_KEY_LENGTH) {
+    throw httpError(400, "Client key is too long.");
+  }
+
+  const now = utcNowIso();
+  return normalizeClient({
+    id: payload.id || crypto.randomUUID(),
+    key,
+    metadata: payload.metadata || {},
+    models: payload.models || ["*"],
+    name: payload.name || "generated-client",
+    upstreams: payload.upstreams || [],
+    created_at: payload.created_at || now,
+    updated_at: now,
+  });
+}
+
+async function saveClientRecord(store, record) {
+  const existing = await store.get(clientIdKey(record.id), "json");
+  const createdAt = existing?.created_at || record.created_at;
+  const stored = {
+    ...record,
+    created_at: createdAt,
+    updated_at: utcNowIso(),
+  };
+
+  await store.put(clientIdKey(stored.id), JSON.stringify(stored));
+  await store.put(clientTokenKey(stored.key), JSON.stringify(stored));
+
+  const index = await listClientIndex(store);
+  const next = index.filter((item) => item.id !== stored.id);
+  next.push(publicClientRecord(stored));
+  next.sort((a, b) => a.name.localeCompare(b.name));
+
+  await store.put(clientIndexKey(), JSON.stringify(next));
+  delete _clientCache[stored.key];
+  delete _clientCacheTs[stored.key];
+}
+
+async function deleteClientRecord(store, id) {
+  const value = String(id || "").trim();
+  const record = await resolveClientRecord(store, id);
+  const index = await listClientIndex(store);
+
+  const matchesRef = (item) =>
+    [item?.id, item?.name, item?.key, item?.key_preview].some((candidate) => String(candidate || "") === value) ||
+    Boolean(record?.id && item.id === record.id);
+
+  const next = index.filter((item) => !matchesRef(item));
+
+  if (record?.key) {
+    await store.delete(clientIdKey(record.id));
+    await store.delete(clientTokenKey(record.key));
+    delete _clientCache[record.key];
+    delete _clientCacheTs[record.key];
+  }
+
+  // Ghost entries (index references a client whose records are already gone)
+  // still show up in the admin list and make copy/delete return "not found".
+  // Removing the index entry here lets the frontend clean them up.
+  if (next.length !== index.length) {
+    await store.put(clientIndexKey(), JSON.stringify(next));
+  }
+
+  if (!record?.key && next.length === index.length) {
+    throw httpError(404, "Client not found.");
+  }
+}
+
+async function resolveClientRecord(store, reference) {
+  const value = String(reference || "").trim();
+  if (!value) return null;
+
+  const direct = await store.get(clientIdKey(value), "json");
+  if (direct?.key) return direct;
+
+  const byToken = await store.get(clientTokenKey(value), "json");
+  if (byToken?.key) return byToken;
+
+  const indexed = (await listClientIndex(store)).find((item) =>
+    [item?.id, item?.name, item?.key, item?.key_preview].some((candidate) => String(candidate || "") === value),
+  );
+  if (!indexed) return null;
+
+  const indexedRecord = indexed.id ? await store.get(clientIdKey(indexed.id), "json") : null;
+  if (indexedRecord?.key) return indexedRecord;
+  return indexed.key ? store.get(clientTokenKey(indexed.key), "json") : null;
+}
+
+async function listClientIndex(store) {
+  return (await store.get(clientIndexKey(), "json")) || [];
+}
+
+async function listClientIndexWithUsage(app) {
+  const rows = await listClientIndex(app.state);
+  return Promise.all(rows.map(async (record) => ({
+    ...record,
+    today_usage: await readClientDailyUsage(app.state, record),
+  })));
+}
+
+async function readClientDailyUsage(store, record) {
+  const day = legacyStatsDayKey();
+  const storageKey = await clientDailyUsageStorageKey(record.id, day);
+  try {
+    const existing = store ? await store.get(storageKey, "json") : null;
+    return publicClientDailyUsage(mergeClientUsageSnapshot(existing, _pendingClientUsage[storageKey]) || emptyClientDailyUsage(day, record.name));
+  } catch {
+    return emptyClientDailyUsage(day, record.name);
+  }
+}
+
+function publicClientDailyUsage(usage) {
+  return { ...usage, updated_at: utcTimestamp(usage?.updated_at) };
+}
+
+function publicClientRecord(record) {
+  return {
+    id: record.id,
+    name: record.name,
+    key_preview: maskKey(record.key),
+    models: record.models,
+    upstreams: record.upstreams,
+    metadata: record.metadata,
+    created_at: utcTimestamp(record.created_at),
+    updated_at: utcTimestamp(record.updated_at),
+  };
+}
+
+function clientSetupPayload(record, baseUrl) {
+  const model = firstClientModel(record);
+  const apiKey = record.key;
+  return {
+    base_url: baseUrl,
+    api_key: apiKey,
+    model,
+    opencode: {
+      provider: "llm-merge",
+      npm: "@ai-sdk/openai-compatible",
+      options: { baseURL: baseUrl, apiKey },
+      models: { [model]: {} },
+    },
+    openclaw: {
+      providers: {
+        "llm-merge": {
+          api: "openai-completions",
+          baseUrl,
+          apiKey,
+          models: { [model]: {} },
+        },
+      },
+    },
+    rikkahub: { baseUrl, apiKey, model },
+    cherry_studio: { provider: "Custom OpenAI Compatible", apiAddress: baseUrl, apiKey, model },
+  };
+}
+
+function firstClientModel(record) {
+  return normalizeStringArray(record?.models).find((model) => model !== "*") || "your-model-id";
+}
+
+async function ensureEncryptedValue(value, secret) {
+  if (!secret) {
+    throw badConfig("Missing API_KEY_CRYPT_SECRET or ADMIN_TOKEN for encryption.");
+  }
+
+  if (value.startsWith("enc::")) {
+    return value;
+  }
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveAesKey(secret);
+  const cipher = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(value),
+  );
+
+  return `enc::${base64UrlEncode(joinBytes(iv, new Uint8Array(cipher)))}`;
+}
+
+// ponytail: decryptValue accepts optional pre-derived AES key to avoid per-upstream re-derivation
+async function decryptValue(value, secret, preDerivedKey) {
+  if (!value) {
+    return "";
+  }
+
+  if (!value.startsWith("enc::")) {
+    return value;
+  }
+
+  const raw = base64UrlDecode(value.slice("enc::".length));
+  const iv = raw.slice(0, 12);
+  const payload = raw.slice(12);
+  const key = preDerivedKey || (await deriveAesKey(secret));
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, payload);
+  return new TextDecoder().decode(plain);
+}
+
+async function deriveAesKey(secret) {
+  if (_aesKeyPromise && _aesKeySecret === secret) return _aesKeyPromise;
+  _aesKeySecret = secret;
+  _aesKeyPromise = crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret))
+    .then((digest) => crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]));
+  try {
+    return await _aesKeyPromise;
+  } catch (error) {
+    if (_aesKeySecret === secret) _aesKeyPromise = null;
+    throw error;
+  }
+}
+
+function joinBytes(first, second) {
+  const merged = new Uint8Array(first.length + second.length);
+  merged.set(first, 0);
+  merged.set(second, first.length);
+  return merged;
+}
+
+function base64UrlEncode(bytes) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecode(text) {
+  const normalized = text.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return bytes;
+}
+
+function parseJsonEnvArray(value, name) {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      throw new Error();
+    }
+    return parsed;
+  } catch {
+    throw badConfig(`${name} must be a JSON array.`);
+  }
+}
+
+async function readRequestText(request, maxChars = MAX_REQUEST_BODY_CHARS, maxBytes = maxChars) {
+  const declaredLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw httpError(413, "Request body is too large.");
+  }
+  const text = await request.text();
+  if (text.length > maxChars || new TextEncoder().encode(text).byteLength > maxBytes) throw httpError(413, "Request body is too large.");
+  return text;
+}
+
+function parseJsonBody(bodyText) {
+  if (!bodyText) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(bodyText);
+  } catch {
+    throw httpError(400, "Request body must be valid JSON.");
+  }
+}
+
+function normalizePathname(pathname) {
+  const value = String(pathname || "").trim();
+  if (!value || value === "/") {
+    return "/";
+  }
+
+  return value.replace(/\/+$/, "") || "/";
+}
+
+function normalizeAdminPath(pathname) {
+  const normalized = normalizePathname(pathname);
+  return (normalized.startsWith("/") ? normalized : `/${normalized}`).toLowerCase();
+}
+
+function pickAdminToken(env) {
+  const candidates = [
+    env.ADMIN_TOKEN,
+    env.ADMINTOKEN,
+    env.admintoken,
+    env.ADMIN,
+    env.admin,
+    env.TOKEN,
+    env.token,
+  ];
+
+  for (const value of candidates) {
+    const token = String(value || "").trim();
+    if (token) {
+      return token;
+    }
+  }
+
+  return "";
+}
+
+function buildAdminPathAliases(adminToken) {
+  const raw = `/${adminToken}`;
+  const variants = new Set([raw.toLowerCase()]);
+  const normalized = adminToken.toLowerCase();
+
+  if (normalized.includes("-")) {
+    variants.add(`/${normalized.replace(/-/g, "")}`);
+    variants.add(`/${normalized.replace(/-/g, "_")}`);
+  }
+
+  if (normalized.includes("_")) {
+    variants.add(`/${normalized.replace(/_/g, "-")}`);
+    variants.add(`/${normalized.replace(/_/g, "")}`);
+  }
+
+  return [...variants].map((value) => normalizeAdminPath(value));
+}
+
+function looksLikeAdminPath(pathnameLower, env) {
+  const token = pickAdminToken(env);
+  const paths = [normalizeAdminPath(env.ADMIN_PATH || "/llmmerge-admin")];
+  if (token) paths.push(...buildAdminPathAliases(token));
+  return paths.some((basePath) => pathnameLower === basePath || pathnameLower.startsWith(`${basePath}/api/`));
+}
+
+function matchAdminRoute(pathnameLower, app) {
+  for (const basePath of app.adminPaths) {
+    if (pathnameLower === basePath) {
+      return { kind: "page", basePath };
+    }
+    if (pathnameLower.startsWith(`${basePath}/api/`)) {
+      return { kind: "api", basePath };
+    }
+  }
+  return null;
+}
+
+function authorizeAdminRequest(request, url, app, adminRoute) {
+  const legacyPath = adminRoute.basePath !== app.adminPath;
+  const token = adminRequestToken(request, url);
+  if (!legacyPath && token !== app.adminToken) return { ok: false };
+  return {
+    ok: true,
+    setCookie: token === app.adminToken ? adminSessionCookie(app, url) : "",
+  };
+}
+
+function adminRequestToken(request, url) {
+  const authorization = String(request.headers.get("authorization") || "");
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
+  return String(
+    request.headers.get("x-admin-token") ||
+    bearer ||
+    url.searchParams.get("token") ||
+    readCookie(request, ADMIN_SESSION_COOKIE) ||
+    "",
+  ).trim();
+}
+
+function readCookie(request, name) {
+  const prefix = `${name}=`;
+  for (const item of String(request.headers.get("cookie") || "").split(";")) {
+    const value = item.trim();
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
+  }
+  return "";
+}
+
+function adminSessionCookie(app, url) {
+  return `${ADMIN_SESSION_COOKIE}=${app.adminToken}; Path=${app.adminPath}; Max-Age=${ADMIN_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax${url.protocol === "https:" ? "; Secure" : ""}`;
+}
+
+function adminUnauthorizedResponse(isApi) {
+  if (isApi) return withCorsResponse(json(openAiError("Admin authentication required.", "authentication_error"), 401));
+  const headers = new Headers(HTML_HEADERS);
+  headers.set("cache-control", "private, no-store");
+  headers.set("www-authenticate", "Bearer");
+  return new Response("Admin authentication required.", { status: 401, headers });
+}
+
+function privateAdminResponse(response, setCookie) {
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "private, no-store");
+  headers.set("x-frame-options", "DENY");
+  headers.set("referrer-policy", "no-referrer");
+  if (setCookie) headers.set("set-cookie", setCookie);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function normalizeTimeZoneOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 480;
+  return Math.max(-720, Math.min(840, Math.floor(parsed)));
+}
+
+function parsePriority(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function normalizeHeaders(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const headers = {};
+  for (const [key, item] of Object.entries(value)) {
+    const headerName = String(key || "").trim();
+    if (!headerName) {
+      continue;
+    }
+    headers[headerName] = String(item ?? "").trim();
+  }
+  return headers;
+}
+
+function normalizeModelContexts(value, models = []) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const contexts = {};
+  for (const model of normalizeStringArray(models)) {
+    contexts[model] = String(source[model] || "1m").trim() || "1m";
+  }
+  return contexts;
+}
+
+function presetDefaultHeaders(presetId) {
+  const preset = presetById(presetId);
+  return normalizeHeaders(preset?.headers || {});
+}
+
+function resolveBaseUrl(presetId, inputBaseUrl, defaultBaseUrl, accountId) {
+  const preset = presetById(presetId);
+  if (preset && preset.requires_account_id) {
+    const manual = String(inputBaseUrl || "").trim();
+    if (manual) {
+      return manual;
+    }
+    const account = String(accountId || "").trim();
+    return account
+      ? String(defaultBaseUrl || preset.base_url || "").replace("{ACCOUNT_ID}", account).trim()
+      : "";
+  }
+
+  if (preset && preset.requires_base_url === false) {
+    return String(defaultBaseUrl || preset.base_url || "").trim();
+  }
+
+  return String(inputBaseUrl || defaultBaseUrl || "").trim();
+}
+
+function isAllowedUpstreamUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+function getBearerToken(request) {
+  const auth = request.headers.get("authorization") || "";
+  const token = auth.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || (request.headers.get("x-api-key") || "").trim();
+  return token && token.length <= MAX_CLIENT_KEY_LENGTH ? token : null;
+}
+
+async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose) {
+  const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
+  const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
+  const controller = new AbortController();
+  const upstreamSignal = init?.signal;
+  const abort = () => controller.abort(upstreamSignal?.reason || httpError(499, "Response cancelled."));
+  const cleanupSignal = () => upstreamSignal?.removeEventListener("abort", abort);
+  if (upstreamSignal?.aborted) abort();
+  else upstreamSignal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(httpError(504, "Upstream first byte timeout.")), timeout);
+
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    clearTimeout(timer);
+    return wrapIdleTimeout(response, idleTimeout, () => {
+      cleanupSignal();
+      onClose?.();
+    });
+  } catch (error) {
+    clearTimeout(timer);
+    cleanupSignal();
+    const reason = controller.signal.reason;
+    if (controller.signal.aborted) {
+      if (reason?.statusCode) throw reason;
+      if (upstreamSignal?.aborted) throw httpError(499, "Response cancelled.");
+      throw normalizeThrownError(reason || error, "Upstream request aborted.");
+    }
+    throw normalizeThrownError(error);
+  }
+}
+
+function wrapIdleTimeout(response, timeoutMs, onClose) {
+  if (!response.body) {
+    onClose?.();
+    return response;
+  }
+  const stream = response.body;
+  let reader = null;
+  let closed = false;
+  let timer = null;
+  let finished = false;
+  const stop = () => { if (timer) clearTimeout(timer); timer = null; };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    onClose?.();
+  };
+  return new Response(new ReadableStream({
+    async start(controller) {
+      reader = stream.getReader();
+      const reset = () => {
+        stop();
+        timer = setTimeout(async () => {
+          if (closed) return;
+          closed = true;
+          try { await reader.cancel("idle timeout"); } catch {}
+          stop();
+          finish();
+          controller.error(new Error("Upstream idle timeout."));
+        }, timeoutMs);
+      };
+
+      reset();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          reset();
+          if (closed) break;
+          controller.enqueue(value);
+        }
+        if (!closed) {
+          closed = true;
+          stop();
+          finish();
+          controller.close();
+        }
+      } catch (error) {
+        if (!closed) {
+          closed = true;
+          stop();
+          finish();
+          controller.error(error);
+        }
+      }
+    },
+    async cancel(reason) {
+      closed = true;
+      stop();
+      finish();
+      try { await reader?.cancel(reason); } catch {}
+    },
+  }), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseBodyHeaders(response.headers),
+  });
+}
+
+function responseBodyHeaders(headers) {
+  const safe = new Headers(headers);
+  ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-encoding"].forEach((name) => safe.delete(name));
+  return safe;
+}
+
+function proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId) {
+  const headers = responseBodyHeaders(upstreamResp.headers);
+  for (const [key, value] of Object.entries(CORS_HEADERS)) headers.set(key, value);
+  headers.set("cache-control", "no-store");
+  headers.set("x-llm-gateway-upstream", proxyResponse.upstream.name);
+  headers.set("x-llm-gateway-client", client.name || client.id || "client");
+  headers.set("x-llm-gateway-attempts", String(proxyResponse.attempts));
+  headers.set("x-llm-gateway-trace-id", traceId);
+  if (proxyResponse.timing) {
+    headers.set("x-llm-gateway-route-ms", String(proxyResponse.timing.route_selected_ms || 0));
+    headers.set("x-llm-gateway-dispatch-ms", String(proxyResponse.timing.dispatch_wait_ms || 0));
+    headers.set("x-llm-gateway-upstream-start-ms", String(proxyResponse.timing.upstream_started_ms || 0));
+  }
+  const trace = gatewayTraceFields(proxyResponse.trace);
+  if (trace.trace_stage) headers.set("x-llm-gateway-trace-stage", trace.trace_stage);
+  if (trace.trace_upstream_headers_ms != null) headers.set("x-llm-gateway-upstream-headers-ms", String(trace.trace_upstream_headers_ms));
+  return headers;
+}
+
+function setSseHeaders(headers) {
+  headers.set("content-type", "text/event-stream; charset=utf-8");
+  headers.set("cache-control", "no-cache, no-transform");
+  headers.set("x-accel-buffering", "no");
+  headers.delete("content-length");
+}
+
+function pendingSseHeaders(client, traceId) {
+  const headers = new Headers(CORS_HEADERS);
+  setSseHeaders(headers);
+  headers.set("x-llm-gateway-client", client.name || client.id || "client");
+  headers.set("x-llm-gateway-trace-id", traceId);
+  headers.set("x-llm-gateway-upstream", "pending");
+  headers.set("x-llm-gateway-attempts", "0");
+  return headers;
+}
+
+function generateClientKey() {
+  return `sk-gw-${randomString(40)}`;
+}
+
+function requestTraceId(request) {
+  const incoming = String(request.headers.get("x-request-id") || request.headers.get("x-trace-id") || "").trim();
+  return incoming && incoming.length <= 128 ? incoming : `gw_${randomString(16)}`;
+}
+
+function mergeAbortSignals(...signals) {
+  const active = signals.filter(Boolean);
+  if (active.length <= 1) return active[0] || null;
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") return AbortSignal.any(active);
+  const controller = new AbortController();
+  const abort = (signal) => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  active.forEach((signal) => {
+    if (signal.aborted) abort(signal);
+    else signal.addEventListener("abort", () => abort(signal), { once: true });
+  });
+  return controller.signal;
+}
+
+function randomString(length) {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let output = "";
+
+  for (const byte of bytes) {
+    output += alphabet[byte % alphabet.length];
+  }
+
+  return output;
+}
+
+function maskKey(key) {
+  if (!key || key.length < 12) {
+    return key;
+  }
+  return `${key.slice(0, 8)}...${key.slice(-4)}`;
+}
+
+function clientTokenKey(token) {
+  return `client:token:${token}`;
+}
+
+function clientIdKey(id) {
+  return `client:id:${id}`;
+}
+
+function clientIndexKey() {
+  return "client:index";
+}
+
+function modelsCacheKey(upstreamName) {
+  return `cache:models:${upstreamName}`;
+}
+
+function openAiError(message, type) {
+  return {
+    error: {
+      message,
+      type,
+    },
+  };
+}
+
+function mapErrorType(statusCode) {
+  if (statusCode === 401) {
+    return "authentication_error";
+  }
+  if (statusCode === 403) {
+    return "permission_error";
+  }
+  if (statusCode === 404) {
+    return "not_found_error";
+  }
+  if (statusCode && statusCode < 500) {
+    return "invalid_request_error";
+  }
+  return "server_error";
+}
+
+// ponytail: no pretty-print, smaller wire size for large responses
+function json(payload, status) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: JSON_HEADERS,
+  });
+}
+
+function withCorsResponse(response) {
+  const headers = new Headers(response.headers);
+
+  for (const [key, value] of Object.entries(CORS_HEADERS)) {
+    headers.set(key, value);
+  }
+  if (response.status >= 500 || [408, 409, 425, 429].includes(response.status)) {
+    headers.set("retry-after", "1");
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function normalizeThrownError(error, fallback = "Upstream request failed.") {
+  if (error && typeof error === "object") return error;
+  return new Error(String(error || fallback));
+}
+
+function httpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function badConfig(message) {
+  return httpError(500, message);
+}
+
+// ponytail: origin param lets us pre-fill gateway URL server-side (no API wait)

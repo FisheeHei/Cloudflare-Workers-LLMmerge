@@ -97,8 +97,9 @@ Common variables:
 | `ANALYTICS_ACCOUNT_ID` | empty | Account ID for Analytics Engine queries |
 | `ANALYTICS_API_TOKEN` | empty | Requires Account Analytics Read |
 | `ANALYTICS_DATASET` | `llmmerge_requests` | Analytics Engine dataset name |
+| `WORKERS_DAILY_REQUEST_BUDGET` | `10000000` | Reference threshold shown in the Workers usage panel; does not change Cloudflare account quota |
 
-KV-only deployments can also use `KV_FLUSH_INTERVAL_MS`, `KV_DAILY_READ_BUDGET`, `KV_DAILY_WRITE_BUDGET`, and `WORKERS_DAILY_REQUEST_BUDGET` for mirror and admin usage limits.
+KV-only deployments can also use `KV_FLUSH_INTERVAL_MS`, `KV_DAILY_READ_BUDGET`, and `KV_DAILY_WRITE_BUDGET` for mirror and admin usage data. The per-invocation ceiling for fetch, KV, D1, and DO subrequests is configured by `[limits].subrequests` in both Wrangler files and is currently set to `10000000`; the effective limit still depends on the Cloudflare account plan.
 
 ## Adding Upstreams
 
@@ -220,7 +221,11 @@ When no first byte arrives, inspect `x-llm-gateway-upstream-start-ms`. A large v
 
 ## Files
 
-- `_worker.js`: Worker/Pages Advanced Mode entry.
+- `_worker.js`: Worker/Pages Advanced Mode entry; keeps deployment exports small.
+- `gateway-worker.js`: gateway request path, protocol handlers, auth, routing, upstream transport, streaming finalization, storage, and admin API.
+- `gateway-context.js`: Prompt / Context injection, client scope, on-demand context, and history trimming.
+- `gateway-primitives.js`: shared model matching, text normalization, array parsing, and stable hashing helpers.
+- `gateway-observability.js`: request tracing, failure classification, and diagnostic fields.
 - `admin-page.js`: admin panel.
 - `provider-bridges.js`: generic upstream and NVIDIA NIM adapters.
 - `presets.js`: upstream templates.

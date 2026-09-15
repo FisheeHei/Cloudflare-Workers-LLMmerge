@@ -97,8 +97,9 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `ANALYTICS_ACCOUNT_ID` | 空 | Analytics Engine 查询所需 Account ID |
 | `ANALYTICS_API_TOKEN` | 空 | 需要 Account Analytics Read 权限 |
 | `ANALYTICS_DATASET` | `llmmerge_requests` | Analytics Engine 数据集名 |
+| `WORKERS_DAILY_REQUEST_BUDGET` | `10000000` | 后台 Workers 用量面板的参考阈值，不改变 Cloudflare 实际配额 |
 
-KV-only 部署还可使用 `KV_FLUSH_INTERVAL_MS`、`KV_DAILY_READ_BUDGET`、`KV_DAILY_WRITE_BUDGET` 和 `WORKERS_DAILY_REQUEST_BUDGET` 控制镜像与后台用量表。
+KV-only 部署还可使用 `KV_FLUSH_INTERVAL_MS`、`KV_DAILY_READ_BUDGET` 和 `KV_DAILY_WRITE_BUDGET` 控制镜像与后台用量表。单次 Worker 调用的 fetch、KV、D1、DO 等子请求上限由两份 Wrangler 配置中的 `[limits].subrequests` 控制，当前设置为 `10000000`；实际生效仍受 Cloudflare 账户套餐限制。
 
 ## 添加上游
 
@@ -220,7 +221,11 @@ const response = await client.chat.completions.create({
 
 ## 文件说明
 
-- `_worker.js`：Worker/Pages Advanced Mode 入口。
+- `_worker.js`：Worker/Pages Advanced Mode 入口，只保留部署转发导出。
+- `gateway-worker.js`：网关主运行链路，负责协议入口、鉴权、路由、上游连接、流式收尾、存储和管理 API。
+- `gateway-context.js`：Prompt / Context 注入、客户端范围、按需上下文和历史裁剪。
+- `gateway-primitives.js`：模型匹配、文本归一化、数组解析和稳定哈希等共享基础函数。
+- `gateway-observability.js`：请求追踪、失败分类和诊断字段。
 - `admin-page.js`：管理后台页面。
 - `provider-bridges.js`：通用上游及 NVIDIA NIM 等服务的协议适配。
 - `presets.js`：上游模板。

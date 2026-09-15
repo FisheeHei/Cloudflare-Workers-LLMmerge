@@ -34,6 +34,11 @@ class_name = "LlmMergeStore"
 tag = "v1"
 new_sqlite_classes = ["LlmMergeStore"]
 
+# Paid plan: raise the per-invocation fetch/KV/D1/DO subrequest ceiling.
+# Free plans keep Cloudflare's platform maximum instead.
+[limits]
+subrequests = 10000000
+
 # [[migrations]]
 # tag = "v1"
 # new_sqlite_classes = ["LlmMergeStore"]
