@@ -919,7 +919,7 @@ const clientStatusResp = await worker.default.fetch(new Request("https://gw.test
 }), env);
 assert.equal(clientStatusResp.status, 200);
 assert.equal(clientStatusResp.headers.get("cache-control"), "no-store");
-assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-18-stable-routing-1");
+assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-18-stable-routing-2");
 const clientStatus = await clientStatusResp.json();
 assert.equal(clientStatus.ok, true);
 assert.equal(clientStatus.gateway, "connected");
@@ -943,7 +943,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-18-stable-routing-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-18-stable-routing-2"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
