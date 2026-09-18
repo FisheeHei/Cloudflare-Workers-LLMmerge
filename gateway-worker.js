@@ -57,6 +57,7 @@ const RESPONSES_PATH = "/v1/responses";
 const RESPONSES_COMPACT_PATH = "/v1/responses/compact";
 const EMBEDDINGS_PATH = "/v1/embeddings";
 const MESSAGES_PATH = "/v1/messages";
+const CLIENT_STATUS_PATH = "/v1/gateway/status";
 const RESPONSE_STORE_PREFIX = "responses:store:";
 const RESPONSE_STORE_TTL_SECONDS = 7 * 24 * 3600;
 const GATEWAY_CONFIG_KEY = "gateway:config";
@@ -69,7 +70,6 @@ const CLIENT_DAILY_USAGE_TTL_SECONDS = 35 * 24 * 3600;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
 const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
-const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
@@ -85,9 +85,14 @@ const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
 const SSE_KEEPALIVE_MS = 5000;
 const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
-// Keep upstream staggering advisory: a crowded account must not turn into an unbounded gateway queue.
-const MAX_UPSTREAM_DISPATCH_WAIT_MS = 1000;
-const ROUTE_COORDINATOR_TIMEOUT_MS = 1500;
+// Keep upstream staggering advisory: a crowded account must not turn into a gateway queue.
+const MAX_UPSTREAM_DISPATCH_WAIT_MS = 50;
+const ROUTE_COORDINATOR_TIMEOUT_MS = 50;
+const DEFAULT_FAILOVER_MAX_ATTEMPTS = 3;
+const MAX_FAILOVER_ATTEMPTS = 5;
+const DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS = 12000;
+const DEFAULT_SLOW_UPSTREAM_FIRST_BYTE_TIMEOUT_MS = 60000;
+const STREAM_TERMINAL_GRACE_MS = 20;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
@@ -112,7 +117,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-15-workers-limits-1";
+const VERSION = "v26-09-18-stable-routing-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -148,7 +153,7 @@ export default {
         );
       }
 
-      if (env.ASSETS && request.method === "GET" && pathname !== "/" && pathname !== MODEL_PATH && !looksLikeAdminPath(pathnameLower, env)) {
+      if (env.ASSETS && request.method === "GET" && pathname !== "/" && pathname !== MODEL_PATH && pathname !== CLIENT_STATUS_PATH && !looksLikeAdminPath(pathnameLower, env)) {
         const assetResponse = await env.ASSETS.fetch(request);
         if (assetResponse.status !== 404) return assetResponse;
       }
@@ -176,6 +181,29 @@ export default {
         if (!adminAuth?.ok) return adminUnauthorizedResponse(true);
         const response = await handleAdminApi(request, url, pathnameLower, app, adminRoute.basePath);
         return privateAdminResponse(response, adminAuth.setCookie);
+      }
+
+      if (pathname === CLIENT_STATUS_PATH && request.method === "GET") {
+        const runtime = await loadRuntimeConfig(app);
+        const client = await requireClient(request, runtime);
+        const usage = await readClientDailyUsage(app.state, client);
+        const response = withCorsResponse(json({
+          object: "gateway_status",
+          ok: true,
+          gateway: "connected",
+          version: VERSION,
+          client: {
+            id: client.id,
+            name: client.name,
+          },
+          usage: publicClientStatusUsage(usage),
+          now: utcNowIso(),
+        }, 200));
+        const headers = new Headers(response.headers);
+        headers.set("cache-control", "no-store");
+        headers.set("vary", "Authorization");
+        headers.set("x-llm-gateway-version", VERSION);
+        return new Response(response.body, { status: response.status, headers });
       }
 
       if (pathname === MODEL_PATH && request.method === "GET") {
@@ -382,7 +410,6 @@ let _upstreamReservations = {};
 // ponytail: stagger same-upstream dispatches without delaying already-spread requests.
 let _upstreamDispatchAt = {};
 let _upstreamDispatchClients = {};
-const _routeSelectionTails = {};
 // ponytail: per-isolate active Responses streams, keyed by response id for cancel support
 const _activeResponses = new Map();
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -808,6 +835,8 @@ function recordAnalyticsPoint(app, entry, ctx) {
       entry.finish_reason || "",
       entry.failure_code || "",
       entry.trace_stage || "",
+      entry.trace_dispatch_mode || "",
+      entry.trace_failure_reason || "",
     ],
     doubles: [
       Number(entry.status || 0),
@@ -823,6 +852,8 @@ function recordAnalyticsPoint(app, entry, ctx) {
       Number(entry.trace_upstream_start_ms || 0),
       Number(entry.trace_upstream_headers_ms || 0),
       Number(entry.trace_attempts || 0),
+      Number(entry.trace_first_visible_ms || 0),
+      entry.trace_failover_used === true ? 1 : 0,
     ],
     indexes: [entry.client || "client"],
   })).catch(() => {});
@@ -1134,7 +1165,11 @@ SELECT
   double10 AS trace_route_ms,
   double11 AS trace_upstream_start_ms,
   double12 AS trace_upstream_headers_ms,
-  double13 AS trace_attempts
+  double13 AS trace_attempts,
+  double14 AS trace_first_visible_ms,
+  double15 AS trace_failover_used,
+  blob13 AS trace_dispatch_mode,
+  blob14 AS trace_failure_reason
 FROM ${app.analyticsDataset}
 WHERE timestamp >= NOW() - INTERVAL '24' HOUR
 ORDER BY timestamp DESC
@@ -1167,6 +1202,10 @@ LIMIT 50
       trace_upstream_start_ms: Number(row.trace_upstream_start_ms || 0),
       trace_upstream_headers_ms: Number(row.trace_upstream_headers_ms || 0),
       trace_attempts: Number(row.trace_attempts || 0),
+      trace_first_visible_ms: Number(row.trace_first_visible_ms || 0),
+      trace_failover_used: Number(row.trace_failover_used || 0) === 1,
+      trace_dispatch_mode: row.trace_dispatch_mode || "",
+      trace_failure_reason: row.trace_failure_reason || "",
     };
   });
 }
@@ -1487,7 +1526,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
     if (!completionPending || upstreamStopped) return;
     upstreamStopped = true;
     try { onComplete?.(); } catch {}
-    Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+    cancelReaderAfterGrace(upstreamReader, "response completed");
   };
   const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
   const transformChunk = Boolean(responseModel || hideReasoning || normalizeNimReasoning);
@@ -2464,9 +2503,11 @@ function normalizeGatewayRouting(routing = {}) {
   return {
     coordination_level: Number.isFinite(coordination) ? Math.max(0, Math.min(5, Math.floor(coordination))) : 3,
     failover: routing.failover !== false,
-    fast_routing: routing.fast_routing === true,
-    hedge_enabled: routing.hedge_enabled === true,
-    hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
+    failover_max_attempts: Math.max(1, Math.min(MAX_FAILOVER_ATTEMPTS, parsePositiveInt(routing.failover_max_attempts, DEFAULT_FAILOVER_MAX_ATTEMPTS))),
+    // Keep legacy fields in the normalized shape, but never enable parallel routing.
+    fast_routing: false,
+    hedge_enabled: false,
+    hedge_max: 1,
     soft_interval_ms: parseNonNegativeInt(routing.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000),
     load_balance: routing.load_balance !== false,
   };
@@ -2516,6 +2557,8 @@ function buildUpstreamConfigRecord(item, index, options) {
     priority: parsePriority(item?.priority, index + 1),
     weight: parsePositiveInt(item?.weight, 1),
     capability: item?.capability || null,
+    emergency: item?.emergency === true,
+    first_byte_timeout_ms: parseNonNegativeInt(item?.first_byte_timeout_ms, 0, 600000),
   };
 }
 
@@ -2721,6 +2764,8 @@ async function exportUpstreamGroup(app) {
       preset: upstream.preset || "custom",
       priority: parsePriority(upstream.priority, 1),
       weight: parsePositiveInt(upstream.weight, 1),
+      emergency: upstream.emergency === true,
+      first_byte_timeout_ms: parseNonNegativeInt(upstream.first_byte_timeout_ms, 0, 600000),
     }))
   );
 
@@ -4049,7 +4094,7 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
       if (!completionPending || upstreamStopped) return;
       upstreamStopped = true;
       try { onComplete?.(); } catch {}
-      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+      cancelReaderAfterGrace(upstreamReader, "response completed");
     };
     const diag = createStreamDiag(started);
     const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
@@ -4300,7 +4345,7 @@ function nativeResponsesStream(body, onDone, onComplete = null) {
       if (!completionPending || upstreamStopped) return;
       upstreamStopped = true;
       try { onComplete?.(); } catch {}
-      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+      cancelReaderAfterGrace(upstreamReader, "response completed");
     };
     const reader = body.getReader();
     upstreamReader = reader;
@@ -4808,7 +4853,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       if (!completionPending || upstreamStopped) return;
       upstreamStopped = true;
       try { onComplete?.(); } catch {}
-      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+      cancelReaderAfterGrace(upstreamReader, "response completed");
     };
     const diag = createStreamDiag(started);
     const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
@@ -5020,7 +5065,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       if (!completionPending || upstreamStopped) return;
       upstreamStopped = true;
       try { onComplete?.(); } catch {}
-      Promise.resolve(upstreamReader?.cancel("response completed")).catch(() => {});
+      cancelReaderAfterGrace(upstreamReader, "response completed");
     };
     let messageOutputIndex = null;
     const ensureMessage = () => {
@@ -5177,7 +5222,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   const routingStartedAt = Date.now();
   const trace = createGatewayTrace({ id: traceId || requestTraceId(request), protocol: pathname, model });
   markGatewayTrace(trace, "routing_started");
-  const timing = { route_selected_ms: 0, dispatch_wait_ms: 0, upstream_started_ms: 0 };
+  const timing = { route_selected_ms: 0, dispatch_wait_ms: 0, upstream_started_ms: 0, first_visible_ms: 0 };
   if (pathname === CHAT_PATH && !injection) {
     const prepared = prepareGatewayChatBody(bodyText, runtime.settings, client);
     bodyText = prepared.bodyText;
@@ -5193,45 +5238,45 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     throw error;
   }
 
-  const singleUpstream = candidates.length === 1;
-  if (!singleUpstream) await hydrateUpstreamState(runtime, candidates, model);
-  let attempts = singleUpstream ? candidates : null;
-  let maxAttempts = singleUpstream ? 1 : 0;
+  // Route from the local snapshot first. Cross-edge state is only a hint and
+  // must never delay the first real upstream fetch.
+  const attempts = orderUpstreams(runtime, candidates, model, client);
+  if (!attempts.length) {
+    const error = httpError(404, `No upstream available for model: ${model}`);
+    error.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "route_failed", { failure_reason: "no_eligible_upstream" }));
+    throw error;
+  }
+
+  const singleUpstream = attempts.length === 1;
+  const failoverEnabled = runtime.routing.failover !== false;
+  const maxAttempts = singleUpstream
+    ? 1
+    : failoverEnabled
+      ? Math.min(attempts.length, runtime.routing.failover_max_attempts || DEFAULT_FAILOVER_MAX_ATTEMPTS)
+      : 1;
+  const hydrationTask = hydrateUpstreamState(runtime, candidates, model).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(hydrationTask);
+  else void hydrationTask;
+
+  const hedgeAttemptCount = Math.min(attempts.length, runtime.routing.hedge_max || 2);
+  if (!singleUpstream && (runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && hedgeAttemptCount > 1) {
+    const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, hedgeAttemptCount), model);
+    const used = new Set(hedgedAttempts.map(upstreamKey));
+    const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
+    timing.route_selected_ms = Date.now() - routingStartedAt;
+    markGatewayTrace(trace, "route_selected", { attempt: 1, upstream: hedgedAttempts[0]?.name });
+    return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
+  }
+
+  const failoverDeadline = routingStartedAt + NON_STREAM_RESPONSE_DEADLINE_MS;
   let initialReservation = null;
   let initialDispatchContested = false;
-  const releaseSelection = singleUpstream
-    ? () => {}
-    : await acquireRouteSelectionLock(`${pathname}\n${model}`, signal);
-  let selectionReleased = false;
-  const releaseSelectionOnce = () => {
-    if (selectionReleased) return;
-    selectionReleased = true;
-    releaseSelection();
-  };
   try {
-    if (!singleUpstream) {
-      attempts = orderUpstreams(runtime, candidates, model, client);
-      maxAttempts = runtime.routing.failover === false
-        ? 1
-        : Math.min(attempts.length, runtime.routing.hedge_max || 2);
-      if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
-        const used = new Set(hedgedAttempts.map(upstreamKey));
-        const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-        timing.route_selected_ms = Date.now() - routingStartedAt;
-        markGatewayTrace(trace, "route_selected");
-        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
-        releaseSelectionOnce();
-        return result;
-      }
-    }
     initialDispatchContested = upstreamHasCompetition(attempts[0]);
     initialReservation = reserveUpstreams([attempts[0]]);
     timing.route_selected_ms = Date.now() - routingStartedAt;
-    markGatewayTrace(trace, "route_selected");
-    releaseSelectionOnce();
+    markGatewayTrace(trace, "route_selected", { attempt: 1, upstream: attempts[0]?.name });
   } catch (error) {
-    releaseSelectionOnce();
     const routeError = normalizeThrownError(error);
     routeError.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "route_failed"));
     throw routeError;
@@ -5241,6 +5286,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   for (let index = 0; index < maxAttempts; index += 1) {
     const upstream = attempts[index];
     const isLast = index === maxAttempts - 1;
+    const remainingBudgetMs = Math.max(1, failoverDeadline - Date.now());
     let upstreamResult = null;
     const dispatchContested = index === 0 ? initialDispatchContested : upstreamHasCompetition(upstream);
     const releaseReservation = index === 0 ? initialReservation : reserveUpstreams([upstream]);
@@ -5255,42 +5301,52 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         markGatewayTrace(trace, "dispatch_limited", { attempt: index + 1, upstream: upstream.name });
         continue;
       }
-      markGatewayTrace(trace, "dispatch_accepted", { attempt: index + 1, upstream: upstream.name });
+      markGatewayTrace(trace, "dispatch_accepted", { attempt: index + 1, upstream: upstream.name, dispatch_mode: dispatch.mode || "local" });
       const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         trace, attempt: index + 1,
-        firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
+        firstByteTimeoutMs: Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), remainingBudgetMs)),
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
-      releaseSelectionOnce();
       upstreamResult = await upstreamPromise;
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
-        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream));
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), remainingBudgetMs)));
         response = primed.response;
         upstreamResult.response = response;
         upstreamResult.streamError = primed.error;
         upstreamResult.streamErrorKind = primed.errorKind || "";
+        upstreamResult.firstVisible = primed.firstVisible === true;
+        upstreamResult.completed = primed.completed === true;
         upstreamResult.latency = Date.now() - upstreamResult.startedAt;
+        if (primed.firstVisible) {
+          timing.first_visible_ms = Date.now() - routingStartedAt;
+          markGatewayTrace(trace, "first_visible_output", { attempt: index + 1, upstream: upstream.name, first_visible: true });
+        } else if (primed.completed) {
+          markGatewayTrace(trace, "response_completed", { attempt: index + 1, upstream: upstream.name });
+        }
       }
 
-      const shouldRetry = runtime.routing.failover !== false && (Boolean(upstreamResult.streamError) || await isRetryableUpstreamResponse(response));
+      const shouldRetry = failoverEnabled && (Boolean(upstreamResult.streamError) || await isRetryableUpstreamResponse(response));
       if (shouldRetry) {
-        if (!isLast) {
-          await discardUpstreamResponse(upstreamResult, "retryable upstream response");
-        }
-        lastError = new Error(upstreamResult.streamError || `HTTP ${response.status}`);
+        const failureMessage = upstreamResult.streamError || await responseErrorMessage(response) || `HTTP ${response.status}`;
+        await discardUpstreamResponse(upstreamResult, "retryable upstream response");
+        // An HTTP 200 application error is still a gateway failure. Do not let
+        // the upstream transport status leak into the final response status.
+        lastError = httpError(response.ok ? 502 : (response.status || 502), failureMessage);
         lastError.upstreamName = upstream.name;
-        markGatewayTrace(trace, "retrying_upstream", { attempt: index + 1, upstream: upstream.name, status: response.status });
-        await markUpstreamFailure(runtime, upstream, model, response);
+        const failureReason = upstreamFailureReason({ response, error: lastError, streamErrorKind: upstreamResult.streamErrorKind });
+        lastError.failureReason = failureReason;
+        markGatewayTrace(trace, "retrying_upstream", { attempt: index + 1, upstream: upstream.name, status: response.status, failure_reason: failureReason, failover_used: !isLast });
+        await scheduleUpstreamState(markUpstreamFailure(runtime, upstream, model, response), ctx);
       } else {
-        await clearUpstreamFailure(runtime, upstream, model);
+        await scheduleUpstreamState(clearUpstreamFailure(runtime, upstream, model), ctx);
         rememberUpstreamLatency(runtime, upstream, model, upstreamResult.latency, ctx);
         rememberSuccessfulUpstream(upstream, model);
       }
 
-      if (!shouldRetry || (isLast && (!upstreamResult.streamError || upstreamResult.streamErrorKind === "event"))) {
+      if (!shouldRetry) {
         markGatewayTrace(trace, response.ok ? "response_ready" : "upstream_response_error", { attempt: index + 1, upstream: upstream.name, status: response.status });
         return {
           attempts: index + 1,
@@ -5304,7 +5360,6 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
     } catch (error) {
       const upstreamError = normalizeThrownError(error);
-      releaseSelectionOnce();
       await discardUpstreamResponse(upstreamResult, "upstream request failed");
       if (signal?.aborted) {
         const cancelled = httpError(499, "Response cancelled.");
@@ -5318,8 +5373,10 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
       lastError = upstreamError;
       lastError.upstreamName = upstream.name;
-      markGatewayTrace(trace, "upstream_attempt_failed", { attempt: index + 1, upstream: upstream.name, status: upstreamError.statusCode || 0 });
-      await markUpstreamFailure(runtime, upstream, model);
+      const failureReason = upstreamFailureReason({ error: upstreamError });
+      lastError.failureReason = failureReason;
+      markGatewayTrace(trace, "upstream_attempt_failed", { attempt: index + 1, upstream: upstream.name, status: upstreamError.statusCode || 0, failure_reason: failureReason, failover_used: !isLast });
+      await scheduleUpstreamState(markUpstreamFailure(runtime, upstream, model), ctx);
       if (isLast) {
         break;
       }
@@ -5330,7 +5387,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 
   const err = httpError(lastError?.statusCode || 502, lastError?.message || "All upstreams failed.");
   err.upstreamName = lastError?.upstreamName || "none";
-  err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed"));
+  err.failureReason = lastError?.failureReason || "all_upstreams_failed";
+  err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed", { failure_reason: err.failureReason }));
   throw err;
 }
 
@@ -5418,17 +5476,42 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
 }
 
 function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
-  const base = runtime.requestTimeoutMs;
-  if (!isNvidiaNimUpstream(upstream)) return base;
+  const configured = Math.max(1, Number(runtime?.requestTimeoutMs) || DEFAULT_TIMEOUT_MS);
+  const override = parseNonNegativeInt(upstream?.first_byte_timeout_ms, 0, 600000);
+  if (override > 0) return override;
+  let modelName = "";
+  let slowRequest = false;
   try {
-    const modelName = String(JSON.parse(bodyText || "{}").model || "").toLowerCase();
-    // ponytail: GLM/MiniMax on NIM can spend minutes before first byte; streaming idle timeout still guards after headers.
-    return (isGlmModel(modelName) || isMiniMaxM3Model(modelName))
-      ? Math.max(base, NIM_SLOW_FIRST_BYTE_TIMEOUT_MS)
-      : base;
-  } catch {
-    return base;
+    const payload = JSON.parse(bodyText || "{}");
+    modelName = String(payload.model || "").toLowerCase();
+    slowRequest = Boolean(payload.reasoning_effort || payload.enable_thinking || payload.thinking);
+  } catch {}
+  const slowModel = isSlowFirstByteModel(modelName);
+  if (slowModel || slowRequest) {
+    // Preserve explicitly tiny test/development timeouts while making the normal
+    // default useful for slow reasoning models.
+    return configured === DEFAULT_TIMEOUT_MS
+      ? DEFAULT_SLOW_UPSTREAM_FIRST_BYTE_TIMEOUT_MS
+      : Math.max(configured, DEFAULT_SLOW_UPSTREAM_FIRST_BYTE_TIMEOUT_MS);
   }
+  return Math.min(configured, DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS);
+}
+
+function isSlowFirstByteModel(modelName) {
+  const value = String(modelName || "").toLowerCase();
+  return isGlmModel(value) || isMiniMaxM3Model(value) || /(?:reasoner|reasoning|thinking|deepseek-r1|qwq)/i.test(value);
+}
+
+function upstreamFailureReason({ response = null, error = null, streamErrorKind = "" } = {}) {
+  const status = Number(response?.status || error?.statusCode || 0);
+  const message = String(error?.message || "").toLowerCase();
+  if (streamErrorKind === "timeout" || message.includes("first visible output") || message.includes("first byte")) return "first_byte_timeout";
+  if (streamErrorKind === "empty") return "upstream_stream_eof";
+  if (status === 429) return "upstream_rate_limit";
+  if (status === 408 || status === 504 || message.includes("timeout")) return "upstream_timeout";
+  if (status >= 500) return "upstream_service_error";
+  if (status === 404) return "upstream_model_not_found";
+  return "upstream_error";
 }
 
 function applyGatewayPromptContext(bodyText, settings, client) {
@@ -5443,6 +5526,7 @@ async function isRetryableUpstreamResponse(response) {
   try {
     const body = await response.clone().text();
     if (looksLikeHtmlDocument(body)) return true;
+    if (response.status === 404 && /(?:model|deployment|engine|endpoint).*(?:not found|does not exist|unknown|unavailable)|(?:not found|does not exist|unknown).*(?:model|deployment|engine|endpoint)/i.test(body)) return true;
     return upstreamApplicationErrorMessage(safeJson(body) || body) ||
       body.includes("DEGRADED function cannot be invoked") ||
       /Function id ['"][^'"]+['"].*Specified function .* is not found/i.test(body);
@@ -5515,6 +5599,11 @@ function abortUpstreamResponse(result, reason = "response completed") {
   try { result?.abortUpstream?.(reason); } catch {}
 }
 
+function cancelReaderAfterGrace(reader, reason = "response completed") {
+  if (!reader) return;
+  setTimeout(() => Promise.resolve(reader.cancel(reason)).catch(() => {}), STREAM_TERMINAL_GRACE_MS);
+}
+
 function stopHedgeLosers(pending, controllers, winnerIndex) {
   controllers.forEach((controller, index) => {
     if (index !== winnerIndex) controller.abort("hedged upstream lost");
@@ -5556,13 +5645,19 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
         result = await fetchProxyUpstream({
           bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
           trace, attempt: index + 1,
-          firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+          firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
         });
         if (result.response.ok && streamRequest) {
-          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
+          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS));
           result.response = primed.response;
           result.streamError = primed.error;
           result.streamErrorKind = primed.errorKind || "";
+          if (primed.firstVisible) {
+            result.timing = { ...attemptTiming, first_visible_ms: Date.now() - routingStartedAt };
+            markGatewayTrace(trace, "first_visible_output", { attempt: index + 1, upstream: upstream.name, first_visible: true });
+          } else if (primed.completed) {
+            markGatewayTrace(trace, "response_completed", { attempt: index + 1, upstream: upstream.name });
+          }
           result.latency = Date.now() - result.startedAt;
         }
         return { ...result, upstream, index, timing: attemptTiming };
@@ -5593,16 +5688,18 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       if (result.response && !retryable) {
         done = true;
         stopHedgeLosers(pending, controllers, result.index);
-        await clearUpstreamFailure(runtime, result.upstream, model);
+        await scheduleUpstreamState(clearUpstreamFailure(runtime, result.upstream, model), ctx);
         rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
         rememberSuccessfulUpstream(result.upstream, model);
         markGatewayTrace(trace, "response_ready", { attempt: result.index + 1, upstream: result.upstream.name, status: result.response.status });
         return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing, injection, trace: gatewayTraceFields(trace) };
       }
+      result.failureReason = upstreamFailureReason({ response: result.response, error: result.error, streamErrorKind: result.streamErrorKind });
+      markGatewayTrace(trace, "hedged_attempt_failed", { attempt: result.index + 1, upstream: result.upstream.name, status: result.response?.status || result.error?.statusCode || 0, failure_reason: result.failureReason, failover_used: true });
       if (result.response) {
         await discardUpstreamResponse(result, "retryable hedged response");
       }
-      await markUpstreamFailure(runtime, result.upstream, model, result.response);
+      await scheduleUpstreamState(markUpstreamFailure(runtime, result.upstream, model, result.response), ctx);
     }
 
     const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal, timing, routingStartedAt, trace });
@@ -5611,7 +5708,8 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
 
     const err = httpError(lastResult?.limited ? 503 : 502, lastResult?.error?.message || (lastResult?.limited ? "All eligible upstream dispatch queues are busy." : "All hedged upstreams failed."));
     err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
-    err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed"));
+    err.failureReason = lastResult?.failureReason || "all_upstreams_failed";
+    err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed", { failure_reason: err.failureReason }));
     throw err;
   } finally {
     done = true;
@@ -5637,22 +5735,30 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     result = await fetchProxyUpstream({
       bodyText, client, pathname, request, runtime, search, signal, upstream,
       trace, attempt: 1,
-      firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+      firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
     });
     if (result.response.ok && streamRequest) {
-      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
+      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS));
       result.response = primed.response;
       result.streamError = primed.error;
       result.streamErrorKind = primed.errorKind || "";
+      if (primed.firstVisible) {
+        fallbackTiming.first_visible_ms = Date.now() - routingStartedAt;
+        markGatewayTrace(trace, "first_visible_output", { attempt: 1, upstream: upstream.name, first_visible: true });
+      } else if (primed.completed) {
+        markGatewayTrace(trace, "response_completed", { attempt: 1, upstream: upstream.name });
+      }
       result.latency = Date.now() - result.startedAt;
     }
     const retryable = Boolean(result.streamError) || await isRetryableUpstreamResponse(result.response);
     if (retryable) {
+      const failureReason = upstreamFailureReason({ response: result.response, streamErrorKind: result.streamErrorKind });
+      markGatewayTrace(trace, "hedged_fallback_failed", { attempt: 1, upstream: upstream.name, status: result.response?.status || 0, failure_reason: failureReason, failover_used: true });
       await discardUpstreamResponse(result, "retryable hedged fallback response");
-      await markUpstreamFailure(runtime, upstream, model, result.response);
+      await scheduleUpstreamState(markUpstreamFailure(runtime, upstream, model, result.response), ctx);
       return null;
     }
-    await clearUpstreamFailure(runtime, upstream, model);
+    await scheduleUpstreamState(clearUpstreamFailure(runtime, upstream, model), ctx);
     rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
     rememberSuccessfulUpstream(upstream, model);
     markGatewayTrace(trace, "response_ready", { attempt: 1, upstream: upstream.name, status: result.response.status });
@@ -5662,7 +5768,8 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     await discardUpstreamResponse(result, "hedged fallback failed");
     if (signal?.aborted) throw httpError(499, "Response cancelled.");
     if (upstreamError.statusCode === 499) throw upstreamError;
-    await markUpstreamFailure(runtime, upstream, model);
+    markGatewayTrace(trace, "hedged_fallback_failed", { attempt: 1, upstream: upstream.name, status: upstreamError.statusCode || 0, failure_reason: upstreamFailureReason({ error: upstreamError }), failover_used: true });
+    await scheduleUpstreamState(markUpstreamFailure(runtime, upstream, model), ctx);
     return null;
   } finally {
     releaseReservation();
@@ -5710,7 +5817,7 @@ function requestBodyStreams(bodyText) {
   try { return JSON.parse(bodyText || "{}").stream === true; } catch { return false; }
 }
 
-async function primeSseResponse(response, hideReasoning = false) {
+async function primeSseResponse(response, hideReasoning = false, firstVisibleTimeoutMs = 0) {
   if (!response.body || !(response.headers.get("content-type") || "").includes("text/event-stream")) {
     return { response, error: "" };
   }
@@ -5720,43 +5827,96 @@ async function primeSseResponse(response, hideReasoning = false) {
   let text = "";
   let error = "";
   let bufferedBytes = 0;
+  let terminalSeen = false;
   const stripText = hideReasoning ? createThinkTagStripper() : null;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    bufferedBytes += value.byteLength;
-    if (bufferedBytes > MAX_SSE_PRIME_BYTES) {
-      try { await reader.cancel("SSE priming limit"); } catch {}
-      throw new Error("Upstream SSE did not produce output within 2 MiB.");
-    }
-    chunks.push(value);
-    text += decoder.decode(value, { stream: true });
-    const events = text.split(/\r?\n\r?\n/);
-    text = events.pop() || "";
-    if (text.length > MAX_SSE_EVENT_CHARS) {
-      try { await reader.cancel("SSE event limit"); } catch {}
-      throw new Error("Upstream SSE event exceeds 1 MiB.");
-    }
-    for (const event of events) {
-      const data = event.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
-      if (!data || data === "[DONE]") continue;
-      const payload = safeJson(data);
-      error = streamEventErrorMessage(payload) || upstreamApplicationErrorMessage(data);
-      if (error || ssePayloadHasOutput(payload, hideReasoning, stripText)) {
-        return { response: prependResponseChunks(response, reader, chunks), error, errorKind: error ? "event" : "" };
+  const timeoutMs = Math.max(0, Number(firstVisibleTimeoutMs) || 0);
+  let timedOut = false;
+  let timer = null;
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      Promise.resolve(reader.cancel("Upstream first visible output timeout")).catch(() => {});
+    }, timeoutMs);
+  }
+  try {
+    for (;;) {
+      let result;
+      try {
+        result = await reader.read();
+      } catch (readError) {
+        if (timedOut) {
+          return { response: prependResponseChunks(response, reader, chunks), error: "Upstream first visible output timeout.", errorKind: "timeout" };
+        }
+        throw readError;
+      }
+      const { done, value } = result;
+      if (done) break;
+      bufferedBytes += value.byteLength;
+      if (bufferedBytes > MAX_SSE_PRIME_BYTES) {
+        try { await reader.cancel("SSE priming limit"); } catch {}
+        throw new Error("Upstream SSE did not produce output within 2 MiB.");
+      }
+      chunks.push(value);
+      text += decoder.decode(value, { stream: true });
+      const events = text.split(/\r?\n\r?\n/);
+      text = events.pop() || "";
+      if (text.length > MAX_SSE_EVENT_CHARS) {
+        try { await reader.cancel("SSE event limit"); } catch {}
+        throw new Error("Upstream SSE event exceeds 1 MiB.");
+      }
+      for (const event of events) {
+        const data = event.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+        if (!data) continue;
+        if (data === "[DONE]") {
+          terminalSeen = true;
+          break;
+        }
+        const payload = safeJson(data);
+        error = streamEventErrorMessage(payload) || upstreamApplicationErrorMessage(data);
+        if (error) {
+          return { response: prependResponseChunks(response, reader, chunks), error, errorKind: "event" };
+        }
+        if (ssePayloadHasOutput(payload, hideReasoning, stripText)) {
+          return { response: prependResponseChunks(response, reader, chunks), error: "", firstVisible: true };
+        }
+        if (ssePayloadIsTerminal(payload)) {
+          return { response: prependResponseChunks(response, reader, chunks), error: "", completed: true };
+        }
+      }
+      if (terminalSeen) break;
+      if (timedOut) {
+        return { response: prependResponseChunks(response, reader, chunks), error: "Upstream first visible output timeout.", errorKind: "timeout" };
       }
     }
+    if (timedOut) {
+      return { response: prependResponseChunks(response, reader, chunks), error: "Upstream first visible output timeout.", errorKind: "timeout" };
+    }
+    return { response: prependResponseChunks(response, reader, chunks), error: error || "Upstream stream ended before producing output.", errorKind: "empty" };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return { response: prependResponseChunks(response, reader, chunks), error: error || "Upstream stream ended before producing output.", errorKind: "empty" };
+}
+
+function ssePayloadIsTerminal(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  return payload.type === "response.completed";
 }
 
 function ssePayloadHasOutput(payload, hideReasoning = false, stripText = null) {
   if (!payload || typeof payload !== "object") return false;
-  if (String(payload.type || "").includes("delta")) return !hideReasoning || !String(payload.type || "").includes("reasoning");
+  const type = String(payload.type || "").toLowerCase();
+  if (type.includes("reasoning") || type.includes("thinking")) return false;
+  if (type.includes("function_call") || type.includes("tool_call")) {
+    return Boolean(String(payload.delta ?? payload.arguments ?? payload.name ?? ""));
+  }
+  if (type.includes("delta")) {
+    const delta = payload.delta ?? payload.text ?? payload.content ?? "";
+    return Boolean(chatContentToText(delta));
+  }
   const delta = payload.choices?.[0]?.delta || {};
   const text = chatContentToText(delta.content || "") || String(payload.choices?.[0]?.text || "");
   const visible = hideReasoning && stripText ? stripText(text) : text;
-  return Boolean(visible || (!hideReasoning && (delta.reasoning_content || delta.reasoning || delta.thinking)) || delta.tool_calls?.length);
+  return Boolean(visible || delta.tool_calls?.length);
 }
 
 function prependResponseChunks(response, reader, chunks) {
@@ -5781,10 +5941,15 @@ function prependResponseChunks(response, reader, chunks) {
 }
 
 function orderUpstreams(runtime, candidates, model, client) {
-  if (candidates.length <= 1) {
-    return candidates;
-  }
+  const normal = candidates.filter((upstream) => upstream.emergency !== true);
+  const emergency = candidates.filter((upstream) => upstream.emergency === true);
+  const orderedNormal = orderUpstreamPool(runtime, normal, model, client);
+  if (runtime.routing.failover === false) return orderedNormal.slice(0, 1);
+  return orderedNormal.concat(orderUpstreamPool(runtime, emergency, model, client));
+}
 
+function orderUpstreamPool(runtime, candidates, model, client) {
+  if (candidates.length <= 1) return candidates;
   const now = Date.now();
   const healthy = [];
   const cooling = [];
@@ -5803,10 +5968,6 @@ function orderUpstreams(runtime, candidates, model, client) {
   const orderedCooling = coordinationSort(runtime, cooling, model, client);
 
   const preferred = orderedHealthy.length > 0 ? orderedHealthy : orderedCooling;
-  if (runtime.routing.failover === false) {
-    return preferred.length > 0 ? preferred : candidates;
-  }
-
   const fallback = orderedHealthy.length > 0 ? orderedCooling : [];
   return preferred.concat(fallback);
 }
@@ -5871,93 +6032,81 @@ function upstreamSoftIntervalMs(runtime) {
 async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
   const interval = upstreamSoftIntervalMs(runtime);
   const name = upstreamKey(upstream);
-  if (!interval || !name) return { accepted: true, delayMs: 0 };
-  if (runtime?.routeCoordinator) {
-    const controller = new AbortController();
-    const abort = () => controller.abort(signal?.reason || "request aborted");
-    if (signal?.aborted) abort();
-    else signal?.addEventListener("abort", abort, { once: true });
-    const timeout = setTimeout(() => controller.abort("route coordinator timeout"), ROUTE_COORDINATOR_TIMEOUT_MS);
-    try {
-      const slot = await runtime.routeCoordinator.reserve(name, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
-      const delay = Math.max(0, Number(slot?.delay_ms) || 0);
-      if (slot?.accepted === false || delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) {
-        return { accepted: false, delayMs: delay };
-      }
-      const now = Date.now();
-      _upstreamDispatchAt[name] = Math.max(Number(_upstreamDispatchAt[name] || 0), now + delay + interval);
-      _upstreamDispatchClients[name] = {
-        client: String(client?.key || client?.id || client?.name || "gateway"),
-        at: now,
-      };
-      if (delay > 0) await sleep(delay, signal);
-      if (signal?.aborted) throw httpError(499, "Response cancelled.");
-      return { accepted: true, delayMs: delay };
-    } catch (error) {
-      if (error?.statusCode === 499 || signal?.aborted) throw httpError(499, "Response cancelled.");
-      // ponytail: coordinator is advisory; local scheduling keeps the request alive if DO is unavailable.
-    } finally {
-      clearTimeout(timeout);
-      signal?.removeEventListener("abort", abort);
-    }
-  }
+  if (!interval || !name) return { accepted: true, delayMs: 0, mode: "disabled" };
   const now = Date.now();
   const scheduled = contested ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
-  const delay = scheduled - now;
-  if (delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) return { accepted: false, delayMs: delay };
+  const localDelay = Math.max(0, scheduled - now);
+  noteLocalDispatch(name, scheduled, interval, client);
+
+  if (!runtime?.routeCoordinator) {
+    const delay = Math.min(localDelay, MAX_UPSTREAM_DISPATCH_WAIT_MS);
+    if (delay > 0) await sleep(delay, signal);
+    if (signal?.aborted) throw httpError(499, "Response cancelled.");
+    return { accepted: true, delayMs: delay, mode: localDelay > MAX_UPSTREAM_DISPATCH_WAIT_MS ? "fail_open" : "local" };
+  }
+
+  const coordinatorBudgetMs = Math.max(0, MAX_UPSTREAM_DISPATCH_WAIT_MS - localDelay);
+  if (coordinatorBudgetMs <= 0) {
+    return { accepted: true, delayMs: 0, mode: "fail_open" };
+  }
+  const dispatchStartedAt = Date.now();
+  const coordinatorTask = reserveRouteCoordinator(runtime, name, interval, client, signal, coordinatorBudgetMs)
+    .then((slot) => ({ kind: "slot", slot }))
+    .catch(() => ({ kind: "error" }));
+  const raced = await Promise.race([
+    coordinatorTask,
+    sleep(coordinatorBudgetMs, signal).then(() => ({ kind: "timeout" })),
+  ]);
+  if (signal?.aborted) throw httpError(499, "Response cancelled.");
+  if (raced.kind !== "slot") {
+    // ponytail: DO is advisory; never hold a model request behind coordination.
+    void coordinatorTask;
+    return { accepted: true, delayMs: 0, mode: "fail_open" };
+  }
+
+  const slot = raced.slot || {};
+  const doDelay = Math.max(0, Number(slot.delay_ms) || 0);
+  const remainingBudgetMs = Math.max(0, MAX_UPSTREAM_DISPATCH_WAIT_MS - (Date.now() - dispatchStartedAt));
+  if (slot.accepted === false || doDelay > remainingBudgetMs || localDelay > remainingBudgetMs) {
+    // DO is advisory: a rejected or stale slot must never turn into a gateway queue.
+    return { accepted: true, delayMs: 0, mode: "fail_open" };
+  }
+  noteCoordinatorDispatch(name, doDelay, interval, client);
+  const delay = Math.max(localDelay, doDelay);
+  if (delay > 0) await sleep(delay, signal);
+  if (signal?.aborted) throw httpError(499, "Response cancelled.");
+  return { accepted: true, delayMs: delay, mode: (localDelay > MAX_UPSTREAM_DISPATCH_WAIT_MS || doDelay > MAX_UPSTREAM_DISPATCH_WAIT_MS) ? "fail_open" : "do" };
+}
+
+function noteLocalDispatch(name, scheduled, interval, client) {
   _upstreamDispatchAt[name] = scheduled + interval;
+  _upstreamDispatchClients[name] = {
+    client: String(client?.key || client?.id || client?.name || "gateway"),
+    at: Date.now(),
+  };
+}
+
+function noteCoordinatorDispatch(name, delay, interval, client) {
+  const now = Date.now();
+  _upstreamDispatchAt[name] = Math.max(Number(_upstreamDispatchAt[name] || 0), now + delay + interval);
   _upstreamDispatchClients[name] = {
     client: String(client?.key || client?.id || client?.name || "gateway"),
     at: now,
   };
-  if (delay > 0) await sleep(delay, signal);
-  if (signal?.aborted) throw httpError(499, "Response cancelled.");
-  return { accepted: true, delayMs: delay };
 }
 
-async function acquireRouteSelectionLock(key, signal = null) {
-  const previous = _routeSelectionTails[key] || Promise.resolve();
-  let releaseCurrent;
-  const current = new Promise((resolve) => { releaseCurrent = resolve; });
-  const gate = previous.then(() => undefined);
-  const tail = gate.then(() => current);
-  _routeSelectionTails[key] = tail;
+async function reserveRouteCoordinator(runtime, name, interval, client, signal, timeoutMs = ROUTE_COORDINATOR_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason || "request aborted");
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(() => controller.abort("route coordinator timeout"), Math.max(1, Number(timeoutMs) || ROUTE_COORDINATOR_TIMEOUT_MS));
   try {
-    await awaitWithSignal(gate, signal);
-  } catch (error) {
-    releaseCurrent();
-    void tail.then(() => {
-      if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
-    });
-    throw error;
+    return await runtime.routeCoordinator.reserve(name, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    releaseCurrent();
-    if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
-  };
-}
-
-function awaitWithSignal(promise, signal) {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(httpError(499, "Response cancelled."));
-  return new Promise((resolve, reject) => {
-    const cleanup = () => signal.removeEventListener("abort", abort);
-    const abort = () => {
-      cleanup();
-      reject(httpError(499, "Response cancelled."));
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    Promise.resolve(promise).then((value) => {
-      cleanup();
-      resolve(value);
-    }, (error) => {
-      cleanup();
-      reject(error);
-    });
-  });
 }
 
 function reserveUpstreams(upstreams) {
@@ -6072,7 +6221,6 @@ function clearActiveUpstreamState() {
   _upstreamReservations = {};
   _upstreamDispatchAt = {};
   _upstreamDispatchClients = {};
-  Object.keys(_routeSelectionTails).forEach((key) => delete _routeSelectionTails[key]);
   return released;
 }
 
@@ -6144,6 +6292,15 @@ async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
       { expirationTtl: UPSTREAM_LATENCY_TTL_SECONDS },
     );
   } catch {}
+}
+
+function scheduleUpstreamState(task, ctx) {
+  const pending = Promise.resolve(task).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(pending);
+    return Promise.resolve();
+  }
+  return pending;
 }
 
 async function markUpstreamFailure(runtime, upstream, model, response = null) {
@@ -6381,6 +6538,21 @@ async function readClientDailyUsage(store, record) {
 
 function publicClientDailyUsage(usage) {
   return { ...usage, updated_at: utcTimestamp(usage?.updated_at) };
+}
+
+function publicClientStatusUsage(usage) {
+  const promptTokens = Number(usage?.prompt_tokens || 0);
+  const completionTokens = Number(usage?.completion_tokens || 0);
+  return {
+    day: usage?.day || legacyStatsDayKey(),
+    requests: Number(usage?.requests || 0),
+    success: Number(usage?.success || 0),
+    fail: Number(usage?.fail || 0),
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+    updated_at: utcTimestamp(usage?.updated_at),
+  };
 }
 
 function publicClientRecord(record) {
@@ -6874,10 +7046,13 @@ function proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId) {
     headers.set("x-llm-gateway-route-ms", String(proxyResponse.timing.route_selected_ms || 0));
     headers.set("x-llm-gateway-dispatch-ms", String(proxyResponse.timing.dispatch_wait_ms || 0));
     headers.set("x-llm-gateway-upstream-start-ms", String(proxyResponse.timing.upstream_started_ms || 0));
+    headers.set("x-llm-gateway-first-visible-ms", String(proxyResponse.timing.first_visible_ms || 0));
   }
   const trace = gatewayTraceFields(proxyResponse.trace);
   if (trace.trace_stage) headers.set("x-llm-gateway-trace-stage", trace.trace_stage);
   if (trace.trace_upstream_headers_ms != null) headers.set("x-llm-gateway-upstream-headers-ms", String(trace.trace_upstream_headers_ms));
+  if (trace.trace_dispatch_mode) headers.set("x-llm-gateway-dispatch-mode", trace.trace_dispatch_mode);
+  if (trace.trace_failure_reason) headers.set("x-llm-gateway-failure-reason", trace.trace_failure_reason);
   return headers;
 }
 

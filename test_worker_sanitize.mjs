@@ -82,6 +82,8 @@ const htmlHits = [];
 const emptyStreamHits = [];
 const openAiStreamErrorHits = [];
 const retryAfterHits = [];
+const firstByteHits = [];
+const emergencyHits = [];
 const healthProbeHits = [];
 const analyticsPoints = [];
 const analyticsSqlQueries = [];
@@ -672,6 +674,33 @@ globalThis.fetch = async (url, init) => {
     attemptBudgetHits.push("ok");
     return new Response(JSON.stringify({ id: "attempt-budget-ok", choices: [{ message: { content: "ok" } }] }), { status: 200, headers: { "content-type": "application/json" } });
   }
+  if (String(url).includes("first-byte-timeout.example")) {
+    firstByteHits.push("timeout");
+    let timer = null;
+    return new Response(new ReadableStream({
+      start(controller) {
+        timer = setTimeout(() => {
+          try {
+            controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: [DONE]\n\n'));
+            controller.close();
+          } catch {}
+        }, 80);
+      },
+      cancel() { if (timer) clearTimeout(timer); },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("first-byte-fallback.example")) {
+    firstByteHits.push("fallback");
+    return new Response('data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (String(url).includes("emergency-normal.example")) {
+    emergencyHits.push("normal");
+    return new Response(JSON.stringify({ error: { message: "normal upstream unavailable" } }), { status: 503, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("emergency-only.example")) {
+    emergencyHits.push("emergency");
+    return new Response(JSON.stringify({ id: "emergency", choices: [{ message: { content: "emergency" } }] }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   if (String(url).includes("affinity-")) {
     const name = String(url).match(/affinity-[a-c]/)?.[0] || "affinity";
     affinityHits.push(name);
@@ -885,6 +914,23 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/favicon.ic
 const optionsResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", { method: "OPTIONS" }), unconfiguredEnv);
 assert.equal(optionsResp.status, 204);
 assert.equal(optionsResp.headers.get("access-control-allow-headers").includes("x-request-id"), true);
+const clientStatusResp = await worker.default.fetch(new Request("https://gw.test/v1/gateway/status", {
+  headers: { authorization: "Bearer sk-test" },
+}), env);
+assert.equal(clientStatusResp.status, 200);
+assert.equal(clientStatusResp.headers.get("cache-control"), "no-store");
+assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-18-stable-routing-1");
+const clientStatus = await clientStatusResp.json();
+assert.equal(clientStatus.ok, true);
+assert.equal(clientStatus.gateway, "connected");
+assert.equal(clientStatus.client.name, "c");
+assert.equal(clientStatus.usage.requests, 0);
+assert.equal(clientStatus.usage.total_tokens, 0);
+assert.equal(JSON.stringify(clientStatus).includes("sk-test"), false);
+const clientStatusDenied = await worker.default.fetch(new Request("https://gw.test/v1/gateway/status", {
+  headers: { authorization: "Bearer invalid-client" },
+}), env);
+assert.equal(clientStatusDenied.status, 401);
 const workersUsageNoTokenResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/workers-usage"), {
   ...env,
   ANALYTICS_ACCOUNT_ID: "",
@@ -897,7 +943,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-15-workers-limits-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-18-stable-routing-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -916,8 +962,15 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-a
 }), env)).status, 200);
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
-assert.equal(adminPage.includes("routing-fast"), true);
-assert.equal(adminPage.includes("routing-coordination-level"), true);
+assert.equal(adminPage.includes("routing-policy"), true);
+assert.equal(adminPage.includes("routing-fast"), false);
+assert.equal(adminPage.includes("routing-hedge"), false);
+assert.equal(adminPage.includes("routing-coordination-level"), false);
+assert.equal(adminPage.includes("routing-soft-interval"), false);
+assert.equal(adminPage.includes("routing-failover-max"), true);
+assert.equal(adminPage.includes("vendor-emergency"), true);
+assert.equal(adminPage.includes("vendor-first-byte-timeout"), true);
+assert.equal(adminPage.includes("first_byte_timeout_ms"), true);
 assert.equal(adminPage.includes("translator-hero"), false);
 assert.equal(adminPage.includes("translator-progress-panel"), false);
 assert.equal(adminPage.includes("translator-status-grid"), false);
@@ -942,7 +995,7 @@ assert.equal(adminPage.includes('id="kv-panel"'), true);
 assert.equal(adminPage.includes('id="kv-panel" open'), false);
 assert.equal(adminScript.includes('kvPanel?.addEventListener("toggle"'), true);
 assert.equal(adminPage.includes("document.visibilityState"), true);
-assert.equal(adminPage.includes("Gateway Fast"), true);
+assert.equal(adminPage.includes("Gateway Fast"), false);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("live-upstream-count"), true);
@@ -997,7 +1050,7 @@ assert.equal(adminPage.includes("setInterval(refreshLivePanels, 5000)"), true);
 assert.equal(adminPage.includes("loadKvUsage"), true);
 assert.equal(adminScript.includes('name === "settings"'), false);
 assert.equal(adminPage.includes("loadedViews"), true);
-assert.equal(adminPage.includes("\u5b9e\u9a8c\u6027\u8def\u7531"), true);
+assert.equal(adminPage.includes("\u5b9e\u9a8c\u6027\u8def\u7531"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000)"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000)"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000)"), true);
@@ -2400,7 +2453,7 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/a
   method: "PUT",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
-    routing: { failover: true, load_balance: false },
+    routing: { failover: true, failover_max_attempts: 4, load_balance: false },
     settings: {
       model_cache_ttl: 3600,
       request_timeout_ms: 30000,
@@ -2417,13 +2470,16 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/a
       upstream_cooldown_ttl: 60,
     },
     upstreams: [
-      { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["qwen3"], model_contexts: { qwen3: "1m" }, paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+      { name: "nim", base_url: "https://speed-fast.example/v1", api_key_value: "x", models: ["qwen3"], model_contexts: { qwen3: "1m" }, paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true, emergency: true, first_byte_timeout_ms: 1234 },
     ],
   }),
 }), env);
 assert.equal(saveConfigResp.status, 200);
 const savedConfigPayload = await saveConfigResp.clone().json();
 assert.equal(savedConfigPayload.config.upstreams[0].model_contexts.qwen3, "1m");
+assert.equal(savedConfigPayload.config.routing.failover_max_attempts, 4);
+assert.equal(savedConfigPayload.config.upstreams[0].emergency, true);
+assert.equal(savedConfigPayload.config.upstreams[0].first_byte_timeout_ms, 1234);
 assert.equal(savedConfigPayload.config.settings.global_context, "Project context should guide details.");
 assert.equal(savedConfigPayload.config.settings.context_on_demand, true);
 assert.equal(savedConfigPayload.config.settings.history_max_chars, 12000);
@@ -2602,7 +2658,7 @@ assert.equal(historyMessages.at(-1).content, "latest draft instruction");
 const historyOnlyStore = new Map([[
   "gateway:config",
   JSON.stringify({
-    routing: { failover: true, load_balance: false },
+    routing: { failover: true, failover_max_attempts: 4, load_balance: false },
     settings: { history_max_chars: 80, upstream_cooldown_ttl: 60 },
     upstreams: [{ name: "history-only", base_url: "https://speed-fast.example/v1", api_key_encrypted: "h", models: ["history-only-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true }],
   }),
@@ -2740,226 +2796,9 @@ const speedResp = await speedRequest("sk-both");
 assert.equal(speedResp.headers.get("x-llm-gateway-upstream"), "fast");
 assert.equal(speedHits[beforeSpeedChoice], "fast");
 
-const hedgeStore = new Map();
-hedgeStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 600, upstream_cooldown_ttl: 60 },
-  upstreams: [
-    { name: "hedge-slow", base_url: "https://hedge-slow.example/v1", api_key_encrypted: "s", models: ["hedge-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "hedge-fast", base_url: "https://hedge-fast.example/v1", api_key_encrypted: "f", models: ["hedge-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
-  ],
-}));
-const hedgeEnv = {
-  ADMIN_TOKEN: "admin-test-token",
-  ...env,
-  KV: {
-    async get(key, type) {
-      const value = hedgeStore.get(key);
-      return type === "json" && value ? JSON.parse(value) : value || null;
-    },
-    async put(key, value) { hedgeStore.set(key, value); },
-    async delete(key) { hedgeStore.delete(key); },
-  },
-  CLIENTS_JSON: JSON.stringify([{ name: "hedge-client", key: "sk-hedge", models: ["*"], upstreams: ["hedge-slow", "hedge-fast"] }]),
-};
-const hedgeStart = hedgeHits.length;
-const hedgeCancelStart = hedgeCancels.length;
-const hedgeResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-hedge", "content-type": "application/json" },
-  body: JSON.stringify({ model: "hedge-model", messages: [] }),
-}), hedgeEnv);
-assert.equal(hedgeResp.headers.get("x-llm-gateway-upstream"), "hedge-fast");
-assert.deepEqual(hedgeHits.slice(hedgeStart), ["slow", "fast"]);
-await new Promise((resolve) => setTimeout(resolve, 100));
-assert.deepEqual(hedgeCancels.slice(hedgeCancelStart), ["slow"]);
-const hedgeSecondStart = hedgeHits.length;
-const hedgeResp2 = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-hedge", "content-type": "application/json" },
-  body: JSON.stringify({ model: "hedge-model", messages: [] }),
-}), hedgeEnv);
-assert.equal(hedgeResp2.headers.get("x-llm-gateway-upstream"), "hedge-fast");
-assert.equal(hedgeHits[hedgeSecondStart], "slow");
-
-const hedgeReserveStore = new Map([["gateway:config", JSON.stringify({
-  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 500, upstream_cooldown_ttl: 60 },
-  upstreams: ["a", "b", "c", "d"].map((id, index) => ({
-    name: "hedge-reserve-" + id,
-    base_url: "https://hedge-reserve-" + id + ".example/v1",
-    api_key_encrypted: id,
-    models: ["hedge-reserve-model"],
-    paths: ["/v1/chat/completions"],
-    priority: index + 1,
-    weight: 1,
-    enabled: true,
-  })),
-})]]);
-const hedgeReserveEnv = {
-  ADMIN_TOKEN: "admin-test-token", ...env,
-  KV: {
-    async get(key, type) { const value = hedgeReserveStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
-    async put(key, value) { hedgeReserveStore.set(key, value); },
-    async delete(key) { hedgeReserveStore.delete(key); },
-  },
-  CLIENTS_JSON: JSON.stringify(["one", "two"].map((id) => ({ name: "reserve-" + id, key: "sk-reserve-" + id, models: ["*"], upstreams: ["hedge-reserve-a", "hedge-reserve-b", "hedge-reserve-c", "hedge-reserve-d"] }))),
-};
-const hedgeReserveStart = hedgeReserveHits.length;
-const reserveResponses = await Promise.all(["one", "two"].map((id) => worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-reserve-" + id, "content-type": "application/json" },
-  body: JSON.stringify({ model: "hedge-reserve-model", messages: [] }),
-}), hedgeReserveEnv)));
-assert.deepEqual(reserveResponses.map((response) => response.headers.get("x-llm-gateway-upstream")).sort(), ["hedge-reserve-a", "hedge-reserve-c"]);
-assert.deepEqual(hedgeReserveHits.slice(hedgeReserveStart).sort(), ["hedge-reserve-a", "hedge-reserve-c"]);
-
-const hedgeFallbackStore = new Map([["gateway:config", JSON.stringify({
-  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 500, upstream_cooldown_ttl: 60 },
-  upstreams: ["a", "b", "c", "d"].map((id, index) => ({
-    name: "hedge-fallback-" + id,
-    base_url: "https://hedge-fallback-" + id + ".example/v1",
-    api_key_encrypted: id,
-    models: ["hedge-fallback-model"],
-    paths: ["/v1/chat/completions"],
-    priority: index + 1,
-    weight: 1,
-    enabled: true,
-  })),
-})]]);
-const hedgeFallbackEnv = {
-  ADMIN_TOKEN: "admin-test-token", ...env,
-  KV: {
-    async get(key, type) { const value = hedgeFallbackStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
-    async put(key, value) { hedgeFallbackStore.set(key, value); },
-    async delete(key) { hedgeFallbackStore.delete(key); },
-  },
-  CLIENTS_JSON: JSON.stringify([{ name: "fallback-client", key: "sk-hedge-fallback", models: ["*"], upstreams: ["hedge-fallback-a", "hedge-fallback-b", "hedge-fallback-c", "hedge-fallback-d"] }]),
-};
-const hedgeFallbackStart = hedgeFallbackHits.length;
-const hedgeFallbackResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-hedge-fallback", "content-type": "application/json" },
-  body: JSON.stringify({ model: "hedge-fallback-model", messages: [] }),
-}), hedgeFallbackEnv);
-assert.equal(hedgeFallbackResp.headers.get("x-llm-gateway-upstream"), "hedge-fallback-c");
-assert.deepEqual(hedgeFallbackHits.slice(hedgeFallbackStart), ["a", "b", "c"]);
-
-const hedgeStreamStore = new Map();
-hedgeStreamStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 600, upstream_cooldown_ttl: 60 },
-  upstreams: [
-    { name: "hedge-stream-slow", base_url: "https://hedge-stream-slow.example/v1", api_key_encrypted: "s", models: ["hedge-stream-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "hedge-stream-fast", base_url: "https://hedge-stream-fast.example/v1", api_key_encrypted: "f", models: ["hedge-stream-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
-  ],
-}));
-const hedgeStreamEnv = {
-  ADMIN_TOKEN: "admin-test-token",
-  ...env,
-  KV: {
-    async get(key, type) { const value = hedgeStreamStore.get(key); return (type === "json" || type?.type === "json") && value ? JSON.parse(value) : value || null; },
-    async put(key, value) { hedgeStreamStore.set(key, value); },
-    async delete(key) { hedgeStreamStore.delete(key); },
-  },
-  CLIENTS_JSON: JSON.stringify([{ name: "hedge-stream-client", key: "sk-hedge-stream", models: ["*"], upstreams: ["hedge-stream-slow", "hedge-stream-fast"] }]),
-};
-const hedgeStreamStart = hedgeStreamHits.length;
-const hedgeStreamResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-hedge-stream", "content-type": "application/json" },
-  body: JSON.stringify({ model: "hedge-stream-model", messages: [], stream: true }),
-}), hedgeStreamEnv);
-assert.equal(hedgeStreamResp.headers.get("x-llm-gateway-upstream"), "pending");
-assert.equal((await hedgeStreamResp.text()).includes('"content":"fast"'), true);
-assert.deepEqual(hedgeStreamHits.slice(hedgeStreamStart), ["slow", "fast"]);
-await new Promise((resolve) => setTimeout(resolve, 100));
-assert.equal(hedgeStreamAborts.includes("slow"), true);
-
-const deepSeekHedgeStreamStore = new Map();
-deepSeekHedgeStreamStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, hedge_enabled: true, hedge_max: 2, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 600, upstream_cooldown_ttl: 60 },
-  upstreams: [
-    { name: "deepseek-hedge-slow", preset: "deepseek", base_url: "https://hedge-stream-slow.example/v1", api_key_encrypted: "s", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "deepseek-hedge-fast", preset: "deepseek", base_url: "https://hedge-stream-fast.example/v1", api_key_encrypted: "f", models: ["deepseek-v4-pro"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
-  ],
-}));
-const deepSeekHedgeStreamEnv = {
-  ADMIN_TOKEN: "admin-test-token",
-  ...env,
-  KV: {
-    async get(key, type) { const value = deepSeekHedgeStreamStore.get(key); return (type === "json" || type?.type === "json") && value ? JSON.parse(value) : value || null; },
-    async put(key, value) { deepSeekHedgeStreamStore.set(key, value); },
-    async delete(key) { deepSeekHedgeStreamStore.delete(key); },
-  },
-  CLIENTS_JSON: JSON.stringify([{ name: "deepseek-hedge-client", key: "sk-deepseek-hedge", models: ["*"], upstreams: ["deepseek-hedge-slow", "deepseek-hedge-fast"] }]),
-};
-const deepSeekHedgeStart = hedgeStreamHits.length;
-const deepSeekHedgeResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-deepseek-hedge", "content-type": "application/json" },
-  body: JSON.stringify({ model: "deepseek-v4-pro", messages: [], stream: true }),
-}), deepSeekHedgeStreamEnv);
-const deepSeekHedgeText = await deepSeekHedgeResp.text();
-assertNoDeepSeekLeak(deepSeekHedgeText);
-assert.equal(deepSeekHedgeText.includes('"content":"visible"'), true);
-assert.deepEqual(hedgeStreamHits.slice(deepSeekHedgeStart), ["slow", "fast"]);
-
-const softFastStore = new Map();
-softFastStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, fast_routing: true, hedge_enabled: false, hedge_max: 2, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
-  upstreams: [
-    { name: "soft-fast-slow", base_url: "https://soft-fast-slow.example/v1", api_key_encrypted: "s", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "soft-fast-fast", base_url: "https://soft-fast-fast.example/v1", api_key_encrypted: "f", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
-    { name: "soft-fast-third", base_url: "https://soft-fast-third.example/v1", api_key_encrypted: "t", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
-  ],
-}));
-const softFastEnv = {
-  ADMIN_TOKEN: "admin-test-token",
-  ...env,
-  KV: {
-    async get(key, type) {
-      const value = softFastStore.get(key);
-      return type === "json" && value ? JSON.parse(value) : value || null;
-    },
-    async put(key, value) { softFastStore.set(key, value); },
-    async delete(key) { softFastStore.delete(key); },
-  },
-  CLIENTS_JSON: JSON.stringify([{ name: "soft-fast-client", key: "sk-soft-fast", models: ["*"], upstreams: ["soft-fast-slow", "soft-fast-third", "soft-fast-fast"] }]),
-};
-const softFastStart = softFastHits.length;
-const softFastResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-soft-fast", "content-type": "application/json" },
-  body: JSON.stringify({ model: "soft-fast-model", messages: [] }),
-}), softFastEnv);
-assert.equal(softFastResp.headers.get("x-llm-gateway-upstream"), "soft-fast-fast");
-assert.deepEqual(softFastHits.slice(softFastStart), ["slow", "fast"]);
-
-softFastStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, fast_routing: true, hedge_enabled: true, hedge_max: 3, load_balance: false },
-  settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
-  upstreams: [
-    { name: "soft-fast-slow", base_url: "https://soft-fast-slow.example/v1", api_key_encrypted: "s", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
-    { name: "soft-fast-third", base_url: "https://soft-fast-third.example/v1", api_key_encrypted: "t", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
-    { name: "soft-fast-fast", base_url: "https://soft-fast-fast.example/v1", api_key_encrypted: "f", models: ["soft-fast-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
-  ],
-}));
-const softFastHedgeEnv = { ...softFastEnv };
-const softFastHedgeStart = softFastHits.length;
-await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
-  method: "POST",
-  headers: { authorization: "Bearer sk-soft-fast", "content-type": "application/json" },
-  body: JSON.stringify({ model: "soft-fast-model", messages: [] }),
-}), softFastHedgeEnv);
-assert.equal(softFastHits.slice(softFastHedgeStart).includes("third"), true);
-
 const attemptBudgetStore = new Map();
 attemptBudgetStore.set("gateway:config", JSON.stringify({
-  routing: { failover: true, hedge_enabled: false, fast_routing: false, hedge_max: 1, load_balance: false },
+  routing: { failover: true, hedge_enabled: true, fast_routing: true, hedge_max: 5, load_balance: false },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 300, upstream_cooldown_ttl: 60 },
   upstreams: [
     { name: "attempt-budget-fail", base_url: "https://attempt-budget-fail.example/v1", api_key_encrypted: "f", models: ["attempt-budget-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
@@ -2982,8 +2821,12 @@ const attemptBudgetResp = await worker.default.fetch(new Request("https://gw.tes
   headers: { authorization: "Bearer sk-attempt-budget", "content-type": "application/json" },
   body: JSON.stringify({ model: "attempt-budget-model", messages: [] }),
 }), attemptBudgetEnv);
-assert.equal(attemptBudgetResp.status, 503);
-assert.deepEqual(attemptBudgetHits.slice(attemptBudgetStart), ["fail"]);
+assert.equal(attemptBudgetResp.status, 200);
+assert.deepEqual(attemptBudgetHits.slice(attemptBudgetStart), ["fail", "ok"]);
+const stableRoutingConfig = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), attemptBudgetEnv)).json();
+assert.equal(stableRoutingConfig.config.routing.hedge_enabled, false);
+assert.equal(stableRoutingConfig.config.routing.fast_routing, false);
+assert.equal(stableRoutingConfig.config.routing.hedge_max, 1);
 const cooldownWorker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?cooldown=${Date.now()}`);
 const cooldownStart = attemptBudgetHits.length;
 const cooldownResp = await cooldownWorker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -2993,6 +2836,83 @@ const cooldownResp = await cooldownWorker.default.fetch(new Request("https://gw.
 }), attemptBudgetEnv);
 assert.equal(cooldownResp.headers.get("x-llm-gateway-upstream"), "attempt-budget-ok");
 assert.deepEqual(attemptBudgetHits.slice(cooldownStart), ["ok"]);
+
+const firstByteStore = new Map([[
+  "gateway:config",
+  JSON.stringify({
+    routing: { failover: true, failover_max_attempts: 3, load_balance: false, soft_interval_ms: 0 },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+    upstreams: [
+      { name: "first-byte-timeout", base_url: "https://first-byte-timeout.example/v1", api_key_encrypted: "t", models: ["first-byte-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true, first_byte_timeout_ms: 25 },
+      { name: "first-byte-fallback", base_url: "https://first-byte-fallback.example/v1", api_key_encrypted: "f", models: ["first-byte-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    ],
+  }),
+]]);
+const firstByteEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = firstByteStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { firstByteStore.set(key, value); },
+    async delete(key) { firstByteStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "first-byte-client", key: "sk-first-byte", models: ["*"], upstreams: ["first-byte-timeout", "first-byte-fallback"] }]),
+};
+const firstByteStart = firstByteHits.length;
+const firstByteResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-first-byte", "content-type": "application/json" },
+  body: JSON.stringify({ model: "first-byte-model", messages: [], stream: true }),
+}), firstByteEnv);
+const firstByteText = await firstByteResp.text();
+assert.equal(firstByteResp.status, 200);
+assert.equal(firstByteText.includes("recovered"), true);
+assert.equal(firstByteText.includes("late"), false);
+assert.deepEqual(firstByteHits.slice(firstByteStart), ["timeout", "fallback"]);
+const firstByteLogs = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), firstByteEnv)).json();
+const firstByteLog = firstByteLogs.logs.find((entry) => entry.model === "first-byte-model");
+assert.equal(firstByteLog?.trace_attempts, 2);
+assert.equal(firstByteLog?.trace_failure_reason, "first_byte_timeout");
+
+const emergencyStore = new Map([[
+  "gateway:config",
+  JSON.stringify({
+    routing: { failover: true, failover_max_attempts: 3, load_balance: false, soft_interval_ms: 0 },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+    upstreams: [
+      { name: "emergency-normal", base_url: "https://emergency-normal.example/v1", api_key_encrypted: "n", models: ["emergency-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+      { name: "emergency-only", base_url: "https://emergency-only.example/v1", api_key_encrypted: "e", models: ["emergency-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true, emergency: true },
+    ],
+  }),
+]]);
+const emergencyEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = emergencyStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { emergencyStore.set(key, value); },
+    async delete(key) { emergencyStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "emergency-client", key: "sk-emergency", models: ["*"], upstreams: ["emergency-normal", "emergency-only"] }]),
+};
+const emergencyStart = emergencyHits.length;
+const emergencyResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-emergency", "content-type": "application/json" },
+  body: JSON.stringify({ model: "emergency-model", messages: [] }),
+}), emergencyEnv);
+assert.equal(emergencyResp.status, 200);
+assert.equal(emergencyResp.headers.get("x-llm-gateway-upstream"), "emergency-only");
+assert.deepEqual(emergencyHits.slice(emergencyStart), ["normal", "emergency"]);
+
+const emergencyLimitedStart = emergencyHits.length;
+const emergencyLimitedResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-emergency-limited", "content-type": "application/json" },
+  body: JSON.stringify({ model: "emergency-model", messages: [] }),
+}), { ...emergencyEnv, CLIENTS_JSON: JSON.stringify([{ name: "emergency-limited-client", key: "sk-emergency-limited", models: ["*"], upstreams: ["emergency-normal"] }]) });
+assert.equal(emergencyLimitedResp.status, 503);
+assert.deepEqual(emergencyHits.slice(emergencyLimitedStart), ["normal"]);
 
 const nimStore = new Map();
 nimStore.set("gateway:config", JSON.stringify({
@@ -4114,6 +4034,7 @@ const crossEdgeEnvA = {
 const crossEdgeEnvB = { ...crossEdgeEnvA };
 const workerEdgeB = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?cross-edge=${Date.now()}`);
 const crossEdgeStart = crossEdgeStarts.length;
+const crossEdgeRequestStarted = Date.now();
 await Promise.all([
   worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
     method: "POST", headers: { authorization: "Bearer sk-cross-edge", "content-type": "application/json" },
@@ -4126,7 +4047,8 @@ await Promise.all([
 ]);
 const crossEdgeTimes = crossEdgeStarts.slice(crossEdgeStart);
 assert.equal(crossEdgeTimes.length, 2);
-assert.ok(Math.abs(crossEdgeTimes[1] - crossEdgeTimes[0]) >= 45);
+assert.ok(Date.now() - crossEdgeRequestStarted < 250);
+assert.ok(Math.abs(crossEdgeTimes[1] - crossEdgeTimes[0]) < 150);
 
 const spreadZeroStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false, coordination_level: 0 },
@@ -4452,6 +4374,7 @@ const toolStreamResp = await worker.default.fetch(new Request("https://gw.test/v
 const toolStreamText = await toolStreamResp.text();
 assert.equal(toolStreamText.includes('"finish_reason":"tool_calls"'), true);
 assert.equal(toolStreamText.endsWith("data: [DONE]\n\n"), true);
+await new Promise((resolve) => setTimeout(resolve, 30));
 assert.equal(toolStreamHits.includes("cancel"), true);
 const toolStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), toolStreamEnv);
 const toolStreamLogs = await toolStreamLogsResp.json();

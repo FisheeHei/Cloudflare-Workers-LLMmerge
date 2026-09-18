@@ -20,6 +20,9 @@ export function markGatewayTrace(trace, stage, details = {}) {
   trace.stage = name;
   trace.stage_ms = Math.max(0, now - Number(trace.started_at || now));
   trace.stages[name] = trace.stage_ms;
+  if (details.dispatch_mode) trace.dispatch_mode = String(details.dispatch_mode);
+  if (details.failure_reason) trace.failure_reason = String(details.failure_reason);
+  if (details.failover_used != null) trace.failover_used = trace.failover_used === true || details.failover_used === true;
   const attemptNumber = Number(details.attempt || 0);
   if (attemptNumber > 0) {
     const attempt = trace.attempts[attemptNumber - 1] || (trace.attempts[attemptNumber - 1] = { attempt: attemptNumber });
@@ -27,6 +30,8 @@ export function markGatewayTrace(trace, stage, details = {}) {
     attempt.stage_ms = trace.stage_ms;
     if (details.upstream) attempt.upstream = String(details.upstream);
     if (details.status != null) attempt.status = Number(details.status) || 0;
+    if (details.dispatch_mode) attempt.dispatch_mode = String(details.dispatch_mode);
+    if (details.failure_reason) attempt.failure_reason = String(details.failure_reason);
   }
   return trace;
 }
@@ -44,6 +49,10 @@ export function gatewayTraceFields(trace) {
       trace_upstream_called: trace.trace_upstream_called === true,
       trace_upstream_headers: trace.trace_upstream_headers === true,
       trace_attempts: Number(trace.trace_attempts || 0),
+      trace_first_visible_ms: Number(trace.trace_first_visible_ms || 0),
+      trace_dispatch_mode: String(trace.trace_dispatch_mode || ""),
+      trace_failure_reason: String(trace.trace_failure_reason || ""),
+      trace_failover_used: trace.trace_failover_used === true,
     };
   }
   const hasStage = (name) => Object.prototype.hasOwnProperty.call(trace.stages || {}, name);
@@ -57,6 +66,10 @@ export function gatewayTraceFields(trace) {
     trace_upstream_called: hasStage("upstream_fetch_called"),
     trace_upstream_headers: hasStage("upstream_headers_received"),
     trace_attempts: Array.isArray(trace.attempts) ? trace.attempts.length : 0,
+    trace_first_visible_ms: Number(trace.stages?.first_visible_output || 0),
+    trace_dispatch_mode: String(trace.dispatch_mode || ""),
+    trace_failure_reason: String(trace.failure_reason || ""),
+    trace_failover_used: trace.failover_used === true,
   };
 }
 
@@ -73,6 +86,7 @@ export function gatewayErrorLogFields(error, fallbackTraceId = "") {
   return {
     ...(error?.gatewayTrace ? gatewayTraceLogFields(error.gatewayTrace, fallbackTraceId) : { trace_id: String(fallbackTraceId || "") }),
     dispatch_limited: error?.dispatchLimited === true,
+    ...(error?.failureReason ? { failure_reason: String(error.failureReason) } : {}),
     ...(message ? { error_message: message } : {}),
   };
 }
@@ -87,6 +101,7 @@ export function classifyGatewayFailure({ status = 0, closeReason = "", dispatchL
   if (code === 499 || close === "client_abort" || close === "cancelled") return "client_cancelled";
   if (code === 401 || code === 403) return "auth_or_permission";
   if (code === 404) return "model_or_route_not_found";
+  if (message.includes("first byte") || message.includes("first visible")) return "upstream_first_byte_timeout";
   if (code === 408 || code === 504 || message.includes("timeout")) return "upstream_timeout";
   if (code === 429) return "upstream_rate_limit";
   if (close === "eof") return "upstream_stream_eof";
