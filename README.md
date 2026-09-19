@@ -121,6 +121,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 - `weight`：用于同优先级候选的稳定分散，不会触发并行请求。
 - `emergency`：普通候选全部失败后才参与故障转移。
 - `first_byte_timeout_ms`：可选的首包超时覆盖值。
+- `failover_budget_ms`：故障转移总预算，默认 `30000` ms；多个 Key 共用该预算，避免每个 Key 依次等满首包超时。
 
 客户端权限、模型匹配、路径匹配和 `enabled` 状态始终有效。网关不会自动替换客户端请求的模型名称。
 

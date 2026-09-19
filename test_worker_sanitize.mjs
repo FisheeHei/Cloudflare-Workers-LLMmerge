@@ -693,6 +693,14 @@ globalThis.fetch = async (url, init) => {
     firstByteHits.push("fallback");
     return new Response('data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
   }
+  if (String(url).includes("budget-timeout-")) {
+    attemptBudgetHits.push(String(url).match(/budget-timeout-[a-c]/)?.[0] || "budget-timeout");
+    let timer = null;
+    return new Response(new ReadableStream({
+      start() { timer = setTimeout(() => {}, 500); },
+      cancel() { if (timer) clearTimeout(timer); },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
   if (String(url).includes("emergency-normal.example")) {
     emergencyHits.push("normal");
     return new Response(JSON.stringify({ error: { message: "normal upstream unavailable" } }), { status: 503, headers: { "content-type": "application/json" } });
@@ -919,7 +927,7 @@ const clientStatusResp = await worker.default.fetch(new Request("https://gw.test
 }), env);
 assert.equal(clientStatusResp.status, 200);
 assert.equal(clientStatusResp.headers.get("cache-control"), "no-store");
-assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-18-stable-routing-2");
+assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-20-connection-stability-1");
 const clientStatus = await clientStatusResp.json();
 assert.equal(clientStatus.ok, true);
 assert.equal(clientStatus.gateway, "connected");
@@ -943,7 +951,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-18-stable-routing-2"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-20-connection-stability-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -968,6 +976,9 @@ assert.equal(adminPage.includes("routing-hedge"), false);
 assert.equal(adminPage.includes("routing-coordination-level"), false);
 assert.equal(adminPage.includes("routing-soft-interval"), false);
 assert.equal(adminPage.includes("routing-failover-max"), true);
+assert.equal(adminPage.includes("routing-failover-budget"), true);
+assert.equal(adminPage.includes("download-logs"), true);
+assert.equal(adminPage.includes("connection-strip"), true);
 assert.equal(adminPage.includes("vendor-emergency"), true);
 assert.equal(adminPage.includes("vendor-first-byte-timeout"), true);
 assert.equal(adminPage.includes("first_byte_timeout_ms"), true);
@@ -2453,7 +2464,7 @@ const saveConfigResp = await worker.default.fetch(new Request("https://gw.test/a
   method: "PUT",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
-    routing: { failover: true, failover_max_attempts: 4, load_balance: false },
+    routing: { failover: true, failover_max_attempts: 4, failover_budget_ms: 42000, load_balance: false },
     settings: {
       model_cache_ttl: 3600,
       request_timeout_ms: 30000,
@@ -2478,6 +2489,7 @@ assert.equal(saveConfigResp.status, 200);
 const savedConfigPayload = await saveConfigResp.clone().json();
 assert.equal(savedConfigPayload.config.upstreams[0].model_contexts.qwen3, "1m");
 assert.equal(savedConfigPayload.config.routing.failover_max_attempts, 4);
+assert.equal(savedConfigPayload.config.routing.failover_budget_ms, 42000);
 assert.equal(savedConfigPayload.config.upstreams[0].emergency, true);
 assert.equal(savedConfigPayload.config.upstreams[0].first_byte_timeout_ms, 1234);
 assert.equal(savedConfigPayload.config.settings.global_context, "Project context should guide details.");
@@ -2873,6 +2885,36 @@ const firstByteLogs = await (await worker.default.fetch(new Request("https://gw.
 const firstByteLog = firstByteLogs.logs.find((entry) => entry.model === "first-byte-model");
 assert.equal(firstByteLog?.trace_attempts, 2);
 assert.equal(firstByteLog?.trace_failure_reason, "first_byte_timeout");
+
+const failoverBudgetStore = new Map([["gateway:config", JSON.stringify({
+  routing: { failover: true, failover_max_attempts: 3, failover_budget_ms: 1000, load_balance: false, soft_interval_ms: 0 },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "budget-timeout-a", base_url: "https://budget-timeout-a.example/v1", api_key_encrypted: "a", models: ["budget-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    { name: "budget-timeout-b", base_url: "https://budget-timeout-b.example/v1", api_key_encrypted: "b", models: ["budget-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    { name: "budget-timeout-c", base_url: "https://budget-timeout-c.example/v1", api_key_encrypted: "c", models: ["budget-model"], paths: ["/v1/chat/completions"], priority: 3, weight: 1, enabled: true },
+  ],
+})]]);
+const failoverBudgetEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = failoverBudgetStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { failoverBudgetStore.set(key, value); },
+    async delete(key) { failoverBudgetStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "budget-client", key: "sk-budget", models: ["*"], upstreams: ["budget-timeout-a", "budget-timeout-b", "budget-timeout-c"] }]),
+};
+const budgetStart = Date.now();
+const budgetResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-budget", "content-type": "application/json" },
+  body: JSON.stringify({ model: "budget-model", messages: [], stream: true }),
+}), failoverBudgetEnv);
+await budgetResp.text();
+assert.equal(budgetResp.status, 200);
+assert.deepEqual(attemptBudgetHits.slice(-3), ["budget-timeout-a", "budget-timeout-b", "budget-timeout-c"]);
+assert.equal(Date.now() - budgetStart < 1600, true);
 
 const emergencyStore = new Map([[
   "gateway:config",

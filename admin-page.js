@@ -350,6 +350,7 @@ function renderAdminStyle() {
       .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
       #view-overview #stats-panel { grid-column: 1 / -1; grid-row: auto; }
+      #view-overview .connection-strip { grid-column: 1 / -1; }
       #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
       #view-upstreams #client-panel, #view-upstreams #upstream-panel,
       #view-settings #kv-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
@@ -509,6 +510,24 @@ function renderAdminStyle() {
     .topbar-actions { min-width: 0; }
     #refresh-dashboard { flex: 0 0 auto; }
 
+    .connection-strip {
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;
+      margin: 0 0 18px;
+    }
+    .connection-item {
+      min-width: 0; display: grid; gap: 3px; padding: 12px 14px;
+      border: 1px solid var(--line); border-radius: 7px; background: var(--panel);
+    }
+    .connection-item-label { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+    .connection-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+    .connection-item .note { min-height: 19px; overflow-wrap: anywhere; }
+    .connection-item.good { border-color: #a7d9c5; background: #f4fbf7; }
+    .connection-item.warn { border-color: #f0c58f; background: #fffaf1; }
+    .connection-item.fail { border-color: #efb6b0; background: #fff7f6; }
+    @media (max-width: 700px) {
+      .connection-strip { grid-template-columns: 1fr; gap: 8px; margin-bottom: 12px; }
+    }
+
     #view-upstreams #upstream-panel { order: 1; }
     #view-upstreams #client-panel { order: 2; }
     #view-upstreams #upstream-panel > .toolbar { margin-bottom: 16px; }
@@ -628,6 +647,24 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
+  <div class="connection-strip" id="connection-strip" aria-live="polite">
+    <div class="connection-item good" id="connection-ingress">
+      <span class="connection-item-label">Client → Gateway</span>
+      <strong id="connection-ingress-status">已接入</strong>
+      <span class="note">网关端点可用，当前配置已读取</span>
+    </div>
+    <div class="connection-item" id="connection-upstream">
+      <span class="connection-item-label">Gateway → Upstream</span>
+      <strong id="connection-upstream-status">等待请求</strong>
+      <span class="note" id="connection-upstream-detail">当前没有活跃上游请求</span>
+    </div>
+    <div class="connection-item" id="connection-recent">
+      <span class="connection-item-label">最近链路问题</span>
+      <strong id="connection-recent-status">等待日志</strong>
+      <span class="note" id="connection-recent-detail">加载日志后显示首包、超时和断流摘要</span>
+    </div>
+  </div>
+
   <div class="panel" id="stats-panel">
     <div class="toolbar">
       <h2>统计</h2>
@@ -714,6 +751,7 @@ function renderAdminMarkup(origin, version) {
     <div class="toolbar">
       <h2>\u8c03\u7528\u65e5\u5fd7</h2>
       <button class="small secondary" id="refresh-logs">\u5237\u65b0</button>
+      <button class="small secondary" id="download-logs">\u4e0b\u8f7d\u6700\u8fd1 50 \u6761</button>
       <span class="note" id="token-total"></span>
     </div>
     <div id="log-list"><div class="note">\u52a0\u8f7d\u4e2d...</div></div>
@@ -771,7 +809,8 @@ function renderAdminMarkup(origin, version) {
       <div class="row">
         <div class="field span-4"><label>\u8def\u7531\u7b56\u7565</label><strong id="routing-policy">\u5355\u4e0a\u6e38\u987a\u5e8f\u6545\u969c\u8f6c\u79fb</strong><span class="note">\u6309\u6a21\u578b\u3001\u6743\u9650\u3001\u4f18\u5148\u7ea7\u548c\u5f53\u524d\u538b\u529b\u9009\u62e9</span></div>
         <div class="field span-3"><label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb (\u9ed8\u8ba4\u5f00)</label></div>
-        <div class="field span-5"><label>\u6545\u969c\u8f6c\u79fb\u6700\u5927\u5c1d\u8bd5\u6b21\u6570</label><input id="routing-failover-max" type="number" min="1" max="5" placeholder="3"><span class="note">\u4ec5\u5728\u9996\u4e2a\u53ef\u89c1\u8f93\u51fa\u524d\u5207\u6362 Key</span></div>
+        <div class="field span-3"><label>\u6545\u969c\u8f6c\u79fb\u6700\u5927\u5c1d\u8bd5\u6b21\u6570</label><input id="routing-failover-max" type="number" min="1" max="5" placeholder="3"><span class="note">\u9996\u4e2a\u53ef\u89c1\u8f93\u51fa\u524d\u5207\u6362 Key</span></div>
+        <div class="field span-5"><label>\u6545\u969c\u8f6c\u79fb\u603b\u9884\u7b97 (ms)</label><input id="routing-failover-budget" type="number" min="1000" max="120000" placeholder="30000"><span class="note">\u6240\u6709\u5019\u9009 Key \u5171\u7528\uff0c\u907f\u514d\u9010\u4e2a\u7b49\u6ee1\u9996\u5305\u8d85\u65f6</span></div>
       </div>
       <div class="row">
         <div class="field span-3"><label>\u663e\u793a\u65f6\u533a</label><select id="time-zone-preset"><option value="480" data-label="UTC+8 北京/香港/上海/乌鲁木齐">UTC+8 北京 / 香港 / 上海 / 乌鲁木齐</option><option value="0" data-label="UTC">UTC</option><option value="custom" data-label="Custom">Custom</option></select></div>
@@ -954,7 +993,7 @@ function renderAdminMarkup(origin, version) {
 function renderAdminScript(version) {
   return `<script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all", kvUsage: null };
+  const state = { config: null, presets: [], clients: [], gateway: null, runtime: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all", kvUsage: null };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
   let liveRefreshRunning = false;
@@ -1509,6 +1548,7 @@ function renderAdminScript(version) {
       routing: {
         failover: byId("routing-failover").checked,
         failover_max_attempts: Number(byId("routing-failover-max").value || 3),
+        failover_budget_ms: Number(byId("routing-failover-budget").value || 30000),
       },
       upstreams,
     };
@@ -1536,6 +1576,7 @@ function renderAdminScript(version) {
     renderPromptContextDashboard();
     byId("routing-failover").checked = r.failover !== false;
     byId("routing-failover-max").value = r.failover_max_attempts || 3;
+    byId("routing-failover-budget").value = r.failover_budget_ms || 30000;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
   }
 
@@ -2088,6 +2129,7 @@ function renderAdminScript(version) {
       const resp = await fetch(API_BASE + "/runtime");
       const payload = await parseApiResponse(resp);
       if (!resp.ok) return;
+    state.runtime = payload;
     const topbarStatus = byId("topbar-status");
     if (topbarStatus) {
       topbarStatus.textContent = "Gateway online";
@@ -2121,6 +2163,7 @@ function renderAdminScript(version) {
     });
     updateUpstreamGroupActive(active, activeClients);
     updateUpstreamLiveSummary(active, activeClients, recent);
+    renderConnectionSummary();
     } finally {
       runtimeRefreshRunning = false;
     }
@@ -2234,6 +2277,36 @@ async function loadKvUsage() {
     if (listEl) listEl.textContent = names.length
       ? names.map((name) => name + " (" + active[name] + ")" + (activeClientText(activeClients[name]) ? " " + activeClientText(activeClients[name]) : "")).join(" \u00b7 ")
       : (recent.size ? "\u6700\u8fd1\u6210\u529f: " + [...recent].filter(Boolean).join(" \u00b7 ") : "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42");
+  }
+
+  function renderConnectionSummary() {
+    const runtime = state.runtime || {};
+    const active = runtime.active_upstreams || {};
+    const activeCount = Object.values(active).reduce((sum, value) => sum + Number(value || 0), 0);
+    const upstream = byId("connection-upstream");
+    const upstreamStatus = byId("connection-upstream-status");
+    const upstreamDetail = byId("connection-upstream-detail");
+    if (upstreamStatus) upstreamStatus.textContent = activeCount ? activeCount + " \u4e2a\u6d3b\u8dc3\u8bf7\u6c42" : "\u5f85\u547d";
+    if (upstreamDetail) upstreamDetail.textContent = activeCount ? Object.keys(active).filter((name) => Number(active[name] || 0) > 0).join(" \u00b7 ") : "\u5f53\u524d\u6ca1\u6709\u6d3b\u8dc3\u4e0a\u6e38\u8bf7\u6c42";
+    upstream?.classList.toggle("good", activeCount > 0);
+    upstream?.classList.toggle("warn", activeCount === 0 && !state.logs.length);
+
+    const recent = state.logs.find((entry) => Number(entry.status || 0) >= 400 || ["error", "eof", "finish_grace"].includes(entry.close_reason));
+    const issue = byId("connection-recent");
+    const issueStatus = byId("connection-recent-status");
+    const issueDetail = byId("connection-recent-detail");
+    if (!recent) {
+      if (issueStatus) issueStatus.textContent = state.logs.length ? "\u672a\u53d1\u73b0\u5931\u8d25" : "\u7b49\u5f85\u65e5\u5fd7";
+      if (issueDetail) issueDetail.textContent = state.logs.length ? "\u6700\u8fd1\u8bf7\u6c42\u6ca1\u6709\u8d85\u65f6\u6216\u65ad\u6d41" : "\u52a0\u8f7d\u65e5\u5fd7\u540e\u663e\u793a\u9996\u5305\u3001\u8d85\u65f6\u548c\u65ad\u6d41\u6458\u8981";
+      issue?.classList.toggle("good", Boolean(state.logs.length));
+      issue?.classList.remove("warn", "fail");
+      return;
+    }
+    const reason = logFailureReason(recent);
+    if (issueStatus) issueStatus.textContent = reason;
+    if (issueDetail) issueDetail.textContent = formatGatewayTime(recent.ts) + " \u00b7 " + (recent.latency_ms || 0) + "ms \u00b7 " + (recent.upstream || "unknown");
+    issue?.classList.remove("good", "warn");
+    issue?.classList.add(Number(recent.status || 0) >= 500 ? "fail" : "warn");
   }
 
   function updateUpstreamGroupActive(active, activeClients) {
@@ -2789,6 +2862,7 @@ async function loadKvUsage() {
     const payload = await parseApiResponse(resp);
     const logs = payload.logs || [];
     state.logs = logs;
+    renderConnectionSummary();
     byId("live-log").innerHTML = logs.length
       ? logs.slice(0, 20).map((l) =>
           '<div class="log-row">' +
@@ -2803,6 +2877,17 @@ async function loadKvUsage() {
         ).join("")
       : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
     renderLogs(logs);
+  }
+
+  async function downloadRecentLogs() {
+    await loadLogs();
+    const payload = {
+      exported_at: new Date().toISOString(),
+      count: state.logs.length,
+      logs: state.logs.slice(0, 50),
+    };
+    downloadJsonFile("llmmerge-logs-" + payload.exported_at.slice(0, 10) + ".json", payload);
+    showToast("已下载最近 " + payload.logs.length + " 条日志");
   }
 
   /* ---- Logs ---- */
@@ -3233,6 +3318,9 @@ async function loadKvUsage() {
 
       byId("refresh-logs").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", loadLogs).catch(showError)
+      );
+      byId("download-logs").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u51c6\u5907\u4e2d...", downloadRecentLogs).catch(showError)
       );
 
       // ponytail: keep slow usage and historical queries off the critical boot path

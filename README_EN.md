@@ -119,6 +119,7 @@ Key fields:
 - `weight`: stable spreading among same-priority candidates; it never creates parallel requests.
 - `emergency`: tried only after ordinary candidates fail.
 - `first_byte_timeout_ms`: optional first-byte override.
+- `failover_budget_ms`: total failover budget, default `30000` ms, shared by all candidate keys.
 
 Client permissions, model/path matching, and `enabled` are always enforced. The gateway does not replace the model requested by the client.
 

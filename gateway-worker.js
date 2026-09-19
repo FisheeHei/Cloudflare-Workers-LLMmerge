@@ -69,7 +69,8 @@ const STATS_WINDOW_HOURS = 24;
 const CLIENT_DAILY_USAGE_TTL_SECONDS = 35 * 24 * 3600;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
-const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
+const DEFAULT_FAILOVER_BUDGET_MS = 30000;
+const MAX_FAILOVER_BUDGET_MS = 120000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
@@ -117,7 +118,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-18-stable-routing-2";
+const VERSION = "v26-09-20-connection-stability-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2504,6 +2505,7 @@ function normalizeGatewayRouting(routing = {}) {
     coordination_level: Number.isFinite(coordination) ? Math.max(0, Math.min(5, Math.floor(coordination))) : 3,
     failover: routing.failover !== false,
     failover_max_attempts: Math.max(1, Math.min(MAX_FAILOVER_ATTEMPTS, parsePositiveInt(routing.failover_max_attempts, DEFAULT_FAILOVER_MAX_ATTEMPTS))),
+    failover_budget_ms: Math.max(1000, Math.min(MAX_FAILOVER_BUDGET_MS, parsePositiveInt(routing.failover_budget_ms, DEFAULT_FAILOVER_BUDGET_MS))),
     // Keep legacy fields in the normalized shape, but never enable parallel routing.
     fast_routing: false,
     hedge_enabled: false,
@@ -5268,7 +5270,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     return hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
   }
 
-  const failoverDeadline = routingStartedAt + NON_STREAM_RESPONSE_DEADLINE_MS;
+  const failoverBudgetMs = Math.max(1000, Number(runtime.routing.failover_budget_ms) || DEFAULT_FAILOVER_BUDGET_MS);
+  const failoverDeadline = routingStartedAt + Math.min(MAX_FAILOVER_BUDGET_MS, failoverBudgetMs);
   let initialReservation = null;
   let initialDispatchContested = false;
   try {
@@ -5287,6 +5290,12 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const upstream = attempts[index];
     const isLast = index === maxAttempts - 1;
     const remainingBudgetMs = Math.max(1, failoverDeadline - Date.now());
+    const remainingAttempts = Math.max(1, maxAttempts - index);
+    // Split the remaining budget so a dead key cannot consume the whole
+    // failover window before the next eligible key gets a request.
+    const attemptBudgetMs = maxAttempts === 1
+      ? proxyFirstByteTimeoutMs(runtime, upstream, bodyText)
+      : Math.max(1, Math.floor(remainingBudgetMs / remainingAttempts));
     let upstreamResult = null;
     const dispatchContested = index === 0 ? initialDispatchContested : upstreamHasCompetition(upstream);
     const releaseReservation = index === 0 ? initialReservation : reserveUpstreams([upstream]);
@@ -5305,14 +5314,14 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         trace, attempt: index + 1,
-        firstByteTimeoutMs: Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), remainingBudgetMs)),
+        firstByteTimeoutMs: Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), attemptBudgetMs)),
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
       upstreamResult = await upstreamPromise;
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
-        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), remainingBudgetMs)));
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), attemptBudgetMs)));
         response = primed.response;
         upstreamResult.response = response;
         upstreamResult.streamError = primed.error;
@@ -5645,10 +5654,10 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
         result = await fetchProxyUpstream({
           bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
           trace, attempt: index + 1,
-          firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+          firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS),
         });
         if (result.response.ok && streamRequest) {
-          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS));
+          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS));
           result.response = primed.response;
           result.streamError = primed.error;
           result.streamErrorKind = primed.errorKind || "";
@@ -5735,10 +5744,10 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     result = await fetchProxyUpstream({
       bodyText, client, pathname, request, runtime, search, signal, upstream,
       trace, attempt: 1,
-      firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+      firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS),
     });
     if (result.response.ok && streamRequest) {
-      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS));
+      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS));
       result.response = primed.response;
       result.streamError = primed.error;
       result.streamErrorKind = primed.errorKind || "";
