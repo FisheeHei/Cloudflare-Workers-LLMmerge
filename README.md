@@ -129,6 +129,18 @@ https://your-domain.example/{ADMIN_TOKEN}
 
 内置模板覆盖 NVIDIA NIM、DeepInfra、Together AI、DeepSeek、Kimi/Moonshot、MiniMax、OpenRouter、Groq、GLM/Zhipu、Cloudflare Workers AI REST 和自定义 OpenAI-compatible 上游。模板只提供默认适配，不替代上游自身的模型与路径配置。
 
+### NVIDIA NIM 协议
+
+网关按 NVIDIA 官方 LLM API 接入 NIM：
+
+- 根地址通常为 `https://integrate.api.nvidia.com/v1`，请求使用 `POST /v1/chat/completions` 和 Bearer Token。
+- 请求体沿用 OpenAI Chat Completions；`stream: true` 使用 SSE，正常结束为 `data: [DONE]`。工具调用、采样参数和推理参数只在对应模型文档支持时发送。
+- DeepSeek V4 的 `reasoning_effort` 使用 `none`、`high`、`max`；GLM、Qwen、Kimi 等模型的思考参数由网关转换为各自的 NIM 字段。
+- 某些 NIM 模型会先返回 `202`，并在 `NVCF-REQID` 中给出请求 ID。网关会自动轮询同一上游的 `/v1/status/{requestId}`，直到得到最终结果或达到请求预算，不会把临时 `202` 直接返回给客户端。
+- 模型 ID 必须以 NIM 的实际模型名配置，网关只做别名映射，不自动替换客户端请求的模型。
+
+参考 NVIDIA 官方文档：[Models](https://docs.api.nvidia.com/nim/reference/models-1)、[LLM APIs](https://docs.api.nvidia.com/nim/reference/llm-apis)。
+
 ## 客户端 Key 与注入
 
 ```json
@@ -175,7 +187,7 @@ Responses 使用 `instructions` 注入，不会把网关规则伪装成用户消
 - NIM 429、5xx、首包超时、空流和明确连接失败会更新短期冷却状态。
 - 健康检查只用于排序和诊断，不硬阻断真实请求。
 
-旧配置中的 `hedge_enabled`、`fast_routing`、`hedge_max`、`load_balance`、`coordination_level` 和 `soft_interval_ms` 仍可读取以保持兼容，但实验并行选项不会重新启用；当前请求始终保持单上游。
+绑定 `ROUTE_COORDINATOR` 后，多边缘请求会先在一个共享 DO 候选池中选择下一可用 Key，再由当前边缘直接连接上游；每次协调最多占用约 50ms。DO 不可用、超时或旧版本尚未支持候选池时立即 `fail-open` 到本地顺序路由。旧配置中的 `hedge_enabled`、`fast_routing`、`hedge_max`、`load_balance`、`coordination_level` 和 `soft_interval_ms` 仍可读取以保持兼容，但实验并行选项不会重新启用；当前请求始终保持单上游。
 
 ## API
 
@@ -207,7 +219,7 @@ curl https://your-domain.example/v1/gateway/status \
 - 用户到网关由 Cloudflare 边缘就近承接。
 - 网关到上游从当前边缘直接连接，不让模型数据经过 DO。
 - SSE 每 5 秒发送注释保活，保活不是模型输出。
-- DO 协调最多等待约 50ms，超时即本地直连。
+- DO 协调最多等待约 50ms，超时即本地直连；`/health` 的 `has_route_coordinator` 表示跨边缘协调绑定，`has_do` 只表示主状态存储是否使用 DO。
 - 失败状态和统计优先写入当前 isolate，再异步持久化。
 - 首包超时会按模型类型区分普通模型和推理模型；上游可单独覆盖。
 

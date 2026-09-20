@@ -127,6 +127,18 @@ Client permissions, model/path matching, and `enabled` are always enforced. The 
 
 Built-in templates cover NVIDIA NIM, DeepInfra, Together AI, DeepSeek, Kimi/Moonshot, MiniMax, OpenRouter, Groq, GLM/Zhipu, Cloudflare Workers AI REST, and custom OpenAI-compatible upstreams.
 
+### NVIDIA NIM Protocol
+
+The gateway follows NVIDIA's official LLM API contract:
+
+- The usual root is `https://integrate.api.nvidia.com/v1`; requests use `POST /v1/chat/completions` with a Bearer token.
+- Bodies use OpenAI Chat Completions. `stream: true` uses SSE and normally ends with `data: [DONE]`. Tools, sampling fields, and reasoning fields are sent only when the model bridge supports them.
+- DeepSeek V4 accepts `reasoning_effort` values `none`, `high`, and `max`; GLM, Qwen, Kimi, and other families are translated to their documented NIM fields.
+- Some NIM models return `202` with `NVCF-REQID` first. The gateway polls `/v1/status/{requestId}` on the same upstream until a final result or the request budget is reached, instead of returning the temporary `202` to the client.
+- Model IDs must be configured using the actual NIM model names. The gateway maps aliases but never silently replaces the client's requested model.
+
+See NVIDIA's official [Models](https://docs.api.nvidia.com/nim/reference/models-1) and [LLM APIs](https://docs.api.nvidia.com/nim/reference/llm-apis) references.
+
 ## Client Keys And Injection
 
 ```json
@@ -171,6 +183,8 @@ Failover rules:
 
 Legacy `hedge_enabled`, `fast_routing`, `hedge_max`, `load_balance`, `coordination_level`, and `soft_interval_ms` fields remain readable for compatibility, but experimental parallel routing is never re-enabled. Requests remain single-upstream.
 
+When `ROUTE_COORDINATOR` is bound, concurrent requests from different edges first use one shared DO candidate pool to select the least-recently reserved eligible key, then connect to the model directly from the serving edge. Coordination is capped at about 50ms and fails open to local ordering when unavailable, slow, or running older code.
+
 ## API
 
 | Method | Path | Purpose |
@@ -201,7 +215,7 @@ It returns no full key, upstream key, upstream URL, or other client data.
 - Cloudflare edge handles user ingress nearby.
 - The serving edge connects directly to the upstream; model traffic does not pass through the DO.
 - SSE sends a comment keepalive every five seconds; keepalives are not model output.
-- DO coordination waits about 50ms at most and then fails open.
+- DO coordination waits about 50ms at most and then fails open. `/health` reports `has_route_coordinator` for the cross-edge binding, while `has_do` only describes the primary state backend.
 - Failure state and statistics are recorded in the isolate first and persisted asynchronously.
 - First-byte timeout adapts to ordinary and reasoning models, with per-upstream overrides.
 

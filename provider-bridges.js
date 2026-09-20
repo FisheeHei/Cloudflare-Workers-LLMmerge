@@ -129,7 +129,7 @@ export function sanitizeProxyBody(bodyText, upstream) {
   if (bridge.provider === "zhipu") changed = applyZhipuBridge(payload) || changed;
   if (bridge.provider === "openai") changed = applyGenericOpenAiBridge(payload, { keepReasoningEffort: bridge.family !== "workers-ai" }) || changed;
   if (bridge.provider === "nim") changed = applyNimBridge(payload, modelName, bridge.family) || changed;
-  if (bridge.provider === "nim") changed = applyNimStrictSchema(payload) || changed;
+  if (bridge.provider === "nim") changed = applyNimStrictSchema(payload, modelName, bridge.family) || changed;
 
   return changed ? JSON.stringify(payload) : bodyText;
 }
@@ -594,13 +594,14 @@ function applyNimBridge(payload, modelName, family = modelFamily(modelName)) {
   return changed;
 }
 
-function applyNimStrictSchema(payload) {
+function applyNimStrictSchema(payload, modelName = "", family = modelFamily(modelName)) {
   let changed = false;
   if (payload.max_completion_tokens != null && payload.max_tokens == null) {
     payload.max_tokens = payload.max_completion_tokens;
     changed = true;
   }
-  return deleteKeys(payload, NIM_STRICT_ONLY_FIELDS) || changed;
+  const fields = NIM_STRICT_ONLY_FIELDS.filter((key) => !(key === "stream_options" && family === "kimi"));
+  return deleteKeys(payload, fields) || changed;
 }
 
 function removeNimReasoningPayloadFields(payload, options = {}) {

@@ -49,7 +49,7 @@ const CORS_HEADERS = {
   "access-control-max-age": "3600",
 };
 
-const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529]);
+const RETRYABLE_STATUSES = new Set([401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529]);
 const MODEL_PATH = "/v1/models";
 const COMPLETIONS_PATH = "/v1/completions";
 const CHAT_PATH = "/v1/chat/completions";
@@ -94,6 +94,8 @@ const MAX_FAILOVER_ATTEMPTS = 5;
 const DEFAULT_FAILOVER_ATTEMPT_FIRST_BYTE_TIMEOUT_MS = 8000;
 const DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS = 12000;
 const DEFAULT_SLOW_UPSTREAM_FIRST_BYTE_TIMEOUT_MS = 60000;
+const NIM_PENDING_POLL_INTERVAL_MS = 250;
+const NIM_PENDING_MAX_POLL_MS = 30000;
 const STREAM_TERMINAL_GRACE_MS = 20;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
@@ -119,7 +121,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-20-connection-stability-2";
+const VERSION = "v26-09-21-nim-do-routing-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -137,6 +139,7 @@ export default {
 
       if (pathname === "/health") {
         const storage = pickStateBackend(env);
+        const routeCoordinator = pickRouteCoordinator(env);
         return withCorsResponse(
           json(
             {
@@ -145,6 +148,7 @@ export default {
               has_kv: Boolean(env.KV),
               has_d1: storage.kind === "d1",
               has_do: storage.kind === "do",
+              has_route_coordinator: Boolean(routeCoordinator),
               storage: storage.kind,
               admin_configured: Boolean(pickAdminToken(env)),
               now: utcNowIso(),
@@ -630,7 +634,26 @@ function createDoDispatchCoordinator(namespace) {
         body: JSON.stringify({
           interval_ms: intervalMs,
           max_wait_ms: maxWaitMs,
-          client: String(client?.key || client?.id || client?.name || "gateway"),
+          client: String(client?.id || client?.name || "gateway"),
+        }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`Route coordinator returned ${response.status}.`);
+      return response.json();
+    },
+    async reservePool(upstreams, intervalMs, client, signal, maxWaitMs = MAX_UPSTREAM_DISPATCH_WAIT_MS) {
+      const names = (upstreams || []).map(upstreamKey).filter(Boolean);
+      if (names.length < 2) return null;
+      const id = namespace.idFromName("llmmerge-dispatch-pool");
+      const stub = namespace.get(id);
+      const response = await stub.fetch("https://llmmerge-dispatch/dispatch-pool", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          upstreams: names,
+          interval_ms: intervalMs,
+          max_wait_ms: maxWaitMs,
+          client: String(client?.id || client?.name || "gateway"),
         }),
         signal,
       });
@@ -666,6 +689,32 @@ export class LlmMergeStore {
       return new Response(JSON.stringify({ accepted: true, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: nextAt }), {
         headers: JSON_HEADERS,
       });
+    }
+    if (url.pathname === "/dispatch-pool" && request.method === "POST") {
+      const payload = await request.json().catch(() => ({}));
+      const names = Array.from(new Set((Array.isArray(payload?.upstreams) ? payload.upstreams : [])
+        .map((name) => String(name || "").trim())
+        .filter(Boolean))).slice(0, 32);
+      if (names.length < 2) return new Response(JSON.stringify({ accepted: false, reason: "not_enough_candidates" }), { status: 400, headers: JSON_HEADERS });
+      const intervalMs = Math.max(0, Math.min(2000, Number(payload?.interval_ms) || 0));
+      const maxWaitMs = Number(payload?.max_wait_ms);
+      const now = Date.now();
+      const slots = await Promise.all(names.map(async (name, index) => ({
+        name,
+        index,
+        nextAt: Number(await this.state.storage.get(`dispatch:pool:${name}`)) || 0,
+      })));
+      const selected = slots
+        .map((slot) => ({ ...slot, scheduledAt: Math.max(now, slot.nextAt) }))
+        .sort((a, b) => a.scheduledAt - b.scheduledAt || a.index - b.index)[0];
+      const delayMs = Math.max(0, selected.scheduledAt - now);
+      if (Number.isFinite(maxWaitMs) && maxWaitMs >= 0 && delayMs > maxWaitMs) {
+        return new Response(JSON.stringify({ accepted: false, delay_ms: delayMs, selected: null }), { headers: JSON_HEADERS });
+      }
+      const nextAt = selected.scheduledAt + intervalMs;
+      await this.state.storage.put(`dispatch:pool:${selected.name}`, String(nextAt), { expirationTtl: 120 });
+      await this.state.storage.put("dispatch:pool:last", JSON.stringify({ upstream: selected.name, client: String(payload?.client || "gateway"), at: now }), { expirationTtl: 120 });
+      return new Response(JSON.stringify({ accepted: true, upstream: selected.name, delay_ms: delayMs, scheduled_at: selected.scheduledAt, next_at: nextAt }), { headers: JSON_HEADERS });
     }
     const key = url.searchParams.get("key") || "";
     if (!key) return new Response("missing key", { status: 400 });
@@ -5243,11 +5292,24 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
 
   // Route from the local snapshot first. Cross-edge state is only a hint and
   // must never delay the first real upstream fetch.
-  const attempts = orderUpstreams(runtime, candidates, model, client);
+  let attempts = orderUpstreams(runtime, candidates, model, client);
   if (!attempts.length) {
     const error = httpError(404, `No upstream available for model: ${model}`);
     error.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "route_failed", { failure_reason: "no_eligible_upstream" }));
     throw error;
+  }
+
+  // One shared DO chooses the least-recently reserved candidate across edges.
+  // It is advisory: a missing, old, slow, or failing binding falls back to the
+  // already ordered local list without delaying the model request.
+  let initialDispatchOverride = null;
+  if (attempts.length > 1 && runtime?.routeCoordinator?.reservePool && upstreamSoftIntervalMs(runtime) > 0) {
+    const selection = await selectUpstreamAcrossEdges(runtime, attempts, model, client, signal);
+    initialDispatchOverride = selection;
+    if (selection?.upstream) {
+      const selectedIndex = attempts.findIndex((upstream) => upstreamKey(upstream) === selection.upstream);
+      if (selectedIndex > 0) attempts = [attempts[selectedIndex], ...attempts.slice(0, selectedIndex), ...attempts.slice(selectedIndex + 1)];
+    }
   }
 
   const singleUpstream = attempts.length === 1;
@@ -5305,7 +5367,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     try {
       const dispatchStartedAt = Date.now();
       markGatewayTrace(trace, "dispatch_wait_started", { attempt: index + 1, upstream: upstream.name });
-      const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal, dispatchContested);
+      const dispatch = index === 0 && initialDispatchOverride
+        ? initialDispatchOverride
+        : await waitForUpstreamDispatch(runtime, upstream, client, signal, dispatchContested);
       timing.dispatch_wait_ms += Date.now() - dispatchStartedAt;
       if (!dispatch.accepted) {
         lastError = dispatchQueueFullError(upstream, dispatch.delayMs);
@@ -5320,6 +5384,13 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
       upstreamResult = await upstreamPromise;
+      upstreamResult = await resolveNimPendingResponse(upstreamResult, {
+        request,
+        runtime,
+        signal,
+        upstream,
+        maxPollMs: Math.min(NIM_PENDING_MAX_POLL_MS, Math.max(1, failoverDeadline - Date.now())),
+      });
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
@@ -5351,14 +5422,17 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         lastError.failureReason = failureReason;
         markGatewayTrace(trace, "retrying_upstream", { attempt: index + 1, upstream: upstream.name, status: response.status, failure_reason: failureReason, failover_used: !isLast });
         await scheduleUpstreamState(markUpstreamFailure(runtime, upstream, model, response), ctx);
-      } else {
+      } else if (response.ok) {
         await scheduleUpstreamState(clearUpstreamFailure(runtime, upstream, model), ctx);
         rememberUpstreamLatency(runtime, upstream, model, upstreamResult.latency, ctx);
         rememberSuccessfulUpstream(upstream, model);
       }
 
       if (!shouldRetry) {
-        markGatewayTrace(trace, response.ok ? "response_ready" : "upstream_response_error", { attempt: index + 1, upstream: upstream.name, status: response.status, ...(response.ok ? { failure_reason: "" } : {}) });
+        const finalFailureReason = response.ok
+          ? ""
+          : upstreamFailureReason({ response, streamErrorKind: upstreamResult.streamErrorKind });
+        markGatewayTrace(trace, response.ok ? "response_ready" : "upstream_response_error", { attempt: index + 1, upstream: upstream.name, status: response.status, failure_reason: finalFailureReason });
         return {
           attempts: index + 1,
           response,
@@ -5473,7 +5547,7 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
       release,
     );
     markGatewayTrace(trace, "upstream_headers_received", { attempt, upstream: upstream.name, status: response.status });
-    return { response, release, abortUpstream, latency: Date.now() - started, startedAt: started };
+    return { response, release, abortUpstream, upstreamSignal: controller.signal, latency: Date.now() - started, startedAt: started };
   } catch (error) {
     markGatewayTrace(trace, "upstream_fetch_failed", { attempt, upstream: upstream.name, status: error?.statusCode || 0 });
     release();
@@ -5483,6 +5557,54 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
       throw cancelled;
     }
     throw error;
+  }
+}
+
+async function resolveNimPendingResponse(result, { request, runtime, signal, upstream, maxPollMs = NIM_PENDING_MAX_POLL_MS } = {}) {
+  const response = result?.response;
+  if (!response || response.status !== 202 || !isNvidiaNimUpstream(upstream)) return result;
+  let requestId = String(response.headers.get("NVCF-REQID") || "").trim();
+  if (!requestId) return result;
+
+  try { await response.body?.cancel("NIM async result polling"); } catch {}
+  const pollController = new AbortController();
+  const abortPoll = () => pollController.abort(signal?.reason || "request aborted");
+  const abortFromUpstream = () => pollController.abort("upstream request aborted");
+  if (signal?.aborted || result.upstreamSignal?.aborted) abortPoll();
+  else {
+    signal?.addEventListener("abort", abortPoll, { once: true });
+    result.upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+  }
+  const originalAbort = result.abortUpstream;
+  result.abortUpstream = (reason = "response completed") => {
+    try { originalAbort?.(reason); } catch {}
+    if (!pollController.signal.aborted) pollController.abort(reason);
+  };
+  const deadline = Date.now() + Math.max(1, Math.min(NIM_PENDING_MAX_POLL_MS, Number(maxPollMs) || NIM_PENDING_MAX_POLL_MS));
+  const pollHeaders = buildUpstreamHeaders(request, upstream, "", false);
+  pollHeaders.set("accept", "application/json");
+  try {
+    for (;;) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw httpError(504, "NIM pending result timeout.");
+      const pollResponse = await fetchWithTimeout(
+        buildUpstreamUrl(upstream.base_url, `/v1/status/${encodeURIComponent(requestId)}`, ""),
+        { method: "GET", headers: pollHeaders, signal: pollController.signal },
+        Math.min(remainingMs, DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS),
+        runtime?.streamIdleTimeoutMs,
+      );
+      result.response = pollResponse;
+      result.latency = Date.now() - result.startedAt;
+      if (pollResponse.status !== 202) return result;
+      requestId = String(pollResponse.headers.get("NVCF-REQID") || requestId).trim();
+      try { await pollResponse.body?.cancel("NIM async result still pending"); } catch {}
+      const waitMs = Math.min(NIM_PENDING_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now()));
+      await sleep(waitMs, pollController.signal);
+    }
+  } finally {
+    if (!pollController.signal.aborted) pollController.abort("NIM polling finished");
+    signal?.removeEventListener("abort", abortPoll);
+    result.upstreamSignal?.removeEventListener("abort", abortFromUpstream);
   }
 }
 
@@ -5527,6 +5649,7 @@ function upstreamFailureReason({ response = null, error = null, streamErrorKind 
   const message = String(error?.message || "").toLowerCase();
   if (streamErrorKind === "timeout" || message.includes("first visible output") || message.includes("first byte")) return "first_byte_timeout";
   if (streamErrorKind === "empty") return "upstream_stream_eof";
+  if (status === 401 || status === 403) return "upstream_auth";
   if (status === 429) return "upstream_rate_limit";
   if (status === 408 || status === 504 || message.includes("timeout")) return "upstream_timeout";
   if (status >= 500) return "upstream_service_error";
@@ -5667,6 +5790,13 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
           trace, attempt: index + 1,
           firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS),
         });
+        result = await resolveNimPendingResponse(result, {
+          request,
+          runtime,
+          signal: controllers[index].signal,
+          upstream,
+          maxPollMs: runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS,
+        });
         if (result.response.ok && streamRequest) {
           const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS));
           result.response = primed.response;
@@ -5756,6 +5886,13 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
       bodyText, client, pathname, request, runtime, search, signal, upstream,
       trace, attempt: 1,
       firstByteTimeoutMs: Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS),
+    });
+    result = await resolveNimPendingResponse(result, {
+      request,
+      runtime,
+      signal,
+      upstream,
+      maxPollMs: runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS,
     });
     if (result.response.ok && streamRequest) {
       const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), runtime.routing.failover_budget_ms || DEFAULT_FAILOVER_BUDGET_MS));
@@ -6049,6 +6186,48 @@ function upstreamSoftIntervalMs(runtime) {
   return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000);
 }
 
+async function selectUpstreamAcrossEdges(runtime, attempts, model, client, signal) {
+  const interval = upstreamSoftIntervalMs(runtime);
+  const now = Date.now();
+  const isCooling = (upstream) => {
+    const status = _upstreamCooldowns[upstreamModelKey(upstream, model)];
+    return Boolean(status && Number(status.until) > now);
+  };
+  // Keep the established normal/cooling/emergency order. DO only spreads
+  // requests inside the first eligible tier instead of promoting emergencies.
+  const tiers = [
+    attempts.filter((upstream) => upstream.emergency !== true && !isCooling(upstream)),
+    attempts.filter((upstream) => upstream.emergency !== true && isCooling(upstream)),
+    attempts.filter((upstream) => upstream.emergency === true && !isCooling(upstream)),
+    attempts.filter((upstream) => upstream.emergency === true && isCooling(upstream)),
+  ];
+  const pool = tiers.find((tier) => tier.length > 1) || [];
+  const failOpen = { accepted: true, delayMs: 0, mode: "fail_open" };
+  if (pool.length < 2) return failOpen;
+  const startedAt = Date.now();
+  const coordinatorTask = reserveRouteCoordinatorPool(runtime, pool, interval, client, signal, MAX_UPSTREAM_DISPATCH_WAIT_MS)
+    .then((slot) => ({ kind: "slot", slot }))
+    .catch(() => ({ kind: "error" }));
+  const raced = await Promise.race([
+    coordinatorTask,
+    sleep(MAX_UPSTREAM_DISPATCH_WAIT_MS, signal).then(() => ({ kind: "timeout" })),
+  ]);
+  if (signal?.aborted) throw httpError(499, "Response cancelled.");
+  if (raced.kind !== "slot") {
+    void coordinatorTask;
+    return failOpen;
+  }
+  const slot = raced.slot || {};
+  const selected = pool.find((upstream) => upstreamKey(upstream) === String(slot.upstream || ""));
+  const delayMs = Math.max(0, Number(slot.delay_ms) || 0);
+  if (slot.accepted !== true || !selected || delayMs > MAX_UPSTREAM_DISPATCH_WAIT_MS || Date.now() - startedAt > MAX_UPSTREAM_DISPATCH_WAIT_MS) {
+    return failOpen;
+  }
+  if (delayMs > 0) await sleep(delayMs, signal);
+  noteCoordinatorDispatch(upstreamKey(selected), delayMs, interval, client);
+  return { accepted: true, upstream: upstreamKey(selected), delayMs, mode: "do_pool" };
+}
+
 async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
   const interval = upstreamSoftIntervalMs(runtime);
   const name = upstreamKey(upstream);
@@ -6123,6 +6302,20 @@ async function reserveRouteCoordinator(runtime, name, interval, client, signal, 
   const timeout = setTimeout(() => controller.abort("route coordinator timeout"), Math.max(1, Number(timeoutMs) || ROUTE_COORDINATOR_TIMEOUT_MS));
   try {
     return await runtime.routeCoordinator.reserve(name, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function reserveRouteCoordinatorPool(runtime, upstreams, interval, client, signal, timeoutMs = ROUTE_COORDINATOR_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason || "request aborted");
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(() => controller.abort("route coordinator timeout"), Math.max(1, Number(timeoutMs) || ROUTE_COORDINATOR_TIMEOUT_MS));
+  try {
+    return await runtime.routeCoordinator.reservePool(upstreams, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", abort);

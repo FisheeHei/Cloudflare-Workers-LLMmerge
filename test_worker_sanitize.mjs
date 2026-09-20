@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import { classifyGatewayFailure, createGatewayTrace, gatewayTraceFields, markGatewayTrace } from "./gateway-observability.js";
+import { sanitizeProxyBody } from "./provider-bridges.js";
 
 const worker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?t=${Date.now()}`);
+const nimKimiBody = JSON.parse(sanitizeProxyBody(JSON.stringify({ model: "moonshotai/kimi-k3", messages: [], stream: true, stream_options: { include_usage: true } }), { preset: "nvidia-nim" }));
+assert.deepEqual(nimKimiBody.stream_options, { include_usage: true });
 assert.equal(classifyGatewayFailure({ status: 200 }), "ok");
 assert.equal(classifyGatewayFailure({ status: 503 }), "upstream_unavailable");
 assert.equal(classifyGatewayFailure({ status: 200, closeReason: "eof" }), "upstream_stream_eof");
@@ -70,6 +73,7 @@ const nativeResponseStreamHits = [];
 const completionHits = [];
 const completionChatHits = [];
 const nimCompletionHits = [];
+const nimAsyncHits = [];
 const anthropicHits = [];
 const anthropicStreamHits = [];
 const delayedAnthropicHits = [];
@@ -438,6 +442,20 @@ globalThis.fetch = async (url, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (String(url).includes("nim-async.example")) {
+    const path = new URL(String(url)).pathname;
+    nimAsyncHits.push(path);
+    if (path.includes("/status/")) {
+      return new Response(JSON.stringify({ id: "nim-async-result", model: "nim-async-model", choices: [{ message: { content: "async ok" }, finish_reason: "stop" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("", {
+      status: 202,
+      headers: { "content-type": "application/json", "NVCF-REQID": "00000000-0000-4000-8000-000000000001", "NVCF-STATUS": "pending" },
+    });
+  }
   if (String(url).includes("completions.example")) {
     const body = JSON.parse(init.body);
     completionHits.push(body);
@@ -640,6 +658,14 @@ globalThis.fetch = async (url, init) => {
     softIntervalStarts.push(Date.now());
     await new Promise((resolve) => setTimeout(resolve, 25));
     return new Response(JSON.stringify({ id: "soft-interval", choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (String(url).includes("pool-edge-a.example") || String(url).includes("pool-edge-b.example")) {
+    const name = String(url).includes("-a.") ? "a" : "b";
+    parallelRouteHits.push("pool-" + name);
+    return new Response(JSON.stringify({ id: "pool-" + name, choices: [{ message: { content: name } }] }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -927,6 +953,7 @@ const unconfiguredEnv = {
 const unconfiguredHealth = await worker.default.fetch(new Request("https://gw.test/health"), unconfiguredEnv);
 assert.equal(unconfiguredHealth.status, 200);
 assert.equal((await unconfiguredHealth.json()).admin_configured, false);
+assert.equal((await (await worker.default.fetch(new Request("https://gw.test/health"), unconfiguredEnv)).json()).has_route_coordinator, false);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/favicon.ico"), unconfiguredEnv)).status, 200);
 const optionsResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", { method: "OPTIONS" }), unconfiguredEnv);
 assert.equal(optionsResp.status, 204);
@@ -936,7 +963,7 @@ const clientStatusResp = await worker.default.fetch(new Request("https://gw.test
 }), env);
 assert.equal(clientStatusResp.status, 200);
 assert.equal(clientStatusResp.headers.get("cache-control"), "no-store");
-assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-20-connection-stability-2");
+assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-21-nim-do-routing-1");
 const clientStatus = await clientStatusResp.json();
 assert.equal(clientStatus.ok, true);
 assert.equal(clientStatus.gateway, "connected");
@@ -960,7 +987,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-20-connection-stability-2"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-21-nim-do-routing-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -2895,6 +2922,40 @@ const firstByteLog = firstByteLogs.logs.find((entry) => entry.model === "first-b
 assert.equal(firstByteLog?.trace_attempts, 2);
 assert.equal(firstByteLog?.trace_failure_reason, "");
 
+const authFailoverStore = new Map([[
+  "gateway:config",
+  JSON.stringify({
+    routing: { failover: true, failover_max_attempts: 3, load_balance: false, soft_interval_ms: 0 },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+    upstreams: [
+      { name: "upstream-auth-fail", base_url: "https://health-auth.example/v1", api_key_encrypted: "bad", models: ["upstream-auth-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+      { name: "upstream-auth-fallback", base_url: "https://speed-fast.example/v1", api_key_encrypted: "good", models: ["upstream-auth-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    ],
+  }),
+]]);
+const authFailoverEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = authFailoverStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { authFailoverStore.set(key, value); },
+    async delete(key) { authFailoverStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "upstream-auth-client", key: "sk-upstream-auth", models: ["*"], upstreams: ["upstream-auth-fail", "upstream-auth-fallback"] }]),
+};
+const authFallbackStart = speedHits.length;
+const authFailoverResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-upstream-auth", "content-type": "application/json" },
+  body: JSON.stringify({ model: "upstream-auth-model", messages: [] }),
+}), authFailoverEnv);
+assert.equal(authFailoverResp.status, 200);
+assert.equal(authFailoverResp.headers.get("x-llm-gateway-upstream"), "upstream-auth-fallback");
+assert.equal(speedHits.length, authFallbackStart + 1);
+const authFailoverLogs = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), authFailoverEnv)).json();
+const authFailoverLog = authFailoverLogs.logs.find((entry) => entry.model === "upstream-auth-model");
+assert.equal(authFailoverLog?.trace_failure_reason, "");
+
 const failoverBudgetStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, failover_max_attempts: 3, failover_budget_ms: 1000, load_balance: false, soft_interval_ms: 0 },
   settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
@@ -3000,6 +3061,36 @@ assert.equal(nimResp.headers.get("x-llm-gateway-upstream"), "nim-limit");
 const runtimeResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), nimEnv);
 const runtimeStatus = await runtimeResp.json();
 assert.equal("nim_rpm" in runtimeStatus, false);
+
+const nimAsyncStore = new Map([[
+  "gateway:config",
+  JSON.stringify({
+    routing: { failover: true, failover_max_attempts: 2, load_balance: false, soft_interval_ms: 0 },
+    settings: { request_timeout_ms: 30000 },
+    upstreams: [
+      { name: "nim-async", preset: "nvidia-nim", base_url: "https://nim-async.example/v1", api_key_encrypted: "n", models: ["nim-async-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+    ],
+  }),
+]]);
+const nimAsyncEnv = {
+  ADMIN_TOKEN: "admin-test-token",
+  ...env,
+  KV: {
+    async get(key, type) { const value = nimAsyncStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { nimAsyncStore.set(key, value); },
+    async delete(key) { nimAsyncStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "nim-async-client", key: "sk-nim-async", models: ["*"], upstreams: ["nim-async"] }]),
+};
+const nimAsyncStart = nimAsyncHits.length;
+const nimAsyncResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-nim-async", "content-type": "application/json" },
+  body: JSON.stringify({ model: "nim-async-model", messages: [] }),
+}), nimAsyncEnv);
+assert.equal(nimAsyncResp.status, 200);
+assert.equal((await nimAsyncResp.json()).choices[0].message.content, "async ok");
+assert.deepEqual(nimAsyncHits.slice(nimAsyncStart), ["/v1/chat/completions", "/v1/status/00000000-0000-4000-8000-000000000001"]);
 
 const responsesStore = new Map();
 responsesStore.set("gateway:config", JSON.stringify({
@@ -4100,6 +4191,41 @@ const crossEdgeTimes = crossEdgeStarts.slice(crossEdgeStart);
 assert.equal(crossEdgeTimes.length, 2);
 assert.ok(Date.now() - crossEdgeRequestStarted < 250);
 assert.ok(Math.abs(crossEdgeTimes[1] - crossEdgeTimes[0]) < 150);
+
+const poolEdgeStore = new Map([[
+  "gateway:config",
+  JSON.stringify({
+    routing: { failover: true, failover_max_attempts: 2, load_balance: false, coordination_level: 0, soft_interval_ms: 50 },
+    settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+    upstreams: [
+      { name: "pool-a", base_url: "https://pool-edge-a.example/v1", api_key_encrypted: "a", models: ["pool-model"], paths: ["/v1/chat/completions"], priority: 1, weight: 1, enabled: true },
+      { name: "pool-b", base_url: "https://pool-edge-b.example/v1", api_key_encrypted: "b", models: ["pool-model"], paths: ["/v1/chat/completions"], priority: 2, weight: 1, enabled: true },
+    ],
+  }),
+]]);
+const poolEdgeEnvA = {
+  ADMIN_TOKEN: "admin-test-token", ...env, KV: {
+    async get(key, type) { const value = poolEdgeStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { poolEdgeStore.set(key, value); },
+    async delete(key) { poolEdgeStore.delete(key); },
+  },
+  ROUTE_COORDINATOR: crossEdgeCoordinator,
+  GLOBAL_ROUTE_COORDINATION: "true",
+  CLIENTS_JSON: JSON.stringify([{ name: "pool-edge-client", key: "sk-pool-edge", models: ["*"], upstreams: ["pool-a", "pool-b"] }]),
+};
+const poolEdgeEnvB = { ...poolEdgeEnvA };
+const poolEdgeStart = parallelRouteHits.length;
+await Promise.all([
+  worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer sk-pool-edge", "content-type": "application/json" },
+    body: JSON.stringify({ model: "pool-model", messages: [] }),
+  }), poolEdgeEnvA).then((response) => response.text()),
+  workerEdgeB.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer sk-pool-edge", "content-type": "application/json" },
+    body: JSON.stringify({ model: "pool-model", messages: [] }),
+  }), poolEdgeEnvB).then((response) => response.text()),
+]);
+assert.deepEqual(parallelRouteHits.slice(poolEdgeStart).sort(), ["pool-a", "pool-b"]);
 
 const spreadZeroStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false, coordination_level: 0 },
