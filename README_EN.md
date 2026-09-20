@@ -121,6 +121,8 @@ Key fields:
 - `first_byte_timeout_ms`: optional first-byte override.
 - `failover_budget_ms`: total failover budget, default `30000` ms, shared by all candidate keys.
 
+When multiple candidates are available, the default first-byte probe is capped at `8000` ms so an unresponsive key is handed off quickly. Single-upstream requests and explicit `first_byte_timeout_ms` values keep their configured timeout, while the total failover budget still applies.
+
 Client permissions, model/path matching, and `enabled` are always enforced. The gateway does not replace the model requested by the client.
 
 Built-in templates cover NVIDIA NIM, DeepInfra, Together AI, DeepSeek, Kimi/Moonshot, MiniMax, OpenRouter, Groq, GLM/Zhipu, Cloudflare Workers AI REST, and custom OpenAI-compatible upstreams.

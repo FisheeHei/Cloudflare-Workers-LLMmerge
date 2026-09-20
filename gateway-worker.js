@@ -91,6 +91,7 @@ const MAX_UPSTREAM_DISPATCH_WAIT_MS = 50;
 const ROUTE_COORDINATOR_TIMEOUT_MS = 50;
 const DEFAULT_FAILOVER_MAX_ATTEMPTS = 3;
 const MAX_FAILOVER_ATTEMPTS = 5;
+const DEFAULT_FAILOVER_ATTEMPT_FIRST_BYTE_TIMEOUT_MS = 8000;
 const DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS = 12000;
 const DEFAULT_SLOW_UPSTREAM_FIRST_BYTE_TIMEOUT_MS = 60000;
 const STREAM_TERMINAL_GRACE_MS = 20;
@@ -118,7 +119,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-20-connection-stability-1";
+const VERSION = "v26-09-20-connection-stability-2";
 
 export default {
   async fetch(request, env, ctx) {
@@ -5296,6 +5297,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const attemptBudgetMs = maxAttempts === 1
       ? proxyFirstByteTimeoutMs(runtime, upstream, bodyText)
       : Math.max(1, Math.floor(remainingBudgetMs / remainingAttempts));
+    const attemptFirstByteTimeoutMs = proxyAttemptFirstByteTimeoutMs(runtime, upstream, bodyText, attemptBudgetMs, maxAttempts);
     let upstreamResult = null;
     const dispatchContested = index === 0 ? initialDispatchContested : upstreamHasCompetition(upstream);
     const releaseReservation = index === 0 ? initialReservation : reserveUpstreams([upstream]);
@@ -5314,14 +5316,14 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         trace, attempt: index + 1,
-        firstByteTimeoutMs: Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), attemptBudgetMs)),
+        firstByteTimeoutMs: attemptFirstByteTimeoutMs,
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
       upstreamResult = await upstreamPromise;
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
-        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), attemptBudgetMs)));
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), attemptFirstByteTimeoutMs);
         response = primed.response;
         upstreamResult.response = response;
         upstreamResult.streamError = primed.error;
@@ -5356,7 +5358,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
 
       if (!shouldRetry) {
-        markGatewayTrace(trace, response.ok ? "response_ready" : "upstream_response_error", { attempt: index + 1, upstream: upstream.name, status: response.status });
+        markGatewayTrace(trace, response.ok ? "response_ready" : "upstream_response_error", { attempt: index + 1, upstream: upstream.name, status: response.status, ...(response.ok ? { failure_reason: "" } : {}) });
         return {
           attempts: index + 1,
           response,
@@ -5504,6 +5506,15 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
       : Math.max(configured, DEFAULT_SLOW_UPSTREAM_FIRST_BYTE_TIMEOUT_MS);
   }
   return Math.min(configured, DEFAULT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS);
+}
+
+function proxyAttemptFirstByteTimeoutMs(runtime, upstream, bodyText, attemptBudgetMs, maxAttempts = 1) {
+  const base = proxyFirstByteTimeoutMs(runtime, upstream, bodyText);
+  const explicit = parseNonNegativeInt(upstream?.first_byte_timeout_ms, 0, 600000);
+  const failoverProbeCap = maxAttempts > 1 && explicit === 0
+    ? DEFAULT_FAILOVER_ATTEMPT_FIRST_BYTE_TIMEOUT_MS
+    : base;
+  return Math.max(1, Math.min(base, failoverProbeCap, Number(attemptBudgetMs) || base));
 }
 
 function isSlowFirstByteModel(modelName) {
@@ -5700,7 +5711,7 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
         await scheduleUpstreamState(clearUpstreamFailure(runtime, result.upstream, model), ctx);
         rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
         rememberSuccessfulUpstream(result.upstream, model);
-        markGatewayTrace(trace, "response_ready", { attempt: result.index + 1, upstream: result.upstream.name, status: result.response.status });
+        markGatewayTrace(trace, "response_ready", { attempt: result.index + 1, upstream: result.upstream.name, status: result.response.status, failure_reason: "" });
         return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing, injection, trace: gatewayTraceFields(trace) };
       }
       result.failureReason = upstreamFailureReason({ response: result.response, error: result.error, streamErrorKind: result.streamErrorKind });
@@ -5770,7 +5781,7 @@ async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, r
     await scheduleUpstreamState(clearUpstreamFailure(runtime, upstream, model), ctx);
     rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
     rememberSuccessfulUpstream(upstream, model);
-    markGatewayTrace(trace, "response_ready", { attempt: 1, upstream: upstream.name, status: result.response.status });
+    markGatewayTrace(trace, "response_ready", { attempt: 1, upstream: upstream.name, status: result.response.status, failure_reason: "" });
     return { response: result.response, upstream, abortUpstream: result.abortUpstream, timing: fallbackTiming, trace: gatewayTraceFields(trace) };
   } catch (error) {
     const upstreamError = normalizeThrownError(error);

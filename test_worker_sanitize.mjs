@@ -10,6 +10,15 @@ assert.equal(classifyGatewayFailure({ status: 503, dispatchLimited: true }), "di
 const sameTickTrace = createGatewayTrace({ id: "same-tick" });
 markGatewayTrace(sameTickTrace, "upstream_fetch_called");
 assert.equal(gatewayTraceFields(sameTickTrace).trace_upstream_called, true);
+const retryTrace = createGatewayTrace({ id: "retry-trace" });
+retryTrace.started_at = Date.now() - 20;
+markGatewayTrace(retryTrace, "upstream_fetch_called", { attempt: 1, upstream: "slow-a" });
+const firstUpstreamStart = gatewayTraceFields(retryTrace).trace_upstream_start_ms;
+retryTrace.started_at = Date.now() - 1;
+markGatewayTrace(retryTrace, "upstream_fetch_called", { attempt: 2, upstream: "fast-b" });
+assert.equal(gatewayTraceFields(retryTrace).trace_upstream_start_ms, firstUpstreamStart);
+markGatewayTrace(retryTrace, "response_ready", { attempt: 2, failure_reason: "" });
+assert.equal(gatewayTraceFields(retryTrace).trace_failure_reason, "");
 const keepaliveEncoder = new TextEncoder();
 const keepaliveText = await new Response(worker.withSseKeepAlive(new ReadableStream({
   start(controller) {
@@ -927,7 +936,7 @@ const clientStatusResp = await worker.default.fetch(new Request("https://gw.test
 }), env);
 assert.equal(clientStatusResp.status, 200);
 assert.equal(clientStatusResp.headers.get("cache-control"), "no-store");
-assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-20-connection-stability-1");
+assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-20-connection-stability-2");
 const clientStatus = await clientStatusResp.json();
 assert.equal(clientStatus.ok, true);
 assert.equal(clientStatus.gateway, "connected");
@@ -951,7 +960,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-20-connection-stability-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-20-connection-stability-2"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -2884,7 +2893,7 @@ assert.deepEqual(firstByteHits.slice(firstByteStart), ["timeout", "fallback"]);
 const firstByteLogs = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), firstByteEnv)).json();
 const firstByteLog = firstByteLogs.logs.find((entry) => entry.model === "first-byte-model");
 assert.equal(firstByteLog?.trace_attempts, 2);
-assert.equal(firstByteLog?.trace_failure_reason, "first_byte_timeout");
+assert.equal(firstByteLog?.trace_failure_reason, "");
 
 const failoverBudgetStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, failover_max_attempts: 3, failover_budget_ms: 1000, load_balance: false, soft_interval_ms: 0 },

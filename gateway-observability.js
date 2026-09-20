@@ -19,9 +19,12 @@ export function markGatewayTrace(trace, stage, details = {}) {
   const name = String(stage || "unknown");
   trace.stage = name;
   trace.stage_ms = Math.max(0, now - Number(trace.started_at || now));
-  trace.stages[name] = trace.stage_ms;
+  const preserveFirstTimestamp = name === "upstream_fetch_called" || name === "upstream_headers_received";
+  if (!preserveFirstTimestamp || !Object.prototype.hasOwnProperty.call(trace.stages || {}, name)) {
+    trace.stages[name] = trace.stage_ms;
+  }
   if (details.dispatch_mode) trace.dispatch_mode = String(details.dispatch_mode);
-  if (details.failure_reason) trace.failure_reason = String(details.failure_reason);
+  if (Object.prototype.hasOwnProperty.call(details, "failure_reason")) trace.failure_reason = String(details.failure_reason || "");
   if (details.failover_used != null) trace.failover_used = trace.failover_used === true || details.failover_used === true;
   const attemptNumber = Number(details.attempt || 0);
   if (attemptNumber > 0) {
@@ -31,7 +34,7 @@ export function markGatewayTrace(trace, stage, details = {}) {
     if (details.upstream) attempt.upstream = String(details.upstream);
     if (details.status != null) attempt.status = Number(details.status) || 0;
     if (details.dispatch_mode) attempt.dispatch_mode = String(details.dispatch_mode);
-    if (details.failure_reason) attempt.failure_reason = String(details.failure_reason);
+    if (Object.prototype.hasOwnProperty.call(details, "failure_reason")) attempt.failure_reason = String(details.failure_reason || "");
   }
   return trace;
 }
@@ -56,13 +59,16 @@ export function gatewayTraceFields(trace) {
     };
   }
   const hasStage = (name) => Object.prototype.hasOwnProperty.call(trace.stages || {}, name);
+  const firstTransportStage = (name) => Object.prototype.hasOwnProperty.call(trace.stages || {}, name)
+    ? trace.stages[name]
+    : 0;
   return {
     trace_id: String(trace.trace_id || ""),
     trace_stage: trace.stage || "",
     trace_stage_ms: Number(trace.stage_ms || 0),
     trace_route_ms: Number(trace.stages?.route_selected || 0),
-    trace_upstream_start_ms: Number(trace.stages?.upstream_fetch_called || 0),
-    trace_upstream_headers_ms: Number(trace.stages?.upstream_headers_received || 0),
+    trace_upstream_start_ms: Number(firstTransportStage("upstream_fetch_called") || 0),
+    trace_upstream_headers_ms: Number(firstTransportStage("upstream_headers_received") || 0),
     trace_upstream_called: hasStage("upstream_fetch_called"),
     trace_upstream_headers: hasStage("upstream_headers_received"),
     trace_attempts: Array.isArray(trace.attempts) ? trace.attempts.length : 0,

@@ -123,6 +123,8 @@ https://your-domain.example/{ADMIN_TOKEN}
 - `first_byte_timeout_ms`：可选的首包超时覆盖值。
 - `failover_budget_ms`：故障转移总预算，默认 `30000` ms；多个 Key 共用该预算，避免每个 Key 依次等满首包超时。
 
+多候选故障转移的默认首包探测上限为 `8000` ms，用于尽快切换失去响应的 Key；单上游请求和显式设置的 `first_byte_timeout_ms` 不受此默认探测上限覆盖，总预算仍然生效。
+
 客户端权限、模型匹配、路径匹配和 `enabled` 状态始终有效。网关不会自动替换客户端请求的模型名称。
 
 内置模板覆盖 NVIDIA NIM、DeepInfra、Together AI、DeepSeek、Kimi/Moonshot、MiniMax、OpenRouter、Groq、GLM/Zhipu、Cloudflare Workers AI REST 和自定义 OpenAI-compatible 上游。模板只提供默认适配，不替代上游自身的模型与路径配置。
