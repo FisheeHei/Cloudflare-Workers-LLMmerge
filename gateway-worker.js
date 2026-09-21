@@ -121,7 +121,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-21-nim-do-routing-1";
+const VERSION = "v26-09-21-live-dashboard-1";
 
 export default {
   async fetch(request, env, ctx) {

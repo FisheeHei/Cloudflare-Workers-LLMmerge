@@ -963,7 +963,7 @@ const clientStatusResp = await worker.default.fetch(new Request("https://gw.test
 }), env);
 assert.equal(clientStatusResp.status, 200);
 assert.equal(clientStatusResp.headers.get("cache-control"), "no-store");
-assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-21-nim-do-routing-1");
+assert.equal(clientStatusResp.headers.get("x-llm-gateway-version"), "v26-09-21-live-dashboard-1");
 const clientStatus = await clientStatusResp.json();
 assert.equal(clientStatus.ok, true);
 assert.equal(clientStatus.gateway, "connected");
@@ -987,7 +987,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-21-nim-do-routing-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-21-live-dashboard-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -1100,7 +1100,12 @@ assert.equal(adminPage.includes("loadedViews"), true);
 assert.equal(adminPage.includes("\u5b9e\u9a8c\u6027\u8def\u7531"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000)"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000)"), false);
-assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000)"), true);
+assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000)"), false);
+assert.equal(adminPage.includes("AUTO_STATS_REFRESH_MS = 30000"), true);
+assert.equal(adminPage.includes("AUTO_LOG_REFRESH_MS = 10000"), true);
+assert.equal(adminPage.includes("void Promise.allSettled([loadStats(true), loadLogs(true)])"), true);
+assert.equal(adminPage.includes("document.addEventListener(\"visibilitychange\""), true);
+assert.equal(adminPage.includes('id="logs-updated"'), true);
 assert.equal(adminPage.includes("Promise.allSettled(tasks)"), true);
 assert.equal(adminPage.includes("if (liveRefreshRunning || document.visibilityState"), true);
 assert.equal(adminPage.includes("Configuration error"), true);
