@@ -1,6 +1,7 @@
 name = "llm-merge-worker"
 main = "_worker.js"
 compatibility_date = "2026-07-30"
+keep_vars = true
 
 # Run the automatic upstream health probe every 6 hours. The snapshot is stored
 # in D1/KV under health:probe:last and shown by the admin panel.
@@ -24,20 +25,10 @@ crons = ["0 */6 * * *"]
 # name = "llmerge"
 # class_name = "LlmMergeStore"
 
-# Cross-edge upstream dispatch coordination. The DO handles only short scheduling
-# state; model traffic still fetches directly from the serving Worker edge.
-[[durable_objects.bindings]]
-name = "ROUTE_COORDINATOR"
-class_name = "LlmMergeStore"
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["LlmMergeStore"]
 
-# Paid plan: raise the per-invocation fetch/KV/D1/DO subrequest ceiling.
-# Free plans keep Cloudflare's platform maximum instead.
-[limits]
-subrequests = 10000000
 
 # [[migrations]]
 # tag = "v1"

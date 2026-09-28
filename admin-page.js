@@ -763,33 +763,9 @@ function renderAdminMarkup(origin, version) {
     <summary><h2>\u9ad8\u7ea7\u8fd0\u884c\u8bbe\u7f6e</h2><span class="note">\u8def\u7531\u3001\u8d85\u65f6\u4e0e\u5b58\u50a8\u7ed1\u5b9a</span></summary>
     <div class="settings-body">
       <div class="row">
-        <div class="field span-3"><label>\u8bf7\u6c42\u8d85\u65f6 (ms, \u9ed8\u8ba4180000)</label><input id="request-timeout" type="number" min="1000" placeholder="180000"></div>
-        <div class="field span-3"><label>\u6d41\u5f0f\u7a7a\u95f2\u8d85\u65f6 (ms, \u9ed8\u8ba4900000)</label><input id="stream-idle-timeout" type="number" min="1000" placeholder="900000"></div>
-        <div class="field span-3"><label>\u51b7\u5374 TTL (s, \u9ed8\u8ba460)</label><input id="cooldown-ttl" type="number" min="1" placeholder="60"></div>
-        <div class="field span-3"><label>\u6a21\u578b\u7f13\u5b58 TTL (s, \u9ed8\u8ba43600)</label><input id="model-cache-ttl" type="number" min="1" placeholder="3600"></div>
-      </div>
-      <div class="row">
-        <div class="field span-3">
-          <label><input type="checkbox" id="routing-load-balance"> \u8d1f\u8f7d\u5747\u8861 (\u9ed8\u8ba4\u5f00)</label>
-        </div>
-        <div class="field span-3">
-          <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb (\u9ed8\u8ba4\u5f00)</label>
-        </div>
-      </div>
-      <div class="row">
-        <div class="field span-3"><label>\u4e0a\u6e38\u534f\u8c03\u5f3a\u5ea6 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"><span class="note">\u8d8a\u9ad8\u8d8a\u5206\u6563\u6d3b\u8dc3\u8bf7\u6c42</span></div>
-        <div class="field span-3"><label>Key \u5e76\u53d1\u8f6f\u95f4\u9694 (ms, \u9ed8\u8ba4 50)</label><input id="routing-soft-interval" type="number" min="0" max="2000" placeholder="50"><span class="note">\u4ec5\u540c\u4e00\u4e0a\u6e38\u6392\u961f\u65f6\u751f\u6548，0=\u5173\u95ed</span></div>
         <div class="field span-3"><label>\u663e\u793a\u65f6\u533a</label><select id="time-zone-preset"><option value="480" data-label="UTC+8 北京/香港/上海/乌鲁木齐">UTC+8 北京 / 香港 / 上海 / 乌鲁木齐</option><option value="0" data-label="UTC">UTC</option><option value="custom" data-label="Custom">Custom</option></select></div>
         <div class="field span-3"><label>UTC \u504f\u79fb (\u5206\u949f)</label><input id="time-zone-offset" type="number" min="-720" max="840" placeholder="480"></div>
       </div>
-      <details class="settings-subpanel">
-        <summary>\u5b9e\u9a8c\u6027\u8def\u7531\uff08\u9ed8\u8ba4\u5173\u95ed\uff09</summary>
-        <div class="row">
-          <div class="field span-4"><label><input type="checkbox" id="routing-hedge"> Hedged Request</label></div>
-          <div class="field span-4"><label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305；\u524d 2 \u4e2a\u5019\u9009\u4f18\u5148\u542f\u52a8</span></label></div>
-          <div class="field span-4"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
-        </div>
-      </details>
       <div class="row">
         <div class="field span-12">
           <label>\u5b58\u50a8\u7ed1\u5b9a\u72b6\u6001</label>
@@ -1505,11 +1481,7 @@ function renderAdminScript(version) {
       routing: {
         load_balance: byId("routing-load-balance").checked,
         failover: byId("routing-failover").checked,
-        hedge_enabled: byId("routing-hedge").checked,
-        fast_routing: byId("routing-fast").checked,
-        hedge_max: Number(byId("routing-hedge-max").value || 2),
-        coordination_level: Number(byId("routing-coordination-level").value || 3),
-        soft_interval_ms: byId("routing-soft-interval").value === "" ? 50 : Number(byId("routing-soft-interval").value),
+        failover_max_attempts: Number(byId("routing-failover-attempts").value || 3),
       },
       upstreams,
     };
@@ -1537,11 +1509,7 @@ function renderAdminScript(version) {
     renderPromptContextDashboard();
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
-    byId("routing-hedge").checked = r.hedge_enabled === true;
-    byId("routing-fast").checked = r.fast_routing === true;
-    byId("routing-hedge-max").value = r.hedge_max || 2;
-    byId("routing-coordination-level").value = r.coordination_level ?? 3;
-    byId("routing-soft-interval").value = r.soft_interval_ms ?? 50;
+    byId("routing-failover-attempts").value = r.failover_max_attempts || 3;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
   }
 

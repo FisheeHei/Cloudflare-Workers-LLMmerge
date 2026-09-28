@@ -16,7 +16,7 @@ LLM-merge 是运行在 Cloudflare Workers 或 Pages Advanced Mode 上的单文�
 - 协议：OpenAI Chat/Completions/Embeddings、Responses、Anthropic Messages。
 - Responses：`store`、`previous_response_id`、响应查询/取消，以及 `/v1/responses/compact`。
 - 上游：启用/停用、模型和路径白名单、优先级、权重、故障转移和冷却。
-- 路由：负载均衡、客户端 Key 亲和、跨边缘错峰、Hedged Request、Gateway Fast。
+- 路由：负载均衡、客户端 Key 亲和、串行故障转移和冷却。
 - 上游适配：支持通用 OpenAI-compatible 上游，并兼容 NVIDIA NIM 等常见服务的参数和推理字段。
 - 注入：系统提示词、全局上下文、上下文片段、关键词/模型匹配、客户端范围和字符上限。
 - 管理：模型刷新、上游健康检查、指定模型测速、客户端 Key、导入/导出、实时日志和统计。
@@ -31,6 +31,10 @@ Worker 部署使用 `wrangler.worker.toml`：
 wrangler deploy --config wrangler.worker.toml
 ```
 
+### 变量与重新部署
+
+Worker 重新部署会生成新版本，但不会自动清空 KV、D1、DO 或 Analytics Engine 数据。Wrangler 配置已设置 `keep_vars = true`，部署时保留控制台中已有的明文变量；Secrets 也会保留，除非显式删除。Pages 的变量和绑定仍在项目设置中管理，绑定变更后需要重新部署。
+
 ### Pages Advanced Mode
 
 将 `_worker.js` 设为 Advanced Mode 入口。项目不需要构建步骤；生产环境的 Variables、Secrets 和 Bindings 在 Cloudflare Pages 项目设置中配置。
@@ -38,7 +42,6 @@ wrangler deploy --config wrangler.worker.toml
 Pages 与 Worker 使用相同的绑定名：
 
 - `llmerge`：主状态存储，推荐绑定 D1。
-- `ROUTE_COORDINATOR`：Durable Object，用于跨边缘请求错峰。
 - `KV`：可选的兼容存储和 D1/DO 降级快照。
 - `ANALYTICS`：可选的 Analytics Engine 统计写入。
 
@@ -64,7 +67,7 @@ CREATE TABLE IF NOT EXISTS llmmerge_store (
 );
 ```
 
-`ROUTE_COORDINATOR` 只保存短期调度状态，不代理模型请求，也不保存 Prompt、Context 或上游 Token。没有 `ROUTE_COORDINATOR` 时仍可运行，但跨边缘节点只能依赖各 isolate 的本地状态，不能做到严格的全局错峰。
+`ROUTE_COORDINATOR` 是旧配置中的兼容变量；当前路由不再依赖跨边缘调度 DO。
 
 ## 必要配置
 
@@ -192,11 +195,10 @@ const response = await client.chat.completions.create({
 
 - `failover`：失败、超时或冷却时尝试其他上游。
 - `load_balance`：结合权重、活跃请求、客户端 Key 亲和和近期延迟排序。
-- `coordination_level`：控制对活跃/预留请求的分散程度，默认 `3`。
-- `soft_interval_ms`：同一上游被多个 Key 同时选中时的建议错峰间隔，默认 `50`；设为 `0` 可关闭。
-- `ROUTE_COORDINATOR`：跨 Cloudflare 边缘协调短期预约，模型请求仍从各自边缘直连上游。
+- `failover_max_attempts`：串行故障转移的最大尝试数，默认 `3`，最多 `5`。
+- 流式候选会在首个可见输出超时时自动切换；首个可见输出后不重放。
 - 流式故障转移只发生在首个可见输出前；已经输出给客户端后不会重放，避免重复文本或工具调用。
-- `Hedged Request` 和 `Gateway Fast` 会并行/竞速多个候选。多账号池或并发受限的上游通常应关闭它们，以免主动增加同一模型的并发。
+- 每个流式候选都有首个可见输出时限；收到响应头但持续没有真实输出时也会切换。
 - SSE 每 5 秒发送保活注释，帮助中间代理维持连接；保活不是模型输出。
 
 健康检查只验证上游 `/models`，不代表某个模型一定可用。要验证具体模型，请在管理后台执行模型测速。长推理模型可能需要较长首包时间，网关会在首包阶段使用相应超时并在失败时尝试备用上游。

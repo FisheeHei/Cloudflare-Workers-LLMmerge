@@ -16,7 +16,7 @@ LLM-merge is a single-file LLM gateway for Cloudflare Workers and Pages Advanced
 - OpenAI Chat, Completions, Embeddings, Responses, and Anthropic Messages compatibility.
 - Responses `store`, `previous_response_id`, response retrieval/cancel, and `/v1/responses/compact`.
 - Upstream enable/disable, model and path allowlists, priority, weight, failover, and cooldown.
-- Load balancing, client-key affinity, cross-edge staggering, Hedged Request, and Gateway Fast.
+- Load balancing, client-key affinity, serial failover, and cooldown.
 - Upstream adapters for generic OpenAI-compatible services, including NVIDIA NIM and common reasoning fields.
 - System prompt, global context, context fragments, keyword/model matching, client scopes, and character limits.
 - Model refresh, upstream health checks, model speed tests, client-key management, import/export, logs, and statistics.
@@ -31,6 +31,10 @@ Deploy the Worker configuration with:
 wrangler deploy --config wrangler.worker.toml
 ```
 
+### Variables and redeploys
+
+A Worker redeploy creates a new version; it does not reset KV, D1, Durable Objects, or Analytics Engine data. Both Wrangler configs set `keep_vars = true`, so dashboard variables are kept on deploy. Secrets are also preserved unless explicitly deleted. Pages variables and bindings remain managed in the project settings, and binding changes take effect after a redeploy.
+
 ### Pages Advanced Mode
 
 Use `_worker.js` as the Advanced Mode entry file. No build step is required. Configure production Variables, Secrets, and Bindings in the Cloudflare Pages project settings.
@@ -38,7 +42,6 @@ Use `_worker.js` as the Advanced Mode entry file. No build step is required. Con
 Use the same binding names in Pages and Workers:
 
 - `llmerge`: primary state storage; D1 is recommended.
-- `ROUTE_COORDINATOR`: Durable Object for cross-edge request staggering.
 - `KV`: optional compatibility storage and D1/DO degraded snapshot.
 - `ANALYTICS`: optional Analytics Engine write binding.
 
@@ -64,7 +67,7 @@ CREATE TABLE IF NOT EXISTS llmmerge_store (
 );
 ```
 
-`ROUTE_COORDINATOR` stores only short-lived scheduling state. It does not proxy model requests or store prompts, context, or upstream tokens. Without it, the gateway still works, but coordination is limited to per-isolate state and is not globally strict across edges.
+`ROUTE_COORDINATOR` is retained only as a legacy configuration name; routing no longer depends on cross-edge scheduling.
 
 ## Required Configuration
 
@@ -192,11 +195,10 @@ const response = await client.chat.completions.create({
 
 - `failover`: try another upstream after failure, timeout, or cooldown.
 - `load_balance`: rank by weight, active requests, client-key affinity, and recent latency.
-- `coordination_level`: controls spreading away from active/reserved requests; default is `3`.
-- `soft_interval_ms`: advisory staggering when several keys choose the same upstream; default is `50`, and `0` disables it.
-- `ROUTE_COORDINATOR`: cross-edge short reservations; model requests still go directly from each edge to the upstream.
+- `failover_max_attempts`: maximum serial failover attempts, default `3`, capped at `5`.
+- Streaming candidates fail over when no visible output arrives before the deadline; output is never replayed after it starts.
 - Streaming failover only happens before the first visible output. Once bytes reach the client, the gateway never replays the request, avoiding duplicate text or tool calls.
-- `Hedged Request` and `Gateway Fast` race multiple candidates. For a multi-account pool or concurrency-limited provider, they are usually best disabled because they intentionally increase concurrency.
+- Each streaming candidate has a first-visible-output deadline; a response that sends headers but no real output can fail over.
 - SSE sends a keepalive comment every five seconds to keep proxy connections open; keepalives are not model output.
 
 Health checks only verify the upstream `/models` endpoint and do not prove that a specific model is ready. Use the admin speed test for model-level verification. Long-reasoning models may have slow first bytes, so the gateway uses an appropriate first-byte timeout and can try a fallback upstream.

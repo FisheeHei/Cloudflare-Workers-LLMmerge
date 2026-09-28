@@ -72,6 +72,8 @@ const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
 const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
+const DEFAULT_FAILOVER_MAX_ATTEMPTS = 3;
+const MAX_FAILOVER_ATTEMPTS = 5;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const MAX_RETRY_AFTER_COOLDOWN_SECONDS = 10 * 60;
 const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
@@ -86,8 +88,6 @@ const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 const SSE_KEEPALIVE_MS = 5000;
 const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
 // Keep upstream staggering advisory: a crowded account must not turn into an unbounded gateway queue.
-const MAX_UPSTREAM_DISPATCH_WAIT_MS = 1000;
-const ROUTE_COORDINATOR_TIMEOUT_MS = 1500;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
@@ -377,12 +377,6 @@ let _activeUpstreams = {};
 let _activeUpstreamClients = {};
 let _activeUpstreamEpoch = 0;
 const _activeUpstreamControllers = new Set();
-// ponytail: isolate-local soft reservations; DO only if cross-edge fairness ever matters
-let _upstreamReservations = {};
-// ponytail: stagger same-upstream dispatches without delaying already-spread requests.
-let _upstreamDispatchAt = {};
-let _upstreamDispatchClients = {};
-const _routeSelectionTails = {};
 // ponytail: per-isolate active Responses streams, keyed by response id for cancel support
 const _activeResponses = new Map();
 // ponytail: short runtime cache saves KV + decrypt on hot path; config save invalidates it
@@ -417,14 +411,6 @@ function pickStateBackend(env) {
   return { kind: "memory", backend: null, binding: "" };
 }
 
-function pickRouteCoordinator(env) {
-  if (String(env?.GLOBAL_ROUTE_COORDINATION || "").toLowerCase() === "false") return null;
-  const configured = env?.ROUTE_COORDINATOR;
-  if (configured && typeof configured.idFromName === "function" && typeof configured.get === "function") return configured;
-  const stateBackend = pickStateBackend(env);
-  return stateBackend.kind === "do" ? stateBackend.backend : null;
-}
-
 function decodeStateValue(value, type) {
   const wantJson = type === "json" || type?.type === "json";
   return wantJson ? safeJson(value) : value;
@@ -446,6 +432,10 @@ function createStateStore(env) {
   if (backend.kind === "do") return createDoStateStore(backend.backend, env?.KV || null);
   if (backend.kind === "kv") return createKvStateStore(backend.backend);
   return createMemoryStateStore();
+}
+
+function stateSupportsRoutePersistence(state) {
+  return state?.kind === "d1" || state?.kind === "do";
 }
 
 // ponytail: one generic key/value table keeps migration and admin code trivial.
@@ -473,7 +463,7 @@ function createD1StateStore(d1, kv) {
         store.degraded = false;
         const value = row?.value ?? null;
         if (value !== null) return decodeStateValue(value, type);
-        if (!kv) return null;
+        if (!kv || !isDurableStateKey(key)) return null;
         const legacy = await kv.get(key, type).catch(() => null);
         if (legacy === null || legacy === undefined) return null;
         if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
@@ -567,7 +557,7 @@ function createDoStateStore(namespace, kv) {
       const payload = response.ok ? await response.json() : null;
       const value = payload?.value ?? null;
       if (value !== null) return decodeStateValue(value, type);
-      if (!kv) return null;
+      if (!kv || !isDurableStateKey(key)) return null;
       const legacy = await kv.get(key, type).catch(() => null);
       if (legacy === null || legacy === undefined) return null;
       if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
@@ -589,28 +579,6 @@ function createDoStateStore(namespace, kv) {
   return store;
 }
 
-function createDoDispatchCoordinator(namespace) {
-  if (!namespace) return null;
-  return {
-    async reserve(upstreamName, intervalMs, client, signal, maxWaitMs = MAX_UPSTREAM_DISPATCH_WAIT_MS) {
-      const id = namespace.idFromName(`llmmerge-dispatch:${String(upstreamName)}`);
-      const stub = namespace.get(id);
-      const response = await stub.fetch("https://llmmerge-dispatch/dispatch", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          interval_ms: intervalMs,
-          max_wait_ms: maxWaitMs,
-          client: String(client?.key || client?.id || client?.name || "gateway"),
-        }),
-        signal,
-      });
-      if (!response.ok) throw new Error(`Route coordinator returned ${response.status}.`);
-      return response.json();
-    },
-  };
-}
-
 export class LlmMergeStore {
   constructor(state, env) {
     this.state = state;
@@ -618,26 +586,6 @@ export class LlmMergeStore {
 
   async fetch(request) {
     const url = new URL(request.url);
-    if (url.pathname === "/dispatch" && request.method === "POST") {
-      const payload = await request.json().catch(() => ({}));
-      const intervalMs = Math.max(0, Math.min(2000, Number(payload?.interval_ms) || 0));
-      const maxWaitMs = Number(payload?.max_wait_ms);
-      const now = Date.now();
-      const previousNextAt = Number(await this.state.storage.get("dispatch:next_at")) || 0;
-      const scheduledAt = Math.max(now, previousNextAt);
-      const delayMs = Math.max(0, scheduledAt - now);
-      if (Number.isFinite(maxWaitMs) && maxWaitMs >= 0 && delayMs > maxWaitMs) {
-        return new Response(JSON.stringify({ accepted: false, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: previousNextAt }), {
-          headers: JSON_HEADERS,
-        });
-      }
-      const nextAt = scheduledAt + intervalMs;
-      await this.state.storage.put("dispatch:next_at", String(nextAt), { expirationTtl: 120 });
-      await this.state.storage.put("dispatch:last_client", String(payload?.client || "gateway"), { expirationTtl: 120 });
-      return new Response(JSON.stringify({ accepted: true, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: nextAt }), {
-        headers: JSON_HEADERS,
-      });
-    }
     const key = url.searchParams.get("key") || "";
     if (!key) return new Response("missing key", { status: 400 });
     if (request.method === "GET") {
@@ -674,7 +622,6 @@ function createApp(env) {
 
   const adminPath = normalizeAdminPath(env.ADMIN_PATH || "/llmmerge-admin");
   const appState = createStateStore(env);
-  const routeCoordinator = createDoDispatchCoordinator(pickRouteCoordinator(env));
 
   _cachedApp = {
     adminPath,
@@ -702,7 +649,6 @@ function createApp(env) {
     envUpstreams: parseJsonEnvArray(env.UPSTREAMS_JSON, "UPSTREAMS_JSON"),
     kv: env.KV || null,
     state: appState,
-    routeCoordinator,
     storage: appState.kind,
     workersDailyRequestBudget: parsePositiveInt(env.WORKERS_DAILY_REQUEST_BUDGET, DEFAULT_WORKERS_DAILY_REQUEST_BUDGET),
   };
@@ -2461,12 +2407,15 @@ function normalizeGatewayRouting(routing = {}) {
   const coordination = rawCoordination === undefined || rawCoordination === null || rawCoordination === ""
     ? 3
     : Number(rawCoordination);
+  const legacyAttempts = routing.failover_max_attempts ?? routing.hedge_max;
   return {
     coordination_level: Number.isFinite(coordination) ? Math.max(0, Math.min(5, Math.floor(coordination))) : 3,
     failover: routing.failover !== false,
-    fast_routing: routing.fast_routing === true,
-    hedge_enabled: routing.hedge_enabled === true,
-    hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
+    failover_max_attempts: Math.max(1, Math.min(MAX_FAILOVER_ATTEMPTS, parsePositiveInt(legacyAttempts, DEFAULT_FAILOVER_MAX_ATTEMPTS))),
+    // Legacy fields remain readable in saved configs, but parallel racing is intentionally disabled.
+    fast_routing: false,
+    hedge_enabled: false,
+    hedge_max: 1,
     soft_interval_ms: parseNonNegativeInt(routing.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000),
     load_balance: routing.load_balance !== false,
   };
@@ -2768,7 +2717,6 @@ async function buildRuntimeConfig(app) {
     clients: app.envClients.map(normalizeClient),
     kv: app.kv,
     state: app.state,
-    routeCoordinator: app.routeCoordinator,
     modelCacheTtl: editable.settings.model_cache_ttl,
     requestTimeoutMs: editable.settings.request_timeout_ms,
     streamIdleTimeoutMs: editable.settings.stream_idle_timeout_ms,
@@ -5197,41 +5145,16 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   if (!singleUpstream) await hydrateUpstreamState(runtime, candidates, model);
   let attempts = singleUpstream ? candidates : null;
   let maxAttempts = singleUpstream ? 1 : 0;
-  let initialReservation = null;
-  let initialDispatchContested = false;
-  const releaseSelection = singleUpstream
-    ? () => {}
-    : await acquireRouteSelectionLock(`${pathname}\n${model}`, signal);
-  let selectionReleased = false;
-  const releaseSelectionOnce = () => {
-    if (selectionReleased) return;
-    selectionReleased = true;
-    releaseSelection();
-  };
   try {
     if (!singleUpstream) {
       attempts = orderUpstreams(runtime, candidates, model, client);
       maxAttempts = runtime.routing.failover === false
         ? 1
-        : Math.min(attempts.length, runtime.routing.hedge_max || 2);
-      if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
-        const used = new Set(hedgedAttempts.map(upstreamKey));
-        const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-        timing.route_selected_ms = Date.now() - routingStartedAt;
-        markGatewayTrace(trace, "route_selected");
-        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
-        releaseSelectionOnce();
-        return result;
-      }
+        : Math.min(attempts.length, runtime.routing.failover_max_attempts || DEFAULT_FAILOVER_MAX_ATTEMPTS);
     }
-    initialDispatchContested = upstreamHasCompetition(attempts[0]);
-    initialReservation = reserveUpstreams([attempts[0]]);
     timing.route_selected_ms = Date.now() - routingStartedAt;
     markGatewayTrace(trace, "route_selected");
-    releaseSelectionOnce();
   } catch (error) {
-    releaseSelectionOnce();
     const routeError = normalizeThrownError(error);
     routeError.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "route_failed"));
     throw routeError;
@@ -5242,32 +5165,24 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     const upstream = attempts[index];
     const isLast = index === maxAttempts - 1;
     let upstreamResult = null;
-    const dispatchContested = index === 0 ? initialDispatchContested : upstreamHasCompetition(upstream);
-    const releaseReservation = index === 0 ? initialReservation : reserveUpstreams([upstream]);
-
     try {
       const dispatchStartedAt = Date.now();
       markGatewayTrace(trace, "dispatch_wait_started", { attempt: index + 1, upstream: upstream.name });
-      const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal, dispatchContested);
       timing.dispatch_wait_ms += Date.now() - dispatchStartedAt;
-      if (!dispatch.accepted) {
-        lastError = dispatchQueueFullError(upstream, dispatch.delayMs);
-        markGatewayTrace(trace, "dispatch_limited", { attempt: index + 1, upstream: upstream.name });
-        continue;
-      }
       markGatewayTrace(trace, "dispatch_accepted", { attempt: index + 1, upstream: upstream.name });
       const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         trace, attempt: index + 1,
-        firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
+        firstByteTimeoutMs: streamRequest
+          ? streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts)
+          : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
-      releaseSelectionOnce();
       upstreamResult = await upstreamPromise;
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
-        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream));
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts));
         response = primed.response;
         upstreamResult.response = response;
         upstreamResult.streamError = primed.error;
@@ -5304,7 +5219,6 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       }
     } catch (error) {
       const upstreamError = normalizeThrownError(error);
-      releaseSelectionOnce();
       await discardUpstreamResponse(upstreamResult, "upstream request failed");
       if (signal?.aborted) {
         const cancelled = httpError(499, "Response cancelled.");
@@ -5323,8 +5237,6 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       if (isLast) {
         break;
       }
-    } finally {
-      releaseReservation();
     }
   }
 
@@ -5349,13 +5261,6 @@ function proxyCandidates(runtime, client, model, pathname) {
 function gatewayErrorResponse(error, traceId) {
   const response = withCorsResponse(json(openAiError(error.message || "Internal error.", mapErrorType(error.statusCode)), error.statusCode || 500));
   return traceResponse(response, traceId, error?.gatewayTrace);
-}
-
-function dispatchQueueFullError(upstream, delayMs) {
-  const error = httpError(503, `Upstream dispatch queue is busy${delayMs ? ` (${delayMs}ms)` : ""}.`);
-  error.upstreamName = upstream?.name || "none";
-  error.dispatchLimited = true;
-  return error;
 }
 
 function traceResponse(response, traceId, trace = null) {
@@ -5429,6 +5334,20 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
   } catch {
     return base;
   }
+}
+
+function streamFirstByteTimeoutMs(runtime, upstream, bodyText, candidateCount) {
+  const timeout = proxyFirstByteTimeoutMs(runtime, upstream, bodyText);
+  if (candidateCount <= 1) return timeout;
+  // A dead key should fail over quickly; known slow NIM reasoning models keep their longer budget.
+  return isNvidiaNimUpstream(upstream) && (() => {
+    try {
+      const model = String(JSON.parse(bodyText || "{}").model || "").toLowerCase();
+      return isGlmModel(model) || isMiniMaxM3Model(model);
+    } catch {
+      return false;
+    }
+  })() ? timeout : Math.min(timeout, 15000);
 }
 
 function applyGatewayPromptContext(bodyText, settings, client) {
@@ -5515,160 +5434,6 @@ function abortUpstreamResponse(result, reason = "response completed") {
   try { result?.abortUpstream?.(reason); } catch {}
 }
 
-function stopHedgeLosers(pending, controllers, winnerIndex) {
-  controllers.forEach((controller, index) => {
-    if (index !== winnerIndex) controller.abort("hedged upstream lost");
-  });
-  pending.forEach(({ promise }) => {
-    void promise.then((result) => discardUpstreamResponse(result, "hedged upstream lost")).catch(() => {});
-  });
-}
-
-async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), injection = null, trace = null }) {
-  const controllers = attempts.map(() => new AbortController());
-  const streamRequest = requestBodyStreams(bodyText);
-  const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
-  const knownTtft = upstreamLatencyScore(attempts[0], model);
-  const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
-  const launchDelay = (index) => runtime.routing.fast_routing === true && index < 2
-    ? index * fastDelayMs
-    : index * hedgeDelayMs;
-  let done = false;
-  const releaseReservation = reserveUpstreams(attempts);
-  const abortHedge = () => controllers.forEach((controller) => controller.abort(signal?.reason || "hedged request cancelled"));
-  if (signal?.aborted) abortHedge();
-  else signal?.addEventListener("abort", abortHedge, { once: true });
-
-  function launchLater(index) {
-    const upstream = attempts[index];
-    return sleep(launchDelay(index), controllers[index].signal).then(async () => {
-      if (done) return { cancelled: true, upstream, index };
-      let result = null;
-      try {
-        const dispatchStartedAt = Date.now();
-        const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, controllers[index].signal);
-        const attemptTiming = {
-          ...timing,
-          dispatch_wait_ms: Date.now() - dispatchStartedAt,
-          upstream_started_ms: Date.now() - routingStartedAt,
-        };
-        if (!dispatch.accepted) return { limited: true, upstream, index, delayMs: dispatch.delayMs, timing: attemptTiming };
-        result = await fetchProxyUpstream({
-          bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
-          trace, attempt: index + 1,
-          firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
-        });
-        if (result.response.ok && streamRequest) {
-          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
-          result.response = primed.response;
-          result.streamError = primed.error;
-          result.streamErrorKind = primed.errorKind || "";
-          result.latency = Date.now() - result.startedAt;
-        }
-        return { ...result, upstream, index, timing: attemptTiming };
-      } catch (error) {
-        await discardUpstreamResponse(result, "hedged upstream request failed");
-        return { error, upstream, index, latency: 0 };
-      }
-    });
-  }
-
-  try {
-    const pending = attempts.map((_, index) => ({ index, promise: launchLater(index) }));
-    let lastResult = null;
-    while (pending.length) {
-      const raced = await Promise.race(pending.map((entry) => entry.promise.then((result) => ({ entry, result }))));
-      if (signal?.aborted) throw httpError(499, "Response cancelled.");
-      pending.splice(pending.indexOf(raced.entry), 1);
-      const result = raced.result;
-      if (result.cancelled) continue;
-      lastResult = result;
-      if (result.error?.statusCode === 499) {
-        done = true;
-        stopHedgeLosers(pending, controllers, -1);
-        throw result.error;
-      }
-      if (result.limited) continue;
-      const retryable = Boolean(result.streamError) || (result.response && await isRetryableUpstreamResponse(result.response));
-      if (result.response && !retryable) {
-        done = true;
-        stopHedgeLosers(pending, controllers, result.index);
-        await clearUpstreamFailure(runtime, result.upstream, model);
-        rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
-        rememberSuccessfulUpstream(result.upstream, model);
-        markGatewayTrace(trace, "response_ready", { attempt: result.index + 1, upstream: result.upstream.name, status: result.response.status });
-        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing, injection, trace: gatewayTraceFields(trace) };
-      }
-      if (result.response) {
-        await discardUpstreamResponse(result, "retryable hedged response");
-      }
-      await markUpstreamFailure(runtime, result.upstream, model, result.response);
-    }
-
-    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal, timing, routingStartedAt, trace });
-    if (fallbackResult?.response) return { ...fallbackResult, attempts: attempts.length + 1, injection };
-    if (fallbackResult?.limited) lastResult = fallbackResult;
-
-    const err = httpError(lastResult?.limited ? 503 : 502, lastResult?.error?.message || (lastResult?.limited ? "All eligible upstream dispatch queues are busy." : "All hedged upstreams failed."));
-    err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
-    err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed"));
-    throw err;
-  } finally {
-    done = true;
-    signal?.removeEventListener("abort", abortHedge);
-    releaseReservation();
-  }
-}
-
-async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), trace = null }) {
-  const upstream = attempts?.[0];
-  if (!upstream || runtime.routing.failover === false) return null;
-  let result = null;
-  const releaseReservation = reserveUpstreams([upstream]);
-  try {
-    const dispatchStartedAt = Date.now();
-    const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal);
-    const fallbackTiming = {
-      ...timing,
-      dispatch_wait_ms: Date.now() - dispatchStartedAt,
-      upstream_started_ms: Date.now() - routingStartedAt,
-    };
-    if (!dispatch.accepted) return { limited: true, upstream, delayMs: dispatch.delayMs, timing: fallbackTiming };
-    result = await fetchProxyUpstream({
-      bodyText, client, pathname, request, runtime, search, signal, upstream,
-      trace, attempt: 1,
-      firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
-    });
-    if (result.response.ok && streamRequest) {
-      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
-      result.response = primed.response;
-      result.streamError = primed.error;
-      result.streamErrorKind = primed.errorKind || "";
-      result.latency = Date.now() - result.startedAt;
-    }
-    const retryable = Boolean(result.streamError) || await isRetryableUpstreamResponse(result.response);
-    if (retryable) {
-      await discardUpstreamResponse(result, "retryable hedged fallback response");
-      await markUpstreamFailure(runtime, upstream, model, result.response);
-      return null;
-    }
-    await clearUpstreamFailure(runtime, upstream, model);
-    rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
-    rememberSuccessfulUpstream(upstream, model);
-    markGatewayTrace(trace, "response_ready", { attempt: 1, upstream: upstream.name, status: result.response.status });
-    return { response: result.response, upstream, abortUpstream: result.abortUpstream, timing: fallbackTiming, trace: gatewayTraceFields(trace) };
-  } catch (error) {
-    const upstreamError = normalizeThrownError(error);
-    await discardUpstreamResponse(result, "hedged fallback failed");
-    if (signal?.aborted) throw httpError(499, "Response cancelled.");
-    if (upstreamError.statusCode === 499) throw upstreamError;
-    await markUpstreamFailure(runtime, upstream, model);
-    return null;
-  } finally {
-    releaseReservation();
-  }
-}
-
 function sleep(ms, signal = null) {
   if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
   if (signal.aborted) return Promise.reject(httpError(499, "Response cancelled."));
@@ -5710,7 +5475,7 @@ function requestBodyStreams(bodyText) {
   try { return JSON.parse(bodyText || "{}").stream === true; } catch { return false; }
 }
 
-async function primeSseResponse(response, hideReasoning = false) {
+async function primeSseResponse(response, hideReasoning = false, timeoutMs = DEFAULT_TIMEOUT_MS) {
   if (!response.body || !(response.headers.get("content-type") || "").includes("text/event-stream")) {
     return { response, error: "" };
   }
@@ -5721,8 +5486,27 @@ async function primeSseResponse(response, hideReasoning = false) {
   let error = "";
   let bufferedBytes = 0;
   const stripText = hideReasoning ? createThinkTagStripper() : null;
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
   for (;;) {
-    const { done, value } = await reader.read();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      try { await reader.cancel("SSE first output timeout"); } catch {}
+      throw new Error("Upstream SSE did not produce visible output before timeout.");
+    }
+    let timer;
+    let readResult;
+    try {
+      readResult = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Upstream SSE first output timeout.")), remaining); }),
+      ]);
+    } catch (error) {
+      try { await reader.cancel("SSE first output timeout"); } catch {}
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    const { done, value } = readResult;
     if (done) break;
     bufferedBytes += value.byteLength;
     if (bufferedBytes > MAX_SSE_PRIME_BYTES) {
@@ -5780,6 +5564,7 @@ function prependResponseChunks(response, reader, chunks) {
   }), { status: response.status, statusText: response.statusText, headers: responseBodyHeaders(response.headers) });
 }
 
+
 function orderUpstreams(runtime, candidates, model, client) {
   if (candidates.length <= 1) {
     return candidates;
@@ -5819,8 +5604,8 @@ function coordinationSort(runtime, items, model, client) {
   const loadBalance = runtime.routing.load_balance !== false;
   const base = loadBalance ? weightedAffinitySort(items, client) : prioritySort(items);
   return base
-    .map((item, index) => ({ item, index, specificity: upstreamModelSpecificity(item, model), pressure: upstreamCoordinationPressure(runtime, item, client), latency: upstreamLatencySortScore(item, model) }))
-    .sort((a, b) => a.specificity - b.specificity || a.pressure - b.pressure || (loadBalance ? a.index - b.index || a.latency - b.latency : a.latency - b.latency || a.index - b.index))
+    .map((item, index) => ({ item, index, specificity: upstreamModelSpecificity(item, model), latency: upstreamLatencySortScore(item, model) }))
+    .sort((a, b) => a.specificity - b.specificity || (loadBalance ? a.index - b.index || a.latency - b.latency : a.latency - b.latency || a.index - b.index))
     .map((entry) => entry.item);
 }
 
@@ -5829,150 +5614,9 @@ function upstreamModelSpecificity(upstream, model) {
   return !models.length || models.includes("*") ? 1 : 0;
 }
 
-function activeUpstreamCount(upstream) {
-  return Number(_activeUpstreams[upstreamKey(upstream)] || 0) || 0;
-}
-
-function upstreamReservationCount(upstream) {
-  return Number(_upstreamReservations[upstreamKey(upstream)] || 0) || 0;
-}
-
-function upstreamHasCompetition(upstream) {
-  return activeUpstreamCount(upstream) > 0 || upstreamReservationCount(upstream) > 0;
-}
-
-function upstreamCoordinationPressure(runtime, upstream, client) {
-  const level = upstreamCoordinationPressureMs(runtime);
-  if (level <= 0) return 0;
-  const capacity = Math.max(1, Number(upstream?.weight) || 1);
-  const pressure = ((activeUpstreamCount(upstream) + upstreamReservationCount(upstream) * 1.5) / capacity) * level;
-  const interval = upstreamSoftIntervalMs(runtime);
-  const recent = _upstreamDispatchClients[upstreamKey(upstream)];
-  const currentClient = String(client?.key || client?.id || client?.name || "gateway");
-  const busy = upstreamHasCompetition(upstream);
-  const crossClient = busy && recent && recent.client !== currentClient && Date.now() - Number(recent.at || 0) < interval;
-  return pressure + (crossClient ? level : 0);
-}
-
 function upstreamLatencySortScore(upstream, model) {
   const latency = upstreamLatencyScore(upstream, model);
   return Number.isFinite(latency) ? latency : Number.MAX_SAFE_INTEGER;
-}
-
-function upstreamCoordinationPressureMs(runtime) {
-  const level = Number(runtime?.routing?.coordination_level ?? 3);
-  return Math.max(0, Math.min(5, Number.isFinite(level) ? Math.floor(level) : 3)) * 500;
-}
-
-function upstreamSoftIntervalMs(runtime) {
-  return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000);
-}
-
-async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
-  const interval = upstreamSoftIntervalMs(runtime);
-  const name = upstreamKey(upstream);
-  if (!interval || !name) return { accepted: true, delayMs: 0 };
-  if (runtime?.routeCoordinator) {
-    const controller = new AbortController();
-    const abort = () => controller.abort(signal?.reason || "request aborted");
-    if (signal?.aborted) abort();
-    else signal?.addEventListener("abort", abort, { once: true });
-    const timeout = setTimeout(() => controller.abort("route coordinator timeout"), ROUTE_COORDINATOR_TIMEOUT_MS);
-    try {
-      const slot = await runtime.routeCoordinator.reserve(name, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
-      const delay = Math.max(0, Number(slot?.delay_ms) || 0);
-      if (slot?.accepted === false || delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) {
-        return { accepted: false, delayMs: delay };
-      }
-      const now = Date.now();
-      _upstreamDispatchAt[name] = Math.max(Number(_upstreamDispatchAt[name] || 0), now + delay + interval);
-      _upstreamDispatchClients[name] = {
-        client: String(client?.key || client?.id || client?.name || "gateway"),
-        at: now,
-      };
-      if (delay > 0) await sleep(delay, signal);
-      if (signal?.aborted) throw httpError(499, "Response cancelled.");
-      return { accepted: true, delayMs: delay };
-    } catch (error) {
-      if (error?.statusCode === 499 || signal?.aborted) throw httpError(499, "Response cancelled.");
-      // ponytail: coordinator is advisory; local scheduling keeps the request alive if DO is unavailable.
-    } finally {
-      clearTimeout(timeout);
-      signal?.removeEventListener("abort", abort);
-    }
-  }
-  const now = Date.now();
-  const scheduled = contested ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
-  const delay = scheduled - now;
-  if (delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) return { accepted: false, delayMs: delay };
-  _upstreamDispatchAt[name] = scheduled + interval;
-  _upstreamDispatchClients[name] = {
-    client: String(client?.key || client?.id || client?.name || "gateway"),
-    at: now,
-  };
-  if (delay > 0) await sleep(delay, signal);
-  if (signal?.aborted) throw httpError(499, "Response cancelled.");
-  return { accepted: true, delayMs: delay };
-}
-
-async function acquireRouteSelectionLock(key, signal = null) {
-  const previous = _routeSelectionTails[key] || Promise.resolve();
-  let releaseCurrent;
-  const current = new Promise((resolve) => { releaseCurrent = resolve; });
-  const gate = previous.then(() => undefined);
-  const tail = gate.then(() => current);
-  _routeSelectionTails[key] = tail;
-  try {
-    await awaitWithSignal(gate, signal);
-  } catch (error) {
-    releaseCurrent();
-    void tail.then(() => {
-      if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
-    });
-    throw error;
-  }
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    releaseCurrent();
-    if (_routeSelectionTails[key] === tail) delete _routeSelectionTails[key];
-  };
-}
-
-function awaitWithSignal(promise, signal) {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(httpError(499, "Response cancelled."));
-  return new Promise((resolve, reject) => {
-    const cleanup = () => signal.removeEventListener("abort", abort);
-    const abort = () => {
-      cleanup();
-      reject(httpError(499, "Response cancelled."));
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    Promise.resolve(promise).then((value) => {
-      cleanup();
-      resolve(value);
-    }, (error) => {
-      cleanup();
-      reject(error);
-    });
-  });
-}
-
-function reserveUpstreams(upstreams) {
-  const names = (upstreams || []).map(upstreamKey).filter(Boolean);
-  names.forEach((name) => { _upstreamReservations[name] = Number(_upstreamReservations[name] || 0) + 1; });
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    names.forEach((name) => {
-      const next = Math.max(0, Number(_upstreamReservations[name] || 0) - 1);
-      if (next) _upstreamReservations[name] = next;
-      else delete _upstreamReservations[name];
-    });
-  };
 }
 
 function upstreamKey(upstream) {
@@ -5982,12 +5626,6 @@ function upstreamKey(upstream) {
 function upstreamLatencyScore(upstream, model) {
   const score = Number(_upstreamLatency[upstreamModelKey(upstream, model)]);
   return Number.isFinite(score) && score > 0 ? score : Number.POSITIVE_INFINITY;
-}
-
-function avoidLastSuccessfulUpstream(items, model) {
-  const last = _lastSuccessfulUpstreamName[String(model || "*")];
-  if (items.length <= 1 || !last || items[0]?.name !== last) return items;
-  return items.slice(1).concat(items[0]);
 }
 
 function rememberSuccessfulUpstream(upstream, model) {
@@ -6069,10 +5707,6 @@ function clearActiveUpstreamState() {
   _activeUpstreamControllers.clear();
   _activeUpstreams = {};
   _activeUpstreamClients = {};
-  _upstreamReservations = {};
-  _upstreamDispatchAt = {};
-  _upstreamDispatchClients = {};
-  Object.keys(_routeSelectionTails).forEach((key) => delete _routeSelectionTails[key]);
   return released;
 }
 
@@ -6107,7 +5741,7 @@ function weightedAffinitySort(items, client) {
 }
 
 async function hydrateUpstreamState(runtime, upstreams, model) {
-  if (!runtime?.state || !upstreams?.length) return;
+  if (!stateSupportsRoutePersistence(runtime?.state) || !upstreams?.length) return;
   const hydrateKey = `${String(model || "*")}\n${upstreams.map(upstreamKey).join("|")}`;
   const hydratedAt = Date.now();
   if (hydratedAt - Number(_upstreamStateHydratedAt[hydrateKey] || 0) < UPSTREAM_STATE_HYDRATE_INTERVAL_MS) return;
@@ -6137,6 +5771,7 @@ async function hydrateUpstreamState(runtime, upstreams, model) {
 }
 
 async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
+  if (!stateSupportsRoutePersistence(runtime?.state)) return;
   try {
     await runtime.state.put(
       await upstreamLatencyStorageKey(key),
@@ -6152,7 +5787,7 @@ async function markUpstreamFailure(runtime, upstream, model, response = null) {
   const ttl = retryAfterCooldownSeconds(response, runtime.upstreamCooldownTtl);
   const status = { until: Date.now() + ttl * 1000 };
   _upstreamCooldowns[key] = status;
-  if (runtime.state) {
+  if (stateSupportsRoutePersistence(runtime.state)) {
     try {
       await runtime.state.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: ttl });
     } catch {}
@@ -6163,7 +5798,7 @@ async function clearUpstreamFailure(runtime, upstream, model) {
   const key = upstreamModelKey(upstream, model);
   const hadCooldown = Boolean(_upstreamCooldowns[key]);
   delete _upstreamCooldowns[key];
-  if (hadCooldown && runtime.state) {
+  if (hadCooldown && stateSupportsRoutePersistence(runtime.state)) {
     try { await runtime.state.delete(await upstreamCooldownStorageKey(key)); } catch {}
   }
 }
