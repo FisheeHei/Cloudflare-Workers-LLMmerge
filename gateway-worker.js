@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-30-session-switch-1";
+const VERSION = "v26-09-30-dashboard-layout-1";
 
 export default {
   async fetch(request, env, ctx) {

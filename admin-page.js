@@ -250,15 +250,19 @@ function renderAdminStyle() {
     .upstream-live-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
     .upstream-live-summary strong { color: var(--ink); }
     .upstream-live-summary-list { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .connection-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0 0 16px; }
-    .connection-item { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); }
+    .connection-strip { display: grid; grid-template-columns: minmax(180px, .85fr) minmax(240px, 1.15fr) minmax(300px, 1.4fr); gap: 10px; margin: 0 0 16px; align-items: stretch; }
+    .connection-item { min-width: 0; min-height: 104px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); display: grid; grid-template-rows: auto auto 1fr; align-content: start; }
     .connection-item.good { border-color: #b7dec8; background: #f2fbf5; }
     .connection-item.warn { border-color: #f0d49b; background: #fffaf0; }
     .connection-item.bad { border-color: #efb4b4; background: #fff5f5; }
     .connection-item-label { display: block; color: var(--muted); font-size: 11px; }
     .connection-item strong { display: block; margin-top: 4px; color: var(--ink); font-size: 15px; }
-    .connection-item .note { display: block; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    @media (max-width: 760px) { .connection-strip { grid-template-columns: 1fr; } }
+    .connection-item .note { display: block; margin-top: 4px; overflow-wrap: anywhere; line-height: 1.45; }
+    @media (min-width: 761px) and (max-width: 1100px) {
+      .connection-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #connection-recent { grid-column: 1 / -1; }
+    }
+    @media (max-width: 760px) { .connection-strip { grid-template-columns: 1fr; } .connection-item { min-height: 0; } }
 
     .key-output {
       margin-top: 12px; padding: 14px; background: var(--surface-active);

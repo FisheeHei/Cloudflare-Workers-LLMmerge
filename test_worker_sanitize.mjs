@@ -903,7 +903,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-session-switch-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-dashboard-layout-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
