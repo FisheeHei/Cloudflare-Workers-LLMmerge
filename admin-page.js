@@ -1768,7 +1768,7 @@ function renderAdminScript(version) {
     const items = Array.isArray(source.context_items) ? source.context_items : (Array.isArray(source.items) ? source.items : []);
     return {
       global_context: text(source.global_context || source.context_text || ""),
-      global_context_clients: source.global_context_clients === undefined
+      global_context_clients: source.global_context_clients == null
         ? ["*"]
         : normalizeImportList(source.global_context_clients),
       context_always_clients: normalizeImportList(source.context_always_clients),

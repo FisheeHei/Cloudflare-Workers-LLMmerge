@@ -2469,8 +2469,8 @@ function normalizeGatewaySettings(settings = {}, app) {
     system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
     subagent_prompt_clients: normalizeStringArray(settings.subagent_prompt_clients),
     global_context: String(settings.global_context || settings.context_prompt || ""),
-    // Missing keeps legacy full-context behavior; an explicit [] means on-demand only.
-    global_context_clients: settings.global_context_clients === undefined
+    // Missing/null keeps legacy full-context behavior; an explicit [] means on-demand only.
+    global_context_clients: settings.global_context_clients == null
       ? ["*"]
       : normalizeStringArray(settings.global_context_clients),
     context_always_clients: normalizeStringArray(settings.context_always_clients),
