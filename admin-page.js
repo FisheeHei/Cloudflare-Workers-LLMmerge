@@ -775,6 +775,7 @@ function renderAdminMarkup(origin, version) {
         <div class="field span-3">
           <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb (\u9ed8\u8ba4\u5f00)</label>
         </div>
+        <div class="field span-3"><label>\u6700\u591a\u6545\u969c\u5207\u6362\u6b21\u6570</label><input id="routing-failover-attempts" type="number" min="1" max="5" placeholder="3"></div>
       </div>
       <div class="row">
         <div class="field span-3"><label>\u4e0a\u6e38\u534f\u8c03\u5f3a\u5ea6 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"><span class="note">\u8d8a\u9ad8\u8d8a\u5206\u6563\u6d3b\u8dc3\u8bf7\u6c42</span></div>
@@ -1505,6 +1506,7 @@ function renderAdminScript(version) {
       routing: {
         load_balance: byId("routing-load-balance").checked,
         failover: byId("routing-failover").checked,
+        failover_max_attempts: Number(byId("routing-failover-attempts").value || 3),
         hedge_enabled: byId("routing-hedge").checked,
         fast_routing: byId("routing-fast").checked,
         hedge_max: Number(byId("routing-hedge-max").value || 2),
@@ -1537,6 +1539,7 @@ function renderAdminScript(version) {
     renderPromptContextDashboard();
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
+    byId("routing-failover-attempts").value = r.failover_max_attempts || 3;
     byId("routing-hedge").checked = r.hedge_enabled === true;
     byId("routing-fast").checked = r.fast_routing === true;
     byId("routing-hedge-max").value = r.hedge_max || 2;

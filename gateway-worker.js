@@ -72,6 +72,8 @@ const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
 const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
+const DEFAULT_FAILOVER_MAX_ATTEMPTS = 3;
+const MAX_FAILOVER_ATTEMPTS = 5;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const MAX_RETRY_AFTER_COOLDOWN_SECONDS = 10 * 60;
 const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
@@ -112,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-15-workers-limits-1";
+const VERSION = "v26-09-29-reliable-failover-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -448,6 +450,10 @@ function createStateStore(env) {
   return createMemoryStateStore();
 }
 
+function stateSupportsRoutePersistence(state) {
+  return state?.kind === "d1" || state?.kind === "do";
+}
+
 // ponytail: one generic key/value table keeps migration and admin code trivial.
 function ensureD1Schema(d1) {
   _d1SchemaReady ||= d1.prepare(`CREATE TABLE IF NOT EXISTS ${D1_STORE_TABLE} (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)`).run().then(() => true).catch((error) => {
@@ -473,7 +479,7 @@ function createD1StateStore(d1, kv) {
         store.degraded = false;
         const value = row?.value ?? null;
         if (value !== null) return decodeStateValue(value, type);
-        if (!kv) return null;
+        if (!kv || !isDurableStateKey(key)) return null;
         const legacy = await kv.get(key, type).catch(() => null);
         if (legacy === null || legacy === undefined) return null;
         if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
@@ -567,7 +573,7 @@ function createDoStateStore(namespace, kv) {
       const payload = response.ok ? await response.json() : null;
       const value = payload?.value ?? null;
       if (value !== null) return decodeStateValue(value, type);
-      if (!kv) return null;
+      if (!kv || !isDurableStateKey(key)) return null;
       const legacy = await kv.get(key, type).catch(() => null);
       if (legacy === null || legacy === undefined) return null;
       if (isDurableStateKey(key)) await store.put(key, typeof legacy === "string" ? legacy : JSON.stringify(legacy)).catch(() => {});
@@ -2461,9 +2467,11 @@ function normalizeGatewayRouting(routing = {}) {
   const coordination = rawCoordination === undefined || rawCoordination === null || rawCoordination === ""
     ? 3
     : Number(rawCoordination);
+  const legacyAttempts = routing.failover_max_attempts ?? routing.hedge_max;
   return {
     coordination_level: Number.isFinite(coordination) ? Math.max(0, Math.min(5, Math.floor(coordination))) : 3,
     failover: routing.failover !== false,
+    failover_max_attempts: Math.max(1, Math.min(MAX_FAILOVER_ATTEMPTS, parsePositiveInt(legacyAttempts, DEFAULT_FAILOVER_MAX_ATTEMPTS))),
     fast_routing: routing.fast_routing === true,
     hedge_enabled: routing.hedge_enabled === true,
     hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
@@ -5213,7 +5221,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       attempts = orderUpstreams(runtime, candidates, model, client);
       maxAttempts = runtime.routing.failover === false
         ? 1
-        : Math.min(attempts.length, runtime.routing.hedge_max || 2);
+        : Math.min(attempts.length, runtime.routing.failover_max_attempts || DEFAULT_FAILOVER_MAX_ATTEMPTS);
       if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
         const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
         const used = new Set(hedgedAttempts.map(upstreamKey));
@@ -5259,7 +5267,9 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         trace, attempt: index + 1,
-        firstByteTimeoutMs: streamRequest ? undefined : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
+        firstByteTimeoutMs: streamRequest
+          ? streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts)
+          : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
       releaseSelectionOnce();
@@ -5267,7 +5277,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
-        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream));
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts));
         response = primed.response;
         upstreamResult.response = response;
         upstreamResult.streamError = primed.error;
@@ -5428,6 +5438,19 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
       : base;
   } catch {
     return base;
+  }
+}
+
+function streamFirstByteTimeoutMs(runtime, upstream, bodyText, candidateCount) {
+  const timeout = proxyFirstByteTimeoutMs(runtime, upstream, bodyText);
+  if (candidateCount <= 1) return timeout;
+  try {
+    const model = String(JSON.parse(bodyText || "{}").model || "").toLowerCase();
+    return isNvidiaNimUpstream(upstream) && (isGlmModel(model) || isMiniMaxM3Model(model))
+      ? timeout
+      : Math.min(timeout, 15000);
+  } catch {
+    return Math.min(timeout, 15000);
   }
 }
 
@@ -5710,7 +5733,7 @@ function requestBodyStreams(bodyText) {
   try { return JSON.parse(bodyText || "{}").stream === true; } catch { return false; }
 }
 
-async function primeSseResponse(response, hideReasoning = false) {
+async function primeSseResponse(response, hideReasoning = false, timeoutMs = DEFAULT_TIMEOUT_MS) {
   if (!response.body || !(response.headers.get("content-type") || "").includes("text/event-stream")) {
     return { response, error: "" };
   }
@@ -5721,8 +5744,27 @@ async function primeSseResponse(response, hideReasoning = false) {
   let error = "";
   let bufferedBytes = 0;
   const stripText = hideReasoning ? createThinkTagStripper() : null;
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
   for (;;) {
-    const { done, value } = await reader.read();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      try { await reader.cancel("SSE first output timeout"); } catch {}
+      throw new Error("Upstream SSE did not produce visible output before timeout.");
+    }
+    let timer;
+    let result;
+    try {
+      result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Upstream SSE first output timeout.")), remaining); }),
+      ]);
+    } catch (error) {
+      try { await reader.cancel("SSE first output timeout"); } catch {}
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    const { done, value } = result;
     if (done) break;
     bufferedBytes += value.byteLength;
     if (bufferedBytes > MAX_SSE_PRIME_BYTES) {
@@ -6107,7 +6149,7 @@ function weightedAffinitySort(items, client) {
 }
 
 async function hydrateUpstreamState(runtime, upstreams, model) {
-  if (!runtime?.state || !upstreams?.length) return;
+  if (!stateSupportsRoutePersistence(runtime?.state) || !upstreams?.length) return;
   const hydrateKey = `${String(model || "*")}\n${upstreams.map(upstreamKey).join("|")}`;
   const hydratedAt = Date.now();
   if (hydratedAt - Number(_upstreamStateHydratedAt[hydrateKey] || 0) < UPSTREAM_STATE_HYDRATE_INTERVAL_MS) return;
@@ -6137,6 +6179,7 @@ async function hydrateUpstreamState(runtime, upstreams, model) {
 }
 
 async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
+  if (!stateSupportsRoutePersistence(runtime?.state)) return;
   try {
     await runtime.state.put(
       await upstreamLatencyStorageKey(key),
@@ -6152,7 +6195,7 @@ async function markUpstreamFailure(runtime, upstream, model, response = null) {
   const ttl = retryAfterCooldownSeconds(response, runtime.upstreamCooldownTtl);
   const status = { until: Date.now() + ttl * 1000 };
   _upstreamCooldowns[key] = status;
-  if (runtime.state) {
+  if (stateSupportsRoutePersistence(runtime.state)) {
     try {
       await runtime.state.put(await upstreamCooldownStorageKey(key), JSON.stringify(status), { expirationTtl: ttl });
     } catch {}
@@ -6163,7 +6206,7 @@ async function clearUpstreamFailure(runtime, upstream, model) {
   const key = upstreamModelKey(upstream, model);
   const hadCooldown = Boolean(_upstreamCooldowns[key]);
   delete _upstreamCooldowns[key];
-  if (hadCooldown && runtime.state) {
+  if (hadCooldown && stateSupportsRoutePersistence(runtime.state)) {
     try { await runtime.state.delete(await upstreamCooldownStorageKey(key)); } catch {}
   }
 }

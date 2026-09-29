@@ -1,5 +1,6 @@
 name = "llm-gateway"
 compatibility_date = "2026-06-29"
+keep_vars = true
 
 # ponytail: keep this file local-only for `wrangler pages dev`.
 # Do not set `pages_build_output_dir` here, so Pages production config stays managed in Cloudflare.

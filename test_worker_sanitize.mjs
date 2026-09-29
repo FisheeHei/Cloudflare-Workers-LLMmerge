@@ -897,7 +897,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-15-workers-limits-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-29-reliable-failover-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -917,6 +917,7 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-a
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
 assert.equal(adminPage.includes("routing-fast"), true);
+assert.equal(adminPage.includes("routing-failover-attempts"), true);
 assert.equal(adminPage.includes("routing-coordination-level"), true);
 assert.equal(adminPage.includes("translator-hero"), false);
 assert.equal(adminPage.includes("translator-progress-panel"), false);
@@ -2306,15 +2307,16 @@ assert.equal(exported.upstreams[1].base_url, "https://api.cloudflare.com/client/
 
 const waitUntilTasks = [];
 const kvPutsBeforeWaitUntil = kvPuts.length;
-await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+const waitUntilResp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   method: "POST",
   headers: { authorization: "Bearer sk-test", "content-type": "application/json" },
   body: JSON.stringify({ model: "qwen3-throttle-check", messages: [] }),
 }), env, { waitUntil(task) { waitUntilTasks.push(task); } });
+assert.equal(waitUntilResp.status, 200);
 assert.equal(waitUntilTasks.length > 0, true);
 await Promise.all(waitUntilTasks);
-assert.equal(kvPuts.length > kvPutsBeforeWaitUntil, true);
-assert.equal(kvPuts.some((key) => key.startsWith("state:latency:")), true);
+assert.equal(kvPuts.length >= kvPutsBeforeWaitUntil, true);
+assert.equal(kvPuts.some((key) => key.startsWith("state:latency:")), false);
 
 const analyticsTasks = [];
 const kvPutsBeforeAnalytics = kvPuts.length;
@@ -2336,7 +2338,7 @@ await Promise.all(analyticsTasks);
 assert.equal(analyticsPoints.length > 0, true);
 assert.equal(analyticsPoints.at(-1).blobs[3], "qwen3-analytics-check");
 assert.equal(analyticsPoints.at(-1).doubles[2] > 0, true);
-assert.equal(kvPuts.length > kvPutsBeforeAnalytics, true);
+assert.equal(kvPuts.length, kvPutsBeforeAnalytics);
 const realDateNow = Date.now;
 const mirroredNow = realDateNow() + 3 * 60 * 1000;
 Date.now = () => mirroredNow;
@@ -2709,7 +2711,7 @@ assert.equal(manualSpeed.results.filter((r) => r.ok).length, 3);
 assert.equal(manualSpeed.results.find((r) => r.name === "stream").metric, "first_output");
 assert.equal(speedStreamHits.includes("cancel"), true);
 assert.equal(speedBodies.at(-1).stream, true);
-assert.equal([...speedStore.keys()].some((key) => key.startsWith("state:latency:")), true);
+assert.equal([...speedStore.keys()].some((key) => key.startsWith("state:latency:")), false);
 const latencyWorker = await import(pathToFileURL(process.cwd() + "/_worker.js").href + "?latency-state");
 const latencyChoiceStart = speedHits.length;
 const latencyChoiceResp = await latencyWorker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -3671,8 +3673,8 @@ const retryAfterResp = await worker.default.fetch(new Request("https://gw.test/v
 }), retryAfterEnv);
 assert.equal(retryAfterResp.headers.get("x-llm-gateway-upstream"), "retry-fallback");
 assert.equal(Date.now() - retryAfterStarted < 1500, true);
-const retryAfterCooldown = JSON.parse([...retryAfterStore.entries()].find(([key]) => key.startsWith("state:cooldown:"))[1]);
-assert.equal(Number(retryAfterCooldown.until) - retryAfterStarted >= 110000, true);
+assert.deepEqual(retryAfterHits, ["429"]);
+assert.equal([...retryAfterStore.keys()].some((key) => key.startsWith("state:cooldown:")), false);
 const anthropicResp = await worker.default.fetch(new Request("https://gw.test/v1/messages", {
   method: "POST",
   headers: { authorization: "Bearer sk-anthropic", "content-type": "application/json", "anthropic-version": "2023-06-01" },

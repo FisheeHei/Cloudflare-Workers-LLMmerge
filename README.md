@@ -35,6 +35,8 @@ wrangler deploy --config wrangler.worker.toml
 
 将 `_worker.js` 设为 Advanced Mode 入口。项目不需要构建步骤；生产环境的 Variables、Secrets 和 Bindings 在 Cloudflare Pages 项目设置中配置。
 
+Worker 配置使用 `keep_vars = true` 保留控制台变量；重新部署不会清空 KV、D1、DO 或 Analytics Engine 数据。Pages 变量仍在项目设置中管理。
+
 Pages 与 Worker 使用相同的绑定名：
 
 - `llmerge`：主状态存储，推荐绑定 D1。
@@ -99,7 +101,7 @@ https://your-domain.example/{ADMIN_TOKEN}
 | `ANALYTICS_DATASET` | `llmmerge_requests` | Analytics Engine 数据集名 |
 | `WORKERS_DAILY_REQUEST_BUDGET` | `10000000` | 后台 Workers 用量面板的参考阈值，不改变 Cloudflare 实际配额 |
 
-KV-only 部署还可使用 `KV_FLUSH_INTERVAL_MS`、`KV_DAILY_READ_BUDGET` 和 `KV_DAILY_WRITE_BUDGET` 控制镜像与后台用量表。单次 Worker 调用的 fetch、KV、D1、DO 等子请求上限由两份 Wrangler 配置中的 `[limits].subrequests` 控制，当前设置为 `10000000`；实际生效仍受 Cloudflare 账户套餐限制。
+KV-only 部署还可使用 `KV_FLUSH_INTERVAL_MS`、`KV_DAILY_READ_BUDGET` 和 `KV_DAILY_WRITE_BUDGET` 控制镜像与后台用量表。单次 Worker 调用的 fetch、KV、D1、DO 等子请求上限由两份 Wrangler 配置中的 `[limits].subrequests` 控制，实际生效仍受 Cloudflare 账户套餐限制。
 
 ## 添加上游
 
@@ -192,9 +194,9 @@ const response = await client.chat.completions.create({
 
 - `failover`：失败、超时或冷却时尝试其他上游。
 - `load_balance`：结合权重、活跃请求、客户端 Key 亲和和近期延迟排序。
-- `coordination_level`：控制对活跃/预留请求的分散程度，默认 `3`。
+- `failover_max_attempts`：串行故障转移最大尝试数，默认 `3`，最多 `5` 次。
 - `soft_interval_ms`：同一上游被多个 Key 同时选中时的建议错峰间隔，默认 `50`；设为 `0` 可关闭。
-- `ROUTE_COORDINATOR`：跨 Cloudflare 边缘协调短期预约，模型请求仍从各自边缘直连上游。
+- 流式候选在首个可见输出超时时切换上游；已有可见输出后不重放。
 - 流式故障转移只发生在首个可见输出前；已经输出给客户端后不会重放，避免重复文本或工具调用。
 - `Hedged Request` 和 `Gateway Fast` 会并行/竞速多个候选。多账号池或并发受限的上游通常应关闭它们，以免主动增加同一模型的并发。
 - SSE 每 5 秒发送保活注释，帮助中间代理维持连接；保活不是模型输出。
