@@ -903,7 +903,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-dashboard-layout-2"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-dashboard-layout-3"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -954,8 +954,8 @@ assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("live-upstream-count"), true);
 assert.equal(adminPage.includes("connection-strip"), true);
-assert.equal(adminPage.includes("grid-template-columns: repeat(3, 1fr)"), true);
-assert.equal(adminPage.includes("border-radius: 6px"), true);
+assert.equal(adminPage.includes("grid-template-columns: minmax(200px, .9fr) minmax(260px, 1.2fr) minmax(340px, 1.6fr)"), true);
+assert.equal(adminPage.includes("grid-template-columns: repeat(2, minmax(0, 1fr))"), true);
 assert.equal(adminPage.includes('id="connection-ingress"'), true);
 assert.equal(adminPage.includes('id="connection-upstream"'), true);
 assert.equal(adminPage.includes('id="connection-recent"'), true);
