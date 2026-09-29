@@ -250,6 +250,15 @@ function renderAdminStyle() {
     .upstream-live-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
     .upstream-live-summary strong { color: var(--ink); }
     .upstream-live-summary-list { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .connection-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0 0 16px; }
+    .connection-item { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); }
+    .connection-item.good { border-color: #b7dec8; background: #f2fbf5; }
+    .connection-item.warn { border-color: #f0d49b; background: #fffaf0; }
+    .connection-item.bad { border-color: #efb4b4; background: #fff5f5; }
+    .connection-item-label { display: block; color: var(--muted); font-size: 11px; }
+    .connection-item strong { display: block; margin-top: 4px; color: var(--ink); font-size: 15px; }
+    .connection-item .note { display: block; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    @media (max-width: 760px) { .connection-strip { grid-template-columns: 1fr; } }
 
     .key-output {
       margin-top: 12px; padding: 14px; background: var(--surface-active);
@@ -350,7 +359,7 @@ function renderAdminStyle() {
       .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
       #view-overview #stats-panel { grid-column: 1 / -1; grid-row: auto; }
-      #view-activity #log-panel, #view-activity #request-log-panel { grid-column: 1 / -1; }
+      #view-activity #log-panel { grid-column: 1 / -1; }
       #view-upstreams #client-panel, #view-upstreams #upstream-panel,
       #view-settings #kv-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
@@ -628,6 +637,24 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
+  <div class="connection-strip" id="connection-strip" aria-live="polite">
+    <div class="connection-item good" id="connection-ingress">
+      <span class="connection-item-label">Client → Gateway</span>
+      <strong id="connection-ingress-status">已接入</strong>
+      <span class="note" id="connection-ingress-detail">网关端点可用，当前配置已读取</span>
+    </div>
+    <div class="connection-item" id="connection-upstream">
+      <span class="connection-item-label">Gateway → Upstream</span>
+      <strong id="connection-upstream-status">等待请求</strong>
+      <span class="note" id="connection-upstream-detail">当前没有活跃上游请求</span>
+    </div>
+    <div class="connection-item" id="connection-recent">
+      <span class="connection-item-label">最近链路问题</span>
+      <strong id="connection-recent-status">等待日志</strong>
+      <span class="note" id="connection-recent-detail">加载日志后显示首包、超时和断流摘要</span>
+    </div>
+  </div>
+
   <div class="panel" id="stats-panel">
     <div class="toolbar">
       <h2>统计</h2>
@@ -652,15 +679,6 @@ function renderAdminMarkup(origin, version) {
       <div class="stat-box"><span class="stat-num" id="stat-pt-session">0</span><span class="stat-label">会话 Input</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-ct-session">0</span><span class="stat-label">会话 Output</span></div>
     </div>
-  </div>
-
-  <div class="panel" id="request-log-panel">
-    <div class="toolbar">
-      <h2>请求日志</h2>
-      <button class="small secondary" id="load-logs">刷新</button>
-      <span class="note" id="logs-updated"></span>
-    </div>
-    <div class="live-log" id="live-log"></div>
   </div>
 
   </section>
@@ -967,15 +985,15 @@ function renderAdminMarkup(origin, version) {
 function renderAdminScript(version) {
   return `<script>
     const API_BASE = location.pathname.replace(new RegExp("/+$"), "") + "/api";
-  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all", kvUsage: null };
+  const state = { config: null, presets: [], clients: [], gateway: null, draftPresetId: null, lastCreatedClient: null, sessionInputTokens: 0, sessionOutputTokens: 0, modelPicker: null, speedPicker: null, logs: [], logExpanded: false, logFilter: "all", kvUsage: null, activeUpstreams: {}, activeUpstreamClients: {} };
   const byId = (id) => document.getElementById(id);
   const text = (value) => String(value ?? "");
   let liveRefreshRunning = false;
   let runtimeRefreshRunning = false;
   let statsRefreshRunning = false;
   let logsRefreshRunning = false;
-  const AUTO_STATS_REFRESH_MS = 30000;
-  const AUTO_LOG_REFRESH_MS = 10000;
+  const AUTO_STATS_REFRESH_MS = 15000;
+  const AUTO_LOG_REFRESH_MS = 15000;
   const loadedViews = {};
 
   function loadViewData(name) {
@@ -2114,6 +2132,8 @@ function renderAdminScript(version) {
     }
     const active = payload.active_upstreams || {};
     const activeClients = payload.active_upstream_clients || {};
+    state.activeUpstreams = active;
+    state.activeUpstreamClients = activeClients;
     const last = payload.last_successful_upstream || {};
     const recent = new Set(typeof last === "string" ? [last] : Object.values(last));
     document.querySelectorAll(".upstream-status-emoji").forEach(function(el) {
@@ -2140,6 +2160,7 @@ function renderAdminScript(version) {
     });
     updateUpstreamGroupActive(active, activeClients);
     updateUpstreamLiveSummary(active, activeClients, recent);
+    updateConnectionCards(active, activeClients, state.logs);
     } finally {
       runtimeRefreshRunning = false;
     }
@@ -2253,6 +2274,41 @@ async function loadKvUsage() {
     if (listEl) listEl.textContent = names.length
       ? names.map((name) => name + " (" + active[name] + ")" + (activeClientText(activeClients[name]) ? " " + activeClientText(activeClients[name]) : "")).join(" \u00b7 ")
       : (recent.size ? "\u6700\u8fd1\u6210\u529f: " + [...recent].filter(Boolean).join(" \u00b7 ") : "\u6682\u65e0\u6d3b\u8dc3\u8bf7\u6c42");
+  }
+
+  function updateConnectionCards(active, activeClients, logs) {
+    const ingress = byId("connection-ingress");
+    const upstream = byId("connection-upstream");
+    const recent = byId("connection-recent");
+    const ingressStatus = byId("connection-ingress-status");
+    const upstreamStatus = byId("connection-upstream-status");
+    const upstreamDetail = byId("connection-upstream-detail");
+    const recentStatus = byId("connection-recent-status");
+    const recentDetail = byId("connection-recent-detail");
+    if (!ingressStatus || !upstreamStatus || !recentStatus) return;
+    ingress?.classList.add("good");
+    ingressStatus.textContent = "已接入";
+    const names = Object.keys(active || {}).filter((name) => Number(active[name] || 0) > 0);
+    const count = names.reduce((sum, name) => sum + Number(active[name] || 0), 0);
+    upstream?.classList.toggle("good", count > 0);
+    upstream?.classList.toggle("warn", count === 0);
+    upstreamStatus.textContent = count ? "活跃请求 " + count : "等待请求";
+    if (upstreamDetail) upstreamDetail.textContent = count
+      ? names.map((name) => name + (activeClientText(activeClients?.[name]) ? " · " + activeClientText(activeClients[name]) : "")).join(" · ")
+      : "当前没有活跃上游请求";
+    const latest = Array.isArray(logs) ? logs[0] : null;
+    if (!latest) {
+      recentStatus.textContent = "等待日志";
+      if (recentDetail) recentDetail.textContent = "加载日志后显示首包、超时和断流摘要";
+      return;
+    }
+    const reason = logFailureReason(latest);
+    const ok = reason === "正常" && Number(latest.status || 0) < 400;
+    recent?.classList.toggle("good", ok);
+    recent?.classList.toggle("bad", !ok);
+    recentStatus.textContent = ok ? "最近请求正常" : reason;
+    const stream = streamDiag(latest);
+    if (recentDetail) recentDetail.textContent = [latest.upstream, latest.model, latest.latency_ms != null ? latest.latency_ms + "ms" : "", stream].filter(Boolean).join(" · ");
   }
 
   function updateUpstreamGroupActive(active, activeClients) {
@@ -2822,7 +2878,8 @@ async function loadKvUsage() {
       if (!resp.ok) throw new Error(payload?.error?.message || "读取日志失败");
       const logs = payload.logs || [];
       state.logs = logs;
-      byId("live-log").innerHTML = logs.length
+      const liveLog = byId("live-log");
+      if (liveLog) liveLog.innerHTML = logs.length
         ? logs.slice(0, 20).map((l) =>
             '<div class="log-row">' +
               '<span class="log-badge ' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</span>' +
@@ -2836,6 +2893,7 @@ async function loadKvUsage() {
           ).join("")
         : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
       renderLogs(logs);
+      updateConnectionCards(state.activeUpstreams, state.activeUpstreamClients, logs);
       const updated = byId("logs-updated");
       if (updated) updated.textContent = "更新 " + formatGatewayTime(new Date().toISOString());
       if (!silent) showToast("日志已加载");
@@ -3240,7 +3298,8 @@ async function loadKvUsage() {
       byId("load-stats").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadStats).catch(showError)
       );
-      byId("load-logs").addEventListener("click", (e) =>
+      const loadLogsButton = byId("load-logs");
+      if (loadLogsButton) loadLogsButton.addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u52a0\u8f7d\u4e2d...", loadLogs).catch(showError)
       );
 
@@ -3292,7 +3351,7 @@ async function loadKvUsage() {
       if (bootSpan?.parentNode) bootSpan.remove();
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
-      setInterval(refreshLivePanels, 5000);
+      setInterval(refreshLivePanels, 10000);
       setInterval(() => { void loadStats(true).catch(function(){}); }, AUTO_STATS_REFRESH_MS);
       setInterval(() => { void loadLogs(true).catch(function(){}); }, AUTO_LOG_REFRESH_MS);
       document.addEventListener("visibilitychange", () => {

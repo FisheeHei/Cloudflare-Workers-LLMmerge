@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-29-live-stream-3";
+const VERSION = "v26-09-29-live-stream-4";
 
 export default {
   async fetch(request, env, ctx) {

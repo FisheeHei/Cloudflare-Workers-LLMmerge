@@ -903,7 +903,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-29-live-stream-3"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-29-live-stream-4"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -953,6 +953,11 @@ assert.equal(adminPage.includes("Gateway Fast"), true);
 assert.equal(adminPage.includes("upstream-status-emoji"), true);
 assert.equal(adminPage.includes("upstream-group-active"), true);
 assert.equal(adminPage.includes("live-upstream-count"), true);
+assert.equal(adminPage.includes("connection-strip"), true);
+assert.equal(adminPage.includes('id="connection-ingress"'), true);
+assert.equal(adminPage.includes('id="connection-upstream"'), true);
+assert.equal(adminPage.includes('id="connection-recent"'), true);
+assert.equal(adminPage.includes('id="request-log-panel"'), false);
 assert.equal(adminPage.includes("run-cloudflare-self-check"), true);
 assert.equal(adminPage.includes("\u68c0\u67e5\u6a21\u578b\u5217\u8868"), true);
 assert.equal(adminPage.includes("\u6a21\u578b\u5217\u8868\u53ef\u8bbf\u95ee"), true);
@@ -1000,7 +1005,9 @@ assert.equal(adminPage.includes("nv-embed"), true);
 assert.equal(adminPage.includes("nemotron-nano-vl"), true);
 assert.equal(adminPage.includes("Reranker"), true);
 assert.equal(adminPage.includes("coding"), true);
-assert.equal(adminPage.includes("setInterval(refreshLivePanels, 5000)"), true);
+assert.equal(adminPage.includes("setInterval(refreshLivePanels, 10000)"), true);
+assert.equal(adminPage.includes("const AUTO_STATS_REFRESH_MS = 15000"), true);
+assert.equal(adminPage.includes("const AUTO_LOG_REFRESH_MS = 15000"), true);
 assert.equal(adminPage.includes("loadKvUsage"), true);
 assert.equal(adminScript.includes('name === "settings"'), false);
 assert.equal(adminPage.includes("loadedViews"), true);
