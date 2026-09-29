@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-29-reliable-failover-1";
+const VERSION = "v26-09-29-reliable-failover-2";
 
 export default {
   async fetch(request, env, ctx) {
