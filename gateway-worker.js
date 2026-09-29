@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-29-reliable-failover-2";
+const VERSION = "v26-09-29-live-stream-3";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1551,15 +1551,7 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
       upstreamReader = reader;
       try {
         for (;;) {
-          const result = await readSseChunk(reader, finishReason);
-          if (result.completed) {
-            closeReason = "completed";
-            markUpstreamComplete();
-            controller.enqueue(doneChunk);
-            sawDone = true;
-            break;
-          }
-          const { done, value } = result;
+          const { done, value } = await reader.read();
           if (done) break;
           const now = Date.now();
           noteStreamByte(diag, now);
@@ -1768,18 +1760,11 @@ function consumeOpenAiStreamBuffer(text, onChunk, onDone = null) {
     const chunk = safeJson(data);
     if (!chunk) continue;
     onChunk(chunk);
-    if (isCompletedSseChunk(chunk)) break;
+    // A choice-level finish_reason only closes that choice. Keep reading until
+    // the provider sends the stream terminator or the body reaches EOF.
+    if (chunk.type === "response.completed") break;
   }
   return rest;
-}
-
-function isCompletedSseChunk(chunk) {
-  if (!chunk || typeof chunk !== "object") return false;
-  if (chunk.type === "response.completed") return true;
-  return (chunk.choices || []).some((choice) => {
-    const reason = String(choice?.finish_reason || "").trim().toLowerCase();
-    return reason && reason !== "tool_calls";
-  });
 }
 
 function createStreamDiag(started = Date.now()) {
@@ -2090,16 +2075,11 @@ function responseFinishReason(payload) {
   return [...reasons].join(",");
 }
 
-async function readSseChunk(reader, finishReason = "") {
-  if (String(finishReason || "").trim()) return { completed: true };
-  return reader.read();
-}
-
 function noteStreamToolCalls(chunk, seen) {
   const calls = (chunk?.choices || []).flatMap((choice) => Array.isArray(choice?.delta?.tool_calls) ? choice.delta.tool_calls : []);
   for (let index = 0; index < calls.length; index += 1) {
     const call = calls[index] || {};
-    seen.add(String(call.id ?? call.index ?? index));
+    seen.add(String(call.index ?? call.id ?? index));
   }
 }
 
@@ -4083,14 +4063,7 @@ function streamCompletionsFromChat(openaiResp, seed, onDone = null, started = Da
       const reader = openaiResp.body.getReader();
       upstreamReader = reader;
       for (;;) {
-        const result = await readSseChunk(reader, finishReason);
-        if (result.completed) {
-          closeReason = "completed";
-          markUpstreamComplete();
-          sawDone = true;
-          break;
-        }
-        const { done, value } = result;
+        const { done, value } = await reader.read();
         if (done) break;
         const now = Date.now();
         noteStreamByte(diag, now);
@@ -4329,14 +4302,7 @@ function nativeResponsesStream(body, onDone, onComplete = null) {
       return chunk;
     };
     for (;;) {
-      const result = await readSseChunk(reader, finishReason);
-      if (result.completed) {
-        closeReason = "completed";
-        markUpstreamComplete();
-        sawDone = true;
-        break;
-      }
-      const { done, value } = result;
+      const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const events = [];
@@ -4922,14 +4888,7 @@ function streamAnthropicMessagesFromChat(openaiResp, seed, onDone = null, starte
       const reader = openaiResp.body.getReader();
       upstreamReader = reader;
       for (;;) {
-        const result = await readSseChunk(reader, finishReason);
-        if (result.completed) {
-          closeReason = "completed";
-          markUpstreamComplete();
-          sawDone = true;
-          break;
-        }
-        const { done, value } = result;
+        const { done, value } = await reader.read();
         if (done) break;
         const now = Date.now();
         noteStreamByte(diag, now);
@@ -5094,14 +5053,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       const reader = openaiResp.body.getReader();
       upstreamReader = reader;
       for (;;) {
-        const result = await readSseChunk(reader, finishReason);
-        if (result.completed) {
-          closeReason = "completed";
-          markUpstreamComplete();
-          sawDone = true;
-          break;
-        }
-        const { done, value } = result;
+        const { done, value } = await reader.read();
         if (done) break;
         const now = Date.now();
         noteStreamByte(diag, now);

@@ -633,7 +633,7 @@ function renderAdminMarkup(origin, version) {
       <h2>统计</h2>
       <span class="note" id="stat-current-model"></span>
       <span class="note" id="stat-updated"></span>
-      <button class="small secondary" id="load-stats">加载统计</button>
+      <button class="small secondary" id="load-stats">刷新统计</button>
     </div>
     <div class="chart-label">请求量</div>
     <div class="chart-bar" id="chart-requests"></div>
@@ -652,6 +652,15 @@ function renderAdminMarkup(origin, version) {
       <div class="stat-box"><span class="stat-num" id="stat-pt-session">0</span><span class="stat-label">会话 Input</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-ct-session">0</span><span class="stat-label">会话 Output</span></div>
     </div>
+  </div>
+
+  <div class="panel" id="request-log-panel">
+    <div class="toolbar">
+      <h2>请求日志</h2>
+      <button class="small secondary" id="load-logs">刷新</button>
+      <span class="note" id="logs-updated"></span>
+    </div>
+    <div class="live-log" id="live-log"></div>
   </div>
 
   </section>
@@ -708,7 +717,7 @@ function renderAdminMarkup(origin, version) {
   </section>
   <section class="page-view" id="view-activity" data-view="logs" hidden>
   <div class="view-heading">
-    <div class="view-heading-copy"><span class="view-heading-kicker">Logs &amp; Diagnostics</span><h2>日志与诊断</h2><p>按需加载历史记录，聚焦路由、首包和流式收尾。</p></div>
+    <div class="view-heading-copy"><span class="view-heading-kicker">Logs &amp; Diagnostics</span><h2>日志与诊断</h2><p>自动加载最近记录，聚焦路由、首包和流式收尾。</p></div>
   </div>
   <div class="panel" id="log-panel">
     <div class="toolbar">
@@ -718,13 +727,7 @@ function renderAdminMarkup(origin, version) {
     </div>
     <div id="log-list"><div class="note">\u52a0\u8f7d\u4e2d...</div></div>
   </div>
-  <div class="panel" id="request-log-panel">
-    <div class="toolbar">
-      <h2>\u8bf7\u6c42\u65e5\u5fd7</h2>
-      <button class="small secondary" id="load-logs">\u5237\u65b0</button>
-    </div>
-    <div class="live-log" id="live-log"></div>
-  </div>
+
 
 
   </section>
@@ -969,10 +972,18 @@ function renderAdminScript(version) {
   const text = (value) => String(value ?? "");
   let liveRefreshRunning = false;
   let runtimeRefreshRunning = false;
+  let statsRefreshRunning = false;
+  let logsRefreshRunning = false;
+  const AUTO_STATS_REFRESH_MS = 30000;
+  const AUTO_LOG_REFRESH_MS = 10000;
   const loadedViews = {};
 
   function loadViewData(name) {
     if (loadedViews[name]) return Promise.resolve();
+    if (name === "overview" && state.config) {
+      loadedViews[name] = true;
+      return loadLogs(true).catch(function(error) { loadedViews[name] = false; throw error; });
+    }
     if (name === "logs") {
       loadedViews[name] = true;
       return loadLogs().catch(function(error) { loadedViews[name] = false; throw error; });
@@ -1592,8 +1603,7 @@ function renderAdminScript(version) {
   }
 
   async function refreshDashboard() {
-    const tasks = [loadConfig(), loadClients(), renderCachedHealth(), loadRuntimeStatus()];
-    if (loadedViews.logs) tasks.push(loadLogs());
+    const tasks = [loadConfig(), loadClients(), renderCachedHealth(), loadRuntimeStatus(), loadStats(true), loadLogs(true)];
     if (loadedViews.settings) tasks.push(loadKvUsage());
     const results = await Promise.allSettled(tasks);
     const failed = results.filter((result) => result.status === "rejected");
@@ -2725,7 +2735,17 @@ async function loadKvUsage() {
   }
 
   async function loadStats(silent) {
-    const resp = await fetch(API_BASE + "/stats");
+    if (document.visibilityState !== "visible" || statsRefreshRunning) return;
+    statsRefreshRunning = true;
+    try {
+      return await renderStats(silent);
+    } finally {
+      statsRefreshRunning = false;
+    }
+  }
+
+  async function renderStats(silent) {
+    const resp = await fetch(API_BASE + "/stats", { cache: "no-store" });
     const payload = await parseApiResponse(resp);
     if (!resp.ok) throw new Error(payload?.error?.message || "读取统计失败");
     const buckets = payload.buckets || [];
@@ -2793,25 +2813,35 @@ async function loadKvUsage() {
     if (!silent) showToast("统计已加载");
   }
 
-  async function loadLogs() {
-    const resp = await fetch(API_BASE + "/logs");
-    const payload = await parseApiResponse(resp);
-    const logs = payload.logs || [];
-    state.logs = logs;
-    byId("live-log").innerHTML = logs.length
-      ? logs.slice(0, 20).map((l) =>
-          '<div class="log-row">' +
-            '<span class="log-badge ' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</span>' +
-            '<strong>' + esc(l.upstream) + '</strong>' +
-            '<span class="note">' + esc(l.model) + '</span>' +
-            '<span class="note">' + esc(formatGatewayTime(l.ts).slice(11, 19)) + '</span>' +
-            '<span class="note">' + esc(l.latency_ms + "ms") + '</span>' +
-            '<span class="note">' + esc(logFailureReason(l)) + '</span>' +
-            '<span class="note">' + esc((l.prompt_tokens || 0) + (l.completion_tokens || 0) + " tk") + '</span>' +
-            '</div>'
-        ).join("")
-      : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
-    renderLogs(logs);
+  async function loadLogs(silent) {
+    if (document.visibilityState !== "visible" || logsRefreshRunning) return;
+    logsRefreshRunning = true;
+    try {
+      const resp = await fetch(API_BASE + "/logs", { cache: "no-store" });
+      const payload = await parseApiResponse(resp);
+      if (!resp.ok) throw new Error(payload?.error?.message || "读取日志失败");
+      const logs = payload.logs || [];
+      state.logs = logs;
+      byId("live-log").innerHTML = logs.length
+        ? logs.slice(0, 20).map((l) =>
+            '<div class="log-row">' +
+              '<span class="log-badge ' + (l.status < 400 ? 'ok' : 'err') + '">' + esc(l.status) + '</span>' +
+              '<strong>' + esc(l.upstream) + '</strong>' +
+              '<span class="note">' + esc(l.model) + '</span>' +
+              '<span class="note">' + esc(formatGatewayTime(l.ts).slice(11, 19)) + '</span>' +
+              '<span class="note">' + esc(l.latency_ms + "ms") + '</span>' +
+              '<span class="note">' + esc(logFailureReason(l)) + '</span>' +
+              '<span class="note">' + esc((l.prompt_tokens || 0) + (l.completion_tokens || 0) + " tk") + '</span>' +
+              '</div>'
+          ).join("")
+        : '<div class="note">\u6682\u65e0\u8bf7\u6c42\u8bb0\u5f55</div>';
+      renderLogs(logs);
+      const updated = byId("logs-updated");
+      if (updated) updated.textContent = "更新 " + formatGatewayTime(new Date().toISOString());
+      if (!silent) showToast("日志已加载");
+    } finally {
+      logsRefreshRunning = false;
+    }
   }
 
   /* ---- Logs ---- */
@@ -3237,7 +3267,7 @@ async function loadKvUsage() {
       );
 
       byId("refresh-logs").addEventListener("click", (e) =>
-        withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", loadLogs).catch(showError)
+        withButtonBusy(e.currentTarget, "\u5237\u65b0\u4e2d...", () => loadLogs(false)).catch(showError)
       );
 
       // ponytail: keep slow usage and historical queries off the critical boot path
@@ -3247,6 +3277,9 @@ async function loadKvUsage() {
       bootSpan.textContent = ' 加载中...';
       if (hero) hero.querySelector('h1')?.appendChild(bootSpan);
       await Promise.all([loadConfig(), loadClients()]);
+      loadedViews.logs = true;
+      loadedViews.overview = true;
+      void Promise.allSettled([loadStats(true), loadLogs(true)]);
       void renderCachedHealth();
       const refreshStorageBtn = byId("refresh-storage-status");
       if (refreshStorageBtn) refreshStorageBtn.addEventListener("click", (e) =>
@@ -3260,8 +3293,12 @@ async function loadKvUsage() {
       refreshLivePanels();
       // ponytail: one guarded poll prevents slow AE queries from piling up.
       setInterval(refreshLivePanels, 5000);
-      // ponytail: runtime is isolate-local and cheap; poll it separately so active calls feel live.
-      setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000);
+      setInterval(() => { void loadStats(true).catch(function(){}); }, AUTO_STATS_REFRESH_MS);
+      setInterval(() => { void loadLogs(true).catch(function(){}); }, AUTO_LOG_REFRESH_MS);
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") return;
+        void Promise.allSettled([refreshLivePanels(), loadStats(true), loadLogs(true)]);
+      });
     } catch (error) {
       if (bootSpan?.parentNode) bootSpan.remove();
       const topbarStatus = byId("topbar-status");

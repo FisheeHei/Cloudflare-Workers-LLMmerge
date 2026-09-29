@@ -199,9 +199,10 @@ globalThis.fetch = async (url, init) => {
   }
   if (String(url).includes("stop-eof-mock.example")) {
     return new Response([
-      'data: {"choices":[{"delta":{"content":"done early"}}]}\n\n',
-      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}\n\n',
-      'data: {"choices":[{"delta":{"content":"stale-after-complete"}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"content":"done early"},"finish_reason":"stop"}]}\n\n',
+      'data: {"choices":[{"index":1,"delta":{"content":"second choice tail"},"finish_reason":"stop"}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":9,"total_tokens":12}}\n\n',
+      'data: [DONE]\n\n',
     ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   if (String(url).includes("responses-eof.example")) {
@@ -244,7 +245,12 @@ globalThis.fetch = async (url, init) => {
     const encoder = new TextEncoder();
     return new Response(new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"web_search","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n'));
+        controller.enqueue(encoder.encode([
+          'data: {"choices":[{"delta":{"content":"hello","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":"}}]},"finish_reason":"tool_calls"}]}\n\n',
+          'data: {"choices":[{"delta":{"content":" tail","tool_calls":[{"index":0,"function":{"arguments":"\\"tail\\"}"}}]}}]}\n\n',
+          'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":19,"total_tokens":26}}\n\n',
+          'data: [DONE]\n\n',
+        ].join("")));
       },
       cancel() {
         toolStreamHits.push("cancel");
@@ -897,7 +903,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-29-reliable-failover-2"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-29-live-stream-3"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -1001,7 +1007,7 @@ assert.equal(adminPage.includes("loadedViews"), true);
 assert.equal(adminPage.includes("\u5b9e\u9a8c\u6027\u8def\u7531"), true);
 assert.equal(adminPage.includes("setInterval(() => { void loadKvUsage().catch(function(){}); }, 60000)"), false);
 assert.equal(adminPage.includes("setInterval(() => { void loadWorkersUsage().catch(function(){}); }, 60000)"), false);
-assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000)"), true);
+assert.equal(adminPage.includes("setInterval(() => { void loadRuntimeStatus().catch(function(){}); }, 5000)"), false);
 assert.equal(adminPage.includes("Promise.allSettled(tasks)"), true);
 assert.equal(adminPage.includes("if (liveRefreshRunning || document.visibilityState"), true);
 assert.equal(adminPage.includes("Configuration error"), true);
@@ -4325,11 +4331,12 @@ const stopEofResp = await worker.default.fetch(new Request("https://gw.test/v1/c
   body: JSON.stringify({ model: "stop-eof-model", messages: [], stream: true }),
 }), streamFixEnv);
 const stopEofText = await stopEofResp.text();
-assert.equal(stopEofText.includes("stale-after-complete"), false);
+assert.equal(stopEofText.includes("second choice tail"), true);
 assert.equal(stopEofText.includes('"finish_reason":"stop"'), true);
 assert.equal(stopEofText.includes("data: [DONE]"), true);
 const stopEofLog = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), streamFixEnv)).json()).logs.find((entry) => entry.model === "stop-eof-model");
-assert.equal(stopEofLog.close_reason, "completed");
+assert.equal(stopEofLog.close_reason, "done");
+assert.equal(stopEofLog.completion_tokens, 9);
 assert.equal(stopEofLog.status, 200);
 const responsesEofResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST",
@@ -4458,10 +4465,13 @@ assert.equal(toolStreamHits.includes("cancel"), true);
 const toolStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), toolStreamEnv);
 const toolStreamLogs = await toolStreamLogsResp.json();
 const toolStreamLog = toolStreamLogs.logs.find((entry) => entry.model === "tool-stream-model");
-assert.equal(toolStreamLog.close_reason, "completed");
+assert.equal(toolStreamLog.close_reason, "done");
 assert.equal(toolStreamLog.finish_reason, "tool_calls");
 assert.equal(toolStreamLog.tools_count, 1);
 assert.equal(toolStreamLog.tool_calls_count, 1);
+assert.equal(toolStreamLog.completion_tokens, 19);
+assert.equal(toolStreamText.includes("hello"), true);
+assert.equal(toolStreamText.includes(" tail"), true);
 
 const bodyIsolationStore = new Map([["gateway:config", JSON.stringify({
   routing: { failover: true, load_balance: false }, settings: {},
