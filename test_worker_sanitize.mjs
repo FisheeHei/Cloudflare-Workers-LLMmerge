@@ -903,7 +903,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-dashboard-layout-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-dashboard-live-2"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -1005,9 +1005,12 @@ assert.equal(adminPage.includes("nv-embed"), true);
 assert.equal(adminPage.includes("nemotron-nano-vl"), true);
 assert.equal(adminPage.includes("Reranker"), true);
 assert.equal(adminPage.includes("coding"), true);
-assert.equal(adminPage.includes("setInterval(refreshLivePanels, 10000)"), true);
-assert.equal(adminPage.includes("const AUTO_STATS_REFRESH_MS = 15000"), true);
-assert.equal(adminPage.includes("const AUTO_LOG_REFRESH_MS = 15000"), true);
+assert.equal(adminPage.includes("const AUTO_RUNTIME_REFRESH_MS = 5000"), true);
+assert.equal(adminPage.includes("const AUTO_STATS_REFRESH_MS = 10000"), true);
+assert.equal(adminPage.includes("const AUTO_LOG_REFRESH_MS = 10000"), true);
+assert.equal(adminPage.includes("function startLiveRefresh()"), true);
+assert.equal(adminPage.includes("function stopLiveRefresh()"), true);
+assert.equal(adminPage.includes("document.addEventListener(\"visibilitychange\""), true);
 assert.equal(adminPage.includes("loadKvUsage"), true);
 assert.equal(adminScript.includes('name === "settings"'), false);
 assert.equal(adminPage.includes("loadedViews"), true);

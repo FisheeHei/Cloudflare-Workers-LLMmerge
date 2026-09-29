@@ -996,8 +996,10 @@ function renderAdminScript(version) {
   let runtimeRefreshRunning = false;
   let statsRefreshRunning = false;
   let logsRefreshRunning = false;
-  const AUTO_STATS_REFRESH_MS = 15000;
-  const AUTO_LOG_REFRESH_MS = 15000;
+  const AUTO_RUNTIME_REFRESH_MS = 5000;
+  const AUTO_STATS_REFRESH_MS = 10000;
+  const AUTO_LOG_REFRESH_MS = 10000;
+  let liveRefreshTimers = [];
   const loadedViews = {};
 
   function loadViewData(name) {
@@ -2180,6 +2182,20 @@ function renderAdminScript(version) {
     }
   }
 
+  function stopLiveRefresh() {
+    liveRefreshTimers.forEach((timer) => clearInterval(timer));
+    liveRefreshTimers = [];
+  }
+
+  function startLiveRefresh() {
+    if (document.visibilityState !== "visible" || liveRefreshTimers.length) return;
+    liveRefreshTimers = [
+      setInterval(() => { void refreshLivePanels(); }, AUTO_RUNTIME_REFRESH_MS),
+      setInterval(() => { void loadStats(true).catch(function(){}); }, AUTO_STATS_REFRESH_MS),
+      setInterval(() => { void loadLogs(true).catch(function(){}); }, AUTO_LOG_REFRESH_MS),
+    ];
+  }
+
   function renderStorageStatusCard(payload) {
     const value = byId("storage-status-value");
     const detail = byId("storage-status-detail");
@@ -3354,12 +3370,13 @@ async function loadKvUsage() {
       );
       if (bootSpan?.parentNode) bootSpan.remove();
       refreshLivePanels();
-      // ponytail: one guarded poll prevents slow AE queries from piling up.
-      setInterval(refreshLivePanels, 10000);
-      setInterval(() => { void loadStats(true).catch(function(){}); }, AUTO_STATS_REFRESH_MS);
-      setInterval(() => { void loadLogs(true).catch(function(){}); }, AUTO_LOG_REFRESH_MS);
+      startLiveRefresh();
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState !== "visible") return;
+        if (document.visibilityState !== "visible") {
+          stopLiveRefresh();
+          return;
+        }
+        startLiveRefresh();
         void Promise.allSettled([refreshLivePanels(), loadStats(true), loadLogs(true)]);
       });
     } catch (error) {
