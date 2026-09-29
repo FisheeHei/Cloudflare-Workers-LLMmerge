@@ -967,7 +967,7 @@ function renderAdminMarkup(origin, version) {
           <div class="prompt-client-scope" id="subagent-prompt-client-scope"></div>
         </div>
         <div class="field">
-          <label>\u5168\u5c40\u4e0a\u4e0b\u6587\u751f\u6548\u5ba2\u6237\u7aef Key</label>
+          <label>\u5168\u5c40\u4e0a\u4e0b\u6587\u751f\u6548\u5ba2\u6237\u7aef Key <span class="note">\u7559\u7a7a=\u4e0d\u6ce8\u5165\u5b8c\u6574\u5168\u5c40\u4e0a\u4e0b\u6587\uff0c\u6539\u4e3a\u6309\u9700\u7247\u6bb5</span></label>
           <div class="prompt-client-scope" id="global-context-client-scope"></div>
         </div>
         <div class="field">
@@ -1768,7 +1768,9 @@ function renderAdminScript(version) {
     const items = Array.isArray(source.context_items) ? source.context_items : (Array.isArray(source.items) ? source.items : []);
     return {
       global_context: text(source.global_context || source.context_text || ""),
-      global_context_clients: normalizeImportList(source.global_context_clients),
+      global_context_clients: source.global_context_clients === undefined
+        ? ["*"]
+        : normalizeImportList(source.global_context_clients),
       context_always_clients: normalizeImportList(source.context_always_clients),
       context_on_demand: source.context_on_demand === true || items.length > 0,
       context_item_limit: Number(source.context_item_limit || 1),
@@ -1932,18 +1934,18 @@ function renderAdminScript(version) {
     if (!systemHost || !subagentHost || !contextHost || !alwaysHost) return;
     systemHost.innerHTML = clientScopeHtml(s.system_prompt_clients || [], false);
     subagentHost.innerHTML = clientScopeHtml(s.subagent_prompt_clients || ["__none__"], true);
-    contextHost.innerHTML = clientScopeHtml(s.global_context_clients || [], false);
+    contextHost.innerHTML = clientScopeHtml(s.global_context_clients || ["__none__"], true);
     alwaysHost.innerHTML = clientScopeHtml(s.context_always_clients || [], true);
     bindPromptScope(systemHost, false);
     bindPromptScope(subagentHost, true);
-    bindPromptScope(contextHost, false);
+    bindPromptScope(contextHost, true);
     bindPromptScope(alwaysHost, true);
   }
 
   function selectedPromptClients(id) {
     const host = byId(id);
     if (!host) return [];
-    if (id === "context-always-client-scope" || id === "subagent-prompt-client-scope") {
+    if (id === "context-always-client-scope" || id === "subagent-prompt-client-scope" || id === "global-context-client-scope") {
       if (host.querySelector('input[value="*"]:checked')) return ["*"];
       return [...host.querySelectorAll('input:checked')].map((input) => input.value).filter((value) => value && value !== "__none__");
     }
@@ -1963,7 +1965,7 @@ function renderAdminScript(version) {
     const itemCount = collectContextItems().length;
     const systemScope = promptScopeLabel("system-prompt-client-scope", "\u5168\u90e8");
     const subagentScope = promptScopeLabel("subagent-prompt-client-scope", "\u65e0");
-    const contextScope = promptScopeLabel("global-context-client-scope", "\u5168\u90e8");
+    const contextScope = promptScopeLabel("global-context-client-scope", "\u6309\u9700");
     const alwaysScope = promptScopeLabel("context-always-client-scope", "\u65e0");
     const subagentEnabled = selectedPromptClients("subagent-prompt-client-scope").length > 0;
     if (!systemLen && !contextLen && !itemCount && !subagentEnabled) {

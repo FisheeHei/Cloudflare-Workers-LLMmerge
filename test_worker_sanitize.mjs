@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import { classifyGatewayFailure, createGatewayTrace, gatewayTraceFields, markGatewayTrace } from "./gateway-observability.js";
+import { gatewayInjectionPlan } from "./gateway-context.js";
 
 const worker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?t=${Date.now()}`);
 assert.equal(classifyGatewayFailure({ status: 200 }), "ok");
@@ -10,6 +11,17 @@ assert.equal(classifyGatewayFailure({ status: 503, dispatchLimited: true }), "di
 const sameTickTrace = createGatewayTrace({ id: "same-tick" });
 markGatewayTrace(sameTickTrace, "upstream_fetch_called");
 assert.equal(gatewayTraceFields(sameTickTrace).trace_upstream_called, true);
+const onDemandContextPlan = gatewayInjectionPlan({
+  model: "demo-model",
+  messages: [{ role: "user", content: "needle" }],
+}, {
+  global_context: "full context must stay opt-in",
+  global_context_clients: [],
+  context_on_demand: false,
+  context_items: [{ title: "Needle", keywords: ["needle"], text: "matched context" }],
+}, { id: "demo", key: "sk-demo" });
+assert.equal(onDemandContextPlan.contextText.includes("full context must stay opt-in"), false);
+assert.equal(onDemandContextPlan.contextText.includes("matched context"), true);
 const keepaliveEncoder = new TextEncoder();
 const keepaliveText = await new Response(worker.withSseKeepAlive(new ReadableStream({
   start(controller) {
@@ -903,7 +915,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-dashboard-layout-3"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-context-reliability-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);

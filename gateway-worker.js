@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-30-dashboard-layout-3";
+const VERSION = "v26-09-30-context-reliability-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2469,7 +2469,10 @@ function normalizeGatewaySettings(settings = {}, app) {
     system_prompt_clients: normalizeStringArray(settings.system_prompt_clients),
     subagent_prompt_clients: normalizeStringArray(settings.subagent_prompt_clients),
     global_context: String(settings.global_context || settings.context_prompt || ""),
-    global_context_clients: normalizeStringArray(settings.global_context_clients),
+    // Missing keeps legacy full-context behavior; an explicit [] means on-demand only.
+    global_context_clients: settings.global_context_clients === undefined
+      ? ["*"]
+      : normalizeStringArray(settings.global_context_clients),
     context_always_clients: normalizeStringArray(settings.context_always_clients),
     context_on_demand: settings.context_on_demand === true,
     context_item_limit: Math.max(1, Math.min(3, parsePositiveInt(settings.context_item_limit, 1))),
@@ -6752,7 +6755,7 @@ function getBearerToken(request) {
   return token && token.length <= MAX_CLIENT_KEY_LENGTH ? token : null;
 }
 
-async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose) {
+async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs, onClose, allowSafeRetry = true) {
   const timeout = Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
   const idleTimeout = Math.max(1, Number(idleTimeoutMs) || timeout);
   const controller = new AbortController();
@@ -6778,6 +6781,11 @@ async function fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs = timeoutMs,
       if (reason?.statusCode) throw reason;
       if (upstreamSignal?.aborted) throw httpError(499, "Response cancelled.");
       throw normalizeThrownError(reason || error, "Upstream request aborted.");
+    }
+    const method = String(init?.method || "GET").toUpperCase();
+    if (allowSafeRetry && ["GET", "HEAD"].includes(method) && !upstreamSignal?.aborted) {
+      await sleep(100, upstreamSignal);
+      return fetchWithTimeout(url, init, timeoutMs, idleTimeoutMs, onClose, false);
     }
     throw normalizeThrownError(error);
   }

@@ -104,8 +104,10 @@ export function gatewayInjectionPlan(payload, settings, client) {
   const subagentClients = normalizeStringArray(settings?.subagent_prompt_clients);
   const subagentText = subagentClients.length && promptAppliesToClient(subagentClients, client, clientIds) ? SUBAGENT_PROMPT : "";
   const items = Array.isArray(settings?.context_items) ? settings.context_items : [];
-  const hasContext = (promptAppliesToClient(settings?.global_context_clients, client, clientIds) && String(settings?.global_context || "").trim()) ||
-    (settings?.context_on_demand === true && items.some((item) => item && item.enabled !== false && item.text));
+  const fullContextEnabled = globalContextAppliesToClient(settings, client, clientIds);
+  const onDemand = settings?.context_on_demand === true || !fullContextEnabled;
+  const hasContext = (fullContextEnabled && String(settings?.global_context || "").trim()) ||
+    (onDemand && items.some((item) => item && item.enabled !== false && item.text));
   return {
     systemText: [systemText, subagentText].filter(Boolean).join("\n\n"),
     contextText: hasContext ? selectGatewayContext(payload, settings, client, clientIds) : "",
@@ -174,8 +176,9 @@ function chatMessagesChars(messages) {
 }
 
 function selectGatewayContext(payload, settings, client, clientIds) {
-  const base = promptAppliesToClient(settings?.global_context_clients, client, clientIds) ? String(settings?.global_context || "").trim() : "";
-  if (settings?.context_on_demand !== true) return base;
+  const fullContextEnabled = globalContextAppliesToClient(settings, client, clientIds);
+  const base = fullContextEnabled ? String(settings?.global_context || "").trim() : "";
+  if (settings?.context_on_demand !== true && fullContextEnabled) return base;
   const items = Array.isArray(settings?.context_items) ? settings.context_items : normalizeContextItems(settings?.context_items);
   if (!items.length) return base;
 
@@ -201,6 +204,11 @@ function selectGatewayContext(payload, settings, client, clientIds) {
     remaining -= text.length;
   }
   return [base, ...parts].filter(Boolean).join("\n\n");
+}
+
+function globalContextAppliesToClient(settings, client, clientIds) {
+  const scope = normalizeStringArray(settings?.global_context_clients);
+  return scope.length > 0 && !scope.includes("__none__") && promptAppliesToClient(scope, client, clientIds);
 }
 
 function contextScopeMatches(scope, client, clientIds) {
