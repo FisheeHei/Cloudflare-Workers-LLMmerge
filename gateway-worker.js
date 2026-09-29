@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-29-live-stream-4";
+const VERSION = "v26-09-30-session-switch-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2916,6 +2916,7 @@ async function resolveAuthorizedClientModel(client, runtime, requestedModel, req
 }
 
 async function enforceSessionModelLock(client, runtime, request, payload, model) {
+  // Session model state is advisory: model switches replace it for long-running agents.
   const scopeId = requestModelLockScope(request, payload);
   if (!scopeId) return;
 
@@ -2928,9 +2929,8 @@ async function enforceSessionModelLock(client, runtime, request, payload, model)
       if (stored?.model && Number(stored.expires) > now) lock = stored;
     } catch {}
   }
-  if (lock?.expires > now) {
+  if (lock?.expires > now && lock.model === model) {
     _sessionModelLocks[cacheKey] = lock;
-    if (lock.model !== model) throw httpError(403, `This session is locked to model: ${lock.model}`);
     return;
   }
 

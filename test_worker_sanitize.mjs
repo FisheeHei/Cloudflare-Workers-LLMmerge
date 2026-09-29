@@ -903,7 +903,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-29-live-stream-4"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-session-switch-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -1384,12 +1384,12 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/respons
   method: "POST", headers: sessionHeaders,
   body: JSON.stringify({ model: "z-ai/glm-5.2", input: "hi" }),
 }), restrictedEnv)).status, 200);
-const deniedSessionSwitch = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+const switchedSessionResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST", headers: sessionHeaders,
   body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "switch" }),
 }), restrictedEnv);
-assert.equal(deniedSessionSwitch.status, 403);
-assert.equal((await deniedSessionSwitch.text()).includes("locked to model: z-ai/glm-5.2"), true);
+assert.equal(switchedSessionResp.status, 200);
+assert.equal(bodies.at(-1).model, "openai/gpt-oss-120b");
 const sessionKvStore = new Map();
 const sessionKvEnv = {
   ...restrictedEnv,
@@ -1408,12 +1408,11 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/respons
   body: JSON.stringify({ model: "z-ai/glm-5.2", input: "hi" }),
 }), sessionKvEnv)).status, 200);
 const freshWorker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?sessionKv=${Date.now()}`);
-const persistedLockResp = await freshWorker.default.fetch(new Request("https://gw.test/v1/responses", {
+const persistedSwitchResp = await freshWorker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST", headers: persistedSessionHeaders,
   body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "switch" }),
 }), sessionKvEnv);
-assert.equal(persistedLockResp.status, 403);
-assert.equal((await persistedLockResp.text()).includes("locked to model: z-ai/glm-5.2"), true);
+assert.equal(persistedSwitchResp.status, 200);
 assert.equal((await worker.default.fetch(new Request("https://gw.test/v1/responses", {
   method: "POST", headers: { ...sessionHeaders, "x-codex-turn-metadata": JSON.stringify({ session_id: "codex-session-mixed", turn_id: "turn-gpt" }) },
   body: JSON.stringify({ model: "openai/gpt-oss-120b", input: "next turn" }),
