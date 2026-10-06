@@ -49,7 +49,7 @@ const CORS_HEADERS = {
   "access-control-max-age": "3600",
 };
 
-const RETRYABLE_STATUSES = new Set([402, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529]);
+const RETRYABLE_STATUSES = new Set([401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529]);
 const MODEL_PATH = "/v1/models";
 const COMPLETIONS_PATH = "/v1/completions";
 const CHAT_PATH = "/v1/chat/completions";
@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-09-30-context-reliability-1";
+const VERSION = "v26-10-06-advanced-routing-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -5178,14 +5178,17 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         ? 1
         : Math.min(attempts.length, runtime.routing.failover_max_attempts || DEFAULT_FAILOVER_MAX_ATTEMPTS);
       if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
-        const used = new Set(hedgedAttempts.map(upstreamKey));
-        const fallbackAttempts = attempts.filter((upstream) => !used.has(upstreamKey(upstream))).slice(0, 1);
-        timing.route_selected_ms = Date.now() - routingStartedAt;
-        markGatewayTrace(trace, "route_selected");
-        const result = hedgedProxyRequest({ attempts: hedgedAttempts, fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
-        releaseSelectionOnce();
-        return result;
+        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, runtime.routing.hedge_max)), model);
+        if (hedgedAttempts.length === 1) {
+          attempts = hedgedAttempts;
+          maxAttempts = 1;
+        } else {
+          timing.route_selected_ms = Date.now() - routingStartedAt;
+          markGatewayTrace(trace, "route_selected");
+          const result = hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
+          releaseSelectionOnce();
+          return result;
+        }
       }
     }
     initialDispatchContested = upstreamHasCompetition(attempts[0]);
@@ -5502,16 +5505,22 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), injection = null, trace = null }) {
+async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), injection = null, trace = null }) {
   const controllers = attempts.map(() => new AbortController());
+  const launchNow = [];
+  const started = attempts.map(() => false);
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
   const knownTtft = upstreamLatencyScore(attempts[0], model);
   const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
-  const launchDelay = (index) => runtime.routing.fast_routing === true && index < 2
-    ? index * fastDelayMs
-    : index * hedgeDelayMs;
+  const launchDelay = (index) => index === 0 ? 0
+    : runtime.routing.fast_routing === true && index === 1 ? fastDelayMs
+      : runtime.routing.hedge_enabled === true ? index * hedgeDelayMs : Infinity;
   let done = false;
+  let launched = 0;
+  let lastResponse = null;
+  let winnerIndex = -1;
+  let pending = [];
   const releaseReservation = reserveUpstreams(attempts);
   const abortHedge = () => controllers.forEach((controller) => controller.abort(signal?.reason || "hedged request cancelled"));
   if (signal?.aborted) abortHedge();
@@ -5519,10 +5528,16 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
 
   function launchLater(index) {
     const upstream = attempts[index];
-    return sleep(launchDelay(index), controllers[index].signal).then(async () => {
-      if (done) return { cancelled: true, upstream, index };
+    return (async () => {
       let result = null;
       try {
+        const wake = new Promise((resolve) => { launchNow[index] = resolve; });
+        const delay = launchDelay(index);
+        const waitForWake = awaitWithSignal(wake, controllers[index].signal);
+        await (Number.isFinite(delay) ? Promise.race([sleep(delay, controllers[index].signal), waitForWake]) : waitForWake);
+        launchNow[index]();
+        if (done || controllers[index].signal.aborted) return { cancelled: true, upstream, index };
+        started[index] = true;
         const dispatchStartedAt = Date.now();
         const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, controllers[index].signal);
         const attemptTiming = {
@@ -5531,9 +5546,10 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
           upstream_started_ms: Date.now() - routingStartedAt,
         };
         if (!dispatch.accepted) return { limited: true, upstream, index, delayMs: dispatch.delayMs, timing: attemptTiming };
+        const attempt = ++launched;
         result = await fetchProxyUpstream({
           bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
-          trace, attempt: index + 1,
+          trace, attempt,
           firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
         });
         if (result.response.ok && streamRequest) {
@@ -5543,16 +5559,16 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
           result.streamErrorKind = primed.errorKind || "";
           result.latency = Date.now() - result.startedAt;
         }
-        return { ...result, upstream, index, timing: attemptTiming };
+        return { ...result, upstream, index, attempt, timing: attemptTiming };
       } catch (error) {
         await discardUpstreamResponse(result, "hedged upstream request failed");
         return { error, upstream, index, latency: 0 };
       }
-    });
+    })();
   }
 
   try {
-    const pending = attempts.map((_, index) => ({ index, promise: launchLater(index) }));
+    pending = attempts.map((_, index) => ({ index, promise: launchLater(index) }));
     let lastResult = null;
     while (pending.length) {
       const raced = await Promise.race(pending.map((entry) => entry.promise.then((result) => ({ entry, result }))));
@@ -5562,87 +5578,55 @@ async function hedgedProxyRequest({ attempts, fallbackAttempts = [], bodyText, c
       if (result.cancelled) continue;
       lastResult = result;
       if (result.error?.statusCode === 499) {
-        done = true;
-        stopHedgeLosers(pending, controllers, -1);
         throw result.error;
       }
-      if (result.limited) continue;
+      if (result.limited) {
+        const next = started.findIndex((value) => !value);
+        if (next >= 0) launchNow[next]?.();
+        continue;
+      }
       const retryable = Boolean(result.streamError) || (result.response && await isRetryableUpstreamResponse(result.response));
       if (result.response && !retryable) {
         done = true;
+        winnerIndex = result.index;
         stopHedgeLosers(pending, controllers, result.index);
+        if (lastResponse) {
+          await discardUpstreamResponse(lastResponse, "hedged request succeeded");
+          lastResponse = null;
+        }
         await clearUpstreamFailure(runtime, result.upstream, model);
         rememberUpstreamLatency(runtime, result.upstream, model, result.latency, ctx);
         rememberSuccessfulUpstream(result.upstream, model);
-        markGatewayTrace(trace, "response_ready", { attempt: result.index + 1, upstream: result.upstream.name, status: result.response.status });
-        return { attempts: result.index + 1, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing, injection, trace: gatewayTraceFields(trace) };
+        markGatewayTrace(trace, "response_ready", { attempt: result.attempt, upstream: result.upstream.name, status: result.response.status });
+        return { attempts: launched, response: result.response, upstream: result.upstream, abortUpstream: result.abortUpstream, timing: result.timing, injection, trace: gatewayTraceFields(trace) };
       }
-      if (result.response) {
+      const next = started.findIndex((value) => !value);
+      if (next >= 0) launchNow[next]?.();
+      if (result.response && (!result.response.ok || result.streamErrorKind === "event")) {
+        if (lastResponse) await discardUpstreamResponse(lastResponse, "newer upstream error");
+        lastResponse = result;
+      } else if (result.response) {
         await discardUpstreamResponse(result, "retryable hedged response");
       }
       await markUpstreamFailure(runtime, result.upstream, model, result.response);
     }
 
-    const fallbackResult = await tryHedgeFallback({ attempts: fallbackAttempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal, timing, routingStartedAt, trace });
-    if (fallbackResult?.response) return { ...fallbackResult, attempts: attempts.length + 1, injection };
-    if (fallbackResult?.limited) lastResult = fallbackResult;
+    if (lastResponse) {
+      markGatewayTrace(trace, "upstream_response_error", { upstream: lastResponse.upstream.name, status: lastResponse.response.status });
+      const retained = lastResponse;
+      lastResponse = null;
+      return { attempts: launched, response: retained.response, upstream: retained.upstream, abortUpstream: retained.abortUpstream, timing: retained.timing, injection, trace: gatewayTraceFields(trace) };
+    }
 
-    const err = httpError(lastResult?.limited ? 503 : 502, lastResult?.error?.message || (lastResult?.limited ? "All eligible upstream dispatch queues are busy." : "All hedged upstreams failed."));
+    const err = httpError(lastResult?.limited ? 503 : lastResult?.error?.statusCode || 502, lastResult?.error?.message || (lastResult?.limited ? "All eligible upstream dispatch queues are busy." : "All hedged upstreams failed."));
     err.upstreamName = lastResult?.upstream?.name || attempts[attempts.length - 1]?.name || "none";
     err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed"));
     throw err;
   } finally {
     done = true;
+    if (winnerIndex < 0 && pending.length) stopHedgeLosers(pending, controllers, -1);
+    if (lastResponse) await discardUpstreamResponse(lastResponse, "hedged request cancelled");
     signal?.removeEventListener("abort", abortHedge);
-    releaseReservation();
-  }
-}
-
-async function tryHedgeFallback({ attempts, bodyText, client, model, pathname, request, runtime, search, streamRequest, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), trace = null }) {
-  const upstream = attempts?.[0];
-  if (!upstream || runtime.routing.failover === false) return null;
-  let result = null;
-  const releaseReservation = reserveUpstreams([upstream]);
-  try {
-    const dispatchStartedAt = Date.now();
-    const dispatch = await waitForUpstreamDispatch(runtime, upstream, client, signal);
-    const fallbackTiming = {
-      ...timing,
-      dispatch_wait_ms: Date.now() - dispatchStartedAt,
-      upstream_started_ms: Date.now() - routingStartedAt,
-    };
-    if (!dispatch.accepted) return { limited: true, upstream, delayMs: dispatch.delayMs, timing: fallbackTiming };
-    result = await fetchProxyUpstream({
-      bodyText, client, pathname, request, runtime, search, signal, upstream,
-      trace, attempt: 1,
-      firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
-    });
-    if (result.response.ok && streamRequest) {
-      const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
-      result.response = primed.response;
-      result.streamError = primed.error;
-      result.streamErrorKind = primed.errorKind || "";
-      result.latency = Date.now() - result.startedAt;
-    }
-    const retryable = Boolean(result.streamError) || await isRetryableUpstreamResponse(result.response);
-    if (retryable) {
-      await discardUpstreamResponse(result, "retryable hedged fallback response");
-      await markUpstreamFailure(runtime, upstream, model, result.response);
-      return null;
-    }
-    await clearUpstreamFailure(runtime, upstream, model);
-    rememberUpstreamLatency(runtime, upstream, model, result.latency, ctx);
-    rememberSuccessfulUpstream(upstream, model);
-    markGatewayTrace(trace, "response_ready", { attempt: 1, upstream: upstream.name, status: result.response.status });
-    return { response: result.response, upstream, abortUpstream: result.abortUpstream, timing: fallbackTiming, trace: gatewayTraceFields(trace) };
-  } catch (error) {
-    const upstreamError = normalizeThrownError(error);
-    await discardUpstreamResponse(result, "hedged fallback failed");
-    if (signal?.aborted) throw httpError(499, "Response cancelled.");
-    if (upstreamError.statusCode === 499) throw upstreamError;
-    await markUpstreamFailure(runtime, upstream, model);
-    return null;
-  } finally {
     releaseReservation();
   }
 }

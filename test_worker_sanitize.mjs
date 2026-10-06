@@ -915,7 +915,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-09-30-context-reliability-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-10-06-advanced-routing-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -2874,8 +2874,9 @@ const hedgeFallbackResp = await worker.default.fetch(new Request("https://gw.tes
   headers: { authorization: "Bearer sk-hedge-fallback", "content-type": "application/json" },
   body: JSON.stringify({ model: "hedge-fallback-model", messages: [] }),
 }), hedgeFallbackEnv);
-assert.equal(hedgeFallbackResp.headers.get("x-llm-gateway-upstream"), "hedge-fallback-c");
-assert.deepEqual(hedgeFallbackHits.slice(hedgeFallbackStart), ["a", "b", "c"]);
+assert.equal(hedgeFallbackResp.status, 503);
+assert.equal(hedgeFallbackResp.headers.get("x-llm-gateway-attempts"), "2");
+assert.deepEqual(hedgeFallbackHits.slice(hedgeFallbackStart), ["a", "b"]);
 
 const hedgeStreamStore = new Map();
 hedgeStreamStore.set("gateway:config", JSON.stringify({

@@ -813,7 +813,7 @@ function renderAdminMarkup(origin, version) {
         <div class="row">
           <div class="field span-4"><label><input type="checkbox" id="routing-hedge"> Hedged Request</label></div>
           <div class="field span-4"><label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305；\u524d 2 \u4e2a\u5019\u9009\u4f18\u5148\u542f\u52a8</span></label></div>
-          <div class="field span-4"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
+          <div class="field span-4"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570\uff08\u542b\u4e3b\u8bf7\u6c42\uff09</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
         </div>
       </details>
       <div class="row">
