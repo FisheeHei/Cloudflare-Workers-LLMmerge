@@ -355,6 +355,12 @@ function renderAdminStyle() {
     .model-tag-filter button.active { background: var(--success); color: white; }
     .picker-actions { display: flex; gap: 10px; justify-content: flex-end; align-items: center; flex-wrap: wrap; margin-top: 14px; }
     .picker-actions button.small { padding: 7px 13px; font-size: 13px; }
+    .overview-summary-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; grid-column: 1 / -1; align-items: start; }
+    .overview-summary-grid > .panel { min-width: 0; }
+    #overview-client-panel summary { min-height: 42px; }
+    #overview-client-panel summary h2 { margin: 0; font-size: 17px; }
+    #overview-client-list { display: grid; gap: 8px; }
+    #overview-client-list .client-item { padding: 9px 0; }
     @media (min-width: 980px) {
       .wrap { width: min(1680px, calc(100% - 48px)); padding: 20px 0 40px; }
       .page-view { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; align-items: start; }
@@ -363,6 +369,7 @@ function renderAdminStyle() {
       .hero { gap: 32px; }
       .gateway-urls { margin-top: 0; }
       #view-overview #stats-panel { grid-column: 1 / -1; grid-row: auto; }
+      .overview-summary-grid { grid-template-columns: minmax(0, 1fr) minmax(280px, .42fr); }
       #view-activity #log-panel { grid-column: 1 / -1; }
       #view-upstreams #client-panel, #view-upstreams #upstream-panel,
       #view-settings #kv-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
@@ -374,6 +381,7 @@ function renderAdminStyle() {
       .prompt-modal-grid { grid-template-columns: minmax(240px, .85fr) minmax(360px, 1.25fr) minmax(220px, .8fr); }
     }
     @media (max-width: 760px) {
+      .overview-summary-grid { grid-template-columns: 1fr; }
       .prompt-modal-grid { grid-template-columns: 1fr; }
       .prompt-client-scope { max-height: 130px; }
       .model-picker-grid { grid-template-columns: 1fr; }
@@ -600,6 +608,7 @@ function renderAdminMarkup(origin, version) {
       <a class="nav-item active" href="#overview" data-view-target="overview"><span class="nav-icon">⌂</span><span>总览</span></a>
       <a class="nav-item" href="#upstreams" data-view-target="upstreams"><span class="nav-icon">⇄</span><span>上游与客户端</span></a>
       <a class="nav-item" href="#logs" data-view-target="logs"><span class="nav-icon">≡</span><span>日志与诊断</span></a>
+      <a class="nav-item" href="#scheduler" data-view-target="scheduler"><span class="nav-icon">↯</span><span>统一调度器</span></a>
       <a class="nav-item" href="#settings" data-view-target="settings"><span class="nav-icon">⚙</span><span>Prompt / Context</span></a>
     </nav>
     <div class="sidebar-footer">
@@ -659,6 +668,7 @@ function renderAdminMarkup(origin, version) {
     </div>
   </div>
 
+  <div class="overview-summary-grid">
   <div class="panel" id="stats-panel">
     <div class="toolbar">
       <h2>统计</h2>
@@ -683,6 +693,11 @@ function renderAdminMarkup(origin, version) {
       <div class="stat-box"><span class="stat-num" id="stat-pt-session">0</span><span class="stat-label">会话 Input</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-ct-session">0</span><span class="stat-label">会话 Output</span></div>
     </div>
+  </div>
+  <details class="panel settings-panel" id="overview-client-panel">
+    <summary><h2>客户端 Keys</h2><span class="client-summary" id="overview-client-summary">0 keys</span></summary>
+    <div id="overview-client-list"><div class="note">加载中...</div></div>
+  </details>
   </div>
 
   </section>
@@ -753,6 +768,33 @@ function renderAdminMarkup(origin, version) {
 
 
   </section>
+  <section class="page-view" id="view-scheduler" data-view="scheduler" hidden>
+  <div class="view-heading">
+    <div class="view-heading-copy"><span class="view-heading-kicker">Unified Scheduler</span><h2>统一调度器</h2><p>统一决定请求如何选择、竞速和切换上游；主请求计入参与数。</p></div>
+  </div>
+  <details class="panel settings-panel" open>
+    <summary><h2>调度策略</h2><span class="note">兼容旧版路由配置</span></summary>
+    <div class="settings-body">
+      <div class="row">
+        <div class="field span-4"><label>路由模式</label><select id="routing-mode"><option value="serial">串行故障转移</option><option value="adaptive">自适应竞速</option><option value="parallel">并行竞速</option></select><span class="note">自适应会按首包延迟逐步加入候选。</span></div>
+        <div class="field span-4"><label>单次请求最多参与上游数（含主请求）</label><input id="routing-max-upstreams" type="number" min="1" max="5" placeholder="2"><input id="routing-hedge-max" type="hidden"></div>
+        <div class="field span-4"><label><input type="checkbox" id="routing-load-balance"> 负载均衡</label><span class="note">按权重、优先级和近期质量排序。</span></div>
+      </div>
+      <div class="row">
+        <div class="field span-4"><label><input type="checkbox" id="routing-failover"> 故障转移</label></div>
+        <div class="field span-4"><label>并发协调强度 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"></div>
+        <div class="field span-4"><label>Key 错峰间隔 (ms)</label><input id="routing-soft-interval" type="number" min="0" max="2000" placeholder="50"><span class="note">同一上游排队时生效，0=关闭。</span></div>
+      </div>
+      <div class="row">
+        <div class="field span-4"><label>旧版故障切换次数</label><input id="routing-failover-attempts" type="number" min="1" max="5" placeholder="3"><span class="note">仅用于兼容旧配置，串行模式仍受上限约束。</span></div>
+        <div class="field span-4"><label><input type="checkbox" id="routing-hedge"> 兼容 Hedged Request</label></div>
+        <div class="field span-4"><label><input type="checkbox" id="routing-fast"> 兼容 Gateway Fast</label></div>
+      </div>
+      <div class="context-controls"><button class="good small" id="save-routing">保存调度器</button><span class="note" id="routing-status"></span></div>
+    </div>
+  </details>
+  </section>
+
   <section class="page-view" id="view-settings" data-view="settings" hidden>
   <div class="view-heading">
     <div class="view-heading-copy"><span class="view-heading-kicker">Prompt / Context</span><h2>Prompt / Context</h2><p>在固定 snapshot 进入请求内核前，统一查看、编辑与预览注入规则。</p></div>
@@ -794,28 +836,9 @@ function renderAdminMarkup(origin, version) {
         <div class="field span-3"><label>\u6a21\u578b\u7f13\u5b58 TTL (s, \u9ed8\u8ba43600)</label><input id="model-cache-ttl" type="number" min="1" placeholder="3600"></div>
       </div>
       <div class="row">
-        <div class="field span-3">
-          <label><input type="checkbox" id="routing-load-balance"> \u8d1f\u8f7d\u5747\u8861 (\u9ed8\u8ba4\u5f00)</label>
-        </div>
-        <div class="field span-3">
-          <label><input type="checkbox" id="routing-failover"> \u6545\u969c\u8f6c\u79fb (\u9ed8\u8ba4\u5f00)</label>
-        </div>
-        <div class="field span-3"><label>\u6700\u591a\u6545\u969c\u5207\u6362\u6b21\u6570</label><input id="routing-failover-attempts" type="number" min="1" max="5" placeholder="3"></div>
-      </div>
-      <div class="row">
-        <div class="field span-3"><label>\u4e0a\u6e38\u534f\u8c03\u5f3a\u5ea6 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"><span class="note">\u8d8a\u9ad8\u8d8a\u5206\u6563\u6d3b\u8dc3\u8bf7\u6c42</span></div>
-        <div class="field span-3"><label>Key \u5e76\u53d1\u8f6f\u95f4\u9694 (ms, \u9ed8\u8ba4 50)</label><input id="routing-soft-interval" type="number" min="0" max="2000" placeholder="50"><span class="note">\u4ec5\u540c\u4e00\u4e0a\u6e38\u6392\u961f\u65f6\u751f\u6548，0=\u5173\u95ed</span></div>
         <div class="field span-3"><label>\u663e\u793a\u65f6\u533a</label><select id="time-zone-preset"><option value="480" data-label="UTC+8 北京/香港/上海/乌鲁木齐">UTC+8 北京 / 香港 / 上海 / 乌鲁木齐</option><option value="0" data-label="UTC">UTC</option><option value="custom" data-label="Custom">Custom</option></select></div>
         <div class="field span-3"><label>UTC \u504f\u79fb (\u5206\u949f)</label><input id="time-zone-offset" type="number" min="-720" max="840" placeholder="480"></div>
       </div>
-      <details class="settings-subpanel">
-        <summary>\u5b9e\u9a8c\u6027\u8def\u7531\uff08\u9ed8\u8ba4\u5173\u95ed\uff09</summary>
-        <div class="row">
-          <div class="field span-4"><label><input type="checkbox" id="routing-hedge"> Hedged Request</label></div>
-          <div class="field span-4"><label><input type="checkbox" id="routing-fast"> Gateway Fast \u6a21\u5f0f <span class="note">\u62a2\u9996\u5305；\u524d 2 \u4e2a\u5019\u9009\u4f18\u5148\u542f\u52a8</span></label></div>
-          <div class="field span-4"><label>\u5355\u6b21\u8bf7\u6c42\u6700\u591a\u53c2\u4e0e\u4e0a\u6e38\u6570\uff08\u542b\u4e3b\u8bf7\u6c42\uff09</label><input id="routing-hedge-max" type="number" min="1" max="5" placeholder="2"></div>
-        </div>
-      </details>
       <div class="row">
         <div class="field span-12">
           <label>\u5b58\u50a8\u7ed1\u5b9a\u72b6\u6001</label>
@@ -1539,12 +1562,14 @@ function renderAdminScript(version) {
         time_zone_label: selectedTimeZoneLabel(),
       },
       routing: {
+        routing_mode: byId("routing-mode").value,
+        max_upstreams: Number(byId("routing-max-upstreams").value || 2),
         load_balance: byId("routing-load-balance").checked,
         failover: byId("routing-failover").checked,
         failover_max_attempts: Number(byId("routing-failover-attempts").value || 3),
         hedge_enabled: byId("routing-hedge").checked,
         fast_routing: byId("routing-fast").checked,
-        hedge_max: Number(byId("routing-hedge-max").value || 2),
+        hedge_max: Number(byId("routing-max-upstreams").value || 2),
         coordination_level: Number(byId("routing-coordination-level").value || 3),
         soft_interval_ms: byId("routing-soft-interval").value === "" ? 50 : Number(byId("routing-soft-interval").value),
       },
@@ -1572,12 +1597,14 @@ function renderAdminScript(version) {
     renderPromptClientScopes();
     renderPromptContextStatus();
     renderPromptContextDashboard();
+    byId("routing-mode").value = r.routing_mode || ((r.fast_routing || r.hedge_enabled) ? "adaptive" : "serial");
+    byId("routing-max-upstreams").value = r.max_upstreams || r.hedge_max || r.failover_max_attempts || 2;
+    byId("routing-hedge-max").value = byId("routing-max-upstreams").value;
     byId("routing-load-balance").checked = r.load_balance !== false;
     byId("routing-failover").checked = r.failover !== false;
     byId("routing-failover-attempts").value = r.failover_max_attempts || 3;
     byId("routing-hedge").checked = r.hedge_enabled === true;
     byId("routing-fast").checked = r.fast_routing === true;
-    byId("routing-hedge-max").value = r.hedge_max || 2;
     byId("routing-coordination-level").value = r.coordination_level ?? 3;
     byId("routing-soft-interval").value = r.soft_interval_ms ?? 50;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
@@ -3041,8 +3068,11 @@ async function loadKvUsage() {
     const host = byId("client-list");
     const recentHost = byId("client-recent-list");
     const summary = byId("client-summary");
+    const overviewHost = byId("overview-client-list");
+    const overviewSummary = byId("overview-client-summary");
     const clients = state.clients || [];
     if (summary) summary.textContent = clients.length + " keys";
+    if (overviewSummary) overviewSummary.textContent = clients.length + " keys";
     const itemHtml = (c, compact) =>
       '<div class="client-item">' +
         '<div class="client-meta">' +
@@ -3086,8 +3116,14 @@ async function loadKvUsage() {
     recentHost.innerHTML = recent.length
       ? recent.map((c) => itemHtml(c, true)).join("")
       : '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
+    if (overviewHost) {
+      overviewHost.innerHTML = recent.length
+        ? recent.map((c) => itemHtml(c, true)).join("")
+        : '<div class="note">\u6682\u65e0\u5ba2\u6237\u7aef Key</div>';
+    }
     bindActions(host, false);
     bindActions(recentHost, true);
+    if (overviewHost) bindActions(overviewHost, true);
     updateClientPanelView();
   }
 
@@ -3277,6 +3313,13 @@ async function loadKvUsage() {
       );
       byId("save-settings").addEventListener("click", (e) =>
         withButtonBusy(e.currentTarget, "\u4fdd\u5b58\u4e2d...", saveSettings).catch(showError)
+      );
+      byId("save-routing").addEventListener("click", (e) =>
+        withButtonBusy(e.currentTarget, "\u4fdd\u5b58\u4e2d...", async () => {
+          await saveConfig();
+          byId("routing-status").textContent = "✓ 已保存";
+          setTimeout(() => byId("routing-status").textContent = "", 3000);
+        }).catch(showError)
       );
       byId("time-zone-preset").addEventListener("change", () => {
         const value = byId("time-zone-preset").value;

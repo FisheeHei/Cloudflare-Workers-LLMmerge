@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-06-advanced-routing-1";
+const VERSION = "v26-10-12-unified-scheduler-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2448,13 +2448,22 @@ function normalizeGatewayRouting(routing = {}) {
     ? 3
     : Number(rawCoordination);
   const legacyAttempts = routing.failover_max_attempts ?? routing.hedge_max;
+  const legacyAdvanced = routing.fast_routing === true || routing.hedge_enabled === true;
+  const routingMode = ["serial", "adaptive", "parallel"].includes(String(routing.routing_mode || ""))
+    ? String(routing.routing_mode)
+    : (legacyAdvanced ? "adaptive" : "serial");
+  const maxUpstreams = Math.max(1, Math.min(5, parsePositiveInt(routing.max_upstreams, legacyAdvanced
+    ? parsePositiveInt(routing.hedge_max, 2)
+    : parsePositiveInt(legacyAttempts, DEFAULT_FAILOVER_MAX_ATTEMPTS))));
   return {
+    routing_mode: routingMode,
+    max_upstreams: maxUpstreams,
     coordination_level: Number.isFinite(coordination) ? Math.max(0, Math.min(5, Math.floor(coordination))) : 3,
     failover: routing.failover !== false,
     failover_max_attempts: Math.max(1, Math.min(MAX_FAILOVER_ATTEMPTS, parsePositiveInt(legacyAttempts, DEFAULT_FAILOVER_MAX_ATTEMPTS))),
     fast_routing: routing.fast_routing === true,
     hedge_enabled: routing.hedge_enabled === true,
-    hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, 2))),
+    hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, maxUpstreams))),
     soft_interval_ms: parseNonNegativeInt(routing.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000),
     load_balance: routing.load_balance !== false,
   };
@@ -5174,11 +5183,11 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   try {
     if (!singleUpstream) {
       attempts = orderUpstreams(runtime, candidates, model, client);
-      maxAttempts = runtime.routing.failover === false
-        ? 1
-        : Math.min(attempts.length, runtime.routing.failover_max_attempts || DEFAULT_FAILOVER_MAX_ATTEMPTS);
-      if ((runtime.routing.hedge_enabled === true || runtime.routing.fast_routing === true) && maxAttempts > 1) {
-        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, Math.min(maxAttempts, runtime.routing.hedge_max)), model);
+      const maxUpstreams = Math.max(1, Math.min(attempts.length, runtime.routing.max_upstreams || runtime.routing.hedge_max || DEFAULT_FAILOVER_MAX_ATTEMPTS));
+      maxAttempts = runtime.routing.failover === false ? 1 : maxUpstreams;
+      const routingMode = runtime.routing.routing_mode || ((runtime.routing.hedge_enabled || runtime.routing.fast_routing) ? "adaptive" : "serial");
+      if (routingMode !== "serial" && maxAttempts > 1) {
+        const hedgedAttempts = avoidLastSuccessfulUpstream(attempts.slice(0, maxAttempts), model);
         if (hedgedAttempts.length === 1) {
           attempts = hedgedAttempts;
           maxAttempts = 1;
@@ -5513,9 +5522,11 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
   const knownTtft = upstreamLatencyScore(attempts[0], model);
   const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
+  const routingMode = runtime.routing.routing_mode || ((runtime.routing.fast_routing || runtime.routing.hedge_enabled) ? "adaptive" : "parallel");
   const launchDelay = (index) => index === 0 ? 0
-    : runtime.routing.fast_routing === true && index === 1 ? fastDelayMs
-      : runtime.routing.hedge_enabled === true ? index * hedgeDelayMs : Infinity;
+    : routingMode === "parallel" ? 0
+      : runtime.routing.fast_routing === true && index === 1 ? fastDelayMs
+        : routingMode === "adaptive" ? index * hedgeDelayMs : Infinity;
   let done = false;
   let launched = 0;
   let lastResponse = null;
