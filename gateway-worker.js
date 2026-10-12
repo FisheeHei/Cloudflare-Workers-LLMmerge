@@ -68,7 +68,7 @@ const STATS_WINDOW_HOURS = 24;
 const CLIENT_DAILY_USAGE_TTL_SECONDS = 35 * 24 * 3600;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
-const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
+const NON_STREAM_RESPONSE_DEADLINE_MS = 300000;
 const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-12-unified-scheduler-1";
+const VERSION = "v26-10-12-unified-scheduler-2";
 
 export default {
   async fetch(request, env, ctx) {
@@ -5236,7 +5236,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         trace, attempt: index + 1,
         firstByteTimeoutMs: streamRequest
           ? streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts)
-          : Math.max(1, Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), Math.floor(NON_STREAM_RESPONSE_DEADLINE_MS / maxAttempts))),
+          : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
       releaseSelectionOnce();
@@ -5409,16 +5409,8 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
 }
 
 function streamFirstByteTimeoutMs(runtime, upstream, bodyText, candidateCount) {
-  const timeout = proxyFirstByteTimeoutMs(runtime, upstream, bodyText);
-  if (candidateCount <= 1) return timeout;
-  try {
-    const model = String(JSON.parse(bodyText || "{}").model || "").toLowerCase();
-    return isNvidiaNimUpstream(upstream) && (isGlmModel(model) || isMiniMaxM3Model(model))
-      ? timeout
-      : Math.min(timeout, 15000);
-  } catch {
-    return Math.min(timeout, 15000);
-  }
+  // ponytail: candidate count must not shorten first-byte time; stream idle timeout still protects stalled responses.
+  return proxyFirstByteTimeoutMs(runtime, upstream, bodyText);
 }
 
 function applyGatewayPromptContext(bodyText, settings, client) {
