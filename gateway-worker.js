@@ -87,6 +87,8 @@ const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
 const SSE_KEEPALIVE_MS = 5000;
 const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
+// Soft preference across NIM accounts, not a hard RPM cap.
+const NIM_RECENT_DISPATCH_WINDOW_MS = 10000;
 // Keep upstream staggering advisory: a crowded account must not turn into an unbounded gateway queue.
 const MAX_UPSTREAM_DISPATCH_WAIT_MS = 1000;
 const ROUTE_COORDINATOR_TIMEOUT_MS = 1500;
@@ -384,6 +386,7 @@ let _upstreamReservations = {};
 // ponytail: stagger same-upstream dispatches without delaying already-spread requests.
 let _upstreamDispatchAt = {};
 let _upstreamDispatchClients = {};
+const _nimLastDispatchAt = {};
 const _routeSelectionTails = {};
 // ponytail: per-isolate active Responses streams, keyed by response id for cancel support
 const _activeResponses = new Map();
@@ -5390,6 +5393,7 @@ async function fetchProxyUpstream({ bodyText, client, pathname, request, runtime
       body: sanitizedBody,
     };
     init.signal = controller.signal;
+    if (isNvidiaNimUpstream(upstream)) _nimLastDispatchAt[upstreamKey(upstream)] = Date.now();
     const response = await fetchWithTimeout(
       buildUpstreamUrl(upstream.base_url, pathname, search),
       init,
@@ -5855,6 +5859,8 @@ function upstreamHasCompetition(upstream) {
 function upstreamCoordinationPressure(runtime, upstream, client) {
   const level = upstreamCoordinationPressureMs(runtime);
   if (level <= 0) return 0;
+  const lastDispatchAt = isNvidiaNimUpstream(upstream) ? Number(_nimLastDispatchAt[upstreamKey(upstream)] || 0) : 0;
+  const recentDispatchPenalty = lastDispatchAt ? Math.max(0, 1 - (Date.now() - lastDispatchAt) / NIM_RECENT_DISPATCH_WINDOW_MS) * level : 0;
   const capacity = Math.max(1, Number(upstream?.weight) || 1);
   const pressure = ((activeUpstreamCount(upstream) + upstreamReservationCount(upstream) * 1.5) / capacity) * level;
   const interval = upstreamSoftIntervalMs(runtime);
@@ -5862,7 +5868,7 @@ function upstreamCoordinationPressure(runtime, upstream, client) {
   const currentClient = String(client?.key || client?.id || client?.name || "gateway");
   const busy = upstreamHasCompetition(upstream);
   const crossClient = busy && recent && recent.client !== currentClient && Date.now() - Number(recent.at || 0) < interval;
-  return pressure + (crossClient ? level : 0);
+  return pressure + (crossClient ? level : 0) + recentDispatchPenalty;
 }
 
 function upstreamLatencySortScore(upstream, model) {
