@@ -76,7 +76,7 @@ const DEFAULT_FAILOVER_MAX_ATTEMPTS = 3;
 const MAX_FAILOVER_ATTEMPTS = 5;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const MAX_RETRY_AFTER_COOLDOWN_SECONDS = 10 * 60;
-const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 10 * 1000;
+const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 15 * 1000;
 const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 35 * 1000;
 const HEALTH_PROBE_KEY = "health:probe:last";
 const HEALTH_PROBE_TTL_SECONDS = 24 * 3600;
@@ -85,17 +85,17 @@ const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
-const SSE_KEEPALIVE_MS = 10000;
-const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 30 * 1000;
-// Keep upstream staggering advisory: a crowded account must not turn into an unbounded gateway queue.
-const MAX_UPSTREAM_DISPATCH_WAIT_MS = 30 * 1000;
-const ROUTE_COORDINATOR_TIMEOUT_MS = 31 * 1000;
+const SSE_KEEPALIVE_MS = 15000;
+const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 20 * 1000;
+// Keep initial-key staggering bounded: a crowded account must not create an unbounded gateway queue.
+const MAX_UPSTREAM_DISPATCH_WAIT_MS = 20 * 1000;
+const ROUTE_COORDINATOR_TIMEOUT_MS = 21 * 1000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const COMPACTION_PROMPT = "Compress the conversation for continued agent work. Preserve user requirements, decisions, file paths, commands, errors, tool results, unresolved tasks, and current state. Do not solve the task, call tools, change models, or add commentary. Output only a concise self-contained summary.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
-const ANALYTICS_QUERY_CACHE_MS = 7000;
+const ANALYTICS_QUERY_CACHE_MS = 12000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
 const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-13-interval-tuning-1";
+const VERSION = "v26-10-13-interval-tuning-2";
 
 export default {
   async fetch(request, env, ctx) {
@@ -384,6 +384,9 @@ let _upstreamReservations = {};
 // ponytail: stagger same-upstream dispatches without delaying already-spread requests.
 let _upstreamDispatchAt = {};
 let _upstreamDispatchClients = {};
+// ponytail: isolate-local per-client soft interval; persistence would add cost without improving this advisory hint.
+const _clientUpstreamRecent = new Map();
+const MAX_CLIENT_UPSTREAM_RECENT = 1024;
 const _routeSelectionTails = {};
 // ponytail: per-isolate active Responses streams, keyed by response id for cancel support
 const _activeResponses = new Map();
@@ -626,7 +629,7 @@ export class LlmMergeStore {
     const url = new URL(request.url);
     if (url.pathname === "/dispatch" && request.method === "POST") {
       const payload = await request.json().catch(() => ({}));
-      const intervalMs = Math.max(0, Math.min(30000, Number(payload?.interval_ms) || 0));
+      const intervalMs = Math.max(0, Math.min(20000, Number(payload?.interval_ms) || 0));
       const maxWaitMs = Number(payload?.max_wait_ms);
       const now = Date.now();
       const [nextAtValue, lastClient] = await Promise.all([
@@ -2472,7 +2475,7 @@ function normalizeGatewayRouting(routing = {}) {
     soft_interval_ms: parseNonNegativeInt(
       routing.soft_interval_ms === 50 ? DEFAULT_UPSTREAM_SOFT_INTERVAL_MS : routing.soft_interval_ms,
       DEFAULT_UPSTREAM_SOFT_INTERVAL_MS,
-      30000,
+      20000,
     ),
     load_balance: routing.load_balance !== false,
   };
@@ -5523,11 +5526,17 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
   const knownTtft = upstreamLatencyScore(attempts[0], model);
   const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
+  const initialKeyIntervalMs = upstreamSoftIntervalMs(runtime);
   const routingMode = runtime.routing.routing_mode || ((runtime.routing.fast_routing || runtime.routing.hedge_enabled) ? "adaptive" : "parallel");
-  const launchDelay = (index) => index === 0 ? 0
-    : routingMode === "parallel" ? 0
+  const launchDelay = (index) => {
+    if (index === 0) return 0;
+    const modeDelay = routingMode === "parallel" ? 0
       : runtime.routing.fast_routing === true && index === 1 ? fastDelayMs
         : routingMode === "adaptive" ? index * hedgeDelayMs : Infinity;
+    // ponytail: parallel mode still respects the configured initial-key stagger; otherwise one burst defeats the setting.
+    if (!initialKeyIntervalMs || !Number.isFinite(modeDelay)) return modeDelay;
+    return Math.max(modeDelay, index * initialKeyIntervalMs);
+  };
   let done = false;
   let launched = 0;
   let lastResponse = null;
@@ -5844,7 +5853,44 @@ function upstreamCoordinationPressure(runtime, upstream, client) {
   const currentClient = String(client?.key || client?.id || client?.name || "gateway");
   const busy = upstreamHasCompetition(upstream);
   const crossClient = busy && recent && recent.client !== currentClient && Date.now() - Number(recent.at || 0) < interval;
-  return pressure + (crossClient ? level : 0);
+  return pressure + (crossClient ? level : 0) + clientUpstreamRecentPressure(runtime, upstream, currentClient, level);
+}
+
+function clientUpstreamRecentKey(clientKey, upstream) {
+  const name = upstreamKey(upstream);
+  return clientKey && name ? `${clientKey}\n${name}` : "";
+}
+
+function clientUpstreamRecentPressure(runtime, upstream, clientKey, level) {
+  const interval = upstreamSoftIntervalMs(runtime);
+  if (!interval || !clientKey) return 0;
+  const recent = _clientUpstreamRecent.get(clientUpstreamRecentKey(clientKey, upstream));
+  if (!recent) return 0;
+  const age = Math.max(0, Date.now() - Number(recent.at || 0));
+  if (!recent.active && age >= interval) return 0;
+  return level * (recent.active ? 1 : Math.max(0, 1 - age / interval));
+}
+
+function noteClientUpstreamUse(client, upstream, active) {
+  const clientKey = String(client?.key || client?.id || client?.name || "gateway").trim();
+  const key = clientUpstreamRecentKey(clientKey, upstream);
+  if (!key) return;
+  const previous = _clientUpstreamRecent.get(key);
+  if (!active && !previous) return;
+  if (active && !previous && _clientUpstreamRecent.size >= MAX_CLIENT_UPSTREAM_RECENT) {
+    const cutoff = Date.now() - DEFAULT_UPSTREAM_SOFT_INTERVAL_MS;
+    for (const [entryKey, entry] of _clientUpstreamRecent) {
+      if (!entry.active && Number(entry.at || 0) < cutoff) _clientUpstreamRecent.delete(entryKey);
+    }
+    if (_clientUpstreamRecent.size >= MAX_CLIENT_UPSTREAM_RECENT) {
+      const oldestInactive = [..._clientUpstreamRecent].find(([, entry]) => !entry.active);
+      if (oldestInactive) _clientUpstreamRecent.delete(oldestInactive[0]);
+      else return;
+    }
+  }
+  const count = Math.max(0, Number(previous?.active || 0) + (active ? 1 : -1));
+  _clientUpstreamRecent.delete(key);
+  _clientUpstreamRecent.set(key, { at: Date.now(), active: count });
 }
 
 function upstreamLatencySortScore(upstream, model) {
@@ -5858,7 +5904,7 @@ function upstreamCoordinationPressureMs(runtime) {
 }
 
 function upstreamSoftIntervalMs(runtime) {
-  return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 30000);
+  return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 20000);
 }
 
 async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
@@ -5875,7 +5921,8 @@ async function waitForUpstreamDispatch(runtime, upstream, client, signal, contes
       const slot = await runtime.routeCoordinator.reserve(name, interval, client, controller.signal, MAX_UPSTREAM_DISPATCH_WAIT_MS);
       const delay = Math.max(0, Number(slot?.delay_ms) || 0);
       if (slot?.accepted === false || delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) {
-        return { accepted: false, delayMs: delay };
+        // ponytail: staggering is advisory; a full queue must not turn a usable upstream into a 503.
+        return { accepted: true, delayMs: 0 };
       }
       const now = Date.now();
       _upstreamDispatchAt[name] = Math.max(Number(_upstreamDispatchAt[name] || 0), now + delay + interval);
@@ -5899,7 +5946,7 @@ async function waitForUpstreamDispatch(runtime, upstream, client, signal, contes
   const sameClient = _upstreamDispatchClients[name]?.client === currentClient;
   const scheduled = contested && !sameClient ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
   const delay = scheduled - now;
-  if (delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) return { accepted: false, delayMs: delay };
+  if (delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) return { accepted: true, delayMs: 0 };
   _upstreamDispatchAt[name] = scheduled + interval;
   _upstreamDispatchClients[name] = {
     client: currentClient,
@@ -6039,6 +6086,7 @@ function trackActiveUpstream(upstream, client, controller) {
   const epoch = _activeUpstreamEpoch;
   if (controller) _activeUpstreamControllers.add(controller);
   noteActiveUpstream(upstream, client, 1);
+  noteClientUpstreamUse(client, upstream, true);
   let released = false;
   return () => {
     if (released) return;
@@ -6046,6 +6094,7 @@ function trackActiveUpstream(upstream, client, controller) {
     if (controller) _activeUpstreamControllers.delete(controller);
     if (epoch !== _activeUpstreamEpoch) return;
     noteActiveUpstream(upstream, client, -1);
+    noteClientUpstreamUse(client, upstream, false);
   };
 }
 
@@ -6067,6 +6116,7 @@ function clearActiveUpstreamState() {
   _upstreamReservations = {};
   _upstreamDispatchAt = {};
   _upstreamDispatchClients = {};
+  _clientUpstreamRecent.clear();
   Object.keys(_routeSelectionTails).forEach((key) => delete _routeSelectionTails[key]);
   return released;
 }
@@ -7024,3 +7074,4 @@ function badConfig(message) {
 }
 
 // ponytail: origin param lets us pre-fill gateway URL server-side (no API wait)
+
