@@ -89,9 +89,9 @@ https://your-domain.example/{ADMIN_TOKEN}
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `REQUEST_TIMEOUT_MS` | `180000` | 上游首包/非流式请求基础超时；非流式仍受 90 秒响应期限约束 |
+| `REQUEST_TIMEOUT_MS` | `180000` | 上游首包/非流式请求基础超时；非流式额外受 300 秒响应期限保护 |
 | `STREAM_IDLE_TIMEOUT_MS` | `900000` | 流式响应空闲超时 |
-| `SSE_KEEPALIVE_MS` | `5000` | SSE 保活注释间隔 |
+| `SSE_KEEPALIVE_MS` | `10000` | SSE 保活注释间隔 |
 | `UPSTREAM_COOLDOWN_TTL` | `60` | 上游失败冷却秒数 |
 | `MODEL_CACHE_TTL` | `3600` | 聚合模型列表缓存秒数 |
 | `UPSTREAMS_JSON` | 空 | 初始上游配置 JSON |
@@ -195,7 +195,7 @@ const response = await client.chat.completions.create({
 - `failover`：失败、超时或冷却时尝试其他上游。
 - `load_balance`：结合权重、活跃请求、客户端 Key 亲和和近期延迟排序。
 - `failover_max_attempts`：串行故障转移最大尝试数，默认 `3`，最多 `5` 次。
-- `soft_interval_ms`：同一上游被多个 Key 同时选中时的建议错峰间隔，默认 `50`；设为 `0` 可关闭。
+- `soft_interval_ms`：不同客户端竞争同一上游时的建议错峰间隔，默认 `30000`（30 秒）；设为 `0` 可关闭。
 - 流式候选在首个可见输出超时时切换上游；已有可见输出后不重放。
 - 流式故障转移只发生在首个可见输出前；已经输出给客户端后不会重放，避免重复文本或工具调用。
 - `Hedged Request` 和 `Gateway Fast` 会并行/竞速多个候选。多账号池或并发受限的上游通常应关闭它们，以免主动增加同一模型的并发。

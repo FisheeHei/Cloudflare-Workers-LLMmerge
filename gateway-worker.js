@@ -76,8 +76,8 @@ const DEFAULT_FAILOVER_MAX_ATTEMPTS = 3;
 const MAX_FAILOVER_ATTEMPTS = 5;
 const UPSTREAM_LATENCY_TTL_SECONDS = 6 * 3600;
 const MAX_RETRY_AFTER_COOLDOWN_SECONDS = 10 * 60;
-const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 5 * 1000;
-const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 30 * 1000;
+const UPSTREAM_STATE_HYDRATE_INTERVAL_MS = 10 * 1000;
+const UPSTREAM_LATENCY_PERSIST_INTERVAL_MS = 35 * 1000;
 const HEALTH_PROBE_KEY = "health:probe:last";
 const HEALTH_PROBE_TTL_SECONDS = 24 * 3600;
 const D1_STORE_TABLE = "llmmerge_store";
@@ -85,17 +85,17 @@ const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
-const SSE_KEEPALIVE_MS = 5000;
-const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 50;
+const SSE_KEEPALIVE_MS = 10000;
+const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 30 * 1000;
 // Keep upstream staggering advisory: a crowded account must not turn into an unbounded gateway queue.
-const MAX_UPSTREAM_DISPATCH_WAIT_MS = 1000;
-const ROUTE_COORDINATOR_TIMEOUT_MS = 1500;
+const MAX_UPSTREAM_DISPATCH_WAIT_MS = 30 * 1000;
+const ROUTE_COORDINATOR_TIMEOUT_MS = 31 * 1000;
 const CLOUDFLARE_MODEL_SEARCH_PER_PAGE = 100;
 const CLOUDFLARE_MODEL_SEARCH_MAX_PAGES = 20;
 const SUBAGENT_PROMPT = "When the task benefits from parallel investigation or isolated implementation, use subagents to perform the work.";
 const COMPACTION_PROMPT = "Compress the conversation for continued agent work. Preserve user requirements, decisions, file paths, commands, errors, tool results, unresolved tasks, and current state. Do not solve the task, call tools, change models, or add commentary. Output only a concise self-contained summary.";
 const ANALYTICS_LIVE_PENDING_MS = 120000;
-const ANALYTICS_QUERY_CACHE_MS = 2000;
+const ANALYTICS_QUERY_CACHE_MS = 7000;
 const SESSION_MODEL_LOCK_TTL_SECONDS = 7 * 24 * 3600;
 const MAX_SSE_EVENT_CHARS = 1024 * 1024;
 const MAX_SSE_PRIME_BYTES = 2 * 1024 * 1024;
@@ -114,7 +114,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-12-unified-scheduler-2";
+const VERSION = "v26-10-13-interval-tuning-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -626,11 +626,16 @@ export class LlmMergeStore {
     const url = new URL(request.url);
     if (url.pathname === "/dispatch" && request.method === "POST") {
       const payload = await request.json().catch(() => ({}));
-      const intervalMs = Math.max(0, Math.min(2000, Number(payload?.interval_ms) || 0));
+      const intervalMs = Math.max(0, Math.min(30000, Number(payload?.interval_ms) || 0));
       const maxWaitMs = Number(payload?.max_wait_ms);
       const now = Date.now();
-      const previousNextAt = Number(await this.state.storage.get("dispatch:next_at")) || 0;
-      const scheduledAt = Math.max(now, previousNextAt);
+      const [nextAtValue, lastClient] = await Promise.all([
+        this.state.storage.get("dispatch:next_at"),
+        this.state.storage.get("dispatch:last_client"),
+      ]);
+      const previousNextAt = Number(nextAtValue) || 0;
+      const client = String(payload?.client || "gateway");
+      const scheduledAt = lastClient === client ? now : Math.max(now, previousNextAt);
       const delayMs = Math.max(0, scheduledAt - now);
       if (Number.isFinite(maxWaitMs) && maxWaitMs >= 0 && delayMs > maxWaitMs) {
         return new Response(JSON.stringify({ accepted: false, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: previousNextAt }), {
@@ -639,7 +644,7 @@ export class LlmMergeStore {
       }
       const nextAt = scheduledAt + intervalMs;
       await this.state.storage.put("dispatch:next_at", String(nextAt), { expirationTtl: 120 });
-      await this.state.storage.put("dispatch:last_client", String(payload?.client || "gateway"), { expirationTtl: 120 });
+      await this.state.storage.put("dispatch:last_client", client, { expirationTtl: 120 });
       return new Response(JSON.stringify({ accepted: true, delay_ms: delayMs, scheduled_at: scheduledAt, next_at: nextAt }), {
         headers: JSON_HEADERS,
       });
@@ -768,7 +773,7 @@ const _pendingLogs = [];
 const _pendingStats = {}; // hourKey -> bucket
 const _pendingClientUsage = {}; // storageKey -> delta
 let _lastFlush = Date.now();
-const DEFAULT_KV_FLUSH_INTERVAL_MS = 120 * 1000;
+const DEFAULT_KV_FLUSH_INTERVAL_MS = 125 * 1000;
 const FLUSH_PENDING_LIMIT = 200;
 let _flushPromise = null;
 
@@ -2464,7 +2469,11 @@ function normalizeGatewayRouting(routing = {}) {
     fast_routing: routing.fast_routing === true,
     hedge_enabled: routing.hedge_enabled === true,
     hedge_max: Math.max(1, Math.min(5, parsePositiveInt(routing.hedge_max, maxUpstreams))),
-    soft_interval_ms: parseNonNegativeInt(routing.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000),
+    soft_interval_ms: parseNonNegativeInt(
+      routing.soft_interval_ms === 50 ? DEFAULT_UPSTREAM_SOFT_INTERVAL_MS : routing.soft_interval_ms,
+      DEFAULT_UPSTREAM_SOFT_INTERVAL_MS,
+      30000,
+    ),
     load_balance: routing.load_balance !== false,
   };
 }
@@ -5849,7 +5858,7 @@ function upstreamCoordinationPressureMs(runtime) {
 }
 
 function upstreamSoftIntervalMs(runtime) {
-  return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 2000);
+  return parseNonNegativeInt(runtime?.routing?.soft_interval_ms, DEFAULT_UPSTREAM_SOFT_INTERVAL_MS, 30000);
 }
 
 async function waitForUpstreamDispatch(runtime, upstream, client, signal, contested = true) {
@@ -5886,12 +5895,14 @@ async function waitForUpstreamDispatch(runtime, upstream, client, signal, contes
     }
   }
   const now = Date.now();
-  const scheduled = contested ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
+  const currentClient = String(client?.key || client?.id || client?.name || "gateway");
+  const sameClient = _upstreamDispatchClients[name]?.client === currentClient;
+  const scheduled = contested && !sameClient ? Math.max(now, Number(_upstreamDispatchAt[name] || 0)) : now;
   const delay = scheduled - now;
   if (delay > MAX_UPSTREAM_DISPATCH_WAIT_MS) return { accepted: false, delayMs: delay };
   _upstreamDispatchAt[name] = scheduled + interval;
   _upstreamDispatchClients[name] = {
-    client: String(client?.key || client?.id || client?.name || "gateway"),
+    client: currentClient,
     at: now,
   };
   if (delay > 0) await sleep(delay, signal);
