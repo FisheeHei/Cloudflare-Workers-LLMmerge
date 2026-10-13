@@ -783,7 +783,7 @@ function renderAdminMarkup(origin, version) {
       <div class="row">
         <div class="field span-4"><label><input type="checkbox" id="routing-failover"> 故障转移</label></div>
         <div class="field span-4"><label>并发协调强度 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"></div>
-        <div class="field span-4"><label>Key 错峰间隔 (ms)</label><input id="routing-soft-interval" type="number" min="0" max="30000" placeholder="30000"><span class="note">不同客户端竞争同一上游时生效，默认 30 秒；0=关闭。</span></div>
+        <div class="field span-4"><label>初始候选 Key 启动间隔 (ms)</label><input id="routing-soft-interval" type="number" min="0" max="20000" placeholder="20000"><span class="note">首个候选立即启动，后续候选按此间隔错开；默认 20 秒，0=关闭。</span></div>
       </div>
       <div class="row">
         <div class="field span-4"><label>旧版故障切换次数</label><input id="routing-failover-attempts" type="number" min="1" max="5" placeholder="3"><span class="note">仅用于兼容旧配置，串行模式仍受上限约束。</span></div>
@@ -1019,9 +1019,9 @@ function renderAdminScript(version) {
   let runtimeRefreshRunning = false;
   let statsRefreshRunning = false;
   let logsRefreshRunning = false;
-  const AUTO_RUNTIME_REFRESH_MS = 10000;
-  const AUTO_STATS_REFRESH_MS = 15000;
-  const AUTO_LOG_REFRESH_MS = 15000;
+  const AUTO_RUNTIME_REFRESH_MS = 15000;
+  const AUTO_STATS_REFRESH_MS = 20000;
+  const AUTO_LOG_REFRESH_MS = 20000;
   let liveRefreshTimers = [];
   const loadedViews = {};
 
@@ -1571,7 +1571,7 @@ function renderAdminScript(version) {
         fast_routing: byId("routing-fast").checked,
         hedge_max: Number(byId("routing-max-upstreams").value || 2),
         coordination_level: Number(byId("routing-coordination-level").value || 3),
-        soft_interval_ms: byId("routing-soft-interval").value === "" ? 30000 : Number(byId("routing-soft-interval").value),
+        soft_interval_ms: byId("routing-soft-interval").value === "" ? 20000 : Number(byId("routing-soft-interval").value),
       },
       upstreams,
     };
@@ -1606,7 +1606,7 @@ function renderAdminScript(version) {
     byId("routing-hedge").checked = r.hedge_enabled === true;
     byId("routing-fast").checked = r.fast_routing === true;
     byId("routing-coordination-level").value = r.coordination_level ?? 3;
-    byId("routing-soft-interval").value = r.soft_interval_ms ?? 30000;
+    byId("routing-soft-interval").value = r.soft_interval_ms ?? 20000;
     byId("gateway-url-pill").textContent = (state.gateway && state.gateway.base_url) || "loading...";
   }
 
@@ -3447,3 +3447,4 @@ async function loadKvUsage() {
   boot();
 </script>`;
 }
+
