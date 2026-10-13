@@ -3740,14 +3740,14 @@ function responseStoreKey(id) {
 }
 
 function maybeStoreResponse(runtime, responsePayload, ctx) {
-  if (!runtime?.state || !responsePayload?.id || responsePayload.store !== true) return;
+  if (!runtime?.state || !responsePayload?.id || responsePayload.store !== true) return Promise.resolve();
   const task = runtime.state.put(
     responseStoreKey(responsePayload.id),
     JSON.stringify(responsePayload),
     { expirationTtl: RESPONSE_STORE_TTL_SECONDS },
   ).catch(() => {});
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(task);
-  else void task;
+  return task;
 }
 
 async function readStoredResponse(runtime, id) {
@@ -3858,7 +3858,8 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
         };
         if (useNative) {
           const onDone = (usage, extra) => finish(usage, extra);
-          return nativeResponsesStream(upstreamResp.body, onDone, () => abortUpstreamResponse(proxyResponse));
+          const onFinal = (responsePayload) => maybeStoreResponse(runtime, { ...responsePayload, store: translated.seed.store }, ctx);
+          return nativeResponsesStream(upstreamResp.body, onDone, () => abortUpstreamResponse(proxyResponse), onFinal);
         }
         const onFinal = (responsePayload) => maybeStoreResponse(runtime, responsePayload, ctx);
         return streamResponsesFromChat(upstreamResp, translated.seed, finish, started, shouldHideDeepSeekReasoning(translated.model, translated.seed.model, proxyResponse.upstream), onFinal, isNvidiaNimUpstream(proxyResponse.upstream), () => abortUpstreamResponse(proxyResponse));
@@ -3934,7 +3935,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
       const reasoning = hideReasoning ? "" : reasoningText(message.reasoning_content ?? message.reasoning ?? message.thinking);
       responsePayload = makeResponsesPayload(translated.seed, { text, usage: openaiPayload.usage, toolCalls: message.tool_calls || [], reasoning });
     }
-    maybeStoreResponse(runtime, responsePayload, ctx);
+    await maybeStoreResponse(runtime, responsePayload, ctx);
     headers.set("content-type", "application/json; charset=utf-8");
     recordResponsesLog(app, client, proxyResponse.upstream.name, translated.model, started, 200, translated.bodyText, responsePayload.usage, ctx, traceId, {
       ...gatewayRequestTraceLogFields({ trace: proxyResponse.trace, traceId }),
@@ -4265,7 +4266,7 @@ async function handleCompletionsRequest(request, url, app, ctx, traceId) {
   }
 }
 
-function nativeResponsesStream(body, onDone, onComplete = null) {
+function nativeResponsesStream(body, onDone, onComplete = null, onFinal = null) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -4284,6 +4285,7 @@ function nativeResponsesStream(body, onDone, onComplete = null) {
     let sawDone = false;
     let completed = false;
     let outputChars = 0;
+    let storedFinal = false;
     let closeReason = "done";
     let completionPending = false;
     let upstreamStopped = false;
@@ -4319,7 +4321,13 @@ function nativeResponsesStream(body, onDone, onComplete = null) {
       buffer += decoder.decode(value, { stream: true });
       const events = [];
       buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; markUpstreamComplete(); });
-      for (const event of events) await writeEvent(event);
+      for (const event of events) {
+        if (!storedFinal && event?.type === "response.completed" && event.response) {
+          storedFinal = true;
+          await onFinal?.(event.response);
+        }
+        await writeEvent(event);
+      }
       if (sawDone || completed) {
         break;
       }
@@ -4328,7 +4336,13 @@ function nativeResponsesStream(body, onDone, onComplete = null) {
     if (!sawDone && !completed && buffer) {
       const events = [];
       consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => events.push(processChunk(chunk)), () => { sawDone = true; markUpstreamComplete(); });
-      for (const event of events) await writeEvent(event);
+      for (const event of events) {
+        if (!storedFinal && event?.type === "response.completed" && event.response) {
+          storedFinal = true;
+          await onFinal?.(event.response);
+        }
+        await writeEvent(event);
+      }
     }
     if (!sawDone && !completed) {
       closeReason = "eof";
@@ -4508,7 +4522,7 @@ function translateResponsesRequest(payload, { previousResponse = null } = {}) {
       reasoningId: `rs_${crypto.randomUUID().replace(/-/g, "")}`,
       reasoningEffort: payload.reasoning?.effort ?? payload.reasoning_effort ?? payload.reasoningEffort ?? null,
       reasoningSummary: payload.reasoning?.summary ?? payload.reasoningSummary ?? null,
-      store: payload.store === true,
+      store: payload.store !== false,
       temperature: payload.temperature ?? null,
       textFormat: payload.text?.format && typeof payload.text.format === "object" ? payload.text.format : { type: "text" },
       toolChoice: payload.tool_choice ?? "auto",
@@ -5090,7 +5104,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       if (!sawDone && !finishReason) {
         closeReason = "eof";
         const failedResponse = { ...makeResponsesPayload(seed, { text, reasoning, usage, status: "failed" }), error: { message: "Upstream stream ended without [DONE].", type: "server_error" } };
-        if (onFinal) onFinal(failedResponse);
+        if (onFinal) await onFinal(failedResponse);
         await write({ type: "response.failed", response: failedResponse });
         await write({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
         return;
@@ -5120,13 +5134,13 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         reasoning,
         outputOrder: outputItems.map((item) => ({ type: item.type, call: item.type === "function_call" ? item.item : null })),
       });
-      if (onFinal) onFinal(completedResponse);
+      if (onFinal) await onFinal(completedResponse);
       await write({ type: "response.completed", response: completedResponse });
       await writer.write(encoder.encode("data: [DONE]\n\n"));
     } catch (error) {
       closeReason = "error";
       const failedResponse = { ...makeResponsesPayload(seed, { text: textParts.join(""), reasoning: reasoningParts.join(""), usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } };
-      if (onFinal) onFinal(failedResponse);
+      if (onFinal) await onFinal(failedResponse);
       await write({ type: "response.failed", response: failedResponse });
       await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
     } finally {
@@ -5234,9 +5248,12 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       const upstreamPromise = fetchProxyUpstream({
         bodyText, client, pathname, request, runtime, search, signal, upstream,
         trace, attempt: index + 1,
-        firstByteTimeoutMs: streamRequest
-          ? streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts)
-          : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+        firstByteTimeoutMs: Math.min(
+          streamRequest
+            ? streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts)
+            : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+          remainingRequestTimeoutMs(runtime, routingStartedAt),
+        ),
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
       releaseSelectionOnce();
@@ -5244,7 +5261,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
       let response = upstreamResult.response;
 
       if (response.ok && streamRequest) {
-        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts));
+        const primed = await primeSseResponse(response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts), remainingRequestTimeoutMs(runtime, routingStartedAt)));
         response = primed.response;
         upstreamResult.response = response;
         upstreamResult.streamError = primed.error;
@@ -5408,6 +5425,11 @@ function proxyFirstByteTimeoutMs(runtime, upstream, bodyText) {
   }
 }
 
+function remainingRequestTimeoutMs(runtime, routingStartedAt) {
+  const configured = Math.max(1, Number(runtime?.requestTimeoutMs) || DEFAULT_TIMEOUT_MS);
+  return Math.max(1, configured - Math.max(0, Date.now() - Number(routingStartedAt || Date.now())));
+}
+
 function streamFirstByteTimeoutMs(runtime, upstream, bodyText, candidateCount) {
   // ponytail: candidate count must not shorten first-byte time; stream idle timeout still protects stalled responses.
   return proxyFirstByteTimeoutMs(runtime, upstream, bodyText);
@@ -5553,10 +5575,15 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
         result = await fetchProxyUpstream({
           bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
           trace, attempt,
-          firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+          firstByteTimeoutMs: Math.min(
+            streamRequest
+              ? streamFirstByteTimeoutMs(runtime, upstream, bodyText, attempts.length)
+              : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+            remainingRequestTimeoutMs(runtime, routingStartedAt),
+          ),
         });
         if (result.response.ok && streamRequest) {
-          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
+          const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream), Math.min(streamFirstByteTimeoutMs(runtime, upstream, bodyText, attempts.length), remainingRequestTimeoutMs(runtime, routingStartedAt)));
           result.response = primed.response;
           result.streamError = primed.error;
           result.streamErrorKind = primed.errorKind || "";
