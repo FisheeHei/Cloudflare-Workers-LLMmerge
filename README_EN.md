@@ -87,7 +87,7 @@ Common variables:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `REQUEST_TIMEOUT_MS` | `180000` | Base upstream first-byte/non-stream timeout; non-stream requests also have a 300-second safety deadline |
+| `REQUEST_TIMEOUT_MS` | `180000` | Base upstream first-byte/non-stream timeout; non-stream requests share a 90-second total deadline to avoid edge 524s |
 | `STREAM_IDLE_TIMEOUT_MS` | `900000` | Streaming idle timeout |
 | `SSE_KEEPALIVE_MS` | `10000` | SSE keepalive comment interval |
 | `UPSTREAM_COOLDOWN_TTL` | `60` | Upstream failure cooldown in seconds |
@@ -197,7 +197,7 @@ const response = await client.chat.completions.create({
 - Streaming candidates fail over before the first visible output; output is never replayed after it starts.
 - Streaming failover only happens before the first visible output. Once bytes reach the client, the gateway never replays the request, avoiding duplicate text or tool calls.
 - `Hedged Request` and `Gateway Fast` race multiple candidates. For a multi-account pool or concurrency-limited provider, they are usually best disabled because they intentionally increase concurrency.
-- SSE sends a keepalive comment every five seconds to keep proxy connections open; keepalives are not model output.
+- SSE sends a padded keepalive comment every 10 seconds by default to keep proxy connections open; keepalives are not model output.
 
 Health checks only verify the upstream `/models` endpoint and do not prove that a specific model is ready. Use the admin speed test for model-level verification. Long-reasoning models may have slow first bytes, so the gateway uses an appropriate first-byte timeout and can try a fallback upstream.
 
