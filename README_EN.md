@@ -193,7 +193,7 @@ const response = await client.chat.completions.create({
 - `failover`: try another upstream after failure, timeout, or cooldown.
 - `load_balance`: rank by weight, active requests, client-key affinity, and recent latency.
 - `failover_max_attempts`: maximum serial failover attempts, default `3`, capped at `5`.
-- `soft_interval_ms`: advisory staggering when different clients choose the same upstream; default is `30000` (30 seconds), and `0` disables it.
+- `soft_interval_ms`: staggered startup for the initial upstream candidate batch; the first candidate starts immediately and later candidates use this interval. The default and maximum are `20000` (20 seconds), and `0` disables it.
 - Streaming candidates fail over before the first visible output; output is never replayed after it starts.
 - Streaming failover only happens before the first visible output. Once bytes reach the client, the gateway never replays the request, avoiding duplicate text or tool calls.
 - `Hedged Request` and `Gateway Fast` race multiple candidates. For a multi-account pool or concurrency-limited provider, they are usually best disabled because they intentionally increase concurrency.
@@ -232,3 +232,4 @@ When no first byte arrives, inspect `x-llm-gateway-upstream-start-ms`. A large v
 - `wrangler.worker.toml`: Worker deployment configuration.
 - `wrangler.toml`: Pages/local development reference configuration.
 - `d1_migrations/0001_create_store.sql`: D1 schema migration.
+
