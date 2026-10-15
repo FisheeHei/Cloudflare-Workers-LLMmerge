@@ -68,7 +68,8 @@ const STATS_WINDOW_HOURS = 24;
 const CLIENT_DAILY_USAGE_TTL_SECONDS = 35 * 24 * 3600;
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 900000;
-const NON_STREAM_RESPONSE_DEADLINE_MS = 300000;
+// Cloudflare commonly emits 524 after about 100s without origin response; keep a margin and bound all retries together.
+const NON_STREAM_RESPONSE_DEADLINE_MS = 90000;
 const NIM_SLOW_FIRST_BYTE_TIMEOUT_MS = 300000;
 const DEFAULT_MODEL_CACHE_TTL = 3600;
 const DEFAULT_COOLDOWN_TTL = 60;
@@ -85,7 +86,9 @@ const UPSTREAM_PROBE_CONCURRENCY = 4;
 const API_TIME_ZONE_LABEL = "UTC";
 const LEGACY_STATS_UTC_OFFSET_MS = 8 * 3600 * 1000;
 // Keep the SSE connection visibly active through an additional proxy layer.
-const SSE_KEEPALIVE_MS = 15000;
+const SSE_KEEPALIVE_MS = 10000;
+const SSE_KEEPALIVE_COMMENT = ": keepalive\n\n";
+const SSE_PADDED_KEEPALIVE_COMMENT = `: keepalive\n: ${" ".repeat(2048)}\n\n`;
 const DEFAULT_UPSTREAM_SOFT_INTERVAL_MS = 20 * 1000;
 // Keep initial-key staggering bounded: a crowded account must not create an unbounded gateway queue.
 const MAX_UPSTREAM_DISPATCH_WAIT_MS = 20 * 1000;
@@ -114,7 +117,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-13-interval-tuning-2";
+const VERSION = "v26-10-15-routing-tuning-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1634,7 +1637,8 @@ function trackOpenAiStreamUsage(body, fallbackPrompt, onDone, started = Date.now
 export function withSseKeepAlive(body, intervalMs = _sseKeepaliveMs) {
   if (!body) return body;
   const encoder = new TextEncoder();
-  const ping = encoder.encode(": keepalive\n\n");
+  const initialPing = encoder.encode(SSE_KEEPALIVE_COMMENT);
+  const ping = encoder.encode(SSE_PADDED_KEEPALIVE_COMMENT);
   const errorChunk = (error) => encoder.encode("data: " + JSON.stringify(openAiError(error?.message || "Stream error.", "server_error")) + "\n\n");
   const interval = Math.max(1, Number(intervalMs) || _sseKeepaliveMs);
   let reader = null;
@@ -1662,6 +1666,7 @@ export function withSseKeepAlive(body, intervalMs = _sseKeepaliveMs) {
   return new ReadableStream({
     async start(controller) {
       reader = body.getReader();
+      safeEnqueue(controller, initialPing);
       timer = setInterval(() => {
         if (!closed && controller.desiredSize > 0) safeEnqueue(controller, ping);
       }, interval);
@@ -1692,7 +1697,7 @@ export function withSseKeepAlive(body, intervalMs = _sseKeepaliveMs) {
 
 function streamPendingAnthropicResponse(open) {
   // ponytail: padded SSE crosses buffering proxies that otherwise hold tiny first chunks.
-  const ping = `: ${" ".repeat(2048)}\nevent: ping\ndata: {"type":"ping"}\n\n`;
+  const ping = `${SSE_PADDED_KEEPALIVE_COMMENT}event: ping\ndata: {"type":"ping"}\n\n`;
   return streamPendingSseResponse(open, ping, ping, (error) => {
     const status = error.statusCode || 502;
     const payload = { type: "error", error: { type: anthropicErrorType(status), message: error.message || "Upstream request failed." } };
@@ -5168,6 +5173,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
     injection = prepared.injection;
   }
   const streamRequest = requestBodyStreams(bodyText);
+  const responseDeadline = streamRequest ? 0 : Date.now() + NON_STREAM_RESPONSE_DEADLINE_MS;
 
   const candidates = proxyCandidates(runtime, client, model, pathname);
 
@@ -5206,7 +5212,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         } else {
           timing.route_selected_ms = Date.now() - routingStartedAt;
           markGatewayTrace(trace, "route_selected");
-          const result = hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace });
+          const result = hedgedProxyRequest({ attempts: hedgedAttempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal, timing, routingStartedAt, injection, trace, responseDeadline });
           releaseSelectionOnce();
           return result;
         }
@@ -5248,7 +5254,7 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         trace, attempt: index + 1,
         firstByteTimeoutMs: streamRequest
           ? streamFirstByteTimeoutMs(runtime, upstream, bodyText, maxAttempts)
-          : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+          : nonStreamAttemptTimeoutMs(runtime, upstream, bodyText, responseDeadline),
       });
       timing.upstream_started_ms = Date.now() - routingStartedAt;
       releaseSelectionOnce();
@@ -5321,6 +5327,11 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
   err.upstreamName = lastError?.upstreamName || "none";
   err.gatewayTrace = gatewayTraceFields(markGatewayTrace(trace, "request_failed"));
   throw err;
+}
+
+function nonStreamAttemptTimeoutMs(runtime, upstream, bodyText, deadline) {
+  const remaining = Math.max(1, Number(deadline || 0) - Date.now());
+  return Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), remaining);
 }
 
 function proxyCandidates(runtime, client, model, pathname) {
@@ -5518,7 +5529,7 @@ function stopHedgeLosers(pending, controllers, winnerIndex) {
   });
 }
 
-async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), injection = null, trace = null }) {
+async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname, request, runtime, search, ctx, signal = null, timing = {}, routingStartedAt = Date.now(), injection = null, trace = null, responseDeadline = 0 }) {
   const controllers = attempts.map(() => new AbortController());
   const launchNow = [];
   const started = attempts.map(() => false);
@@ -5526,16 +5537,13 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
   const knownTtft = upstreamLatencyScore(attempts[0], model);
   const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
-  const initialKeyIntervalMs = upstreamSoftIntervalMs(runtime);
   const routingMode = runtime.routing.routing_mode || ((runtime.routing.fast_routing || runtime.routing.hedge_enabled) ? "adaptive" : "parallel");
+  // soft_interval_ms coordinates separate requests; the routing mode controls this request's hedge timing.
   const launchDelay = (index) => {
     if (index === 0) return 0;
-    const modeDelay = routingMode === "parallel" ? 0
+    return routingMode === "parallel" ? 0
       : runtime.routing.fast_routing === true && index === 1 ? fastDelayMs
         : routingMode === "adaptive" ? index * hedgeDelayMs : Infinity;
-    // ponytail: parallel mode still respects the configured initial-key stagger; otherwise one burst defeats the setting.
-    if (!initialKeyIntervalMs || !Number.isFinite(modeDelay)) return modeDelay;
-    return Math.max(modeDelay, index * initialKeyIntervalMs);
   };
   let done = false;
   let launched = 0;
@@ -5571,7 +5579,7 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
         result = await fetchProxyUpstream({
           bodyText, client, pathname, request, runtime, search, signal: controllers[index].signal, upstream,
           trace, attempt,
-          firstByteTimeoutMs: streamRequest ? undefined : Math.min(proxyFirstByteTimeoutMs(runtime, upstream, bodyText), NON_STREAM_RESPONSE_DEADLINE_MS),
+          firstByteTimeoutMs: streamRequest ? undefined : nonStreamAttemptTimeoutMs(runtime, upstream, bodyText, responseDeadline),
         });
         if (result.response.ok && streamRequest) {
           const primed = await primeSseResponse(result.response, shouldHideDeepSeekReasoning(model, model, upstream));
@@ -6054,8 +6062,8 @@ function noteActiveUpstream(upstream, client, delta) {
 function streamPendingOpenAiResponse(open) {
   return streamPendingSseResponse(
     open,
-    `: ${" ".repeat(2048)}\n\n`,
-    ": keepalive\n\n",
+    SSE_PADDED_KEEPALIVE_COMMENT,
+    SSE_PADDED_KEEPALIVE_COMMENT,
     (error) => {
       const status = error.statusCode || 502;
       return `data: ${JSON.stringify({ error: { message: error.message || "Upstream request failed.", type: mapErrorType(status) } })}\n\ndata: [DONE]\n\n`;
@@ -6066,8 +6074,8 @@ function streamPendingOpenAiResponse(open) {
 function streamPendingResponsesResponse(open, seed) {
   return streamPendingSseResponse(
     open,
-    `: ${" ".repeat(2048)}\n\n`,
-    ": keepalive\n\n",
+    SSE_PADDED_KEEPALIVE_COMMENT,
+    SSE_PADDED_KEEPALIVE_COMMENT,
     (error) => {
       const status = error.statusCode || 502;
       const message = error.message || "Upstream request failed.";

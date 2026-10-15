@@ -783,7 +783,7 @@ function renderAdminMarkup(origin, version) {
       <div class="row">
         <div class="field span-4"><label><input type="checkbox" id="routing-failover"> 故障转移</label></div>
         <div class="field span-4"><label>并发协调强度 (0-5)</label><input id="routing-coordination-level" type="number" min="0" max="5" placeholder="3"></div>
-        <div class="field span-4"><label>初始候选 Key 启动间隔 (ms)</label><input id="routing-soft-interval" type="number" min="0" max="20000" placeholder="20000"><span class="note">首个候选立即启动，后续候选按此间隔错开；默认 20 秒，0=关闭。</span></div>
+        <div class="field span-4"><label>上游软间隔 (ms)</label><input id="routing-soft-interval" type="number" min="0" max="20000" placeholder="20000"><span class="note">跨客户端错开同一上游，并降低近期使用过的上游优先级；默认 20 秒，0=关闭。</span></div>
       </div>
       <div class="row">
         <div class="field span-4"><label>旧版故障切换次数</label><input id="routing-failover-attempts" type="number" min="1" max="5" placeholder="3"><span class="note">仅用于兼容旧配置，串行模式仍受上限约束。</span></div>
