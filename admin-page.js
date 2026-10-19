@@ -250,7 +250,7 @@ function renderAdminStyle() {
     .upstream-live-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
     .upstream-live-summary strong { color: var(--ink); }
     .upstream-live-summary-list { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .connection-strip { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.05fr) minmax(280px, 1.25fr); gap: 12px; margin: 0 0 16px; align-items: stretch; }
+    .connection-strip { display: grid; grid-column: 1 / -1; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.05fr) minmax(280px, 1.25fr); gap: 12px; margin: 0 0 16px; align-items: stretch; }
     .connection-item { min-width: 0; min-height: 100px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); display: grid; grid-template-rows: auto auto 1fr; align-content: start; }
     .connection-item.good { border-color: #b7dec8; background: #f2fbf5; }
     .connection-item.warn { border-color: #f0d49b; background: #fffaf0; }
