@@ -50,6 +50,10 @@ const speedHits = [];
 const speedBodies = [];
 const speedStreamHits = [];
 const hedgeHits = [];
+const adaptiveBudgetHits = [];
+let adaptiveBudgetActive = 0;
+let adaptiveBudgetPeak = 0;
+let adaptiveBudgetFailPrimary = false;
 const hedgeStreamHits = [];
 const hedgeStreamAborts = [];
 const hedgeCancels = [];
@@ -95,6 +99,9 @@ const emptyStreamHits = [];
 const openAiStreamErrorHits = [];
 const retryAfterHits = [];
 const healthProbeHits = [];
+const nimHealthHits = [];
+const nimHealthAuth = [];
+const nimKeyHits = [];
 const analyticsPoints = [];
 const analyticsSqlQueries = [];
 const kvPuts = [];
@@ -107,6 +114,44 @@ function assertNoDeepSeekLeak(text) {
 }
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (String(url).includes("nim-health-")) {
+    const kind = new URL(url).hostname.split(".")[0].replace("nim-health-", "");
+    const path = new URL(url).pathname;
+    nimHealthHits.push(kind + ":" + path);
+    nimHealthAuth.push([kind, init.headers.get("authorization")]);
+    if (path.endsWith("/health/ready")) return new Response("", { status: kind === "ready" ? 200 : kind === "missing" ? 404 : 503 });
+    return new Response(JSON.stringify({ data: [{ id: "nim-model" }] }), { headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("nim-key-invalid.example")) {
+    nimKeyHits.push(new URL(url).hostname);
+    return Response.json({ error: { message: "invalid key" } }, { status: 401 });
+  }
+  if (String(url).includes("nim-key-fallback.example")) {
+    nimKeyHits.push(new URL(url).hostname);
+    return Response.json({ choices: [{ message: { content: "ok" } }] });
+  }
+  if (String(url).includes("adaptive-budget-")) {
+    const name = new URL(url).hostname.split(".")[0].replace("adaptive-budget-", "");
+    adaptiveBudgetHits.push(name);
+    adaptiveBudgetPeak = Math.max(adaptiveBudgetPeak, ++adaptiveBudgetActive);
+    try {
+      await new Promise((resolve, reject) => {
+        const onAbort = () => { clearTimeout(timer); reject(new Error("cancelled")); };
+        const timer = setTimeout(() => {
+          init.signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, name === "primary" ? 1000 : name === "secondary" ? 900 : 0);
+        init.signal.addEventListener("abort", onAbort, { once: true });
+        if (init.signal.aborted) onAbort();
+      });
+      return new Response(JSON.stringify({ choices: [{ message: { content: name } }] }), {
+        status: name === "primary" && adaptiveBudgetFailPrimary ? 503 : 200,
+        headers: { "content-type": "application/json" },
+      });
+    } finally {
+      adaptiveBudgetActive--;
+    }
+  }
   if (String(url).includes("admin-abort.example")) {
     notifyAdminAbortStarted?.();
     return new Promise((resolve, reject) => {
@@ -915,7 +960,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-10-15-routing-tuning-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-10-21-nim-aware-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -934,6 +979,17 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-a
 }), env)).status, 200);
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
+const nimStateLabel = { dataset: { upstream: "nim" }, textContent: "" };
+const nimStateDetail = { dataset: { upstream: "nim" }, textContent: "" };
+const renderNimHealth = new Function("document", `
+  ${adminScript.slice(adminScript.indexOf("  function updateNimHealth("), adminScript.indexOf("  async function runCloudflareSelfCheck("))}
+  return updateNimHealth;
+`)({ querySelectorAll: (selector) => selector === ".nim-state" ? [nimStateLabel] : [nimStateDetail] });
+renderNimHealth({ name: "nim", status: 429, latency_ms: 12, nim: { mode: "hosted", ready: false, probe: "models" } });
+assert.equal(nimStateLabel.textContent, "限流");
+assert.match(nimStateDetail.textContent, /Hosted NIM.*models \/ Key.*限流/);
+renderNimHealth({ name: "nim", status: 200, latency_ms: 8, nim: { mode: "self-hosted", ready: true, probe: "ready" } });
+assert.equal(nimStateLabel.textContent, "Ready");
 assert.equal(adminPage.includes("routing-fast"), true);
 assert.equal(adminPage.includes("routing-failover-attempts"), true);
 assert.equal(adminPage.includes("routing-coordination-level"), true);
@@ -1019,11 +1075,64 @@ assert.equal(adminPage.includes("nv-embed"), true);
 assert.equal(adminPage.includes("nemotron-nano-vl"), true);
 assert.equal(adminPage.includes("Reranker"), true);
 assert.equal(adminPage.includes("coding"), true);
-assert.equal(adminPage.includes("const AUTO_RUNTIME_REFRESH_MS = 15000"), true);
-assert.equal(adminPage.includes("const AUTO_STATS_REFRESH_MS = 20000"), true);
-assert.equal(adminPage.includes("const AUTO_LOG_REFRESH_MS = 20000"), true);
+assert.equal(adminPage.includes("const AUTO_RUNTIME_REFRESH_MS = 5000"), true);
+assert.equal(adminPage.includes("const AUTO_STATS_REFRESH_MS = 15000"), true);
+assert.equal(adminPage.includes("const AUTO_LOG_REFRESH_MS = 15000"), true);
 assert.equal(adminPage.includes("function startLiveRefresh()"), true);
 assert.equal(adminPage.includes("function stopLiveRefresh()"), true);
+assert.equal(adminPage.includes("container-type: inline-size"), true);
+assert.equal(adminPage.includes("@container (max-width: 560px)"), true);
+const refreshFunction = adminScript.slice(adminScript.indexOf("  async function refreshLivePanels()"), adminScript.indexOf("  function stopLiveRefresh()"));
+let refreshClock = 100000;
+let refreshView = "overview";
+let refreshFailure = false;
+const refreshCalls = [];
+const refreshRendered = [];
+const refreshDocument = {
+  visibilityState: "visible",
+  querySelector() { return { dataset: { view: refreshView } }; },
+};
+const runRefresh = new Function("document", "Date", "fetch", "parseApiResponse", "loadRuntimeStatus", "loadStats", "loadLogs", "byId", "AbortSignal", `
+  const API_BASE = "/admin/api";
+  const AUTO_RUNTIME_REFRESH_MS = 5000, AUTO_STATS_REFRESH_MS = 15000, AUTO_LOG_REFRESH_MS = 15000;
+  let liveRefreshRunning = false, nextLiveRefreshAt = 0, nextStatsRefreshAt = 0, nextLogsRefreshAt = 0, liveRefreshFailures = 0;
+  ${refreshFunction}
+  return refreshLivePanels;
+`)(refreshDocument, { now: () => refreshClock }, async (url) => {
+  refreshCalls.push(url);
+  const include = new URL(url, "https://gw.test").searchParams.get("include");
+  return { ok: !refreshFailure, payload: {
+    ...(include.includes("stats") ? { stats: {} } : {}),
+    ...(include.includes("logs") ? { logs: [] } : {}),
+  } };
+}, async (resp) => resp.payload, async () => {}, async () => refreshRendered.push("stats"),
+async () => refreshRendered.push("logs"), () => null, AbortSignal);
+await runRefresh();
+assert.deepEqual(refreshRendered, ["stats", "logs"]);
+refreshClock += 5000;
+await runRefresh();
+assert.equal(refreshCalls.at(-1).endsWith("include="), true);
+refreshClock += 10000;
+await runRefresh();
+assert.deepEqual(refreshRendered, ["stats", "logs", "stats", "logs"]);
+refreshView = "settings";
+const refreshBeforeHidden = refreshCalls.length;
+await runRefresh();
+refreshView = "overview";
+refreshDocument.visibilityState = "hidden";
+await runRefresh();
+assert.equal(refreshCalls.length, refreshBeforeHidden);
+refreshDocument.visibilityState = "visible";
+refreshFailure = true;
+await runRefresh();
+const refreshBeforeBackoff = refreshCalls.length;
+refreshClock += 5000;
+await runRefresh();
+assert.equal(refreshCalls.length, refreshBeforeBackoff);
+refreshClock += 5000;
+refreshFailure = false;
+await runRefresh();
+assert.equal(refreshCalls.length, refreshBeforeBackoff + 1);
 assert.equal(adminPage.includes("document.addEventListener(\"visibilitychange\""), true);
 assert.equal(adminPage.includes("loadKvUsage"), true);
 assert.equal(adminScript.includes('name === "settings"'), false);
@@ -1132,6 +1241,8 @@ assert.equal(groqPreset.base_url, "https://api.groq.com/openai/v1");
 const nimPreset = configPayload.presets.find((item) => item.id === "nvidia-nim");
 assert.equal(nimPreset.base_url, "https://integrate.api.nvidia.com/v1");
 assert.deepEqual(nimPreset.paths, ["/v1/chat/completions", "/v1/embeddings"]);
+const selfHostedNimPreset = configPayload.presets.find((item) => item.id === "nvidia-nim-self-hosted");
+assert.equal(selfHostedNimPreset.requires_base_url, true);
 const zhipuPreset = configPayload.presets.find((item) => item.id === "zhipu");
 assert.equal(zhipuPreset.name, "GLM / \u667a\u8c31 AI");
 assert.equal(zhipuPreset.base_url, "https://open.bigmodel.cn/api/paas/v4");
@@ -1271,6 +1382,28 @@ const logsResp = await worker.default.fetch(new Request("https://gw.test/admin-t
 const logs = await logsResp.json();
 assert.equal(logs.logs.some((entry) => entry.model === "glm-4.6"), true);
 assert.equal(logs.logs.every((entry) => /Z$/.test(entry.ts)), true);
+const combinedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime?include=stats,logs"), env);
+const combined = await combinedResp.json();
+assert.equal(combinedResp.status, 200);
+assert.match(combinedResp.headers.get("cache-control"), /\bno-store\b/);
+assert.deepEqual(combined.logs, logs.logs);
+assert.deepEqual(combined.stats.buckets, stats.buckets);
+assert.equal(combined.stats.last_model, stats.last_model);
+const runtimeOnly = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), env)).json();
+assert.equal("logs" in runtimeOnly, false);
+assert.equal("stats" in runtimeOnly, false);
+const dashboardReads = [];
+const dashboardEnv = {
+  ...env,
+  KV: { ...env.KV, async get(key, type) { dashboardReads.push(key); return env.KV.get(key, type); } },
+};
+await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/stats"), dashboardEnv);
+dashboardReads.length = 0;
+await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime"), dashboardEnv);
+assert.equal(dashboardReads.length, 0);
+await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/runtime?include=stats,logs"), dashboardEnv);
+assert.equal(dashboardReads.filter((key) => key.startsWith("gateway:stats:")).length, 2);
+assert.equal(dashboardReads.filter((key) => key === "gateway:logs").length, 1);
 assert.equal(kvPuts.some((key) => key === "gateway:logs" || key.startsWith("gateway:stats:")), false);
 const developerRoleBodyStart = bodies.length;
 await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
@@ -2154,6 +2287,7 @@ const overrideModelsResp = await worker.default.fetch(new Request("https://gw.te
 const overrideModels = await overrideModelsResp.json();
 assert.equal(overrideModels.models.includes("@cf/deepseek-ai/deepseek-v4-pro"), true);
 
+const hostedHealthStart = fetchUrls.length;
 const healthResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", {
   method: "POST",
 }), env);
@@ -2161,6 +2295,8 @@ const health = await healthResp.json();
 const aiHealth = health.results.find((item) => item.name === "ai");
 assert.equal(aiHealth.ok, true);
 assert.equal(aiHealth.model_count, 102);
+assert.equal(health.results.find((item) => item.name === "nim")?.nim.mode, "hosted");
+assert.equal(fetchUrls.slice(hostedHealthStart).some((url) => url.includes("integrate.api.nvidia.com") && url.includes("/health/ready")), false);
 
 const disabledStore = new Map();
 disabledStore.set("gateway:config", JSON.stringify({
@@ -2219,6 +2355,95 @@ const authHealthEnv = {
 const authHealth = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", { method: "POST" }), authHealthEnv)).json();
 assert.equal(authHealth.results[0].ok, false);
 assert.equal(authHealth.results[0].status, 401);
+
+const nimHealthStore = new Map([["gateway:config", JSON.stringify({
+  routing: {}, settings: {},
+  upstreams: ["ready", "missing", "loading"].map((kind) => ({
+    name: "nim-health-" + kind, preset: "nvidia-nim-self-hosted",
+    base_url: "https://nim-health-" + kind + ".example/v1", api_key_encrypted: kind === "ready" ? "" : "key",
+    models: ["nim-model"], paths: ["/v1/chat/completions"], enabled: true,
+  })),
+})]]);
+const nimHealthEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = nimHealthStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { nimHealthStore.set(key, value); },
+    async delete(key) { nimHealthStore.delete(key); },
+  },
+};
+const nimHealth = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health", { method: "POST" }), nimHealthEnv)).json();
+const nimEditable = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), nimHealthEnv)).json()).config;
+assert.equal((await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(nimEditable),
+}), nimHealthEnv)).status, 200);
+assert.deepEqual(nimHealth.results.map((item) => [item.name, item.ok, item.nim?.probe]), [
+  ["nim-health-ready", true, "ready"],
+  ["nim-health-missing", true, "models"],
+  ["nim-health-loading", false, "ready"],
+]);
+assert.deepEqual(nimHealthHits, [
+  "ready:/v1/health/ready", "missing:/v1/health/ready", "loading:/v1/health/ready",
+  "missing:/v1/models",
+]);
+assert.equal(nimHealthAuth.find(([kind]) => kind === "ready")?.[1], null);
+const savedNimConfig = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), nimHealthEnv)).json()).config;
+assert.equal(savedNimConfig.upstreams.find((item) => item.name === "nim-health-ready").api_key_value, "");
+for (const name of ["nim-health-ready", "nim-health-missing"]) {
+  const upstream = savedNimConfig.upstreams.find((item) => item.name === name);
+  const response = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/fetch-models", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, preset: upstream.preset, base_url: upstream.base_url, api_key: upstream.api_key_value }),
+  }), nimHealthEnv);
+  assert.equal(response.status, 200);
+}
+assert.deepEqual(nimHealthAuth.slice(-2).map(([kind, auth]) => [kind, auth]), [["ready", null], ["missing", "Bearer key"]]);
+const nimHealthCached = await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/health"), nimHealthEnv)).json();
+assert.equal(nimHealthCached.results[0].nim.mode, "self-hosted");
+
+const nimKeyStore = new Map([["gateway:config", JSON.stringify({
+  routing: { routing_mode: "serial", max_upstreams: 2, soft_interval_ms: 0, load_balance: false }, settings: {},
+  upstreams: [
+    { name: "nim-key-invalid", preset: "nvidia-nim-self-hosted", base_url: "https://nim-key-invalid.example/v1", api_key_encrypted: "bad", models: ["nim-key-a", "nim-key-b"], paths: ["/v1/chat/completions"], priority: 1, enabled: true },
+    { name: "nim-key-fallback", preset: "custom", base_url: "https://nim-key-fallback.example/v1", api_key_encrypted: "good", models: ["nim-key-a", "nim-key-b"], paths: ["/v1/chat/completions"], priority: 2, enabled: true },
+  ],
+})]]);
+const nimKeyEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = nimKeyStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { nimKeyStore.set(key, value); },
+    async delete(key) { nimKeyStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "nim-key", key: "sk-nim-key", models: ["*"], upstreams: ["nim-key-invalid", "nim-key-fallback"] }]),
+};
+for (const model of ["nim-key-a", "nim-key-b"]) {
+  const response = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer sk-nim-key", "content-type": "application/json" },
+    body: JSON.stringify({ model, messages: [] }),
+  }), nimKeyEnv);
+  assert.equal(response.status, 200);
+}
+assert.deepEqual(nimKeyHits, ["nim-key-invalid.example", "nim-key-fallback.example", "nim-key-fallback.example"]);
+assert.equal([...nimKeyStore.keys()].some((key) => key.startsWith("state:cooldown:")), false);
+nimKeyStore.set("gateway:config", JSON.stringify({
+  routing: { routing_mode: "serial", failover: false, max_upstreams: 2, soft_interval_ms: 0, load_balance: false }, settings: {},
+  upstreams: [
+    { name: "nim-key-invalid-no-failover", preset: "nvidia-nim-self-hosted", base_url: "https://nim-key-invalid.example/v1", api_key_encrypted: "bad", models: ["nim-key-c", "nim-key-d"], paths: ["/v1/chat/completions"], priority: 1, enabled: true },
+    { name: "nim-key-fallback-no-failover", preset: "custom", base_url: "https://nim-key-fallback.example/v1", api_key_encrypted: "good", models: ["nim-key-c", "nim-key-d"], paths: ["/v1/chat/completions"], priority: 2, enabled: true },
+  ],
+}));
+const nimNoFailoverEnv = { ...nimKeyEnv, CLIENTS_JSON: JSON.stringify([{ name: "nim-key", key: "sk-nim-key-no-failover", models: ["*"], upstreams: ["nim-key-invalid-no-failover", "nim-key-fallback-no-failover"] }]) };
+const nimNoFailoverConfig = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), nimNoFailoverEnv)).json()).config;
+assert.deepEqual(nimNoFailoverConfig.upstreams.map((item) => item.name), ["nim-key-invalid-no-failover", "nim-key-fallback-no-failover"]);
+for (const [model, status] of [["nim-key-c", 401], ["nim-key-d", 200]]) {
+  const response = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST", headers: { authorization: "Bearer sk-nim-key-no-failover", "content-type": "application/json" },
+    body: JSON.stringify({ model, messages: [] }),
+  }), nimNoFailoverEnv);
+  assert.equal(response.status, status, await response.text());
+}
+assert.deepEqual(nimKeyHits.slice(-2), ["nim-key-invalid.example", "nim-key-fallback.example"]);
 
 const probeHealthStore = new Map([["gateway:config", JSON.stringify({
   routing: {},
@@ -3004,6 +3229,44 @@ await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
   body: JSON.stringify({ model: "soft-fast-model", messages: [] }),
 }), softFastHedgeEnv);
 assert.equal(softFastHits.slice(softFastHedgeStart).includes("third"), true);
+
+const adaptiveBudgetStore = new Map([["gateway:config", JSON.stringify({
+  routing: { routing_mode: "adaptive", max_upstreams: 3, coordination_level: 0, soft_interval_ms: 0, load_balance: false },
+  settings: { request_timeout_ms: 1200 },
+  upstreams: ["primary", "secondary", "backup"].map((name, index) => ({
+    name: "adaptive-budget-" + name, base_url: "https://adaptive-budget-" + name + ".example/v1",
+    api_key_encrypted: name, models: ["adaptive-budget", "adaptive-budget-fallback"],
+    paths: ["/v1/chat/completions"], priority: index + 1, weight: 1, enabled: true,
+  })),
+})]]);
+const adaptiveBudgetEnv = {
+  ...env,
+  KV: {
+    async get(key, type) {
+      const value = adaptiveBudgetStore.get(key);
+      return (type === "json" || type?.type === "json") && value ? JSON.parse(value) : value || null;
+    },
+    async put(key, value) { adaptiveBudgetStore.set(key, value); },
+    async delete(key) { adaptiveBudgetStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "adaptive-budget", key: "sk-adaptive-budget", models: ["*"], upstreams: ["primary", "secondary", "backup"].map((name) => "adaptive-budget-" + name) }]),
+};
+for (const failPrimary of [false, true]) {
+  adaptiveBudgetFailPrimary = failPrimary;
+  adaptiveBudgetPeak = 0;
+  const start = adaptiveBudgetHits.length;
+  const resp = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: "Bearer sk-adaptive-budget", "content-type": "application/json" },
+    body: JSON.stringify({ model: failPrimary ? "adaptive-budget-fallback" : "adaptive-budget", messages: [] }),
+  }), adaptiveBudgetEnv);
+  assert.equal(resp.status, 200);
+  assert.equal((await resp.json()).choices[0].message.content, failPrimary ? "backup" : "primary");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(adaptiveBudgetHits.slice(start), failPrimary ? ["primary", "secondary", "backup"] : ["primary", "secondary"]);
+  assert.equal(adaptiveBudgetPeak, 2);
+  assert.equal(adaptiveBudgetActive, 0);
+}
 
 const attemptBudgetStore = new Map();
 attemptBudgetStore.set("gateway:config", JSON.stringify({

@@ -85,7 +85,7 @@ function renderAdminStyle() {
     .topbar-badge { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
     .topbar-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--warning); }
     .topbar-badge.online::before { background: var(--success); }
-    .wrap { width: min(1680px, calc(100% - 48px)); margin: 0 auto; padding: 24px 0 48px; }
+    .wrap { width: min(1680px, calc(100% - 48px)); margin: 0 auto; padding: 24px 0 48px; container-type: inline-size; }
     .wrap > * { min-width: 0; }
     .page-view { min-width: 0; }
     .page-view[hidden] { display: none !important; }
@@ -203,6 +203,9 @@ function renderAdminStyle() {
       border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
     }
     .upstream-status-emoji { width: 22px; text-align: center; font-size: 16px; line-height: 1; }
+    .upstream-card summary .card-badge.nim-badge { color: var(--accent-strong); border: 1px solid #d9a89b; background: #fff3ed; }
+    .nim-state { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .nim-health-note { margin: 10px 0 0; padding: 8px 10px; border-left: 2px solid var(--accent); background: var(--surface-muted); color: var(--muted); font-size: 12px; }
     .upstream-status-emoji.active { animation: upstream-active .55s ease-in-out infinite alternate; }
     .upstream-active-client { max-width: 148px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     @keyframes upstream-active { to { transform: scale(1.22); opacity: .5; } }
@@ -258,11 +261,11 @@ function renderAdminStyle() {
     .connection-item-label { display: block; color: var(--muted); font-size: 11px; }
     .connection-item strong { display: block; min-width: 0; margin-top: 4px; color: var(--ink); font-size: 15px; overflow-wrap: anywhere; }
     .connection-item .note { display: block; margin-top: 4px; overflow-wrap: anywhere; line-height: 1.45; }
-    @media (min-width: 761px) and (max-width: 1100px) {
+    @container (min-width: 561px) and (max-width: 900px) {
       .connection-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       #connection-recent { grid-column: 1 / -1; }
     }
-    @media (max-width: 760px) { .connection-strip { grid-template-columns: 1fr; } .connection-item { min-height: 0; } }
+    @container (max-width: 560px) { .connection-strip { grid-template-columns: 1fr; } .connection-item { min-height: 0; } }
 
     .key-output {
       margin-top: 12px; padding: 14px; background: var(--surface-active);
@@ -369,13 +372,19 @@ function renderAdminStyle() {
       .hero { gap: 28px; }
       .gateway-urls { margin-top: 0; }
       #view-overview #stats-panel { grid-column: 1 / -1; grid-row: auto; }
-      .overview-summary-grid { grid-template-columns: minmax(0, 1.08fr) minmax(300px, .62fr); }
       #view-activity #log-panel { grid-column: 1 / -1; }
       #view-upstreams #client-panel, #view-upstreams #upstream-panel,
       #view-settings #kv-panel, #view-settings #settings-panel { grid-column: 1 / -1; }
       #upstream-panel, #settings-panel { align-self: start; width: 100%; }
       .upstream-card summary { padding: 11px 12px; gap: 9px; }
       .upstream-card .card-body { padding: 0 12px 12px; }
+    }
+    @container (min-width: 900px) {
+      .overview-summary-grid { grid-template-columns: minmax(0, 1.08fr) minmax(300px, .62fr); }
+    }
+    @container (max-width: 760px) {
+      .hero { align-items: stretch; flex-direction: column; gap: 16px; }
+      .gateway-urls { flex: none; width: 100%; min-width: 0; }
     }
     @media (min-width: 980px) and (max-width: 1240px) {
       .prompt-modal-grid { grid-template-columns: minmax(240px, .85fr) minmax(360px, 1.25fr) minmax(220px, .8fr); }
@@ -1026,9 +1035,13 @@ function renderAdminScript(version) {
   let runtimeRefreshRunning = false;
   let statsRefreshRunning = false;
   let logsRefreshRunning = false;
-  const AUTO_RUNTIME_REFRESH_MS = 15000;
-  const AUTO_STATS_REFRESH_MS = 20000;
-  const AUTO_LOG_REFRESH_MS = 20000;
+  const AUTO_RUNTIME_REFRESH_MS = 5000;
+  const AUTO_STATS_REFRESH_MS = 15000;
+  const AUTO_LOG_REFRESH_MS = 15000;
+  let nextStatsRefreshAt = 0;
+  let nextLogsRefreshAt = 0;
+  let nextLiveRefreshAt = 0;
+  let liveRefreshFailures = 0;
   let liveRefreshTimers = [];
   const loadedViews = {};
 
@@ -1177,7 +1190,7 @@ function renderAdminScript(version) {
         priority: Number(item && item.priority || index + 1),
         weight: Number(item && item.weight || 1),
       };
-    }).filter((item) => item.base_url && item.api_key_value);
+    }).filter((item) => item.base_url && (item.api_key_value || item.preset === "nvidia-nim-self-hosted"));
   }
 
   function downloadJsonFile(filename, data) {
@@ -1274,7 +1287,7 @@ function renderAdminScript(version) {
     const suffix = Math.random().toString(36).slice(2, 7);
     const preset = presetById(presetId);
 
-    if (!apiKey) throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
+    if (!apiKey && presetId !== "nvidia-nim-self-hosted") throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
     if (preset && preset.requires_account_id && !accountId) throw new Error("Account ID \u4e0d\u80fd\u4e3a\u7a7a");
     if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
 
@@ -1397,6 +1410,8 @@ function renderAdminScript(version) {
       const badge = p ? p.name : (item.preset || "generic");
       const locked = baseUrlLocked(item.preset);
       const needsAccountId = presetNeedsAccountId(item.preset);
+      const isNim = item.preset === "nvidia-nim" || item.preset === "nvidia-nim-self-hosted";
+      const nimHosted = String(item.base_url || "").toLowerCase().includes("integrate.api.nvidia.com");
       const accountIdValue = text(item.account_id).trim();
       const presetOptions = state.presets.map((pr) =>
         '<option value="' + esc(pr.id) + '"' + (pr.id === item.preset ? ' selected' : '') + '>' + esc(pr.name) + '</option>'
@@ -1407,11 +1422,12 @@ function renderAdminScript(version) {
 
       return '<details class="upstream-card' + (item.enabled ? '' : ' disabled') + '" data-id="' + esc(item.id) + '">' +
         '<summary>' +
-          '<span class="card-badge">' + esc(badge) + '</span>' +
+          '<span class="card-badge' + (isNim ? ' nim-badge' : '') + '">' + esc(isNim ? (nimHosted ? 'Hosted NIM' : '自托管 NIM') : badge) + '</span>' +
           '<strong>' + esc(item.note || item.name || "\u672a\u547d\u540d") + '</strong>' +
           '<span class="upstream-status-emoji" data-upstream="' + esc(item.name) + '" title="' + (item.enabled ? '' : '\u5df2\u505c\u7528') + '">' + (item.enabled ? '' : '\u26d4') + '</span>' +
           '<span class="note upstream-active-client" data-upstream="' + esc(item.name) + '"></span>' +
-          '<span class="health-dot" data-upstream="' + esc(item.name) + '" title="\u672a\u68c0\u67e5\u6a21\u578b\u5217\u8868\u8fde\u901a\u6027"></span>' +
+          '<span class="health-dot" data-upstream="' + esc(item.name) + '" title="未检查上游连接"></span>' +
+          (isNim ? '<span class="nim-state" data-upstream="' + esc(item.name) + '">未检查</span>' : '') +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<span class="capability-badge" data-upstream="' + esc(item.name) + '">' + (item.capability === "openai" ? '\u2713 OpenAI' : item.capability === "claude" ? 'Claude' : '\u672a\u68c0\u6d4b') + '</span>' : '') +
           '<span class="card-meta">\u6743\u91cd:' + esc(item.weight) + ' | \u4f18\u5148:' + esc(item.priority) + ' | ' + (item.enabled ? '\u5df2\u542f\u7528' : '\u5df2\u505c\u7528') + '</span>' +
           '<button type="button" class="small upstream-enable-toggle ' + (item.enabled ? 'secondary' : 'good') + '" data-enabled="' + (item.enabled ? 'true' : 'false') + '">' + (item.enabled ? '\u505c\u7528' : '\u542f\u7528') + '</button>' +
@@ -1436,6 +1452,7 @@ function renderAdminScript(version) {
           '<div class="row">' +
             '<div class="field span-12"><label>\u6a21\u578b / \u4e0a\u4e0b\u6587 (\u7559\u7a7a=\u81ea\u52a8\uff0c\u9ed8\u8ba4 1m)</label>' + modelEditorHtml(item) + '</div>' +
           '</div>' +
+          (isNim ? '<div class="nim-health-note" data-upstream="' + esc(item.name) + '">' + (nimHosted ? 'Hosted NIM · Key 状态待检查' : '自托管 NIM · Ready 状态待检查') + '</div>' : '') +
           '<button type="button" class="danger small delete-upstream">\u5220\u9664\u4e0a\u6e38</button>' +
           (["custom","generic-openai","claude-openai"].includes(item.preset) ? '<button type="button" class="secondary small detect-upstream" data-upstream="' + esc(item.name) + '">\u68c0\u6d4b\u80fd\u529b</button>' : '') +
         '</div>' +
@@ -2070,14 +2087,16 @@ function renderAdminScript(version) {
         const dot = document.querySelector('.health-dot[data-upstream="' + r.name + '"]');
         if (!dot) return;
         dot.className = "health-dot " + (r.ok ? "ok" : "fail");
+        const probe = r.nim?.probe === "ready" ? "NIM ready" : "模型列表";
         dot.title = r.ok
-          ? ("\u6a21\u578b\u5217\u8868\u53ef\u8bbf\u95ee: HTTP " + r.status + ", " + r.latency_ms + "ms")
-          : ("\u6a21\u578b\u5217\u8868\u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+          ? (probe + " 可访问: HTTP " + r.status + ", " + r.latency_ms + "ms")
+          : (probe + " 检查失败: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+        updateNimHealth(r, new Date().toISOString());
       });
       const ok = (payload.results || []).filter((r) => r.ok).length;
       const total = (payload.results || []).length;
       updateUpstreamGroupHealth();
-      if (!silent) showToast("\u6a21\u578b\u5217\u8868\u8fde\u901a\u6027: " + ok + "/" + total + " \u6b63\u5e38");
+      if (!silent) showToast("上游健康检查: " + ok + "/" + total + " 正常");
       return { ok, total };
     } catch (error) {
       previous.forEach(({ dot, className, title }) => { dot.className = className; dot.title = title; });
@@ -2097,14 +2116,28 @@ function renderAdminScript(version) {
         if (!dot) return;
         dot.className = "health-dot " + (r.ok ? "ok" : "fail");
         const ts = (payload.ts || "").slice(0, 16);
+        const probe = r.nim?.probe === "ready" ? "NIM ready" : "模型列表";
         dot.title = r.ok
-          ? ("\u5b9a\u65f6\u68c0\u6d4b " + ts + ": HTTP " + r.status + ", " + r.latency_ms + "ms")
-          : ("\u5b9a\u65f6\u68c0\u6d4b " + ts + " \u5931\u8d25: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+          ? ("定时检查 " + ts + " · " + probe + ": HTTP " + r.status + ", " + r.latency_ms + "ms")
+          : ("定时检查 " + ts + " · " + probe + " 失败: " + (r.error || ("HTTP " + r.status)) + ", " + r.latency_ms + "ms");
+        updateNimHealth(r, payload.ts);
       });
       updateUpstreamGroupHealth();
     } catch {
       // cached snapshot is best-effort; the manual button still works
     }
+  }
+
+  function updateNimHealth(result, checkedAt) {
+    if (!result?.nim) return;
+    const stateEl = [...document.querySelectorAll(".nim-state")].find((el) => el.dataset.upstream === result.name);
+    const noteEl = [...document.querySelectorAll(".nim-health-note")].find((el) => el.dataset.upstream === result.name);
+    if (!stateEl && !noteEl) return;
+    const mode = result.nim.mode === "hosted" ? "Hosted NIM" : "自托管 NIM";
+    const probe = result.nim.probe === "ready" ? "ready" : "models / Key";
+    const status = result.nim.ready ? (result.nim.probe === "ready" ? "Ready" : "模型列表可访问") : (result.status === 401 ? "认证失败" : result.status === 402 ? "额度不足" : result.status === 429 ? "限流" : "未就绪");
+    if (stateEl) stateEl.textContent = status;
+    if (noteEl) noteEl.textContent = mode + " · " + probe + " · " + status + (result.latency_ms != null ? " · " + result.latency_ms + "ms" : "") + (checkedAt ? " · 检查于 " + formatGatewayTime(checkedAt) : "");
   }
 
   async function runCloudflareSelfCheck() {
@@ -2160,13 +2193,15 @@ function renderAdminScript(version) {
     });
   }
 
-  async function loadRuntimeStatus() {
+  async function loadRuntimeStatus(payload) {
     if (runtimeRefreshRunning || document.visibilityState !== "visible") return;
     runtimeRefreshRunning = true;
     try {
-      const resp = await fetch(API_BASE + "/runtime");
-      const payload = await parseApiResponse(resp);
-      if (!resp.ok) return;
+      if (!payload) {
+        const resp = await fetch(API_BASE + "/runtime", { cache: "no-store" });
+        payload = await parseApiResponse(resp);
+        if (!resp.ok) throw new Error(payload?.error?.message || "读取连接状态失败");
+      }
     const topbarStatus = byId("topbar-status");
     if (topbarStatus) {
       topbarStatus.textContent = "Gateway online";
@@ -2209,10 +2244,37 @@ function renderAdminScript(version) {
   }
 
   async function refreshLivePanels() {
-    if (liveRefreshRunning || document.visibilityState !== "visible") return;
+    if (liveRefreshRunning || document.visibilityState !== "visible" || Date.now() < nextLiveRefreshAt) return;
+    const view = document.querySelector(".page-view:not([hidden])")?.dataset.view;
+    if (!["overview", "upstreams", "logs", "scheduler"].includes(view)) return;
     liveRefreshRunning = true;
     try {
-      await loadRuntimeStatus().catch(function(){});
+      const now = Date.now();
+      const include = [];
+      if (view === "overview" && now + 100 >= nextStatsRefreshAt) include.push("stats");
+      if ((view === "overview" || view === "logs") && now + 100 >= nextLogsRefreshAt) include.push("logs");
+      const resp = await fetch(API_BASE + "/runtime?include=" + include.join(","), { cache: "no-store", signal: AbortSignal.timeout(10000) });
+      const payload = await parseApiResponse(resp);
+      if (!resp.ok) throw new Error(payload?.error?.message || "刷新状态失败");
+      await loadRuntimeStatus(payload);
+      if (payload.stats) {
+        await loadStats(true, payload.stats);
+        nextStatsRefreshAt = now + AUTO_STATS_REFRESH_MS;
+      }
+      if (payload.logs) {
+        await loadLogs(true, { logs: payload.logs });
+        nextLogsRefreshAt = now + AUTO_LOG_REFRESH_MS;
+      }
+      liveRefreshFailures = 0;
+      nextLiveRefreshAt = 0;
+    } catch {
+      liveRefreshFailures = Math.min(liveRefreshFailures + 1, 4);
+      nextLiveRefreshAt = Date.now() + AUTO_RUNTIME_REFRESH_MS * Math.pow(2, liveRefreshFailures);
+      const status = byId("topbar-status");
+      if (status) {
+        status.textContent = "连接异常，稍后重试";
+        status.classList.remove("online");
+      }
     } finally {
       liveRefreshRunning = false;
     }
@@ -2227,8 +2289,6 @@ function renderAdminScript(version) {
     if (document.visibilityState !== "visible" || liveRefreshTimers.length) return;
     liveRefreshTimers = [
       setInterval(() => { void refreshLivePanels(); }, AUTO_RUNTIME_REFRESH_MS),
-      setInterval(() => { void loadStats(true).catch(function(){}); }, AUTO_STATS_REFRESH_MS),
-      setInterval(() => { void loadLogs(true).catch(function(){}); }, AUTO_LOG_REFRESH_MS),
     ];
   }
 
@@ -2447,7 +2507,7 @@ async function loadKvUsage() {
     const accountId = byId("vendor-account-id").value.trim();
     if (presetNeedsAccountId(presetId) && !accountId) throw new Error("Account ID \u4e0d\u80fd\u4e3a\u7a7a");
     if (!baseUrl) throw new Error("Base URL \u4e0d\u80fd\u4e3a\u7a7a");
-    if (!apiKey) throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
+    if (!apiKey && presetId !== "nvidia-nim-self-hosted") throw new Error("API Key \u4e0d\u80fd\u4e3a\u7a7a");
     return fetchModels({ account_id: accountId, base_url: baseUrl, api_key: apiKey, preset: presetId });
   }
 
@@ -2846,20 +2906,22 @@ async function loadKvUsage() {
     });
   }
 
-  async function loadStats(silent) {
+  async function loadStats(silent, payload) {
     if (document.visibilityState !== "visible" || statsRefreshRunning) return;
     statsRefreshRunning = true;
     try {
-      return await renderStats(silent);
+      return await renderStats(silent, payload);
     } finally {
       statsRefreshRunning = false;
     }
   }
 
-  async function renderStats(silent) {
-    const resp = await fetch(API_BASE + "/stats", { cache: "no-store" });
-    const payload = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(payload?.error?.message || "读取统计失败");
+  async function renderStats(silent, payload) {
+    if (!payload) {
+      const resp = await fetch(API_BASE + "/stats", { cache: "no-store" });
+      payload = await parseApiResponse(resp);
+      if (!resp.ok) throw new Error(payload?.error?.message || "读取统计失败");
+    }
     const buckets = payload.buckets || [];
 
     const skeleton = buckets;
@@ -2925,13 +2987,15 @@ async function loadKvUsage() {
     if (!silent) showToast("统计已加载");
   }
 
-  async function loadLogs(silent) {
+  async function loadLogs(silent, payload) {
     if (document.visibilityState !== "visible" || logsRefreshRunning) return;
     logsRefreshRunning = true;
     try {
-      const resp = await fetch(API_BASE + "/logs", { cache: "no-store" });
-      const payload = await parseApiResponse(resp);
-      if (!resp.ok) throw new Error(payload?.error?.message || "读取日志失败");
+      if (!payload) {
+        const resp = await fetch(API_BASE + "/logs", { cache: "no-store" });
+        payload = await parseApiResponse(resp);
+        if (!resp.ok) throw new Error(payload?.error?.message || "读取日志失败");
+      }
       const logs = payload.logs || [];
       state.logs = logs;
       const liveLog = byId("live-log");
@@ -3410,7 +3474,6 @@ async function loadKvUsage() {
       await Promise.all([loadConfig(), loadClients()]);
       loadedViews.logs = true;
       loadedViews.overview = true;
-      void Promise.allSettled([loadStats(true), loadLogs(true)]);
       void renderCachedHealth();
       const refreshStorageBtn = byId("refresh-storage-status");
       if (refreshStorageBtn) refreshStorageBtn.addEventListener("click", (e) =>
@@ -3429,7 +3492,7 @@ async function loadKvUsage() {
           return;
         }
         startLiveRefresh();
-        void Promise.allSettled([refreshLivePanels(), loadStats(true), loadLogs(true)]);
+        void refreshLivePanels();
       });
     } catch (error) {
       if (bootSpan?.parentNode) bootSpan.remove();

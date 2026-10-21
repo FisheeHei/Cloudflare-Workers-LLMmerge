@@ -117,7 +117,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-15-routing-tuning-1";
+const VERSION = "v26-10-21-nim-aware-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2096,6 +2096,38 @@ function noteStreamToolCalls(chunk, seen) {
   }
 }
 
+async function getAdminStats(app, logs) {
+  const now = Date.now();
+  const hourKeys = [];
+  for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
+    hourKeys.push(legacyStatsHourKey(now - h * 3600000));
+  }
+  const recentKvStart = Math.max(0, hourKeys.length - 2);
+  const historyKey = hourKeys.slice(0, recentKvStart).join("|");
+  const cached = app.statsHistoryCache;
+  // Historical hours can lag five minutes; the recent two hours are always read fresh.
+  const history = cached?.key === historyKey && cached.until > now
+    ? Promise.resolve(cached.raws)
+    : Promise.all(hourKeys.slice(0, recentKvStart).map((key) => app.state.get(STATS_PREFIX + key, "json"))).then((raws) => {
+      app.statsHistoryCache = { key: historyKey, until: now + 300000, raws };
+      return raws;
+    });
+  const [analyticsBuckets, historicalRaws, recentRaws] = await Promise.all([
+    getAnalyticsStats(app, hourKeys).catch(() => null),
+    history,
+    Promise.all(hourKeys.slice(recentKvStart).map((key) => app.state.get(STATS_PREFIX + key, "json"))),
+  ]);
+  const raws = historicalRaws.concat(recentRaws);
+  const analyticsPending = analyticsBuckets ? recentPendingStats() : {};
+  const buckets = hourKeys.map((storageHour, i) => {
+    const useKv = i >= recentKvStart && raws?.[i];
+    const raw = useKv ? raws[i] : (analyticsBuckets?.[storageHour] || raws?.[i]);
+    const live = useKv || !analyticsBuckets ? _pendingStats : analyticsPending;
+    return { hour: utcHourKey(now - (STATS_WINDOW_HOURS - 1 - i) * 3600000), ...mergeStatsBucket(raw, live[storageHour]) };
+  });
+  return { ok: true, buckets, last_model: logs[0]?.model || "", now: utcNowIso(), time_zone: API_TIME_ZONE_LABEL };
+}
+
 async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   if (!app.state || app.state.kind === "memory") {
     throw badConfig("A KV (`KV`), D1 (`llmerge`) or Durable Object (`llmerge`) binding is required for the admin page.");
@@ -2203,25 +2235,7 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
 
   // Keep the current two hours in state storage while Analytics Engine catches up.
   if (apiPath === "/api/stats" && request.method === "GET") {
-    const now = Date.now();
-    const hourKeys = [];
-    for (let h = STATS_WINDOW_HOURS - 1; h >= 0; h -= 1) {
-      hourKeys.push(legacyStatsHourKey(now - h * 3600000));
-    }
-    const [analyticsBuckets, raws, logs] = await Promise.all([
-      getAnalyticsStats(app, hourKeys).catch(() => null),
-      app.state ? Promise.all(hourKeys.map((key) => app.state.get(STATS_PREFIX + key, "json"))) : Promise.resolve(hourKeys.map(() => null)),
-      getBestLogs(app),
-    ]);
-    const analyticsPending = analyticsBuckets ? recentPendingStats() : {};
-    const recentKvStart = Math.max(0, hourKeys.length - 2);
-    const buckets = hourKeys.map((storageHour, i) => {
-      const useKv = i >= recentKvStart && raws?.[i];
-      const raw = useKv ? raws[i] : (analyticsBuckets?.[storageHour] || raws?.[i]);
-      const live = useKv || !analyticsBuckets ? _pendingStats : analyticsPending;
-      return { hour: utcHourKey(now - (STATS_WINDOW_HOURS - 1 - i) * 3600000), ...mergeStatsBucket(raw, live[storageHour]) };
-    });
-    return withCorsResponse(json({ ok: true, buckets, last_model: logs[0]?.model || "", now: utcNowIso(), time_zone: API_TIME_ZONE_LABEL }, 200));
+    return withCorsResponse(json(await getAdminStats(app, await getBestLogs(app)), 200));
   }
 
   if (apiPath === "/api/kv-usage" && request.method === "GET") {
@@ -2233,7 +2247,19 @@ async function handleAdminApi(request, url, pathname, app, adminBasePath) {
   }
 
   if (apiPath === "/api/runtime" && request.method === "GET") {
-    return withCorsResponse(json({ ok: true, active_upstreams: getActiveUpstreamSnapshot(), active_upstream_clients: getActiveUpstreamClientSnapshot(), last_successful_upstream: _lastSuccessfulUpstreamName }, 200));
+    const include = new Set((url.searchParams.get("include") || "").split(","));
+    const logs = include.has("logs") || include.has("stats") ? await getBestLogs(app) : null;
+    const stats = include.has("stats") ? await getAdminStats(app, logs) : null;
+    const response = json({
+      ok: true,
+      active_upstreams: getActiveUpstreamSnapshot(),
+      active_upstream_clients: getActiveUpstreamClientSnapshot(),
+      last_successful_upstream: _lastSuccessfulUpstreamName,
+      ...(include.has("logs") ? { logs } : {}),
+      ...(stats ? { stats } : {}),
+    }, 200);
+    response.headers.set("cache-control", "no-store");
+    return withCorsResponse(response);
   }
 
   if (apiPath === "/api/runtime/release" && request.method === "POST") {
@@ -2358,10 +2384,11 @@ async function resolveModelFetchUpstream(payload, app) {
     const runtime = await loadRuntimeConfig(app);
     const saved = runtime.upstreams.find((u) => u.name === uName);
     if (!saved) return { response: withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404)) };
+    const editedKey = String(payload.api_key || payload.api_key_value || "").trim();
     return {
       ...saved,
       account_id: String(payload.account_id || saved.account_id || "").trim(),
-      api_key: String(payload.api_key || payload.api_key_value || saved.api_key || "").trim(),
+      api_key: editedKey === saved.api_key_encrypted ? saved.api_key : (editedKey || saved.api_key || ""),
       base_url: String(payload.base_url || saved.base_url || "").trim(),
       headers: { ...normalizeHeaders(saved.headers), ...normalizeHeaders(payload.headers) },
       preset: String(payload.preset || saved.preset || inferPresetId(payload.base_url || saved.base_url)).trim(),
@@ -2370,7 +2397,7 @@ async function resolveModelFetchUpstream(payload, app) {
 
   const baseUrl = String(payload.base_url || "").trim();
   const apiKey = String(payload.api_key || payload.api_key_value || "").trim();
-  if (!baseUrl || !apiKey) return { response: withCorsResponse(json({ ok: false, error: "Base URL and API Key are required" }, 400)) };
+  if (!baseUrl || (!apiKey && payload.preset !== "nvidia-nim-self-hosted")) return { response: withCorsResponse(json({ ok: false, error: "Base URL and API Key are required" }, 400)) };
   return {
     name: "draft",
     account_id: String(payload.account_id || "").trim(),
@@ -2628,7 +2655,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
     if (!name) throw httpError(400, "Each upstream needs a name.");
     if (!baseUrl) throw httpError(400, `Upstream ${name} is missing base_url.`);
     if (!isAllowedUpstreamUrl(baseUrl)) throw httpError(400, `Upstream ${name} must use an HTTP(S) base_url without embedded credentials.`);
-    if (!apiKeyValue) throw httpError(400, `Upstream ${name} is missing api_key.`);
+    if (!apiKeyValue && preset !== "nvidia-nim-self-hosted") throw httpError(400, `Upstream ${name} is missing api_key.`);
     if (presetById(preset)?.requires_account_id && !accountId && !String(item.base_url || "").trim()) {
       throw httpError(400, `Upstream ${name} is missing account_id.`);
     }
@@ -2639,7 +2666,7 @@ async function normalizeGatewayConfigPayload(payload, app) {
     const models = normalizeStringArray(item.models);
     upstreams.push(buildUpstreamConfigRecord(item, index, {
       accountId,
-      apiKeyEncrypted: await ensureEncryptedValue(apiKeyValue, app.encryptionSecret),
+      apiKeyEncrypted: apiKeyValue ? await ensureEncryptedValue(apiKeyValue, app.encryptionSecret) : "",
       baseUrl,
       models,
       name,
@@ -2672,7 +2699,7 @@ function uniqueValidUpstreams(upstreams) {
   const seenNames = new Set();
   return upstreams.filter((item) => {
     const name = String(item?.name || "").toLowerCase();
-    if (!name || !item.base_url || !item.api_key_encrypted || !isAllowedUpstreamUrl(item.base_url) || seenNames.has(name)) return false;
+    if (!name || !item.base_url || (!item.api_key_encrypted && item.preset !== "nvidia-nim-self-hosted") || !isAllowedUpstreamUrl(item.base_url) || seenNames.has(name)) return false;
     seenNames.add(name);
     return true;
   });
@@ -3224,6 +3251,8 @@ async function fetchWorkersAiModelPage(upstream, timeoutMs, page, perPage) {
 
 async function checkUpstreamHealth(upstream, timeoutMs) {
   const started = Date.now();
+  const nim = isNvidiaNimUpstream(upstream);
+  const nimHosted = nim && String(upstream?.base_url || "").toLowerCase().includes("integrate.api.nvidia.com");
   try {
     if (isWorkersAiUpstream(upstream)) {
       const payload = await fetchWorkersAiModelPage(upstream, timeoutMs, 1, CLOUDFLARE_MODEL_SEARCH_PER_PAGE);
@@ -3232,17 +3261,50 @@ async function checkUpstreamHealth(upstream, timeoutMs) {
       return { name: upstream.name, ok: true, status: 200, latency_ms: Date.now() - started, model_count: total, capabilities: { models: true, chat: null } };
     }
 
-    const response = await fetchWithTimeout(
-      buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
-      { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
-      timeoutMs,
-    );
+    let probe = "models";
+    let response = null;
+    if (nim && !nimHosted) {
+      response = await fetchWithTimeout(
+        buildUpstreamUrl(upstream.base_url, "/v1/health/ready", ""),
+        { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+        timeoutMs,
+      );
+      if (response.status === 404 || response.status === 405) {
+        try { await response.body?.cancel("NIM ready endpoint unavailable"); } catch {}
+        response = null;
+      } else {
+        probe = "ready";
+      }
+    }
+    if (!response) {
+      response = await fetchWithTimeout(
+        buildUpstreamUrl(upstream.base_url, MODEL_PATH, ""),
+        { method: "GET", headers: buildUpstreamHeaders(null, upstream) },
+        timeoutMs,
+      );
+    }
     const ok = response.ok;
     const error = ok ? "" : await responseErrorMessage(response);
     try { await response.body?.cancel("health check complete"); } catch {}
-    return { name: upstream.name, ok, status: response.status, ...(error ? { error } : {}), latency_ms: Date.now() - started, capabilities: { models: ok, chat: null } };
+    return {
+      name: upstream.name,
+      ok,
+      status: response.status,
+      ...(error ? { error } : {}),
+      latency_ms: Date.now() - started,
+      capabilities: { models: probe === "models" ? ok : null, chat: null },
+      ...(nim ? { nim: { mode: nimHosted ? "hosted" : "self-hosted", ready: ok, probe } } : {}),
+    };
   } catch (err) {
-    return { name: upstream.name, ok: false, status: err.status || 0, error: err.message, latency_ms: Date.now() - started, capabilities: { models: false, chat: false } };
+    return {
+      name: upstream.name,
+      ok: false,
+      status: err.status || 0,
+      error: err.message,
+      latency_ms: Date.now() - started,
+      capabilities: { models: false, chat: false },
+      ...(nim ? { nim: { mode: nimHosted ? "hosted" : "self-hosted", ready: false, probe: nimHosted ? "models" : "ready" } } : {}),
+    };
   }
 }
 
@@ -5279,6 +5341,8 @@ async function proxyRequest({ client, model, pathname, request, bodyText, runtim
         lastError.upstreamName = upstream.name;
         markGatewayTrace(trace, "retrying_upstream", { attempt: index + 1, upstream: upstream.name, status: response.status });
         await markUpstreamFailure(runtime, upstream, model, response);
+      } else if (isNvidiaNimUpstream(upstream) && (response.status === 401 || response.status === 402)) {
+        await markUpstreamFailure(runtime, upstream, model, response);
       } else {
         await clearUpstreamFailure(runtime, upstream, model);
         rememberUpstreamLatency(runtime, upstream, model, upstreamResult.latency, ctx);
@@ -5536,11 +5600,13 @@ async function hedgedProxyRequest({ attempts, bodyText, client, model, pathname,
   const streamRequest = requestBodyStreams(bodyText);
   const fastDelayMs = Math.max(100, Math.min(300, Math.floor(runtime.requestTimeoutMs / 12)));
   const knownTtft = upstreamLatencyScore(attempts[0], model);
-  const hedgeDelayMs = Math.max(100, Math.min(1500, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 0.75) : 1000));
+  const hedgeDelayMs = Math.max(100, Math.min(5000, Math.floor(runtime.requestTimeoutMs / 3), Number.isFinite(knownTtft) ? Math.floor(knownTtft * 1.25) : 1000));
   const routingMode = runtime.routing.routing_mode || ((runtime.routing.fast_routing || runtime.routing.hedge_enabled) ? "adaptive" : "parallel");
   // soft_interval_ms coordinates separate requests; the routing mode controls this request's hedge timing.
   const launchDelay = (index) => {
     if (index === 0) return 0;
+    // Adaptive keeps at most two attempts running; later candidates wake on failure.
+    if (routingMode === "adaptive" && index > 1) return Infinity;
     return routingMode === "parallel" ? 0
       : runtime.routing.fast_routing === true && index === 1 ? fastDelayMs
         : routingMode === "adaptive" ? index * hedgeDelayMs : Infinity;
@@ -5800,12 +5866,14 @@ function orderUpstreams(runtime, candidates, model, client) {
   const cooling = [];
 
   candidates.forEach((upstream) => {
-    const status = _upstreamCooldowns[upstreamModelKey(upstream, model)];
+    const keyCooldown = isNvidiaNimUpstream(upstream) ? _upstreamCooldowns[upstreamModelKey(upstream, "*")] : null;
+    const status = keyCooldown && Number(keyCooldown.until) > now ? keyCooldown : _upstreamCooldowns[upstreamModelKey(upstream, model)];
     if (status && Number(status.until) > now) {
       cooling.push(upstream);
       return;
     }
     if (status) delete _upstreamCooldowns[upstreamModelKey(upstream, model)];
+    if (keyCooldown && Number(keyCooldown.until) <= now) delete _upstreamCooldowns[upstreamModelKey(upstream, "*")];
     healthy.push(upstream);
   });
 
@@ -6178,6 +6246,16 @@ async function hydrateUpstreamState(runtime, upstreams, model) {
       ]);
       if (cooldown?.until && Number(cooldown.until) > Date.now()) _upstreamCooldowns[key] = cooldown;
       else delete _upstreamCooldowns[key];
+      if (isNvidiaNimUpstream(upstream)) {
+        const keyWide = upstreamModelKey(upstream, "*");
+        const keyWideHydrated = `nim-key:${upstreamKey(upstream)}`;
+        if (Date.now() - Number(_upstreamStateHydratedAt[keyWideHydrated] || 0) >= UPSTREAM_STATE_HYDRATE_INTERVAL_MS) {
+          _upstreamStateHydratedAt[keyWideHydrated] = Date.now();
+          const keyState = await runtime.state.get(await upstreamCooldownStorageKey(keyWide), "json");
+          if (keyState?.until && Number(keyState.until) > Date.now()) _upstreamCooldowns[keyWide] = keyState;
+          else delete _upstreamCooldowns[keyWide];
+        }
+      }
       const score = Number(latency?.latency_ms);
       const updatedAt = Number(latency?.updated_at);
       const localUpdatedAt = Number(_upstreamLatencyUpdatedAt[key] || 0);
@@ -6201,9 +6279,10 @@ async function persistUpstreamLatency(runtime, key, latency, updatedAt) {
 }
 
 async function markUpstreamFailure(runtime, upstream, model, response = null) {
-  if (runtime.routing.failover === false) return;
-  const key = upstreamModelKey(upstream, model);
-  const ttl = retryAfterCooldownSeconds(response, runtime.upstreamCooldownTtl);
+  const keyWide = isNvidiaNimUpstream(upstream) && (response?.status === 401 || response?.status === 402);
+  if (runtime.routing.failover === false && !keyWide) return;
+  const key = upstreamModelKey(upstream, keyWide ? "*" : model);
+  const ttl = keyWide ? MAX_RETRY_AFTER_COOLDOWN_SECONDS : retryAfterCooldownSeconds(response, runtime.upstreamCooldownTtl);
   const status = { until: Date.now() + ttl * 1000 };
   _upstreamCooldowns[key] = status;
   if (stateSupportsRoutePersistence(runtime.state)) {
@@ -6214,11 +6293,14 @@ async function markUpstreamFailure(runtime, upstream, model, response = null) {
 }
 
 async function clearUpstreamFailure(runtime, upstream, model) {
-  const key = upstreamModelKey(upstream, model);
-  const hadCooldown = Boolean(_upstreamCooldowns[key]);
-  delete _upstreamCooldowns[key];
-  if (hadCooldown && stateSupportsRoutePersistence(runtime.state)) {
-    try { await runtime.state.delete(await upstreamCooldownStorageKey(key)); } catch {}
+  const keys = [upstreamModelKey(upstream, model)];
+  if (isNvidiaNimUpstream(upstream)) keys.push(upstreamModelKey(upstream, "*"));
+  for (const key of keys) {
+    const hadCooldown = Boolean(_upstreamCooldowns[key]);
+    delete _upstreamCooldowns[key];
+    if (hadCooldown && stateSupportsRoutePersistence(runtime.state)) {
+      try { await runtime.state.delete(await upstreamCooldownStorageKey(key)); } catch {}
+    }
   }
 }
 
@@ -6247,7 +6329,7 @@ function buildUpstreamUrl(baseUrl, pathname, search) {
 
 function buildUpstreamHeaders(request, upstream, bodyText = "", streamRequest = null) {
   const headers = new Headers();
-  headers.set("authorization", `Bearer ${upstream.api_key}`);
+  if (upstream.api_key) headers.set("authorization", `Bearer ${upstream.api_key}`);
   headers.set(
     "content-type",
     request?.headers.get("content-type") || "application/json; charset=utf-8",

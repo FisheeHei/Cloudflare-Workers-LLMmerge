@@ -199,7 +199,7 @@ const response = await client.chat.completions.create({
 - `Hedged Request` and `Gateway Fast` race multiple candidates. For a multi-account pool or concurrency-limited provider, they are usually best disabled because they intentionally increase concurrency. The gateway aborts losing requests when a winner is selected, but an upstream may already have started processing or billing.
 - SSE sends a padded keepalive comment every 10 seconds by default to keep proxy connections open; keepalives are not model output.
 
-Health checks only verify the upstream `/models` endpoint and do not prove that a specific model is ready. Use the admin speed test for model-level verification. Long-reasoning models may have slow first bytes, so the gateway uses an appropriate first-byte timeout and can try a fallback upstream.
+Health checks use `/models` for ordinary upstreams and Hosted NIM. Self-hosted NIM checks `/v1/health/ready` first and falls back to `/models` only when that endpoint is unavailable. Use the admin speed test for model-level verification. The self-hosted NIM preset allows an optional API key and requires an address reachable from Cloudflare's edge. NIM 401/402 failures lower that upstream's priority across its models for 10 minutes; 429 follows `Retry-After`. Long-reasoning models may have slow first bytes, so the gateway uses an appropriate first-byte timeout and can try a fallback upstream.
 
 ## Statistics And Troubleshooting
 

@@ -1,5 +1,5 @@
 export function isNvidiaNimUpstream(upstream) {
-  return upstreamMatches(upstream, ["nvidia-nim"], ["integrate.api.nvidia.com"]);
+  return upstreamMatches(upstream, ["nvidia-nim", "nvidia-nim-self-hosted"], ["integrate.api.nvidia.com"]);
 }
 
 const NIM_STRICT_ONLY_FIELDS = [

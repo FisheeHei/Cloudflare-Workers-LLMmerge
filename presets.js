@@ -7,6 +7,13 @@ export const PRESET_TEMPLATES = [
     requires_base_url: false,
   },
   {
+    id: "nvidia-nim-self-hosted",
+    name: "NVIDIA NIM (自托管)",
+    base_url: "",
+    paths: ["/v1/chat/completions", "/v1/embeddings"],
+    requires_base_url: true,
+  },
+  {
     id: "deepinfra",
     name: "DeepInfra",
     base_url: "https://api.deepinfra.com/v1/openai",
