@@ -1504,7 +1504,7 @@ function renderAdminScript(version) {
           const models = await fetchUpstreamModels(name, card);
           if (!models.length) throw new Error("\u8be5\u4e0a\u6e38\u65e0\u53ef\u7528\u6a21\u578b");
           showModelPicker(name, models, textarea, card);
-        });
+        }).catch(showError);
       });
     });
 

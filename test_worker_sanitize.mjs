@@ -102,6 +102,7 @@ const healthProbeHits = [];
 const nimHealthHits = [];
 const nimHealthAuth = [];
 const nimKeyHits = [];
+const savedProviderModelAuth = [];
 const analyticsPoints = [];
 const analyticsSqlQueries = [];
 const kvPuts = [];
@@ -114,6 +115,14 @@ function assertNoDeepSeekLeak(text) {
 }
 globalThis.fetch = async (url, init) => {
   fetchUrls.push(String(url));
+  if (["https://openrouter.ai/api/v1/models", "https://api.groq.com/openai/v1/models"].includes(String(url))) {
+    const isGroq = String(url).includes("groq.com");
+    const expected = isGroq ? "Bearer gsk-saved" : "Bearer sk-or-saved";
+    savedProviderModelAuth.push([String(url), init.headers.get("authorization")]);
+    return init.headers.get("authorization") === expected
+      ? Response.json({ data: [{ id: isGroq ? "groq/demo" : "openrouter/demo" }] })
+      : Response.json({ error: { message: "invalid key" } }, { status: 401 });
+  }
   if (String(url).includes("nim-health-")) {
     const kind = new URL(url).hostname.split(".")[0].replace("nim-health-", "");
     const path = new URL(url).pathname;
@@ -960,7 +969,7 @@ assert.equal(workersUsageNoToken.message.includes("Account Analytics > Read"), t
 const adminPageResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token"), env);
 const adminPage = await adminPageResp.text();
 assert.equal(adminPageResp.headers.get("cache-control"), "private, max-age=300, must-revalidate");
-assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-10-21-nim-aware-1"$/);
+assert.match(adminPageResp.headers.get("etag") || "", /^"llmmerge-v26-10-21-model-import-1"$/);
 const adminNotModifiedResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token", {
   headers: { "if-none-match": adminPageResp.headers.get("etag") },
 }), env);
@@ -979,6 +988,8 @@ assert.equal((await worker.default.fetch(new Request("https://gw.test/llmmerge-a
 }), env)).status, 200);
 const adminScript = adminPage.match(/<script>([\s\S]*)<\/script>/)?.[1] || "";
 assert.doesNotThrow(() => new Function(adminScript));
+const cardModelImportHandler = adminScript.slice(adminScript.indexOf('host.querySelectorAll(".fetch-models-btn")'), adminScript.indexOf('host.querySelectorAll(\'select[data-field="preset"]\')'));
+assert.equal(cardModelImportHandler.includes("}).catch(showError);"), true);
 const nimStateLabel = { dataset: { upstream: "nim" }, textContent: "" };
 const nimStateDetail = { dataset: { upstream: "nim" }, textContent: "" };
 const renderNimHealth = new Function("document", `
@@ -2254,6 +2265,37 @@ const modelsResp = await worker.default.fetch(new Request("https://gw.test/admin
 }), env);
 const models = await modelsResp.json();
 assert.deepEqual(models.models, ["deepseek-ai/deepseek-v4-pro", "google/codegemma-7b"]);
+const savedProviderStore = new Map([["gateway:config", JSON.stringify({
+  routing: {}, settings: {}, upstreams: [
+    { name: "saved-openrouter", preset: "openrouter", base_url: "https://openrouter.ai/api/v1", api_key_encrypted: "sk-or-saved", enabled: true },
+    { name: "saved-groq", preset: "groq", base_url: "https://api.groq.com/openai/v1", api_key_encrypted: "gsk-saved", enabled: false },
+  ],
+})]]);
+const savedProviderEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = savedProviderStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { savedProviderStore.set(key, value); },
+    async delete(key) { savedProviderStore.delete(key); },
+  },
+};
+const savedProviderConfig = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), savedProviderEnv)).json()).config;
+assert.equal((await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config", {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(savedProviderConfig),
+}), savedProviderEnv)).status, 200);
+const savedProviderCards = (await (await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/config"), savedProviderEnv)).json()).config.upstreams;
+for (const upstream of savedProviderCards) {
+  const response = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/fetch-models", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: upstream.name, preset: upstream.preset, base_url: upstream.base_url, api_key: upstream.api_key_value }),
+  }), savedProviderEnv);
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.deepEqual((await response.json()).models, [upstream.preset === "groq" ? "groq/demo" : "openrouter/demo"]);
+}
+assert.deepEqual(savedProviderModelAuth, [
+  ["https://openrouter.ai/api/v1/models", "Bearer sk-or-saved"],
+  ["https://api.groq.com/openai/v1/models", "Bearer gsk-saved"],
+]);
 
 const workersModelsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/fetch-models", {
   method: "POST",

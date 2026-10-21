@@ -117,7 +117,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-21-nim-aware-1";
+const VERSION = "v26-10-21-model-import-1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2381,14 +2381,14 @@ async function fetchAdminModels(request, app) {
 async function resolveModelFetchUpstream(payload, app) {
   const uName = payload.name || "";
   if (uName) {
-    const runtime = await loadRuntimeConfig(app);
-    const saved = runtime.upstreams.find((u) => u.name === uName);
+    const saved = (await getEditableConfig(app)).upstreams.find((u) => u.name === uName);
     if (!saved) return { response: withCorsResponse(json({ ok: false, error: "Upstream not found" }, 404)) };
     const editedKey = String(payload.api_key || payload.api_key_value || "").trim();
+    const savedKey = await decryptValue(saved.api_key_encrypted, app.encryptionSecret);
     return {
       ...saved,
       account_id: String(payload.account_id || saved.account_id || "").trim(),
-      api_key: editedKey === saved.api_key_encrypted ? saved.api_key : (editedKey || saved.api_key || ""),
+      api_key: editedKey && !editedKey.startsWith("enc::") ? editedKey : savedKey,
       base_url: String(payload.base_url || saved.base_url || "").trim(),
       headers: { ...normalizeHeaders(saved.headers), ...normalizeHeaders(payload.headers) },
       preset: String(payload.preset || saved.preset || inferPresetId(payload.base_url || saved.base_url)).trim(),
