@@ -51,7 +51,8 @@ export function providerCapabilities(upstream) {
     provider: provider.id,
     name: provider.name,
     supports_developer_role: upstreamSupportsDeveloperRole(upstream),
-    native_responses: provider.id === "nim" && !baseUrl.includes("integrate.api.nvidia.com"),
+    native_responses: upstream?.paths?.includes("/v1/responses") === true &&
+      !(provider.id === "nim" && baseUrl.includes("integrate.api.nvidia.com")),
     strict_chat: provider.id === "nim",
   };
 }

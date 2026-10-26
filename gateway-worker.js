@@ -3861,12 +3861,7 @@ async function handleResponsesCancel(request, app, ctx, responseId) {
 }
 
 function nativeResponsesAvailable(runtime, client, model) {
-  return proxyCandidates(runtime, client, model, RESPONSES_PATH).length > 0 &&
-    runtime.upstreams.some((upstream) =>
-      clientAllowsUpstream(client, upstream.name) &&
-      upstreamSupportsPath(upstream, RESPONSES_PATH) &&
-      providerCapabilities(upstream).native_responses
-    );
+  return proxyCandidates(runtime, client, model, RESPONSES_PATH).length > 0;
 }
 
 function responsesNativeBody(translated, payload, settings, client, previousResponse = null) {
@@ -3904,10 +3899,30 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
   const translated = translateResponsesRequest(payload, { previousResponse });
   await resolveTranslatedRequestModel(client, runtime, translated, request, payload);
   await persistSessionCurrentModel(runtime, client, request, payload, ctx);
-  const useNative = nativeResponsesAvailable(runtime, client, translated.model);
-  const prepared = useNative
+  let useNative = nativeResponsesAvailable(runtime, client, translated.model);
+  let prepared = useNative
     ? responsesNativeBody(translated, payload, runtime.settings, client, previousResponse)
     : prepareGatewayChatBody(translated.bodyText, runtime.settings, client);
+  const requestUpstream = async (signal) => {
+    const options = {
+      client, model: translated.model, request, runtime, search: url.search, ctx, signal, traceId,
+    };
+    let result = await proxyRequest({
+      ...options, pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
+      bodyText: prepared.bodyText, injection: prepared.injection,
+    });
+    if (useNative && [404, 405].includes(result.response.status) &&
+      proxyCandidates(runtime, client, translated.model, CHAT_PATH).length) {
+      abortUpstreamResponse(result, "Responses endpoint unsupported");
+      try { await result.response.body?.cancel("Responses endpoint unsupported"); } catch {}
+      useNative = false;
+      prepared = prepareGatewayChatBody(translated.bodyText, runtime.settings, client);
+      result = await proxyRequest({
+        ...options, pathname: CHAT_PATH, bodyText: prepared.bodyText, injection: prepared.injection,
+      });
+    }
+    return result;
+  };
 
   if (translated.stream) {
     const headers = pendingSseHeaders(client, traceId);
@@ -3916,19 +3931,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
     const body = streamPendingResponsesResponse(async () => {
       let proxyResponse;
       try {
-        proxyResponse = await proxyRequest({
-          client,
-          model: translated.model,
-          pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
-          request,
-          bodyText: prepared.bodyText,
-          injection: prepared.injection,
-           runtime,
-           search: url.search,
-           ctx,
-           signal: mergeAbortSignals(request.signal, controller.signal),
-           traceId,
-         });
+        proxyResponse = await requestUpstream(mergeAbortSignals(request.signal, controller.signal));
         const upstreamResp = proxyResponse.response;
         if (!upstreamResp.ok) throw httpError(upstreamResp.status || 502, await responseErrorMessage(upstreamResp) || `Upstream returned HTTP ${upstreamResp.status}.`);
         const finish = (usage, extra) => {
@@ -3962,19 +3965,7 @@ async function handleResponsesRequest(request, url, app, ctx, traceId) {
 
   let proxyResponse;
   try {
-    proxyResponse = await proxyRequest({
-      client,
-      model: translated.model,
-      pathname: useNative ? RESPONSES_PATH : CHAT_PATH,
-      request,
-      bodyText: prepared.bodyText,
-      injection: prepared.injection,
-       runtime,
-       search: url.search,
-       ctx,
-       signal: request.signal,
-       traceId,
-     });
+    proxyResponse = await requestUpstream(request.signal);
 
     const upstreamResp = proxyResponse.response;
     const headers = proxyResponseHeaders(upstreamResp, proxyResponse, client, traceId);
@@ -5050,7 +5041,9 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let sequenceNumber = 0;
-  const write = (event) => writer.write(encoder.encode(`data: ${JSON.stringify({ ...event, sequence_number: sequenceNumber++ })}\n\n`));
+  const pendingEvents = [];
+  const write = (event) => pendingEvents.push(`data: ${JSON.stringify({ ...event, sequence_number: sequenceNumber++ })}\n\n`);
+  const flush = () => pendingEvents.length ? writer.write(encoder.encode(pendingEvents.splice(0).join(""))) : Promise.resolve();
 
   (async () => {
     let buffer = "";
@@ -5068,7 +5061,6 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
     const diag = createStreamDiag(started);
     const splitChoiceText = normalizeNimReasoning ? createChoiceThinkContentSplitter() : null;
     let closeReason = "done";
-    const writes = [];
     const stripText = createThinkTagStripper();
     let completionPending = false;
     let upstreamStopped = false;
@@ -5086,15 +5078,15 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       messageOutputIndex = nextOutputIndex++;
       const item = { id: seed.messageId, type: "message", status: "in_progress", role: "assistant", content: [] };
       outputItems.push({ type: "message", outputIndex: messageOutputIndex, item });
-      writes.push(write({ type: "response.output_item.added", output_index: messageOutputIndex, item }));
-      writes.push(write({ type: "response.content_part.added", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }));
+      write({ type: "response.output_item.added", output_index: messageOutputIndex, item });
+      write({ type: "response.content_part.added", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
     };
     const ensureReasoning = () => {
       if (reasoningOutputIndex != null) return;
       reasoningOutputIndex = nextOutputIndex++;
       outputItems.push({ type: "reasoning", outputIndex: reasoningOutputIndex });
-      writes.push(write({ type: "response.output_item.added", output_index: reasoningOutputIndex, item: responsesReasoningItem(seed, "", "in_progress") }));
-      writes.push(write({ type: "response.reasoning_summary_part.added", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, part: { type: "summary_text", text: "" } }));
+      write({ type: "response.output_item.added", output_index: reasoningOutputIndex, item: responsesReasoningItem(seed, "", "in_progress") });
+      write({ type: "response.reasoning_summary_part.added", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, part: { type: "summary_text", text: "" } });
     };
     const processChunk = (chunk, now = Date.now()) => {
       chunk = normalizeNimChatStreamChunk(chunk, splitChoiceText);
@@ -5108,7 +5100,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         noteStreamToken(diag, now);
         reasoningParts.push(reasoningDelta);
         outputChars += reasoningDelta.length;
-        writes.push(write({ type: "response.reasoning_summary_text.delta", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, delta: reasoningDelta }));
+        write({ type: "response.reasoning_summary_text.delta", item_id: seed.reasoningId, output_index: reasoningOutputIndex, summary_index: 0, delta: reasoningDelta });
       }
       const content = hideReasoning ? stripText(chatContentToText(delta.content || "")) : chatContentToText(delta.content || "");
       if (content) {
@@ -5116,30 +5108,28 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         noteStreamToken(diag, now);
         textParts.push(content);
         outputChars += content.length;
-        writes.push(write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, delta: content }));
+        write({ type: "response.output_text.delta", item_id: seed.messageId, output_index: messageOutputIndex, content_index: 0, delta: content });
       }
       for (const call of (delta.tool_calls || [])) {
         const key = String(call.index ?? toolCalls.size);
         let item = toolCalls.get(key);
         if (!item) {
-          item = { id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`), name: String(call.function?.name || call.name || "tool"), argumentParts: [], outputIndex: nextOutputIndex++ };
+          item = { id: String(call.id || `call_${crypto.randomUUID().replace(/-/g, "")}`), name: "", argumentParts: [] };
           toolCalls.set(key, item);
-          outputItems.push({ type: "function_call", outputIndex: item.outputIndex, item });
-          writes.push(write({ type: "response.output_item.added", output_index: item.outputIndex, item: responsesFunctionCallItem(item, "in_progress") }));
         }
         if (call.id) item.id = String(call.id);
-        if (call.function?.name) item.name = String(call.function.name);
+        item.name += String(call.function?.name || call.name || "");
         const args = String(call.function?.arguments || "");
         if (args) {
           item.argumentParts.push(args);
           outputChars += args.length;
-          writes.push(write({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: args }));
         }
       }
     };
     try {
-      await write({ type: "response.created", response: makeResponsesPayload(seed, { status: "in_progress" }) });
-      await write({ type: "response.in_progress", response: makeResponsesPayload(seed, { status: "in_progress" }) });
+      write({ type: "response.created", response: makeResponsesPayload(seed, { status: "in_progress" }) });
+      write({ type: "response.in_progress", response: makeResponsesPayload(seed, { status: "in_progress" }) });
+      await flush();
 
       const reader = openaiResp.body.getReader();
       upstreamReader = reader;
@@ -5150,7 +5140,7 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         noteStreamByte(diag, now);
         buffer += decoder.decode(value, { stream: true });
         buffer = consumeOpenAiStreamBuffer(buffer, (chunk) => processChunk(chunk, now), () => { sawDone = true; markUpstreamComplete(); });
-        await Promise.all(writes.splice(0));
+        await flush();
         if (streamError) throw new Error(streamError);
         if (sawDone) {
           break;
@@ -5159,36 +5149,43 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
       buffer += decoder.decode();
       if (!sawDone && buffer) {
         consumeOpenAiStreamBuffer(buffer + "\n\n", (chunk) => processChunk(chunk), () => { sawDone = true; markUpstreamComplete(); });
-        await Promise.all(writes.splice(0));
+        await flush();
         if (streamError) throw new Error(streamError);
       }
 
       const text = textParts.join("");
       const reasoning = reasoningParts.join("");
-      for (const item of toolCalls.values()) item.arguments = item.argumentParts.join("");
       if (!sawDone && !finishReason) {
         closeReason = "eof";
         const failedResponse = { ...makeResponsesPayload(seed, { text, reasoning, usage, status: "failed" }), error: { message: "Upstream stream ended without [DONE].", type: "server_error" } };
         if (onFinal) onFinal(failedResponse);
-        await write({ type: "response.failed", response: failedResponse });
-        await write({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+        write({ type: "response.failed", response: failedResponse });
+        write({ type: "error", error: { message: "Upstream stream ended without [DONE].", type: "server_error" } });
+        await flush();
         return;
       }
       if (!sawDone) closeReason = "completed";
+      for (const item of toolCalls.values()) {
+        item.arguments = item.argumentParts.join("");
+        item.outputIndex = nextOutputIndex++;
+        outputItems.push({ type: "function_call", outputIndex: item.outputIndex, item });
+      }
       for (const outputItem of outputItems) {
         if (outputItem.type === "message") {
           const donePart = { type: "output_text", text, annotations: [] };
-          await write({ type: "response.output_text.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, text });
-          await write({ type: "response.content_part.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, part: donePart });
-          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: { ...outputItem.item, status: "completed", content: [donePart] } });
+          write({ type: "response.output_text.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, text });
+          write({ type: "response.content_part.done", item_id: seed.messageId, output_index: outputItem.outputIndex, content_index: 0, part: donePart });
+          write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: { ...outputItem.item, status: "completed", content: [donePart] } });
         } else if (outputItem.type === "reasoning") {
           const part = { type: "summary_text", text: reasoning };
-          await write({ type: "response.reasoning_summary_text.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, text: reasoning });
-          await write({ type: "response.reasoning_summary_part.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, part });
-          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesReasoningItem(seed, reasoning) });
+          write({ type: "response.reasoning_summary_text.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, text: reasoning });
+          write({ type: "response.reasoning_summary_part.done", item_id: seed.reasoningId, output_index: outputItem.outputIndex, summary_index: 0, part });
+          write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesReasoningItem(seed, reasoning) });
         } else if (outputItem.type === "function_call") {
-          await write({ type: "response.function_call_arguments.done", item_id: outputItem.item.id, output_index: outputItem.outputIndex, arguments: outputItem.item.arguments });
-          await write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesFunctionCallItem(outputItem.item) });
+          write({ type: "response.output_item.added", output_index: outputItem.outputIndex, item: responsesFunctionCallItem({ ...outputItem.item, arguments: "" }, "in_progress") });
+          if (outputItem.item.arguments) write({ type: "response.function_call_arguments.delta", item_id: outputItem.item.id, output_index: outputItem.outputIndex, delta: outputItem.item.arguments });
+          write({ type: "response.function_call_arguments.done", item_id: outputItem.item.id, output_index: outputItem.outputIndex, arguments: outputItem.item.arguments });
+          write({ type: "response.output_item.done", output_index: outputItem.outputIndex, item: responsesFunctionCallItem(outputItem.item) });
         }
       }
       const completedToolCalls = [...toolCalls.values()].map((item) => ({ id: item.id, function: { name: item.name, arguments: item.arguments }, outputIndex: item.outputIndex }));
@@ -5200,14 +5197,16 @@ function streamResponsesFromChat(openaiResp, seed, onDone = null, started = Date
         outputOrder: outputItems.map((item) => ({ type: item.type, call: item.type === "function_call" ? item.item : null })),
       });
       if (onFinal) onFinal(completedResponse);
-      await write({ type: "response.completed", response: completedResponse });
+      write({ type: "response.completed", response: completedResponse });
+      await flush();
       await writer.write(encoder.encode("data: [DONE]\n\n"));
     } catch (error) {
       closeReason = "error";
       const failedResponse = { ...makeResponsesPayload(seed, { text: textParts.join(""), reasoning: reasoningParts.join(""), usage, status: "failed" }), error: { message: error.message || "Stream error.", type: "server_error" } };
       if (onFinal) onFinal(failedResponse);
-      await write({ type: "response.failed", response: failedResponse });
-      await write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
+      write({ type: "response.failed", response: failedResponse });
+      write({ type: "error", error: { message: error.message || "Stream error.", type: "server_error" } });
+      await flush();
     } finally {
       stopUpstream();
       if (onDone) onDone(normalizeResponsesUsage(usage, Math.round(outputChars / 4)), {
@@ -5406,6 +5405,7 @@ function proxyCandidates(runtime, client, model, pathname) {
   const pool = indexedPool && indexedPool.length ? indexedPool : runtime.upstreams;
   return pool.filter((upstream) =>
     clientAllowsUpstream(client, upstream.name) &&
+    (pathname !== RESPONSES_PATH || providerCapabilities(upstream).native_responses) &&
     (indexedPool?.length || (upstreamSupportsModel(upstream, model) && upstreamSupportsPath(upstream, pathname)))
   );
 }

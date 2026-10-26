@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import { classifyGatewayFailure, createGatewayTrace, gatewayTraceFields, markGatewayTrace } from "./gateway-observability.js";
 import { gatewayInjectionPlan } from "./gateway-context.js";
+import { providerCapabilities } from "./provider-bridges.js";
 
 const worker = await import(`${pathToFileURL(`${process.cwd()}/_worker.js`).href}?t=${Date.now()}`);
 assert.equal(classifyGatewayFailure({ status: 200 }), "ok");
 assert.equal(classifyGatewayFailure({ status: 503 }), "upstream_unavailable");
 assert.equal(classifyGatewayFailure({ status: 200, closeReason: "eof" }), "upstream_stream_eof");
 assert.equal(classifyGatewayFailure({ status: 503, dispatchLimited: true }), "dispatch_busy");
+assert.equal(providerCapabilities({ preset: "nvidia-nim", base_url: "https://integrate.api.nvidia.com/v1", paths: ["/v1/responses"] }).native_responses, false);
 const sameTickTrace = createGatewayTrace({ id: "same-tick" });
 markGatewayTrace(sameTickTrace, "upstream_fetch_called");
 assert.equal(gatewayTraceFields(sameTickTrace).trace_upstream_called, true);
@@ -74,6 +76,7 @@ const responseHits = [];
 const responseStreamHits = [];
 const nativeResponseHits = [];
 const nativeResponseStreamHits = [];
+const negotiatedHits = [];
 const completionHits = [];
 const completionChatHits = [];
 const nimCompletionHits = [];
@@ -442,7 +445,8 @@ globalThis.fetch = async (url, init) => {
     }
     if (body.model === "tool-only-stream-model") {
       return new Response([
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_tool_only","type":"function","function":{"name":"shell","arguments":"{\\"command\\":\\"pwd\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_tool_only","type":"function","function":{"name":"sh","arguments":"{\\"command\\":"}}]}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ell","arguments":"\\"pwd\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
         'data: [DONE]\n\n',
       ].join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
     }
@@ -491,6 +495,18 @@ globalThis.fetch = async (url, init) => {
       output_text: "native",
       usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
     }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+  if (String(url).includes("negotiation.example/v1/")) {
+    const pathname = new URL(url).pathname;
+    const body = JSON.parse(init.body);
+    negotiatedHits.push({ pathname, body });
+    if (pathname === "/v1/responses") return new Response("Not Found", { status: body.stream ? 405 : 404 });
+    if (body.stream) return new Response('data: {"choices":[{"delta":{"content":"fallback"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+      status: 200, headers: { "content-type": "text/event-stream" },
+    });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "fallback" } }] }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
   }
   if (String(url).includes("nim-local.example")) {
     nimLocalHits.push(JSON.parse(init.body));
@@ -3513,7 +3529,18 @@ const responsesStreamResp = await worker.default.fetch(new Request("https://gw.t
 assert.equal(responsesStreamResp.headers.get("content-type").includes("text/event-stream"), true);
 assert.equal(responsesStreamResp.headers.get("cache-control"), "no-cache, no-transform");
 assert.equal(responsesStreamResp.headers.get("x-accel-buffering"), "no");
-const responsesStreamText = await responsesStreamResp.text();
+let responsesStreamText = "";
+let responseChunkCount = 0;
+const responsesStreamReader = responsesStreamResp.body.getReader();
+const responsesStreamDecoder = new TextDecoder();
+for (;;) {
+  const { value, done } = await responsesStreamReader.read();
+  if (done) break;
+  responseChunkCount += 1;
+  responsesStreamText += responsesStreamDecoder.decode(value, { stream: true });
+}
+responsesStreamText += responsesStreamDecoder.decode();
+assert.equal(responseChunkCount < 10, true);
 assert.equal(responseStreamHits[0].stream, true);
 assert.equal(responsesStreamText.includes('"type":"response.output_text.delta"'), true);
 assert.equal(responsesStreamText.includes('"delta":"hel"'), true);
@@ -3546,7 +3573,23 @@ const toolOnlyEvents = toolOnlyText.split(/\r?\n\r?\n/)
   .map((data) => JSON.parse(data));
 assert.equal(toolOnlyEvents.some((event) => event.type === "response.output_item.added" && event.item.type === "message"), false);
 assert.deepEqual(toolOnlyEvents.find((event) => event.type === "response.completed").response.output.map((item) => item.type), ["function_call"]);
+const upstreamToolCall = toolOnlyEvents.find((event) => event.type === "response.completed").response.output[0];
+assert.equal(upstreamToolCall.name, "shell");
+assert.equal(upstreamToolCall.arguments, '{"command":"pwd"}');
+assert.equal(toolOnlyEvents.find((event) => event.type === "response.output_item.added").item.name, "shell");
+assert.equal(toolOnlyEvents.find((event) => event.type === "response.output_item.added").item.arguments, "");
+assert.equal(responseStreamHits.at(-1).tools, undefined);
 assert.deepEqual(toolOnlyEvents.map((event) => event.sequence_number), toolOnlyEvents.map((_, index) => index));
+const toolResultResp = await worker.default.fetch(new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-resp", "content-type": "application/json" },
+  body: JSON.stringify({ model: "tool-only-stream-model", input: [
+    { type: "function_call", call_id: upstreamToolCall.call_id, name: upstreamToolCall.name, arguments: upstreamToolCall.arguments },
+    { type: "function_call_output", call_id: upstreamToolCall.call_id, output: "pwd result" },
+  ], stream: true }),
+}), responsesEnv);
+await toolResultResp.text();
+assert.equal(responseStreamHits.at(-1).messages.some((message) => message.role === "tool" && message.tool_call_id === upstreamToolCall.call_id && message.content === "pwd result"), true);
 const responsesStreamLogsResp = await worker.default.fetch(new Request("https://gw.test/admin-test-token/api/logs"), responsesEnv);
 const responsesStreamLogs = await responsesStreamLogsResp.json();
 const responsesStreamLog = responsesStreamLogs.logs.find((entry) => entry.model === "stream-model" && entry.path === "/v1/responses");
@@ -3684,6 +3727,51 @@ const nativeStreamEvents = nativeStreamText.split(/\r?\n\r?\n/)
   .filter((data) => data && data !== "[DONE]")
   .map((data) => JSON.parse(data));
 assert.deepEqual(nativeStreamEvents.map((event) => event.sequence_number), nativeStreamEvents.map((_, index) => index));
+
+const negotiationStore = new Map();
+negotiationStore.set("gateway:config", JSON.stringify({
+  routing: { failover: true, load_balance: false },
+  settings: { model_cache_ttl: 3600, request_timeout_ms: 30000, upstream_cooldown_ttl: 60 },
+  upstreams: [
+    { name: "custom-native", preset: "custom", base_url: "https://nim-native.example/v1", api_key_encrypted: "c", models: ["custom-native-model"], paths: ["/v1/chat/completions", "/v1/responses"], enabled: true },
+    { name: "fallback-native", preset: "custom", base_url: "https://negotiation.example/v1", api_key_encrypted: "f", models: ["fallback-model"], paths: ["/v1/chat/completions", "/v1/responses"], enabled: true },
+  ],
+}));
+const negotiationEnv = {
+  ...env,
+  KV: {
+    async get(key, type) { const value = negotiationStore.get(key); return type === "json" && value ? JSON.parse(value) : value || null; },
+    async put(key, value) { negotiationStore.set(key, value); },
+    async delete(key) { negotiationStore.delete(key); },
+  },
+  CLIENTS_JSON: JSON.stringify([{ name: "negotiation-client", key: "sk-negotiation", models: ["*"], upstreams: ["custom-native", "fallback-native"] }]),
+};
+const negotiatedRequest = (model, stream = false) => new Request("https://gw.test/v1/responses", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-negotiation", "content-type": "application/json" },
+  body: JSON.stringify({ model, input: "hi", stream }),
+});
+const customNativeStart = nativeResponseHits.length;
+const customNativeResponse = await worker.default.fetch(negotiatedRequest("custom-native-model"), negotiationEnv);
+assert.equal(customNativeResponse.status, 200);
+assert.equal(nativeResponseHits.length, customNativeStart + 1);
+assert.equal((await customNativeResponse.json()).output_text, "native");
+const fallbackResponse = await worker.default.fetch(negotiatedRequest("fallback-model"), negotiationEnv);
+assert.equal(fallbackResponse.status, 200);
+assert.equal((await fallbackResponse.json()).output_text, "fallback");
+assert.deepEqual(negotiatedHits.slice(-2).map((hit) => hit.pathname), ["/v1/responses", "/v1/chat/completions"]);
+assert.equal(negotiatedHits.at(-1).body.messages[0].content, "hi");
+const chatNegotiatedResponse = await worker.default.fetch(new Request("https://gw.test/v1/chat/completions", {
+  method: "POST",
+  headers: { authorization: "Bearer sk-negotiation", "content-type": "application/json" },
+  body: JSON.stringify({ model: "fallback-model", messages: [{ role: "user", content: "hi" }] }),
+}), negotiationEnv);
+assert.equal(chatNegotiatedResponse.status, 200);
+assert.equal(negotiatedHits.at(-1).pathname, "/v1/chat/completions");
+const fallbackStreamResponse = await worker.default.fetch(negotiatedRequest("fallback-model", true), negotiationEnv);
+assert.equal(fallbackStreamResponse.status, 200);
+assert.equal((await fallbackStreamResponse.text()).includes('"type":"response.completed"'), true);
+assert.deepEqual(negotiatedHits.slice(-2).map((hit) => hit.pathname), ["/v1/responses", "/v1/chat/completions"]);
 
 const nimLocalStore = new Map();
 nimLocalStore.set("gateway:config", JSON.stringify({
