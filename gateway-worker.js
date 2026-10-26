@@ -117,7 +117,7 @@ const DEFAULT_KV_DAILY_BUDGET = {
   reads: 100_000,
   writes: 1_000,
 };
-const VERSION = "v26-10-21-model-import-1";
+const VERSION = "v26-10-27-responses-1";
 
 export default {
   async fetch(request, env, ctx) {
